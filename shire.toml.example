@@ -1,0 +1,14 @@
+# Shire configuration (optional - defaults work for most repos)
+
+[discovery]
+# Which manifest files to look for
+manifests = ["package.json", "go.mod", "Cargo.toml", "pyproject.toml"]
+
+# Directories to skip (in addition to .gitignore patterns)
+exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party"]
+
+# Override package metadata not in manifests
+# [[packages]]
+# name = "legacy-auth"
+# description = "Legacy auth service - deprecated, use auth-service instead"
+# tags = ["deprecated"]

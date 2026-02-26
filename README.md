@@ -10,12 +10,13 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 **Supported ecosystems:**
 
-| Manifest | Kind |
-|---|---|
-| `package.json` | npm |
-| `go.mod` | go |
-| `Cargo.toml` | cargo |
-| `pyproject.toml` | python |
+| Manifest | Kind | Workspace support |
+|---|---|---|
+| `package.json` | npm | `workspace:` protocol versions normalized |
+| `go.mod` | go | `go.work` member metadata |
+| `go.work` | go | `use` directives parsed for workspace context |
+| `Cargo.toml` | cargo | `workspace = true` deps resolved from root |
+| `pyproject.toml` | python | — |
 
 ## Install
 
@@ -29,11 +30,14 @@ cargo install --path .
 # Index a monorepo
 shire build --root /path/to/repo
 
+# Rebuild from scratch (ignore cached hashes)
+shire build --root /path/to/repo --force
+
 # Start the MCP server
 shire serve
 ```
 
-The index is written to `.shire/index.db` inside the repo root. The server reads from this database in read-only mode.
+The index is written to `.shire/index.db` inside the repo root. Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. The server reads from this database in read-only mode.
 
 ### MCP tools
 
@@ -68,7 +72,7 @@ Drop a `shire.toml` in the repo root to customize discovery:
 
 ```toml
 [discovery]
-manifests = ["package.json", "go.mod", "Cargo.toml", "pyproject.toml"]
+manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml"]
 exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire"]
 
 # Override package descriptions
@@ -89,11 +93,13 @@ src/
 │   ├── mod.rs       # SQLite schema, open/create
 │   └── queries.rs   # FTS search, dependency graph BFS, listing
 ├── index/
-│   ├── mod.rs       # Walk + index orchestrator
+│   ├── mod.rs       # Walk + incremental index orchestrator
 │   ├── manifest.rs  # ManifestParser trait
-│   ├── npm.rs       # package.json parser
+│   ├── hash.rs      # SHA-256 content hashing for incremental builds
+│   ├── npm.rs       # package.json parser (workspace: protocol)
 │   ├── go.rs        # go.mod parser
-│   ├── cargo.rs     # Cargo.toml parser
+│   ├── go_work.rs   # go.work parser (workspace use directives)
+│   ├── cargo.rs     # Cargo.toml parser (workspace dep resolution)
 │   └── python.rs    # pyproject.toml parser
 └── mcp/
     ├── mod.rs       # MCP server setup (rmcp, stdio transport)

@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod index;
 mod mcp;
+mod symbols;
 
 #[derive(Parser)]
 #[command(name = "shire", about = "Monorepo package index and MCP server")]

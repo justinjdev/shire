@@ -81,6 +81,32 @@ pub struct ListParams {
     pub kind: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchSymbolsParams {
+    /// Search query to find symbols by name or signature
+    pub query: String,
+    /// Filter to symbols from a specific package
+    pub package: Option<String>,
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPackageSymbolsParams {
+    /// Exact package name to get symbols for
+    pub package: String,
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSymbolParams {
+    /// Exact symbol name to look up
+    pub name: String,
+    /// Filter to a specific package
+    pub package: Option<String>,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description using full-text search")]
@@ -170,6 +196,63 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::list_packages(&conn, params.kind.as_deref())
             .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Search symbols (functions, classes, types, etc.) by name or signature using full-text search. Returns matching symbols with file location, signature, parameters, and return type.")]
+    fn search_symbols(
+        &self,
+        Parameters(params): Parameters<SearchSymbolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::search_symbols(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            params.kind.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "List all symbols in a package. Useful for understanding a package's public API — its exported functions, classes, types, and methods.")]
+    fn get_package_symbols(
+        &self,
+        Parameters(params): Parameters<GetPackageSymbolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::get_package_symbols(
+            &conn,
+            &params.package,
+            params.kind.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Get details for a specific symbol by exact name. Returns all symbols matching that name across packages, with file location, signature, parameters, and return type.")]
+    fn get_symbol(
+        &self,
+        Parameters(params): Parameters<GetSymbolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::get_symbol(
+            &conn,
+            &params.name,
+            params.package.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))

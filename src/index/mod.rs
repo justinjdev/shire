@@ -1,5 +1,6 @@
 pub mod cargo;
 pub mod go;
+pub mod go_work;
 pub mod hash;
 pub mod manifest;
 pub mod npm;
@@ -7,6 +8,7 @@ pub mod python;
 
 use crate::config::Config;
 use crate::db;
+use crate::symbols;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use manifest::{ManifestParser, PackageInfo};
@@ -29,7 +31,9 @@ fn walk_manifests(
     config: &Config,
     parsers: &[Box<dyn ManifestParser>],
 ) -> Result<Vec<WalkedManifest>> {
-    let manifest_filenames: HashSet<&str> = parsers.iter().map(|p| p.filename()).collect();
+    let mut manifest_filenames: HashSet<&str> = parsers.iter().map(|p| p.filename()).collect();
+    // go.work provides workspace context, not packages — but must be walked
+    manifest_filenames.insert("go.work");
     let enabled: HashSet<&str> = config
         .discovery
         .manifests
@@ -190,14 +194,97 @@ fn recompute_is_internal(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Clear and re-insert symbols for a package.
+fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
+
+    let mut stmt = conn.prepare(
+        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+
+    for sym in syms {
+        let params_json = sym
+            .parameters
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default());
+
+        stmt.execute((
+            package,
+            &sym.name,
+            sym.kind.as_str(),
+            &sym.signature,
+            &sym.file_path,
+            sym.line as i64,
+            &sym.visibility,
+            &sym.parent_symbol,
+            &sym.return_type,
+            &params_json,
+        ))?;
+    }
+
+    Ok(())
+}
+
+/// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
+fn collect_cargo_workspace_context(walked: &[WalkedManifest]) -> HashMap<String, String> {
+    let mut all_ws_deps = HashMap::new();
+
+    for manifest in walked {
+        let filename = manifest
+            .abs_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+
+        if filename == "Cargo.toml" {
+            if let Ok(deps) = cargo::collect_cargo_workspace_deps(&manifest.abs_path) {
+                all_ws_deps.extend(deps);
+            }
+        }
+    }
+
+    all_ws_deps
+}
+
+/// Scan walked go.work files and collect the set of workspace member directories.
+fn collect_go_workspace_context(walked: &[WalkedManifest]) -> HashSet<String> {
+    let mut dirs = HashSet::new();
+
+    for manifest in walked {
+        let filename = manifest
+            .abs_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+
+        if filename == "go.work" {
+            if let Ok(use_dirs) = go_work::parse_go_work(&manifest.abs_path) {
+                for d in use_dirs {
+                    // go.work use directives are relative to the go.work location
+                    let full_dir = if manifest.relative_dir.is_empty() {
+                        d
+                    } else {
+                        format!("{}/{}", manifest.relative_dir, d)
+                    };
+                    dirs.insert(full_dir);
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
 pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
     let db_dir = repo_root.join(".shire");
     let db_path = db_dir.join("index.db");
     let conn = db::open_or_create(&db_path)?;
 
-    // If --force, clear hashes to trigger full rebuild
+    // If --force, clear hashes and symbols to trigger full rebuild
     if force {
         conn.execute("DELETE FROM manifest_hashes", [])?;
+        conn.execute("DELETE FROM symbols", [])?;
     }
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
@@ -209,6 +296,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
     // Phase 1: Walk — discover all manifests with content hashes
     let walked = walk_manifests(repo_root, config, &parsers)?;
+
+    // Phase 1.5: Collect workspace context before parsing
+    let cargo_workspace_deps = collect_cargo_workspace_context(&walked);
+    let go_workspace_dirs = collect_go_workspace_context(&walked);
 
     // Phase 2: Diff — compare against stored hashes
     let stored_hashes = load_stored_hashes(&conn)?;
@@ -229,6 +320,8 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
     // Phase 3: Parse — only new + changed manifests
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut parsed_packages: Vec<(String, String, String)> = Vec::new(); // (name, path, kind)
+    let cargo_parser = cargo::CargoParser;
 
     for manifest in &to_parse {
         let filename = manifest
@@ -237,10 +330,38 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             .and_then(|f| f.to_str())
             .unwrap_or("");
 
+        // Skip go.work files — they provide context, not packages
+        if filename == "go.work" {
+            continue;
+        }
+
+        // Cargo members: use workspace-aware parsing when context exists
+        if filename == "Cargo.toml" && !cargo_workspace_deps.is_empty() {
+            match cargo_parser.parse_with_workspace_deps(
+                &manifest.abs_path,
+                &manifest.relative_dir,
+                &cargo_workspace_deps,
+            ) {
+                Ok(pkg) => {
+                    parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
+                    upsert_package(&conn, &pkg)?;
+                }
+                Err(e) => {
+                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+                }
+            }
+            continue;
+        }
+
         for parser in &parsers {
             if parser.filename() == filename {
                 match parser.parse(&manifest.abs_path, &manifest.relative_dir) {
-                    Ok(pkg) => {
+                    Ok(mut pkg) => {
+                        // Annotate Go packages that are go.work members
+                        if pkg.kind == "go" && go_workspace_dirs.contains(&manifest.relative_dir) {
+                            pkg.metadata = Some(serde_json::json!({"go_workspace": true}));
+                        }
+                        parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
                         upsert_package(&conn, &pkg)?;
                     }
                     Err(e) => {
@@ -259,6 +380,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             .rsplit_once('/')
             .map(|(dir, _)| dir)
             .unwrap_or("");
+        conn.execute(
+            "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+            [relative_dir],
+        )?;
         conn.execute(
             "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
             [relative_dir],
@@ -281,6 +406,18 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     )?;
     for manifest in &to_parse {
         hash_stmt.execute((&manifest.manifest_key, &manifest.content_hash))?;
+    }
+
+    // Phase 7: Extract symbols for new/changed packages
+    for (pkg_name, pkg_path, pkg_kind) in &parsed_packages {
+        match symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind) {
+            Ok(syms) => {
+                upsert_symbols(&conn, pkg_name, &syms)?;
+            }
+            Err(e) => {
+                eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
+            }
+        }
     }
 
     // Apply config overrides
@@ -326,6 +463,11 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         [],
         |row| row.get(0),
     )?;
+    let total_symbols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols",
+        [],
+        |row| row.get(0),
+    )?;
 
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
@@ -334,6 +476,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('package_count', ?1)",
         [total_packages.to_string()],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('symbol_count', ?1)",
+        [total_symbols.to_string()],
     )?;
     if let Some(commit) = git_commit {
         conn.execute(
@@ -351,14 +497,14 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
     if is_full_build || force {
         println!(
-            "Indexed {} packages into {}",
-            total_packages,
+            "Indexed {} packages, {} symbols into {}",
+            total_packages, total_symbols,
             db_path.display()
         );
     } else {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped) into {}",
-            total_packages, num_added, num_changed, num_removed, num_skipped,
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols into {}",
+            total_packages, num_added, num_changed, num_removed, num_skipped, total_symbols,
             db_path.display()
         );
     }
@@ -605,5 +751,175 @@ mod tests {
         build_index(dir.path(), &config, true).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
         assert_eq!(hash_count(dir.path()), 3);
+    }
+
+    #[test]
+    fn test_cargo_workspace_dep_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Workspace root Cargo.toml (no [package], has [workspace])
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+tokio = { version = "1.35", features = ["full"] }
+serde = "1.0"
+"#,
+        )
+        .unwrap();
+
+        // Member crate using workspace = true
+        let member_dir = root.join("crates/my-service");
+        fs::create_dir_all(&member_dir).unwrap();
+        fs::write(
+            member_dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "my-service"
+version = "0.1.0"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = "1"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false).unwrap();
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+
+        // Verify workspace deps resolved
+        let tokio_ver: Option<String> = conn
+            .query_row(
+                "SELECT version_req FROM dependencies WHERE package='my-service' AND dependency='tokio'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokio_ver.as_deref(), Some("1.35"));
+
+        let serde_ver: Option<String> = conn
+            .query_row(
+                "SELECT version_req FROM dependencies WHERE package='my-service' AND dependency='serde'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_ver.as_deref(), Some("1.0"));
+
+        // Non-workspace dep should have its own version
+        let anyhow_ver: Option<String> = conn
+            .query_row(
+                "SELECT version_req FROM dependencies WHERE package='my-service' AND dependency='anyhow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anyhow_ver.as_deref(), Some("1"));
+
+        // Only 1 package (member) — workspace root has no [package]
+        assert_eq!(pkg_count(root), 1);
+    }
+
+    #[test]
+    fn test_npm_workspace_protocol_in_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let app_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("package.json"),
+            br#"{"name": "app", "version": "1.0.0", "dependencies": {"shared": "workspace:*"}}"#,
+        )
+        .unwrap();
+
+        let shared_dir = dir.path().join("packages/shared");
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::write(
+            shared_dir.join("package.json"),
+            br#"{"name": "shared", "version": "2.0.0"}"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(dir.path(), &config, false).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+
+        let version_req: Option<String> = conn
+            .query_row(
+                "SELECT version_req FROM dependencies WHERE package='app' AND dependency='shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_req.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn test_go_work_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // go.work at root
+        fs::write(
+            dir.path().join("go.work"),
+            "go 1.22\n\nuse (\n\t./services/auth\n)\n",
+        )
+        .unwrap();
+
+        // Go module that IS in the workspace
+        let auth_dir = dir.path().join("services/auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("go.mod"),
+            "module github.com/company/auth\n\ngo 1.22\n",
+        )
+        .unwrap();
+
+        // Go module that is NOT in the workspace
+        let other_dir = dir.path().join("tools/cli");
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(
+            other_dir.join("go.mod"),
+            "module github.com/company/cli\n\ngo 1.22\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(dir.path(), &config, false).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+
+        // Auth should have go_workspace metadata
+        let auth_meta: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM packages WHERE name = 'auth'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(auth_meta.is_some());
+        let meta: serde_json::Value = serde_json::from_str(auth_meta.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["go_workspace"], true);
+
+        // CLI tool should have no metadata
+        let cli_meta: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM packages WHERE name = 'cli'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cli_meta.is_none());
     }
 }

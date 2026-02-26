@@ -30,7 +30,7 @@ Only files whose names exactly match a known manifest filename are considered fo
 
 #### Scenario: Recognized manifest filenames
 
-- **WHEN** a file is named `package.json`, `go.mod`, `Cargo.toml`, or `pyproject.toml`
+- **WHEN** a file is named `package.json`, `go.mod`, `go.work`, `Cargo.toml`, or `pyproject.toml`
 - **AND** that filename is in the enabled manifests list
 - **THEN** the file is passed to the corresponding parser
 
@@ -43,9 +43,41 @@ Only files whose names exactly match a known manifest filename are considered fo
 
 Individual manifest parse failures do not abort the build.
 
+### Requirement: go.work discovery
+
+#### Scenario: go.work parsed for workspace context
+
+- **WHEN** a `go.work` file is discovered during walk
+- **THEN** its `use` directives are extracted to identify workspace member directories
+- **AND** the `go.work` file itself is NOT indexed as a package
+
+#### Scenario: Go workspace member metadata
+
+- **WHEN** a `go.mod` package exists in a directory listed in a `go.work` `use` directive
+- **THEN** the package's metadata includes `{"go_workspace": true}`
+
+### Requirement: Parse failure resilience
+
+Individual manifest parse failures do not abort the build.
+
 #### Scenario: One manifest fails to parse
 
 - **WHEN** a manifest file is discovered but fails to parse
 - **THEN** the failure is recorded with file path and error message
 - **AND** indexing continues with remaining manifests
 - **AND** the failure count and details are printed to stderr after indexing
+
+### Requirement: Source file scanning
+
+After packages are indexed, source files within each package directory are scanned for symbol extraction.
+
+#### Scenario: Source files discovered per ecosystem
+
+- **WHEN** symbol extraction runs for a package
+- **THEN** the package's directory is walked for source files matching the package's ecosystem
+- **AND** file extensions are: `.ts`, `.tsx`, `.js`, `.jsx` (npm), `.go` (go), `.rs` (cargo), `.py` (python)
+
+#### Scenario: Excluded directories
+
+- **WHEN** walking a package directory for source files
+- **THEN** directories named `node_modules`, `target`, `dist`, `.build`, `vendor`, `test`, `tests`, `__tests__`, `__pycache__` are skipped

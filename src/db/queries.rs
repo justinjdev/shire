@@ -36,6 +36,183 @@ pub struct IndexStatus {
     pub package_count: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SymbolRow {
+    pub name: String,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub package: String,
+    pub file_path: String,
+    pub line: i64,
+    pub visibility: String,
+    pub parent_symbol: Option<String>,
+    pub return_type: Option<String>,
+    pub parameters: Option<String>,
+}
+
+/// FTS5 search across symbol names and signatures. Returns up to 50 results.
+pub fn search_symbols(
+    conn: &Connection,
+    query: &str,
+    package_filter: Option<&str>,
+    kind_filter: Option<&str>,
+) -> Result<Vec<SymbolRow>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
+
+    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
+        (Some(pkg), Some(kind)) => (
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    s.visibility, s.parent_symbol, s.return_type, s.parameters
+             FROM symbols_fts f
+             JOIN symbols s ON s.rowid = f.rowid
+             WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string())],
+        ),
+        (Some(pkg), None) => (
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    s.visibility, s.parent_symbol, s.return_type, s.parameters
+             FROM symbols_fts f
+             JOIN symbols s ON s.rowid = f.rowid
+             WHERE symbols_fts MATCH ?1 AND s.package = ?2
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
+        ),
+        (None, Some(kind)) => (
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    s.visibility, s.parent_symbol, s.return_type, s.parameters
+             FROM symbols_fts f
+             JOIN symbols s ON s.rowid = f.rowid
+             WHERE symbols_fts MATCH ?1 AND s.kind = ?2
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string())],
+        ),
+        (None, None) => (
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    s.visibility, s.parent_symbol, s.return_type, s.parameters
+             FROM symbols_fts f
+             JOIN symbols s ON s.rowid = f.rowid
+             WHERE symbols_fts MATCH ?1
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
+        ),
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(SymbolRow {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            signature: row.get(2)?,
+            package: row.get(3)?,
+            file_path: row.get(4)?,
+            line: row.get(5)?,
+            visibility: row.get(6)?,
+            parent_symbol: row.get(7)?,
+            return_type: row.get(8)?,
+            parameters: row.get(9)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// List all symbols in a package, optionally filtered by kind.
+pub fn get_package_symbols(
+    conn: &Connection,
+    package: &str,
+    kind_filter: Option<&str>,
+) -> Result<Vec<SymbolRow>> {
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind_filter {
+        Some(kind) => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE package = ?1 AND kind = ?2
+             ORDER BY file_path, line",
+            vec![Box::new(package.to_string()), Box::new(kind.to_string())],
+        ),
+        None => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE package = ?1
+             ORDER BY file_path, line",
+            vec![Box::new(package.to_string())],
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(SymbolRow {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            signature: row.get(2)?,
+            package: row.get(3)?,
+            file_path: row.get(4)?,
+            line: row.get(5)?,
+            visibility: row.get(6)?,
+            parent_symbol: row.get(7)?,
+            return_type: row.get(8)?,
+            parameters: row.get(9)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Look up symbols by exact name, optionally scoped to a package.
+pub fn get_symbol(
+    conn: &Connection,
+    name: &str,
+    package_filter: Option<&str>,
+) -> Result<Vec<SymbolRow>> {
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match package_filter {
+        Some(pkg) => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE name = ?1 AND package = ?2",
+            vec![Box::new(name.to_string()), Box::new(pkg.to_string())],
+        ),
+        None => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE name = ?1",
+            vec![Box::new(name.to_string())],
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(SymbolRow {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            signature: row.get(2)?,
+            package: row.get(3)?,
+            file_path: row.get(4)?,
+            line: row.get(5)?,
+            visibility: row.get(6)?,
+            parent_symbol: row.get(7)?,
+            return_type: row.get(8)?,
+            parameters: row.get(9)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 /// FTS5 search across package name, description, and path. Returns up to 20 results.
 pub fn search_packages(conn: &Connection, query: &str) -> Result<Vec<PackageRow>> {
     if query.trim().is_empty() {
@@ -445,5 +622,134 @@ mod tests {
         assert!(status.indexed_at.is_none());
         assert!(status.git_commit.is_none());
         assert!(status.package_count.is_none());
+    }
+
+    fn seed_symbol_data(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                "auth-service",
+                "AuthService",
+                "class",
+                "export class AuthService",
+                "services/auth/src/auth.ts",
+                10i64,
+                "public",
+                None::<String>,
+                None::<String>,
+                None::<String>,
+            ),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                "auth-service",
+                "validate",
+                "method",
+                "validate(token: string): Promise<boolean>",
+                "services/auth/src/auth.ts",
+                15i64,
+                "public",
+                Some("AuthService"),
+                Some("Promise<boolean>"),
+                Some(r#"[{"name":"token","type":"string"}]"#),
+            ),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (
+                "shared-types",
+                "UserConfig",
+                "interface",
+                "export interface UserConfig",
+                "packages/shared-types/src/types.ts",
+                5i64,
+                "public",
+                None::<String>,
+                None::<String>,
+                None::<String>,
+            ),
+        ).unwrap();
+    }
+
+    fn test_db_with_symbols() -> Connection {
+        let conn = test_db();
+        seed_symbol_data(&conn);
+        conn
+    }
+
+    #[test]
+    fn test_search_symbols_by_name() {
+        let conn = test_db_with_symbols();
+        let results = search_symbols(&conn, "AuthService", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "AuthService");
+        assert_eq!(results[0].package, "auth-service");
+    }
+
+    #[test]
+    fn test_search_symbols_by_signature() {
+        let conn = test_db_with_symbols();
+        let results = search_symbols(&conn, "token", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "validate");
+    }
+
+    #[test]
+    fn test_search_symbols_filter_by_package() {
+        let conn = test_db_with_symbols();
+        let results = search_symbols(&conn, "interface", Some("shared-types"), None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "UserConfig");
+
+        let results = search_symbols(&conn, "interface", Some("auth-service"), None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_filter_by_kind() {
+        let conn = test_db_with_symbols();
+        let results = search_symbols(&conn, "AuthService", None, Some("class")).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = search_symbols(&conn, "AuthService", None, Some("function")).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_empty_query() {
+        let conn = test_db_with_symbols();
+        let results = search_symbols(&conn, "", None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_package_symbols() {
+        let conn = test_db_with_symbols();
+        let results = get_package_symbols(&conn, "auth-service", None).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = get_package_symbols(&conn, "auth-service", Some("method")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "validate");
+    }
+
+    #[test]
+    fn test_get_symbol() {
+        let conn = test_db_with_symbols();
+        let results = get_symbol(&conn, "AuthService", None).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = get_symbol(&conn, "AuthService", Some("auth-service")).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = get_symbol(&conn, "AuthService", Some("shared-types")).unwrap();
+        assert!(results.is_empty());
+
+        let results = get_symbol(&conn, "nonexistent", None).unwrap();
+        assert!(results.is_empty());
     }
 }

@@ -23,35 +23,9 @@ impl ManifestParser for NpmParser {
 
         let mut dependencies = Vec::new();
 
-        if let Some(deps) = json["dependencies"].as_object() {
-            for (name, ver) in deps {
-                dependencies.push(DepInfo {
-                    name: name.clone(),
-                    version_req: ver.as_str().map(|s| s.to_string()),
-                    dep_kind: DepKind::Runtime,
-                });
-            }
-        }
-
-        if let Some(deps) = json["devDependencies"].as_object() {
-            for (name, ver) in deps {
-                dependencies.push(DepInfo {
-                    name: name.clone(),
-                    version_req: ver.as_str().map(|s| s.to_string()),
-                    dep_kind: DepKind::Dev,
-                });
-            }
-        }
-
-        if let Some(deps) = json["peerDependencies"].as_object() {
-            for (name, ver) in deps {
-                dependencies.push(DepInfo {
-                    name: name.clone(),
-                    version_req: ver.as_str().map(|s| s.to_string()),
-                    dep_kind: DepKind::Peer,
-                });
-            }
-        }
+        extract_deps(&json, "dependencies", DepKind::Runtime, &mut dependencies);
+        extract_deps(&json, "devDependencies", DepKind::Dev, &mut dependencies);
+        extract_deps(&json, "peerDependencies", DepKind::Peer, &mut dependencies);
 
         Ok(PackageInfo {
             name,
@@ -63,6 +37,29 @@ impl ManifestParser for NpmParser {
             dependencies,
         })
     }
+}
+
+fn extract_deps(
+    json: &serde_json::Value,
+    section: &str,
+    kind: DepKind,
+    out: &mut Vec<DepInfo>,
+) {
+    if let Some(deps) = json[section].as_object() {
+        for (name, ver) in deps {
+            let version_req = ver.as_str().map(|s| strip_workspace_protocol(s).to_string());
+            out.push(DepInfo {
+                name: name.clone(),
+                version_req,
+                dep_kind: kind,
+            });
+        }
+    }
+}
+
+/// Strip the `workspace:` prefix from npm workspace protocol versions.
+fn strip_workspace_protocol(version: &str) -> &str {
+    version.strip_prefix("workspace:").unwrap_or(version)
 }
 
 #[cfg(test)]
@@ -137,6 +134,44 @@ mod tests {
         assert_eq!(info.version, None);
         assert_eq!(info.description, None);
         assert!(info.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_workspace_protocol_versions() {
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+                "name": "app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "shared-utils": "workspace:*",
+                    "shared-types": "workspace:^",
+                    "shared-config": "workspace:~1.0.0"
+                },
+                "devDependencies": {
+                    "test-helpers": "workspace:^2.0.0"
+                }
+            }"#,
+        );
+
+        let parser = NpmParser;
+        let info = parser.parse(&path, "packages/app").unwrap();
+
+        let find_dep = |name: &str| -> String {
+            info.dependencies
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .version_req
+                .clone()
+                .unwrap()
+        };
+
+        assert_eq!(find_dep("shared-utils"), "*");
+        assert_eq!(find_dep("shared-types"), "^");
+        assert_eq!(find_dep("shared-config"), "~1.0.0");
+        assert_eq!(find_dep("test-helpers"), "^2.0.0");
     }
 
     #[test]

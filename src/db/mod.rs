@@ -74,6 +74,46 @@ fn create_schema(conn: &Connection) -> Result<()> {
             path         TEXT PRIMARY KEY,
             content_hash TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS symbols (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            package       TEXT NOT NULL REFERENCES packages(name),
+            name          TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            signature     TEXT,
+            file_path     TEXT NOT NULL,
+            line          INTEGER NOT NULL,
+            visibility    TEXT NOT NULL DEFAULT 'public',
+            parent_symbol TEXT,
+            return_type   TEXT,
+            parameters    TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_symbols_package ON symbols(package);
+        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+            name, kind, signature, file_path,
+            content='symbols',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+            INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+            VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path);
+            INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+            VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path);
+        END;
         ",
     )?;
     Ok(())
@@ -109,6 +149,7 @@ mod tests {
         assert!(tables.contains(&"dependencies".to_string()));
         assert!(tables.contains(&"shire_meta".to_string()));
         assert!(tables.contains(&"manifest_hashes".to_string()));
+        assert!(tables.contains(&"symbols".to_string()));
     }
 
     #[test]

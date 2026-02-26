@@ -17,6 +17,12 @@
 - **WHEN** `package.json` has no `name` field
 - **THEN** the package name is derived from the relative directory path (slashes replaced with hyphens)
 
+#### Scenario: Workspace protocol version
+
+- **WHEN** a dependency version starts with `workspace:` (e.g., `workspace:*`, `workspace:^`, `workspace:~1.0.0`)
+- **THEN** the `workspace:` prefix is stripped from the stored version_req
+- **AND** `*` becomes `*`, `^` becomes `^`, `~1.0.0` becomes `~1.0.0`
+
 ### Requirement: Go (go.mod)
 
 #### Scenario: Standard go.mod
@@ -50,6 +56,30 @@
 - **WHEN** a `Cargo.toml` has no `[package]` section (e.g., workspace root)
 - **THEN** parsing returns an error
 - **AND** the file is recorded as a parse failure (not indexed as a package)
+
+#### Scenario: Workspace root Cargo.toml
+
+- **WHEN** a `Cargo.toml` contains `[workspace]` but no `[package]`
+- **THEN** it is not indexed as a package
+- **AND** its `[workspace.dependencies]` are collected as workspace context
+
+#### Scenario: Workspace-inherited dependency
+
+- **WHEN** a Cargo member's dependency uses `workspace = true` (e.g., `tokio = { workspace = true }`)
+- **AND** the workspace root's `[workspace.dependencies]` defines `tokio = { version = "1" }`
+- **THEN** the dependency's version_req is resolved to "1"
+
+#### Scenario: Workspace-inherited dependency with local override
+
+- **WHEN** a Cargo member's dependency uses `workspace = true` with additional keys (e.g., `tokio = { workspace = true, features = ["full"] }`)
+- **THEN** the version is still resolved from `[workspace.dependencies]`
+- **AND** local keys like `features` are ignored (only version matters for indexing)
+
+#### Scenario: Workspace dependency not found in root
+
+- **WHEN** a Cargo member uses `workspace = true` for dep "foo"
+- **AND** "foo" is not in `[workspace.dependencies]`
+- **THEN** the dependency is recorded with `version_req: None`
 
 #### Scenario: Table-style dependency
 

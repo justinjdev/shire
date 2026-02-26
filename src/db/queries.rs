@@ -34,6 +34,9 @@ pub struct IndexStatus {
     pub indexed_at: Option<String>,
     pub git_commit: Option<String>,
     pub package_count: Option<String>,
+    pub symbol_count: Option<String>,
+    pub file_count: Option<String>,
+    pub total_duration_ms: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,6 +148,52 @@ pub fn get_package_symbols(
              WHERE package = ?1
              ORDER BY file_path, line",
             vec![Box::new(package.to_string())],
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(SymbolRow {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            signature: row.get(2)?,
+            package: row.get(3)?,
+            file_path: row.get(4)?,
+            line: row.get(5)?,
+            visibility: row.get(6)?,
+            parent_symbol: row.get(7)?,
+            return_type: row.get(8)?,
+            parameters: row.get(9)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// List all symbols defined in a specific file, optionally filtered by kind.
+pub fn get_file_symbols(
+    conn: &Connection,
+    file_path: &str,
+    kind_filter: Option<&str>,
+) -> Result<Vec<SymbolRow>> {
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind_filter {
+        Some(kind) => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE file_path = ?1 AND kind = ?2
+             ORDER BY line",
+            vec![Box::new(file_path.to_string()), Box::new(kind.to_string())],
+        ),
+        None => (
+            "SELECT name, kind, signature, package, file_path, line,
+                    visibility, parent_symbol, return_type, parameters
+             FROM symbols
+             WHERE file_path = ?1
+             ORDER BY line",
+            vec![Box::new(file_path.to_string())],
         ),
     };
     let mut stmt = conn.prepare(sql)?;
@@ -528,6 +577,9 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
         indexed_at: get_meta("indexed_at")?,
         git_commit: get_meta("git_commit")?,
         package_count: get_meta("package_count")?,
+        symbol_count: get_meta("symbol_count")?,
+        file_count: get_meta("file_count")?,
+        total_duration_ms: get_meta("total_duration_ms")?,
     })
 }
 

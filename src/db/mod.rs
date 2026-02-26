@@ -131,6 +131,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_symbols_package ON symbols(package);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+        CREATE INDEX IF NOT EXISTS idx_symbols_file_path ON symbols(file_path);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
             name, kind, signature, file_path,

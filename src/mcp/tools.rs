@@ -108,6 +108,14 @@ pub struct GetSymbolParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetFileSymbolsParams {
+    /// File path relative to repo root (e.g., "services/auth/src/auth.ts")
+    pub file_path: String,
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchFilesParams {
     /// Search query to find files by path or name
     pub query: String,
@@ -276,6 +284,23 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    #[tool(description = "List all symbols defined in a specific file. Useful for understanding what a file exports — its functions, classes, types, and methods.")]
+    fn get_file_symbols(
+        &self,
+        Parameters(params): Parameters<GetFileSymbolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::get_file_symbols(
+            &conn,
+            &params.file_path,
+            params.kind.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
     #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
     fn search_files(
         &self,
@@ -316,7 +341,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Get index status: when it was built, git commit, and package count")]
+    #[tool(description = "Get index status: when it was built, git commit, package/symbol/file counts, and build duration in milliseconds")]
     fn index_status(&self) -> Result<CallToolResult, ErrorData> {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let status = queries::index_status(&conn)

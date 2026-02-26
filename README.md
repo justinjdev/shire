@@ -54,9 +54,10 @@ The index is written to `.shire/index.db` inside the repo root. Subsequent build
 | `search_symbols` | Full-text search across symbol names and signatures |
 | `get_package_symbols` | List all symbols in a package (functions, classes, types, methods) |
 | `get_symbol` | Exact name lookup for a symbol across packages |
+| `get_file_symbols` | List all symbols defined in a specific file |
 | `search_files` | Full-text search across file paths, with optional package/extension filter |
 | `list_package_files` | List all files belonging to a package, with optional extension filter |
-| `index_status` | When the index was built, git commit, package count |
+| `index_status` | When the index was built, git commit, package/symbol/file counts, build duration |
 
 ### Claude Desktop
 
@@ -120,7 +121,7 @@ src/
 │   └── python.rs    # Python extractor (tree-sitter)
 └── mcp/
     ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-    └── tools.rs     # 12 tool handlers
+    └── tools.rs     # 13 tool handlers
 ```
 
 ## License

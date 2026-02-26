@@ -22,7 +22,7 @@ The indexer walks the repository tree to discover manifest files. Only files mat
 #### Scenario: Default excludes
 
 - **WHEN** no custom exclude list is configured
-- **THEN** the following directories are excluded: `node_modules`, `vendor`, `dist`, `.build`, `target`, `third_party`, `.shire`
+- **THEN** the following directories are excluded: `node_modules`, `vendor`, `dist`, `.build`, `target`, `third_party`, `.shire`, `.gradle`, `build`
 
 ### Requirement: Manifest filename filtering
 
@@ -30,7 +30,7 @@ Only files whose names exactly match a known manifest filename are considered fo
 
 #### Scenario: Recognized manifest filenames
 
-- **WHEN** a file is named `package.json`, `go.mod`, `go.work`, `Cargo.toml`, or `pyproject.toml`
+- **WHEN** a file is named `package.json`, `go.mod`, `go.work`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`, or `settings.gradle.kts`
 - **AND** that filename is in the enabled manifests list
 - **THEN** the file is passed to the corresponding parser
 
@@ -75,9 +75,30 @@ After packages are indexed, source files within each package directory are scann
 
 - **WHEN** symbol extraction runs for a package
 - **THEN** the package's directory is walked for source files matching the package's ecosystem
-- **AND** file extensions are: `.ts`, `.tsx`, `.js`, `.jsx` (npm), `.go` (go), `.rs` (cargo), `.py` (python)
+- **AND** file extensions are: `.ts`, `.tsx`, `.js`, `.jsx` (npm), `.go` (go), `.rs` (cargo), `.py` (python), `.java`, `.kt` (maven, gradle)
 
 #### Scenario: Excluded directories
 
 - **WHEN** walking a package directory for source files
 - **THEN** directories named `node_modules`, `target`, `dist`, `.build`, `vendor`, `test`, `tests`, `__tests__`, `__pycache__` are skipped
+
+### Requirement: settings.gradle discovery
+
+#### Scenario: settings.gradle parsed for workspace context
+
+- **WHEN** a `settings.gradle` or `settings.gradle.kts` file is discovered during walk
+- **THEN** its `include` directives are extracted to identify multi-project member directories
+- **AND** the `settings.gradle` file itself is NOT indexed as a package
+
+#### Scenario: Gradle workspace member metadata
+
+- **WHEN** a `build.gradle` or `build.gradle.kts` package exists in a directory listed in a `settings.gradle` `include` directive
+- **THEN** the package's metadata includes `{"gradle_workspace": true}`
+
+### Requirement: Maven parent POM context collection
+
+#### Scenario: Parent POMs collected for child resolution
+
+- **WHEN** `shire build` runs and discovers `pom.xml` files
+- **THEN** parent POMs (those with `<modules>` and `<packaging>pom</packaging>`) are collected for workspace context
+- **AND** their `groupId`, `version`, and `dependencyManagement` entries are available to child POM parsers

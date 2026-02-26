@@ -1,8 +1,11 @@
 pub mod cargo;
 pub mod go;
 pub mod go_work;
+pub mod gradle;
+pub mod gradle_settings;
 pub mod hash;
 pub mod manifest;
+pub mod maven;
 pub mod npm;
 pub mod python;
 
@@ -17,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A discovered manifest file with its relative dir and content hash.
-struct WalkedManifest {
+pub(crate) struct WalkedManifest {
     abs_path: PathBuf,
     relative_dir: String,
     /// Relative manifest path used as DB key (e.g. "services/auth/package.json")
@@ -34,6 +37,9 @@ fn walk_manifests(
     let mut manifest_filenames: HashSet<&str> = parsers.iter().map(|p| p.filename()).collect();
     // go.work provides workspace context, not packages — but must be walked
     manifest_filenames.insert("go.work");
+    // settings.gradle provides workspace context, not packages — but must be walked
+    manifest_filenames.insert("settings.gradle");
+    manifest_filenames.insert("settings.gradle.kts");
     let enabled: HashSet<&str> = config
         .discovery
         .manifests
@@ -395,6 +401,43 @@ fn collect_go_workspace_context(walked: &[WalkedManifest]) -> HashSet<String> {
     dirs
 }
 
+/// Scan walked settings.gradle files and collect the set of workspace member directories.
+fn collect_gradle_settings_context(
+    walked: &[WalkedManifest],
+) -> (HashSet<String>, HashMap<String, Option<String>>) {
+    let mut dirs = HashSet::new();
+    let mut root_names: HashMap<String, Option<String>> = HashMap::new(); // settings dir → rootProject.name
+
+    for manifest in walked {
+        let filename = manifest
+            .abs_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+
+        if filename != "settings.gradle" && filename != "settings.gradle.kts" {
+            continue;
+        }
+
+        if let Ok(settings) = gradle_settings::parse_settings_gradle(&manifest.abs_path) {
+            for d in &settings.include_dirs {
+                let full_dir = if manifest.relative_dir.is_empty() {
+                    d.clone()
+                } else {
+                    format!("{}/{}", manifest.relative_dir, d)
+                };
+                dirs.insert(full_dir);
+            }
+            root_names.insert(
+                manifest.relative_dir.clone(),
+                settings.root_project_name,
+            );
+        }
+    }
+
+    (dirs, root_names)
+}
+
 pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
     let db_dir = repo_root.join(".shire");
     let db_path = db_dir.join("index.db");
@@ -412,6 +455,9 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         Box::new(go::GoParser),
         Box::new(cargo::CargoParser),
         Box::new(python::PythonParser),
+        Box::new(maven::MavenParser),
+        Box::new(gradle::GradleParser),
+        Box::new(gradle::GradleKtsParser),
     ];
 
     // Phase 1: Walk — discover all manifests with content hashes
@@ -420,6 +466,8 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     // Phase 1.5: Collect workspace context before parsing
     let cargo_workspace_deps = collect_cargo_workspace_context(&walked);
     let go_workspace_dirs = collect_go_workspace_context(&walked);
+    let maven_parent_context = maven::collect_maven_parent_context(&walked);
+    let gradle_settings_context = collect_gradle_settings_context(&walked);
 
     // Phase 2: Diff — compare against stored hashes
     let stored_hashes = load_stored_hashes(&conn)?;
@@ -450,8 +498,66 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             .and_then(|f| f.to_str())
             .unwrap_or("");
 
-        // Skip go.work files — they provide context, not packages
-        if filename == "go.work" {
+        // Skip context-only files — they provide workspace context, not packages
+        if filename == "go.work"
+            || filename == "settings.gradle"
+            || filename == "settings.gradle.kts"
+        {
+            continue;
+        }
+
+        // Maven: use parent-context-aware parsing
+        if filename == "pom.xml" {
+            let maven_parser = maven::MavenParser;
+            match maven_parser.parse_with_parent_context(
+                &manifest.abs_path,
+                &manifest.relative_dir,
+                &maven_parent_context,
+            ) {
+                Ok(pkg) => {
+                    parsed_packages.push((
+                        pkg.name.clone(),
+                        pkg.path.clone(),
+                        pkg.kind.to_string(),
+                    ));
+                    upsert_package(&conn, &pkg)?;
+                }
+                Err(e) => {
+                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+                }
+            }
+            continue;
+        }
+
+        // Gradle: use settings-context-aware parsing
+        if filename == "build.gradle" || filename == "build.gradle.kts" {
+            let (ref gradle_dirs, ref gradle_root_names) = gradle_settings_context;
+            let settings_ctx = gradle_root_names
+                .get(&manifest.relative_dir)
+                .map(|name| gradle::GradleSettingsContext {
+                    root_project_name: name.clone(),
+                });
+            match gradle::parse_with_settings_context(
+                &manifest.abs_path,
+                &manifest.relative_dir,
+                &settings_ctx,
+            ) {
+                Ok(mut pkg) => {
+                    // Annotate if this is a gradle workspace member
+                    if gradle_dirs.contains(&manifest.relative_dir) {
+                        pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
+                    }
+                    parsed_packages.push((
+                        pkg.name.clone(),
+                        pkg.path.clone(),
+                        pkg.kind.to_string(),
+                    ));
+                    upsert_package(&conn, &pkg)?;
+                }
+                Err(e) => {
+                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+                }
+            }
             continue;
         }
 

@@ -1018,6 +1018,437 @@ fn test_file_index_rebuild_includes_new_file() {
     assert_eq!(pkg.as_deref(), Some("auth-service"));
 }
 
+// ===== Maven/Gradle Integration Tests =====
+
+#[test]
+fn test_maven_index_basic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // Create a Maven project
+    let svc_dir = dir.path().join("services/auth");
+    fs::create_dir_all(&svc_dir).unwrap();
+    fs::write(
+        svc_dir.join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>auth-service</artifactId>
+    <version>1.0.0</version>
+    <description>Auth service</description>
+    <dependencies>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>32.1</version>
+        </dependency>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    // Check package indexed correctly
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM packages WHERE kind = 'maven'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "com.example:auth-service");
+
+    // Check dependencies with scope mapping
+    let dep_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dependencies WHERE package = 'com.example:auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dep_count, 2);
+
+    let junit_kind: String = conn
+        .query_row(
+            "SELECT dep_kind FROM dependencies WHERE dependency = 'junit:junit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(junit_kind, "dev");
+}
+
+#[test]
+fn test_maven_parent_pom_inheritance() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // Parent POM at root (aggregator — not indexed as package)
+    fs::write(
+        dir.path().join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.0.0</version>
+    <packaging>pom</packaging>
+    <modules>
+        <module>child</module>
+    </modules>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>32.1</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#,
+    )
+    .unwrap();
+
+    // Child POM inheriting from parent
+    let child_dir = dir.path().join("child");
+    fs::create_dir_all(&child_dir).unwrap();
+    fs::write(
+        child_dir.join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>2.0.0</version>
+    </parent>
+    <artifactId>child-service</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+        </dependency>
+    </dependencies>
+</project>"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    // Only child should be indexed (parent is aggregator POM)
+    let pkg_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pkg_count, 1);
+
+    // Child inherits groupId from parent
+    let name: String = conn
+        .query_row("SELECT name FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(name, "com.example:child-service");
+
+    // Child inherits version from parent
+    let version: String = conn
+        .query_row("SELECT version FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, "2.0.0");
+
+    // Guava version resolved from parent's dependencyManagement
+    let guava_ver: Option<String> = conn
+        .query_row(
+            "SELECT version_req FROM dependencies WHERE dependency = 'com.google.guava:guava'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(guava_ver.as_deref(), Some("32.1"));
+}
+
+#[test]
+fn test_gradle_index_basic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    let app_dir = dir.path().join("app");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("build.gradle"),
+        r#"
+group = 'com.example'
+version = '1.0.0'
+
+dependencies {
+    implementation 'com.google.guava:guava:32.1'
+    testImplementation 'junit:junit:4.13'
+    compileOnly 'javax.servlet:javax.servlet-api:4.0.1'
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    let name: String = conn
+        .query_row("SELECT name FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(name, "com.example:app");
+
+    let dep_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM dependencies WHERE package = 'com.example:app'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dep_count, 3);
+}
+
+#[test]
+fn test_gradle_settings_workspace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // settings.gradle
+    fs::write(
+        dir.path().join("settings.gradle"),
+        r#"
+rootProject.name = 'my-project'
+include ':app', ':lib'
+"#,
+    )
+    .unwrap();
+
+    // Root build.gradle
+    fs::write(
+        dir.path().join("build.gradle"),
+        "group = 'com.example'\nversion = '1.0.0'\n",
+    )
+    .unwrap();
+
+    // app subproject
+    let app_dir = dir.path().join("app");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("build.gradle"),
+        "group = 'com.example'\nversion = '1.0.0'\n\ndependencies {\n    implementation project(':lib')\n}\n",
+    )
+    .unwrap();
+
+    // lib subproject
+    let lib_dir = dir.path().join("lib");
+    fs::create_dir_all(&lib_dir).unwrap();
+    fs::write(
+        lib_dir.join("build.gradle"),
+        "group = 'com.example'\nversion = '1.0.0'\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    // 3 packages: root, app, lib
+    let pkg_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pkg_count, 3);
+
+    // app and lib should have gradle_workspace metadata
+    let app_meta: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM packages WHERE name = 'com.example:app'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(app_meta.is_some());
+    let meta: serde_json::Value = serde_json::from_str(app_meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["gradle_workspace"], true);
+}
+
+#[test]
+fn test_mixed_maven_gradle_ecosystem() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // Maven project
+    let maven_dir = dir.path().join("services/auth");
+    fs::create_dir_all(&maven_dir).unwrap();
+    fs::write(
+        maven_dir.join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>auth</artifactId>
+    <version>1.0.0</version>
+</project>"#,
+    )
+    .unwrap();
+
+    // Gradle project
+    let gradle_dir = dir.path().join("services/web");
+    fs::create_dir_all(&gradle_dir).unwrap();
+    fs::write(
+        gradle_dir.join("build.gradle.kts"),
+        "group = \"com.example\"\nversion = \"2.0.0\"\n",
+    )
+    .unwrap();
+
+    // npm project
+    let npm_dir = dir.path().join("frontend");
+    fs::create_dir_all(&npm_dir).unwrap();
+    fs::write(
+        npm_dir.join("package.json"),
+        r#"{"name": "frontend", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    // All 3 packages indexed
+    let pkg_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pkg_count, 3);
+
+    // Check each kind
+    let maven_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'maven'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(maven_count, 1);
+
+    let gradle_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(gradle_count, 1);
+
+    let npm_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'npm'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(npm_count, 1);
+}
+
+#[test]
+fn test_maven_incremental_rebuild() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    let svc_dir = dir.path().join("svc");
+    fs::create_dir_all(&svc_dir).unwrap();
+    fs::write(
+        svc_dir.join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>my-app</artifactId>
+    <version>1.0.0</version>
+</project>"#,
+    )
+    .unwrap();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Modify version
+    fs::write(
+        svc_dir.join("pom.xml"),
+        r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>my-app</artifactId>
+    <version>2.0.0</version>
+</project>"#,
+    )
+    .unwrap();
+
+    // Second build — incremental
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("updated"), "Should show updated count: {stdout}");
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    let version: String = conn
+        .query_row(
+            "SELECT version FROM packages WHERE name = 'com.example:my-app'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "2.0.0");
+}
+
 #[test]
 fn test_serve_fails_without_index() {
     let dir = tempfile::TempDir::new().unwrap();

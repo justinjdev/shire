@@ -32,6 +32,7 @@ pub fn extensions_for_kind(kind: &str) -> Vec<&'static str> {
         "go" => vec!["go"],
         "cargo" => vec!["rs"],
         "python" => vec!["py"],
+        "maven" | "gradle" => vec!["java", "kt"],
         _ => vec![],
     }
 }
@@ -105,6 +106,8 @@ mod tests {
         assert_eq!(extensions_for_kind("go"), vec!["go"]);
         assert_eq!(extensions_for_kind("cargo"), vec!["rs"]);
         assert_eq!(extensions_for_kind("python"), vec!["py"]);
+        assert_eq!(extensions_for_kind("maven"), vec!["java", "kt"]);
+        assert_eq!(extensions_for_kind("gradle"), vec!["java", "kt"]);
         assert!(extensions_for_kind("unknown").is_empty());
     }
 

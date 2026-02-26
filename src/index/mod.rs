@@ -19,6 +19,26 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Execute a closure within an explicit SQLite transaction.
+/// Commits on success, rolls back on error.
+fn with_transaction<F, T>(conn: &Connection, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    conn.execute_batch("BEGIN")?;
+    match f() {
+        Ok(val) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(val)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
 
 /// A discovered manifest file with its relative dir and content hash.
 pub(crate) struct WalkedManifest {
@@ -201,44 +221,91 @@ fn recompute_is_internal(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Clear and re-insert symbols for a package.
+/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
 fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
 
-    let mut stmt = conn.prepare(
-        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-    )?;
+    const BATCH_SIZE: usize = 100;
+    const COLS: usize = 10;
 
-    for sym in syms {
-        let params_json = sym
-            .parameters
-            .as_ref()
-            .map(|p| serde_json::to_string(p).unwrap_or_default());
+    for chunk in syms.chunks(BATCH_SIZE) {
+        let placeholders: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let base = i * COLS + 1;
+                format!(
+                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                    base, base + 1, base + 2, base + 3, base + 4,
+                    base + 5, base + 6, base + 7, base + 8, base + 9
+                )
+            })
+            .collect();
 
-        stmt.execute((
-            package,
-            &sym.name,
-            sym.kind.as_str(),
-            &sym.signature,
-            &sym.file_path,
-            sym.line as i64,
-            &sym.visibility,
-            &sym.parent_symbol,
-            &sym.return_type,
-            &params_json,
-        ))?;
+        let sql = format!(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        for sym in chunk {
+            let params_json = sym
+                .parameters
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_default());
+
+            params.push(Box::new(package.to_string()));
+            params.push(Box::new(sym.name.clone()));
+            params.push(Box::new(sym.kind.as_str().to_string()));
+            params.push(Box::new(sym.signature.clone()));
+            params.push(Box::new(sym.file_path.clone()));
+            params.push(Box::new(sym.line as i64));
+            params.push(Box::new(sym.visibility.clone()));
+            params.push(Box::new(sym.parent_symbol.clone()));
+            params.push(Box::new(sym.return_type.clone()));
+            params.push(Box::new(params_json));
+        }
+
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
     Ok(())
 }
 
-/// Store or update a source hash for a package.
-fn upsert_source_hash(conn: &Connection, package: &str, hash: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO source_hashes (package, content_hash) VALUES (?1, ?2)",
-        (package, hash),
-    )?;
+/// Batch-upsert source hashes for multiple packages using multi-row INSERT OR REPLACE.
+/// Each entry is (package, content_hash). All rows share the same hashed_at timestamp.
+fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    const BATCH_SIZE: usize = 500;
+    const COLS: usize = 3;
+
+    for chunk in entries.chunks(BATCH_SIZE) {
+        let placeholders: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let base = i * COLS + 1;
+                format!("(?{}, ?{}, ?{})", base, base + 1, base + 2)
+            })
+            .collect();
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(chunk.len() * COLS);
+        for (package, hash) in chunk {
+            params.push(Box::new(package.to_string()));
+            params.push(Box::new(hash.to_string()));
+            params.push(Box::new(now.clone()));
+        }
+
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
     Ok(())
 }
 
@@ -337,18 +404,40 @@ fn associate_files_with_packages(
         .collect()
 }
 
-/// Clear and re-insert all files.
+/// Clear and re-insert all files using batched multi-row INSERTs.
 fn upsert_files(
     conn: &Connection,
     files: &[(String, Option<String>, String, u64)],
 ) -> Result<()> {
     conn.execute("DELETE FROM files", [])?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    for (path, package, ext, size) in files {
-        stmt.execute((path, package, ext, *size as i64))?;
+
+    const BATCH_SIZE: usize = 500;
+    const COLS: usize = 4;
+
+    for chunk in files.chunks(BATCH_SIZE) {
+        let placeholders: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let base = i * COLS + 1;
+                format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3)
+            })
+            .collect();
+
+        let sql = format!(
+            "INSERT INTO files (path, package, extension, size_bytes) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        for (path, package, ext, size) in chunk {
+            params.push(Box::new(path.clone()));
+            params.push(Box::new(package.clone()));
+            params.push(Box::new(ext.clone()));
+            params.push(Box::new(*size as i64));
+        }
+
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
+
     Ok(())
 }
 
@@ -458,22 +547,6 @@ struct BuildSummary {
     total_packages: i64,
     total_symbols: i64,
     failures: Vec<(String, String)>,
-}
-
-/// Phase 1+1.5: Walk manifests and collect workspace context.
-fn phase_walk_and_context(
-    repo_root: &Path,
-    config: &Config,
-    parsers: &[Box<dyn ManifestParser>],
-) -> Result<(Vec<WalkedManifest>, WorkspaceContext)> {
-    let walked = walk_manifests(repo_root, config, parsers)?;
-    let ctx = WorkspaceContext {
-        cargo_deps: collect_cargo_workspace_context(&walked),
-        go_dirs: collect_go_workspace_context(&walked),
-        maven_parents: maven::collect_maven_parent_context(&walked),
-        gradle_settings: collect_gradle_settings_context(&walked),
-    };
-    Ok((walked, ctx))
 }
 
 /// Phase 3: Parse new and changed manifests into packages.
@@ -624,14 +697,33 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Phase 6: Store manifest hashes for parsed manifests.
+/// Phase 6: Store manifest hashes for parsed manifests using batched multi-row INSERTs.
 fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result<()> {
-    let mut hash_stmt = conn.prepare(
-        "INSERT OR REPLACE INTO manifest_hashes (path, content_hash) VALUES (?1, ?2)",
-    )?;
-    for manifest in to_parse {
-        hash_stmt.execute((&manifest.manifest_key, &manifest.content_hash))?;
+    const BATCH_SIZE: usize = 500;
+    const COLS: usize = 2;
+
+    for chunk in to_parse.chunks(BATCH_SIZE) {
+        let placeholders: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let base = i * COLS + 1;
+                format!("(?{}, ?{})", base, base + 1)
+            })
+            .collect();
+
+        let sql = format!(
+            "INSERT OR REPLACE INTO manifest_hashes (path, content_hash) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        for manifest in chunk {
+            params.push(Box::new(manifest.manifest_key.clone()));
+            params.push(Box::new(manifest.content_hash.clone()));
+        }
+
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
+
     Ok(())
 }
 
@@ -650,6 +742,7 @@ fn phase_extract_symbols(
         })
         .collect();
 
+    let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for (pkg_name, syms, src_hash) in &results {
         match syms {
             Ok(syms) => {
@@ -660,20 +753,39 @@ fn phase_extract_symbols(
             }
         }
         if let Ok(h) = src_hash {
-            let _ = upsert_source_hash(conn, pkg_name, h);
+            hash_entries.push((pkg_name.as_str(), h.clone()));
         }
     }
+
+    // Batch-upsert all source hashes collected in this phase
+    let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();
+    batch_upsert_source_hashes(conn, &refs)?;
     Ok(())
 }
 
+/// Parse an ISO 8601 / RFC 3339 timestamp string into a SystemTime.
+fn parse_hashed_at(s: &str) -> Option<std::time::SystemTime> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    Some(std::time::SystemTime::from(dt))
+}
+
+/// Result of parallel phase 8 work for a single package.
+enum SourceCheckResult<'a> {
+    /// Hash was computed and differs from stored — needs re-extraction.
+    Changed(&'a str, Result<Vec<symbols::SymbolInfo>>, String),
+    /// Hash was computed but matches stored — just update hashed_at.
+    Unchanged(&'a str, String),
+}
+
 /// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
+/// Uses mtime pre-check to skip hash computation when no files have been modified.
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
 ) -> Result<usize> {
-    // Pre-fetch package info and stored hashes from DB
-    let unchanged_pkgs: Vec<(String, String, String, Option<String>)> = unchanged
+    // Pre-fetch package info, stored hashes, and hashed_at from DB
+    let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>)> = unchanged
         .iter()
         .filter_map(|manifest| {
             let relative_dir = &manifest.relative_dir;
@@ -684,63 +796,118 @@ fn phase_source_incremental(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .ok()?;
-            let stored_hash: Option<String> = conn
+            let (stored_hash, hashed_at): (Option<String>, Option<String>) = conn
                 .query_row(
-                    "SELECT content_hash FROM source_hashes WHERE package = ?1",
+                    "SELECT content_hash, hashed_at FROM source_hashes WHERE package = ?1",
                     [&pkg_name],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .ok();
-            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash))
+                .unwrap_or((None, None));
+            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash, hashed_at))
         })
         .collect();
 
-    // Parallel: compute current hashes and conditionally extract symbols
-    let results: Vec<_> = unchanged_pkgs
+    // Parallel: mtime pre-check, then conditionally compute hashes and extract symbols
+    let results: Vec<SourceCheckResult> = unchanged_pkgs
         .par_iter()
-        .filter_map(|(pkg_name, pkg_path, pkg_kind, stored_hash)| {
+        .filter_map(|(pkg_name, pkg_path, pkg_kind, stored_hash, hashed_at)| {
+            // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
+            if let Some(ts_str) = hashed_at {
+                if let Some(since) = parse_hashed_at(ts_str) {
+                    if !hash::has_newer_source_files(repo_root, pkg_path, pkg_kind, since) {
+                        return None; // No files changed — skip hash computation
+                    }
+                }
+            }
+
+            // Mtime says check needed (or no hashed_at) — compute full hash
             let current_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind).ok()?;
             if stored_hash.as_deref() == Some(current_hash.as_str()) {
-                return None;
+                // Content unchanged — update hashed_at only
+                return Some(SourceCheckResult::Unchanged(pkg_name.as_str(), current_hash));
             }
             let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind);
-            Some((pkg_name, syms, current_hash))
+            Some(SourceCheckResult::Changed(pkg_name.as_str(), syms, current_hash))
         })
         .collect();
 
     // Sequential DB writes
     let mut num_reextracted: usize = 0;
-    for (pkg_name, syms, current_hash) in &results {
-        match syms {
-            Ok(syms) => {
-                upsert_symbols(conn, pkg_name, syms)?;
-                num_reextracted += 1;
+    for result in &results {
+        match result {
+            SourceCheckResult::Changed(pkg_name, syms, current_hash) => {
+                match syms {
+                    Ok(syms) => {
+                        upsert_symbols(conn, pkg_name, syms)?;
+                        num_reextracted += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
+                    }
+                }
+                let _ = upsert_source_hash(conn, pkg_name, current_hash);
             }
-            Err(e) => {
-                eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
+            SourceCheckResult::Unchanged(pkg_name, current_hash) => {
+                // Update hashed_at to reflect the new computation time
+                let _ = upsert_source_hash(conn, pkg_name, current_hash);
             }
         }
-        let _ = upsert_source_hash(conn, pkg_name, current_hash);
     }
 
     Ok(num_reextracted)
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
+/// Uses a file-tree hash to skip the full rebuild when no files have changed.
 fn phase_index_files(
     conn: &Connection,
     repo_root: &Path,
     config: &Config,
 ) -> Result<usize> {
+    let walked_files = walk_files(repo_root, config)?;
+
+    // Compute file-tree hash from (path, size) tuples
+    let file_tuples: Vec<(String, u64)> = walked_files
+        .iter()
+        .map(|f| (f.relative_path.clone(), f.size_bytes))
+        .collect();
+    let current_hash = hash::compute_file_tree_hash(&file_tuples);
+
+    // Check stored hash
+    let stored_hash: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'file_tree_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if stored_hash.as_deref() == Some(current_hash.as_str()) {
+        // File tree unchanged — skip rebuild, read count from existing table
+        let num_files: usize = conn.query_row(
+            "SELECT COUNT(*) FROM files",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        return Ok(num_files);
+    }
+
+    // File tree changed (or first build) — full rebuild
     let all_packages: Vec<(String, String)> = conn
         .prepare("SELECT name, path FROM packages")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let walked_files = walk_files(repo_root, config)?;
     let associated_files = associate_files_with_packages(&walked_files, &all_packages);
     let num_files = associated_files.len();
     upsert_files(conn, &associated_files)?;
+
+    // Store the new file-tree hash
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
+        [&current_hash],
+    )?;
+
     Ok(num_files)
 }
 
@@ -843,15 +1010,31 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
     }
 }
 
+/// Print timing breakdown to stderr.
+fn print_timings(timings: &[(&str, Duration)], total: Duration) {
+    eprintln!("Build timing:");
+    for (label, dur) in timings {
+        eprintln!("  {:<20} {}ms", label, dur.as_millis());
+    }
+    eprintln!("  {:<20} {}ms", "total", total.as_millis());
+}
+
 pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
+    let build_start = Instant::now();
+    let mut timings: Vec<(&str, Duration)> = Vec::new();
+
     let db_dir = repo_root.join(".shire");
     let db_path = db_dir.join("index.db");
     let conn = db::open_or_create(&db_path)?;
 
     if force {
-        conn.execute("DELETE FROM manifest_hashes", [])?;
-        conn.execute("DELETE FROM symbols", [])?;
-        conn.execute("DELETE FROM source_hashes", [])?;
+        with_transaction(&conn, || {
+            conn.execute("DELETE FROM manifest_hashes", [])?;
+            conn.execute("DELETE FROM symbols", [])?;
+            conn.execute("DELETE FROM source_hashes", [])?;
+            conn.execute("DELETE FROM shire_meta WHERE key = 'file_tree_hash'", [])?;
+            Ok(())
+        })?;
     }
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
@@ -864,10 +1047,23 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         Box::new(gradle::GradleKtsParser),
     ];
 
-    // Phase 1+1.5: Walk manifests and collect workspace context
-    let (walked, ws_ctx) = phase_walk_and_context(repo_root, config, &parsers)?;
+    // Phase 1: Walk manifests
+    let t = Instant::now();
+    let walked = walk_manifests(repo_root, config, &parsers)?;
+    timings.push(("walk", t.elapsed()));
+
+    // Phase 1.5: Workspace context
+    let t = Instant::now();
+    let ws_ctx = WorkspaceContext {
+        cargo_deps: collect_cargo_workspace_context(&walked),
+        go_dirs: collect_go_workspace_context(&walked),
+        maven_parents: maven::collect_maven_parent_context(&walked),
+        gradle_settings: collect_gradle_settings_context(&walked),
+    };
+    timings.push(("workspace-context", t.elapsed()));
 
     // Phase 2: Diff against stored hashes
+    let t = Instant::now();
     let stored_hashes = load_stored_hashes(&conn)?;
     let diff = diff_manifests(&walked, &stored_hashes);
     let is_full_build = stored_hashes.is_empty();
@@ -883,32 +1079,58 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     let num_changed = diff.changed.len();
     let num_removed = diff.removed.len();
     let num_skipped = diff.unchanged.len();
+    timings.push(("diff", t.elapsed()));
 
-    // Phase 3: Parse new + changed manifests
-    let (parsed_packages, failures) = phase_parse(&to_parse, &conn, &parsers, &ws_ctx)?;
+    // Phase 3: Parse new + changed manifests (transaction-wrapped)
+    let t = Instant::now();
+    let (parsed_packages, failures) = with_transaction(&conn, || {
+        phase_parse(&to_parse, &conn, &parsers, &ws_ctx)
+    })?;
+    timings.push(("parse", t.elapsed()));
 
-    // Phase 4: Remove deleted packages
-    phase_remove_deleted(&conn, &diff.removed)?;
+    // Phase 4: Remove deleted packages (transaction-wrapped)
+    let t = Instant::now();
+    with_transaction(&conn, || {
+        phase_remove_deleted(&conn, &diff.removed)
+    })?;
+    timings.push(("remove-deleted", t.elapsed()));
 
-    // Phase 5: Recompute is_internal
-    if num_added > 0 || num_changed > 0 || num_removed > 0 {
-        recompute_is_internal(&conn)?;
-    }
+    // Phase 5: Recompute is_internal (transaction-wrapped)
+    let t = Instant::now();
+    with_transaction(&conn, || {
+        if num_added > 0 || num_changed > 0 || num_removed > 0 {
+            recompute_is_internal(&conn)?;
+        }
+        Ok(())
+    })?;
+    timings.push(("recompute-internals", t.elapsed()));
 
-    // Phase 6: Store manifest hashes
-    phase_store_hashes(&conn, &to_parse)?;
+    // Phase 6: Store manifest hashes (transaction-wrapped)
+    let t = Instant::now();
+    with_transaction(&conn, || {
+        phase_store_hashes(&conn, &to_parse)
+    })?;
+    timings.push(("update-hashes", t.elapsed()));
 
-    // Phase 7: Extract symbols for new/changed packages
-    phase_extract_symbols(&conn, repo_root, &parsed_packages)?;
+    // Phase 7+8: Extract symbols + source-level re-extraction (transaction-wrapped)
+    let t = Instant::now();
+    let num_source_reextracted = with_transaction(&conn, || {
+        phase_extract_symbols(&conn, repo_root, &parsed_packages)?;
+        phase_source_incremental(&conn, repo_root, &diff.unchanged)
+    })?;
+    timings.push(("extract-symbols", t.elapsed()));
 
-    // Phase 8: Source-level incremental
-    let num_source_reextracted = phase_source_incremental(&conn, repo_root, &diff.unchanged)?;
+    // Phase 9: Index files (transaction-wrapped)
+    let t = Instant::now();
+    let num_files = with_transaction(&conn, || {
+        phase_index_files(&conn, repo_root, config)
+    })?;
+    timings.push(("index-files", t.elapsed()));
 
-    // Phase 9: Index files
-    let num_files = phase_index_files(&conn, repo_root, config)?;
-
-    // Post-build: config overrides, metadata, summary
-    apply_config_overrides(&conn, config)?;
+    // Post-build: config overrides, metadata, summary (transaction-wrapped)
+    with_transaction(&conn, || {
+        apply_config_overrides(&conn, config)
+    })?;
 
     let total_packages: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))?;
     let total_symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
@@ -925,8 +1147,20 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         failures,
     };
 
-    store_metadata(&conn, repo_root, &summary)?;
+    let total_duration = build_start.elapsed();
+
+    with_transaction(&conn, || {
+        store_metadata(&conn, repo_root, &summary)?;
+        // Store total build duration in shire_meta
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('total_duration_ms', ?1)",
+            [total_duration.as_millis().to_string()],
+        )?;
+        Ok(())
+    })?;
+
     print_summary(&summary, &db_path, is_full_build, force);
+    print_timings(&timings, total_duration);
 
     Ok(())
 }

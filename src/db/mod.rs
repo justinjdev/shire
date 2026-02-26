@@ -77,7 +77,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS source_hashes (
             package      TEXT PRIMARY KEY,
-            content_hash TEXT NOT NULL
+            content_hash TEXT NOT NULL,
+            hashed_at    TEXT
         );
 
         CREATE TABLE IF NOT EXISTS files (

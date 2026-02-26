@@ -21,6 +21,9 @@ enum Commands {
         /// Root directory of the repository (defaults to current directory)
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Force a full rebuild, ignoring cached manifest hashes
+        #[arg(long)]
+        force: bool,
     },
     /// Start the MCP server over stdio
     Serve {
@@ -34,10 +37,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build { root } => {
+        Commands::Build { root, force } => {
             let root = std::fs::canonicalize(&root)?;
             let config = config::load_config(&root)?;
-            index::build_index(&root, &config)
+            index::build_index(&root, &config, force)
         }
         Commands::Serve { db } => {
             let db_path = db.unwrap_or_else(|| PathBuf::from(".shire/index.db"));

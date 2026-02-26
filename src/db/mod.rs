@@ -69,6 +69,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS manifest_hashes (
+            path         TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL
+        );
         ",
     )?;
     Ok(())
@@ -103,6 +108,7 @@ mod tests {
         assert!(tables.contains(&"packages".to_string()));
         assert!(tables.contains(&"dependencies".to_string()));
         assert!(tables.contains(&"shire_meta".to_string()));
+        assert!(tables.contains(&"manifest_hashes".to_string()));
     }
 
     #[test]

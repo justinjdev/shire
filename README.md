@@ -22,6 +22,12 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 ## Install
 
+**From prebuilt binary** (macOS, Linux, Windows):
+
+Download the latest release from [GitHub Releases](https://github.com/justinjdev/shire/releases) and add to your PATH.
+
+**From source:**
+
 ```sh
 cargo install --path .
 ```
@@ -58,6 +64,23 @@ The index is written to `.shire/index.db` inside the repo root. Subsequent build
 | `search_files` | Full-text search across file paths, with optional package/extension filter |
 | `list_package_files` | List all files belonging to a package, with optional extension filter |
 | `index_status` | When the index was built, git commit, package/symbol/file counts, build duration |
+
+### Claude Code
+
+Add to your project's `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "shire": {
+      "command": "shire",
+      "args": ["serve", "--db", "/path/to/repo/.shire/index.db"]
+    }
+  }
+}
+```
+
+Or add globally in `~/.claude/settings.json` to use across all projects.
 
 ### Claude Desktop
 

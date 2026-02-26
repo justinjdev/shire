@@ -15,6 +15,7 @@ use crate::symbols;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use manifest::{ManifestParser, PackageInfo};
+use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -634,77 +635,92 @@ fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result
     Ok(())
 }
 
-/// Phase 7: Extract symbols for new/changed packages.
+/// Phase 7: Extract symbols for new/changed packages (parallel).
 fn phase_extract_symbols(
     conn: &Connection,
     repo_root: &Path,
     parsed_packages: &[(String, String, String)],
 ) -> Result<()> {
-    for (pkg_name, pkg_path, pkg_kind) in parsed_packages {
-        match symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind) {
+    let results: Vec<_> = parsed_packages
+        .par_iter()
+        .map(|(pkg_name, pkg_path, pkg_kind)| {
+            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind);
+            let src_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind);
+            (pkg_name, syms, src_hash)
+        })
+        .collect();
+
+    for (pkg_name, syms, src_hash) in &results {
+        match syms {
             Ok(syms) => {
-                upsert_symbols(conn, pkg_name, &syms)?;
+                upsert_symbols(conn, pkg_name, syms)?;
             }
             Err(e) => {
                 eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
             }
         }
-        if let Ok(src_hash) = hash::compute_source_hash(repo_root, pkg_path, pkg_kind) {
-            let _ = upsert_source_hash(conn, pkg_name, &src_hash);
+        if let Ok(h) = src_hash {
+            let _ = upsert_source_hash(conn, pkg_name, h);
         }
     }
     Ok(())
 }
 
-/// Phase 8: Re-extract symbols for unchanged packages whose source files changed.
+/// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
 ) -> Result<usize> {
-    let mut num_reextracted: usize = 0;
+    // Pre-fetch package info and stored hashes from DB
+    let unchanged_pkgs: Vec<(String, String, String, Option<String>)> = unchanged
+        .iter()
+        .filter_map(|manifest| {
+            let relative_dir = &manifest.relative_dir;
+            let (pkg_name, pkg_kind): (String, String) = conn
+                .query_row(
+                    "SELECT name, kind FROM packages WHERE path = ?1",
+                    [relative_dir.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok()?;
+            let stored_hash: Option<String> = conn
+                .query_row(
+                    "SELECT content_hash FROM source_hashes WHERE package = ?1",
+                    [&pkg_name],
+                    |row| row.get(0),
+                )
+                .ok();
+            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash))
+        })
+        .collect();
 
-    for manifest in unchanged {
-        let relative_dir = &manifest.relative_dir;
-
-        let pkg_info: Option<(String, String)> = conn
-            .query_row(
-                "SELECT name, kind FROM packages WHERE path = ?1",
-                [relative_dir.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        let (pkg_name, pkg_kind) = match pkg_info {
-            Some(info) => info,
-            None => continue,
-        };
-
-        let current_hash = match hash::compute_source_hash(repo_root, relative_dir, &pkg_kind) {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-
-        let stored_hash: Option<String> = conn
-            .query_row(
-                "SELECT content_hash FROM source_hashes WHERE package = ?1",
-                [&pkg_name],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if stored_hash.as_deref() != Some(&current_hash) {
-            match symbols::extract_symbols_for_package(repo_root, relative_dir, &pkg_kind) {
-                Ok(syms) => {
-                    upsert_symbols(conn, &pkg_name, &syms)?;
-                    num_reextracted += 1;
-                }
-                Err(e) => {
-                    eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
-                }
+    // Parallel: compute current hashes and conditionally extract symbols
+    let results: Vec<_> = unchanged_pkgs
+        .par_iter()
+        .filter_map(|(pkg_name, pkg_path, pkg_kind, stored_hash)| {
+            let current_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind).ok()?;
+            if stored_hash.as_deref() == Some(current_hash.as_str()) {
+                return None;
             }
-            let _ = upsert_source_hash(conn, &pkg_name, &current_hash);
+            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind);
+            Some((pkg_name, syms, current_hash))
+        })
+        .collect();
+
+    // Sequential DB writes
+    let mut num_reextracted: usize = 0;
+    for (pkg_name, syms, current_hash) in &results {
+        match syms {
+            Ok(syms) => {
+                upsert_symbols(conn, pkg_name, syms)?;
+                num_reextracted += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
+            }
         }
+        let _ = upsert_source_hash(conn, pkg_name, current_hash);
     }
 
     Ok(num_reextracted)

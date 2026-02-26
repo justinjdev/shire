@@ -107,6 +107,24 @@ pub struct GetSymbolParams {
     pub package: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchFilesParams {
+    /// Search query to find files by path or name
+    pub query: String,
+    /// Filter to files from a specific package
+    pub package: Option<String>,
+    /// Filter by file extension (e.g., "ts", "go", "rs")
+    pub extension: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListPackageFilesParams {
+    /// Exact package name to list files for
+    pub package: String,
+    /// Filter by file extension (e.g., "ts", "go", "rs")
+    pub extension: Option<String>,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description using full-text search")]
@@ -251,6 +269,46 @@ impl ShireService {
             &conn,
             &params.name,
             params.package.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
+    fn search_files(
+        &self,
+        Parameters(params): Parameters<SearchFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::search_files(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            params.extension.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "List all files belonging to a specific package. Optionally filter by file extension.")]
+    fn list_package_files(
+        &self,
+        Parameters(params): Parameters<ListPackageFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::list_package_files(
+            &conn,
+            &params.package,
+            params.extension.as_deref(),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string_pretty(&results)

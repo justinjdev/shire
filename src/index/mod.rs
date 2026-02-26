@@ -235,6 +235,116 @@ fn upsert_source_hash(conn: &Connection, package: &str, hash: &str) -> Result<()
     Ok(())
 }
 
+/// A discovered file during file walking.
+struct WalkedFile {
+    relative_path: String,
+    extension: String,
+    size_bytes: u64,
+}
+
+/// Walk the repo and collect all files with metadata.
+fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
+    let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
+
+    let walker = WalkBuilder::new(repo_root)
+        .hidden(true)
+        .filter_entry(move |entry| {
+            if let Some(name) = entry.file_name().to_str() {
+                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    return !exclude_set.contains(name);
+                }
+            }
+            true
+        })
+        .build();
+
+    let mut files = Vec::new();
+
+    for entry in walker {
+        let entry = entry?;
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            continue;
+        }
+
+        let file_path = entry.path();
+        let relative_path = file_path
+            .strip_prefix(repo_root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .to_string();
+
+        let extension = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+
+        let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+        files.push(WalkedFile {
+            relative_path,
+            extension,
+            size_bytes,
+        });
+    }
+
+    Ok(files)
+}
+
+/// Associate files with their owning package using longest-prefix matching.
+fn associate_files_with_packages(
+    files: &[WalkedFile],
+    packages: &[(String, String)], // (name, path)
+) -> Vec<(String, Option<String>, String, u64)> {
+    // Sort package paths by length descending so longest prefix matches first
+    let mut sorted_pkgs: Vec<&(String, String)> = packages.iter().collect();
+    sorted_pkgs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    files
+        .iter()
+        .map(|file| {
+            let file_dir = file
+                .relative_path
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+
+            let package = sorted_pkgs.iter().find_map(|(name, path)| {
+                if path.is_empty() {
+                    // Root-level package matches everything
+                    Some(name.clone())
+                } else if file_dir == path.as_str() || file_dir.starts_with(&format!("{}/", path)) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            });
+
+            (
+                file.relative_path.clone(),
+                package,
+                file.extension.clone(),
+                file.size_bytes,
+            )
+        })
+        .collect()
+}
+
+/// Clear and re-insert all files.
+fn upsert_files(
+    conn: &Connection,
+    files: &[(String, Option<String>, String, u64)],
+) -> Result<()> {
+    conn.execute("DELETE FROM files", [])?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (path, package, ext, size) in files {
+        stmt.execute((path, package, ext, *size as i64))?;
+    }
+    Ok(())
+}
+
 /// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
 fn collect_cargo_workspace_context(walked: &[WalkedManifest]) -> HashMap<String, String> {
     let mut all_ws_deps = HashMap::new();
@@ -488,6 +598,17 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         }
     }
 
+    // Phase 9: Index files — walk all files, associate with packages, insert
+    let all_packages: Vec<(String, String)> = conn
+        .prepare("SELECT name, path FROM packages")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let walked_files = walk_files(repo_root, config)?;
+    let associated_files = associate_files_with_packages(&walked_files, &all_packages);
+    let num_files = associated_files.len();
+    upsert_files(&conn, &associated_files)?;
+
     // Apply config overrides
     for override_pkg in &config.packages {
         if let Some(desc) = &override_pkg.description {
@@ -549,6 +670,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('symbol_count', ?1)",
         [total_symbols.to_string()],
     )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_count', ?1)",
+        [num_files.to_string()],
+    )?;
     if let Some(commit) = git_commit {
         conn.execute(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('git_commit', ?1)",
@@ -565,20 +690,20 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
     if is_full_build || force {
         println!(
-            "Indexed {} packages, {} symbols into {}",
-            total_packages, total_symbols,
+            "Indexed {} packages, {} symbols, {} files into {}",
+            total_packages, total_symbols, num_files,
             db_path.display()
         );
     } else if num_source_reextracted > 0 {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols into {}",
-            total_packages, num_added, num_changed, num_removed, num_skipped, num_source_reextracted, total_symbols,
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} files into {}",
+            total_packages, num_added, num_changed, num_removed, num_skipped, num_source_reextracted, total_symbols, num_files,
             db_path.display()
         );
     } else {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols into {}",
-            total_packages, num_added, num_changed, num_removed, num_skipped, total_symbols,
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} files into {}",
+            total_packages, num_added, num_changed, num_removed, num_skipped, total_symbols, num_files,
             db_path.display()
         );
     }

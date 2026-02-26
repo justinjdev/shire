@@ -6,7 +6,7 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 ## What it does
 
-`shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. `shire serve` exposes that index as an MCP server over stdio.
+`shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
 
 **Supported ecosystems:**
 
@@ -52,6 +52,8 @@ The index is written to `.shire/index.db` inside the repo root. Subsequent build
 | `search_symbols` | Full-text search across symbol names and signatures |
 | `get_package_symbols` | List all symbols in a package (functions, classes, types, methods) |
 | `get_symbol` | Exact name lookup for a symbol across packages |
+| `search_files` | Full-text search across file paths, with optional package/extension filter |
+| `list_package_files` | List all files belonging to a package, with optional extension filter |
 | `index_status` | When the index was built, git commit, package count |
 
 ### Claude Desktop
@@ -113,7 +115,7 @@ src/
 │   └── python.rs    # Python extractor (tree-sitter)
 └── mcp/
     ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-    └── tools.rs     # 10 tool handlers
+    └── tools.rs     # 12 tool handlers
 ```
 
 ## License

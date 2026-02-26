@@ -186,6 +186,10 @@ fn test_build_command_indexes_fixture() {
         stdout.contains("symbols"),
         "Expected symbol count in output, got: {stdout}"
     );
+    assert!(
+        stdout.contains("files"),
+        "Expected file count in output, got: {stdout}"
+    );
 
     // Verify the db was created
     let db_path = dir.path().join(".shire/index.db");
@@ -827,6 +831,191 @@ export class PermissionManager {
         )
         .unwrap();
     assert_eq!(perm_mgr, 1, "PermissionManager should be extracted from new file");
+}
+
+#[test]
+fn test_file_index_populates_with_associations() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Files table should have entries
+    let file_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert!(file_count > 0, "files table should have entries");
+
+    // auth.ts should be associated with auth-service
+    let pkg: Option<String> = conn
+        .query_row(
+            "SELECT package FROM files WHERE path = 'services/auth/src/auth.ts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg.as_deref(), Some("auth-service"));
+
+    // main.go should be associated with gateway
+    let pkg: Option<String> = conn
+        .query_row(
+            "SELECT package FROM files WHERE path = 'services/gateway/main.go'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg.as_deref(), Some("gateway"));
+
+    // Extension should be extracted
+    let ext: String = conn
+        .query_row(
+            "SELECT extension FROM files WHERE path = 'services/auth/src/auth.ts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ext, "ts");
+}
+
+#[test]
+fn test_file_index_excludes_node_modules() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // No files from node_modules
+    let nm_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path LIKE '%node_modules%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(nm_count, 0, "files in node_modules should be excluded");
+}
+
+#[test]
+fn test_file_index_null_package_for_unowned_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    // Add a file outside any package
+    fs::write(dir.path().join("scripts.sh"), "#!/bin/bash\necho hello").unwrap();
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    let pkg: Option<String> = conn
+        .query_row(
+            "SELECT package FROM files WHERE path = 'scripts.sh'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(pkg.is_none(), "file outside any package should have NULL package");
+}
+
+#[test]
+fn test_file_count_in_shire_meta() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    let file_count: String = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'file_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let count: i64 = file_count.parse().unwrap();
+    assert!(count > 0, "file_count should be in shire_meta");
+}
+
+#[test]
+fn test_file_index_rebuild_includes_new_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let initial_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+
+    // Add a new file
+    let auth_src = dir.path().join("services/auth/src");
+    fs::write(auth_src.join("utils.ts"), "export function helper() {}").unwrap();
+
+    // Rebuild
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let updated_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        updated_count,
+        initial_count + 1,
+        "rebuild should include the new file"
+    );
+
+    // New file should be present and associated
+    let pkg: Option<String> = conn
+        .query_row(
+            "SELECT package FROM files WHERE path = 'services/auth/src/utils.ts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg.as_deref(), Some("auth-service"));
 }
 
 #[test]

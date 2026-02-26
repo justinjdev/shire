@@ -213,6 +213,115 @@ pub fn get_symbol(
     Ok(result)
 }
 
+#[derive(Debug, Serialize)]
+pub struct FileRow {
+    pub path: String,
+    pub package: Option<String>,
+    pub extension: String,
+    pub size_bytes: i64,
+}
+
+/// FTS5 search across file paths. Returns up to 50 results.
+pub fn search_files(
+    conn: &Connection,
+    query: &str,
+    package_filter: Option<&str>,
+    extension_filter: Option<&str>,
+) -> Result<Vec<FileRow>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
+
+    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, extension_filter) {
+        (Some(pkg), Some(ext)) => (
+            "SELECT f.path, f.package, f.extension, f.size_bytes
+             FROM files_fts fts
+             JOIN files f ON f.rowid = fts.rowid
+             WHERE files_fts MATCH ?1 AND f.package = ?2 AND f.extension = ?3
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string())],
+        ),
+        (Some(pkg), None) => (
+            "SELECT f.path, f.package, f.extension, f.size_bytes
+             FROM files_fts fts
+             JOIN files f ON f.rowid = fts.rowid
+             WHERE files_fts MATCH ?1 AND f.package = ?2
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
+        ),
+        (None, Some(ext)) => (
+            "SELECT f.path, f.package, f.extension, f.size_bytes
+             FROM files_fts fts
+             JOIN files f ON f.rowid = fts.rowid
+             WHERE files_fts MATCH ?1 AND f.extension = ?2
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string())],
+        ),
+        (None, None) => (
+            "SELECT f.path, f.package, f.extension, f.size_bytes
+             FROM files_fts fts
+             JOIN files f ON f.rowid = fts.rowid
+             WHERE files_fts MATCH ?1
+             LIMIT 50".to_string(),
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
+        ),
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FileRow {
+            path: row.get(0)?,
+            package: row.get(1)?,
+            extension: row.get(2)?,
+            size_bytes: row.get(3)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// List all files belonging to a package, optionally filtered by extension. Ordered by path.
+pub fn list_package_files(
+    conn: &Connection,
+    package: &str,
+    extension_filter: Option<&str>,
+) -> Result<Vec<FileRow>> {
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match extension_filter {
+        Some(ext) => (
+            "SELECT path, package, extension, size_bytes
+             FROM files
+             WHERE package = ?1 AND extension = ?2
+             ORDER BY path",
+            vec![Box::new(package.to_string()), Box::new(ext.to_string())],
+        ),
+        None => (
+            "SELECT path, package, extension, size_bytes
+             FROM files
+             WHERE package = ?1
+             ORDER BY path",
+            vec![Box::new(package.to_string())],
+        ),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FileRow {
+            path: row.get(0)?,
+            package: row.get(1)?,
+            extension: row.get(2)?,
+            size_bytes: row.get(3)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 /// FTS5 search across package name, description, and path. Returns up to 20 results.
 pub fn search_packages(conn: &Connection, query: &str) -> Result<Vec<PackageRow>> {
     if query.trim().is_empty() {
@@ -751,5 +860,91 @@ mod tests {
 
         let results = get_symbol(&conn, "nonexistent", None).unwrap();
         assert!(results.is_empty());
+    }
+
+    fn seed_file_data(conn: &Connection) {
+        let files = vec![
+            ("services/auth/src/auth.ts", Some("auth-service"), "ts", 1024i64),
+            ("services/auth/src/middleware.ts", Some("auth-service"), "ts", 512),
+            ("services/auth/package.json", Some("auth-service"), "json", 256),
+            ("packages/shared-types/src/types.ts", Some("shared-types"), "ts", 2048),
+            ("services/gateway/main.go", Some("api-gateway"), "go", 4096),
+            ("services/gateway/handler.go", Some("api-gateway"), "go", 3072),
+            ("scripts/deploy.sh", None, "sh", 128),
+            ("README.md", None, "md", 64),
+        ];
+        for (path, package, ext, size) in &files {
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, ?2, ?3, ?4)",
+                (path, package, ext, size),
+            ).unwrap();
+        }
+    }
+
+    fn test_db_with_files() -> Connection {
+        let conn = test_db();
+        seed_file_data(&conn);
+        conn
+    }
+
+    #[test]
+    fn test_search_files_by_filename() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "middleware", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "services/auth/src/middleware.ts");
+    }
+
+    #[test]
+    fn test_search_files_by_path_segment() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "gateway", None, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_files_filter_by_package() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "ts", Some("auth-service"), None).unwrap();
+        assert!(results.iter().all(|f| f.package.as_deref() == Some("auth-service")));
+    }
+
+    #[test]
+    fn test_search_files_filter_by_extension() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "auth", None, Some("ts")).unwrap();
+        assert!(results.iter().all(|f| f.extension == "ts"));
+    }
+
+    #[test]
+    fn test_search_files_combined_filters() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "auth", Some("auth-service"), Some("ts")).unwrap();
+        assert!(results.iter().all(|f| f.package.as_deref() == Some("auth-service") && f.extension == "ts"));
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_search_files_empty_query() {
+        let conn = test_db_with_files();
+        let results = search_files(&conn, "", None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_list_package_files_basic() {
+        let conn = test_db_with_files();
+        let results = list_package_files(&conn, "auth-service", None).unwrap();
+        assert_eq!(results.len(), 3);
+        // Should be ordered by path
+        assert!(results[0].path < results[1].path);
+    }
+
+    #[test]
+    fn test_list_package_files_extension_filter() {
+        let conn = test_db_with_files();
+        let results = list_package_files(&conn, "auth-service", Some("ts")).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|f| f.extension == "ts"));
     }
 }

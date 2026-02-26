@@ -80,6 +80,40 @@ fn create_schema(conn: &Connection) -> Result<()> {
             content_hash TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS files (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            path       TEXT NOT NULL UNIQUE,
+            package    TEXT REFERENCES packages(name) ON DELETE SET NULL,
+            extension  TEXT NOT NULL DEFAULT '',
+            size_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_files_package ON files(package);
+        CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            path,
+            content='files',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, path)
+            VALUES (new.rowid, new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, path)
+            VALUES ('delete', old.rowid, old.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, path)
+            VALUES ('delete', old.rowid, old.path);
+            INSERT INTO files_fts(rowid, path)
+            VALUES (new.rowid, new.path);
+        END;
+
         CREATE TABLE IF NOT EXISTS symbols (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             package       TEXT NOT NULL REFERENCES packages(name),
@@ -155,6 +189,7 @@ mod tests {
         assert!(tables.contains(&"shire_meta".to_string()));
         assert!(tables.contains(&"manifest_hashes".to_string()));
         assert!(tables.contains(&"source_hashes".to_string()));
+        assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"symbols".to_string()));
     }
 

@@ -98,8 +98,8 @@ mod tests {
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(tables.contains(&"packages".to_string()));
         assert!(tables.contains(&"dependencies".to_string()));
         assert!(tables.contains(&"shire_meta".to_string()));
@@ -119,8 +119,8 @@ mod tests {
             .unwrap()
             .query_map(["auth"], |row| row.get(0))
             .unwrap()
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results, vec!["auth-service"]);
     }
 

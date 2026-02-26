@@ -88,6 +88,11 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::search_packages(&conn, &params.query)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -146,8 +151,9 @@ impl ShireService {
     #[tool(description = "Get the transitive dependency graph starting from a package. Returns a list of edges. Set internal_only=true to only follow dependencies within this repo.")]
     fn dependency_graph(
         &self,
-        Parameters(params): Parameters<GraphParams>,
+        Parameters(mut params): Parameters<GraphParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        params.depth = params.depth.min(20);
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let edges = queries::dependency_graph(&conn, &params.name, params.depth, params.internal_only)
             .map_err(|e| Self::mcp_err(e.to_string()))?;

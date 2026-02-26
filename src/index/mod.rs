@@ -9,7 +9,7 @@ use crate::db;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use manifest::ManifestParser;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
@@ -18,9 +18,8 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
     let conn = db::open_or_create(&db_path)?;
 
     // Clear existing data for a clean rebuild
-    conn.execute_batch(
-        "DELETE FROM dependencies; DELETE FROM packages; DELETE FROM packages_fts;",
-    )?;
+    // Note: packages_fts is content-synced via triggers; deleting from packages handles FTS cleanup
+    conn.execute_batch("DELETE FROM dependencies; DELETE FROM packages;")?;
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
@@ -40,6 +39,7 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
     let mut packages = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(true)
@@ -80,7 +80,7 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
                 match parser.parse(file_path, &relative_dir) {
                     Ok(info) => packages.push(info),
                     Err(e) => {
-                        eprintln!("Warning: failed to parse {}: {}", file_path.display(), e);
+                        failures.push((file_path.display().to_string(), e.to_string()));
                     }
                 }
                 break;
@@ -90,6 +90,14 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
 
     // Collect all package names for is_internal resolution
     let all_names: HashSet<String> = packages.iter().map(|p| p.name.clone()).collect();
+
+    // Build alias map for Go packages: full module path -> short name
+    // This lets us detect internal deps when Go requires use full module paths
+    let go_module_aliases: HashMap<String, String> = packages
+        .iter()
+        .filter(|p| p.kind == "go")
+        .filter_map(|p| p.description.as_ref().map(|desc| (desc.clone(), p.name.clone())))
+        .collect();
 
     // Insert packages and dependencies
     let mut pkg_stmt = conn.prepare(
@@ -113,7 +121,8 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
         ))?;
 
         for dep in &pkg.dependencies {
-            let is_internal = all_names.contains(&dep.name);
+            let is_internal =
+                all_names.contains(&dep.name) || go_module_aliases.contains_key(&dep.name);
             dep_stmt.execute((
                 &pkg.name,
                 &dep.name,
@@ -127,21 +136,40 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
     // Apply config overrides
     for override_pkg in &config.packages {
         if let Some(desc) = &override_pkg.description {
-            conn.execute(
+            let rows = conn.execute(
                 "UPDATE packages SET description = ?1 WHERE name = ?2",
                 (desc, &override_pkg.name),
             )?;
+            if rows == 0 {
+                eprintln!(
+                    "Warning: config override for '{}' matched no packages",
+                    override_pkg.name
+                );
+            }
         }
     }
 
     // Store metadata
-    let git_commit = std::process::Command::new("git")
+    let git_commit = match std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_root)
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
+    {
+        Ok(output) => {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            } else {
+                eprintln!("Note: git rev-parse failed (not a git repo?)");
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not run git: {}", e);
+            None
+        }
+    };
 
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
@@ -158,6 +186,12 @@ pub fn build_index(repo_root: &Path, config: &Config) -> Result<()> {
         )?;
     }
 
+    if !failures.is_empty() {
+        eprintln!("{} manifest(s) failed to parse:", failures.len());
+        for (path, err) in &failures {
+            eprintln!("  {}: {}", path, err);
+        }
+    }
     println!("Indexed {} packages into {}", packages.len(), db_path.display());
     Ok(())
 }
@@ -237,8 +271,8 @@ mod tests {
             .unwrap()
             .query_map(["auth"], |row| row.get(0))
             .unwrap()
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(results.contains(&"auth-service".to_string()));
     }
 }

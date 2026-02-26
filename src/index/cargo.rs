@@ -13,21 +13,23 @@ impl ManifestParser for CargoParser {
         let content = std::fs::read_to_string(manifest_path)?;
         let doc: toml::Value = toml::from_str(&content)?;
 
-        let package = doc.get("package");
+        let package = doc
+            .get("package")
+            .ok_or_else(|| anyhow::anyhow!("No [package] section"))?;
 
         let name = package
-            .and_then(|p| p.get("name"))
+            .get("name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| relative_dir.replace('/', "-"));
 
         let version = package
-            .and_then(|p| p.get("version"))
+            .get("version")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         let description = package
-            .and_then(|p| p.get("description"))
+            .get("description")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -176,7 +178,7 @@ edition = "2021"
     }
 
     #[test]
-    fn test_parse_no_package_falls_back_to_dir() {
+    fn test_parse_no_package_returns_error() {
         let dir = TempDir::new().unwrap();
         let path = write_manifest(
             dir.path(),
@@ -187,9 +189,8 @@ serde = "1"
         );
 
         let parser = CargoParser;
-        let info = parser.parse(&path, "crates/unnamed").unwrap();
-
-        assert_eq!(info.name, "crates-unnamed");
-        assert_eq!(info.dependencies.len(), 1);
+        let result = parser.parse(&path, "crates/unnamed");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("[package]"));
     }
 }

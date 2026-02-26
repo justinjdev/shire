@@ -44,6 +44,7 @@ fn default_exclude() -> Vec<String> {
         ".build".into(),
         "target".into(),
         "third_party".into(),
+        ".shire".into(),
     ]
 }
 
@@ -51,7 +52,6 @@ fn default_exclude() -> Vec<String> {
 pub struct PackageOverride {
     pub name: String,
     pub description: Option<String>,
-    pub tags: Option<Vec<String>>,
 }
 
 pub fn load_config(repo_root: &Path) -> Result<Config> {
@@ -87,7 +87,6 @@ exclude = ["vendor", "dist"]
 [[packages]]
 name = "legacy-auth"
 description = "Deprecated auth service"
-tags = ["deprecated"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.discovery.manifests.len(), 2);

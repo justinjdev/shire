@@ -38,6 +38,11 @@ pub struct IndexStatus {
 
 /// FTS5 search across package name, description, and path. Returns up to 20 results.
 pub fn search_packages(conn: &Connection, query: &str) -> Result<Vec<PackageRow>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    // Sanitize for FTS5: wrap in double quotes, escape internal quotes
+    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
     let mut stmt = conn.prepare(
         "SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
          FROM packages_fts f
@@ -45,7 +50,7 @@ pub fn search_packages(conn: &Connection, query: &str) -> Result<Vec<PackageRow>
          WHERE packages_fts MATCH ?1
          LIMIT 20",
     )?;
-    let rows = stmt.query_map([query], |row| {
+    let rows = stmt.query_map([&sanitized], |row| {
         Ok(PackageRow {
             name: row.get(0)?,
             path: row.get(1)?,
@@ -162,11 +167,12 @@ pub fn dependency_graph(
     visited.insert(root.to_string());
     queue.push_back((root.to_string(), 0));
 
+    let mut stmt = conn.prepare(sql)?;
+
     while let Some((current, depth)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
         }
-        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([&current], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;

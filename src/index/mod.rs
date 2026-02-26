@@ -438,60 +438,55 @@ fn collect_gradle_settings_context(
     (dirs, root_names)
 }
 
-pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
-    let db_dir = repo_root.join(".shire");
-    let db_path = db_dir.join("index.db");
-    let conn = db::open_or_create(&db_path)?;
+/// Workspace context collected in Phase 1.5 for use during manifest parsing.
+struct WorkspaceContext {
+    cargo_deps: HashMap<String, String>,
+    go_dirs: HashSet<String>,
+    maven_parents: HashMap<String, maven::MavenParentContext>,
+    gradle_settings: (HashSet<String>, HashMap<String, Option<String>>),
+}
 
-    // If --force, clear hashes and symbols to trigger full rebuild
-    if force {
-        conn.execute("DELETE FROM manifest_hashes", [])?;
-        conn.execute("DELETE FROM symbols", [])?;
-        conn.execute("DELETE FROM source_hashes", [])?;
-    }
+/// Summary of a completed build, used for output and metadata storage.
+struct BuildSummary {
+    num_added: usize,
+    num_changed: usize,
+    num_removed: usize,
+    num_skipped: usize,
+    num_source_reextracted: usize,
+    num_files: usize,
+    total_packages: i64,
+    total_symbols: i64,
+    failures: Vec<(String, String)>,
+}
 
-    let parsers: Vec<Box<dyn ManifestParser>> = vec![
-        Box::new(npm::NpmParser),
-        Box::new(go::GoParser),
-        Box::new(cargo::CargoParser),
-        Box::new(python::PythonParser),
-        Box::new(maven::MavenParser),
-        Box::new(gradle::GradleParser),
-        Box::new(gradle::GradleKtsParser),
-    ];
+/// Phase 1+1.5: Walk manifests and collect workspace context.
+fn phase_walk_and_context(
+    repo_root: &Path,
+    config: &Config,
+    parsers: &[Box<dyn ManifestParser>],
+) -> Result<(Vec<WalkedManifest>, WorkspaceContext)> {
+    let walked = walk_manifests(repo_root, config, parsers)?;
+    let ctx = WorkspaceContext {
+        cargo_deps: collect_cargo_workspace_context(&walked),
+        go_dirs: collect_go_workspace_context(&walked),
+        maven_parents: maven::collect_maven_parent_context(&walked),
+        gradle_settings: collect_gradle_settings_context(&walked),
+    };
+    Ok((walked, ctx))
+}
 
-    // Phase 1: Walk — discover all manifests with content hashes
-    let walked = walk_manifests(repo_root, config, &parsers)?;
-
-    // Phase 1.5: Collect workspace context before parsing
-    let cargo_workspace_deps = collect_cargo_workspace_context(&walked);
-    let go_workspace_dirs = collect_go_workspace_context(&walked);
-    let maven_parent_context = maven::collect_maven_parent_context(&walked);
-    let gradle_settings_context = collect_gradle_settings_context(&walked);
-
-    // Phase 2: Diff — compare against stored hashes
-    let stored_hashes = load_stored_hashes(&conn)?;
-    let diff = diff_manifests(&walked, &stored_hashes);
-
-    let is_full_build = stored_hashes.is_empty();
-    let to_parse: Vec<&WalkedManifest> = diff
-        .new
-        .iter()
-        .chain(diff.changed.iter())
-        .copied()
-        .collect();
-
-    let num_added = diff.new.len();
-    let num_changed = diff.changed.len();
-    let num_removed = diff.removed.len();
-    let num_skipped = diff.unchanged.len();
-
-    // Phase 3: Parse — only new + changed manifests
+/// Phase 3: Parse new and changed manifests into packages.
+fn phase_parse(
+    to_parse: &[&WalkedManifest],
+    conn: &Connection,
+    parsers: &[Box<dyn ManifestParser>],
+    ws: &WorkspaceContext,
+) -> Result<(Vec<(String, String, String)>, Vec<(String, String)>)> {
+    let mut parsed_packages: Vec<(String, String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
-    let mut parsed_packages: Vec<(String, String, String)> = Vec::new(); // (name, path, kind)
     let cargo_parser = cargo::CargoParser;
 
-    for manifest in &to_parse {
+    for manifest in to_parse {
         let filename = manifest
             .abs_path
             .file_name()
@@ -512,7 +507,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             match maven_parser.parse_with_parent_context(
                 &manifest.abs_path,
                 &manifest.relative_dir,
-                &maven_parent_context,
+                &ws.maven_parents,
             ) {
                 Ok(pkg) => {
                     parsed_packages.push((
@@ -520,7 +515,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(&conn, &pkg)?;
+                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -531,7 +526,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
         // Gradle: use settings-context-aware parsing
         if filename == "build.gradle" || filename == "build.gradle.kts" {
-            let (ref gradle_dirs, ref gradle_root_names) = gradle_settings_context;
+            let (ref gradle_dirs, ref gradle_root_names) = ws.gradle_settings;
             let settings_ctx = gradle_root_names
                 .get(&manifest.relative_dir)
                 .map(|name| gradle::GradleSettingsContext {
@@ -543,7 +538,6 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
                 &settings_ctx,
             ) {
                 Ok(mut pkg) => {
-                    // Annotate if this is a gradle workspace member
                     if gradle_dirs.contains(&manifest.relative_dir) {
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
@@ -552,7 +546,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(&conn, &pkg)?;
+                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -562,15 +556,15 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         }
 
         // Cargo members: use workspace-aware parsing when context exists
-        if filename == "Cargo.toml" && !cargo_workspace_deps.is_empty() {
+        if filename == "Cargo.toml" && !ws.cargo_deps.is_empty() {
             match cargo_parser.parse_with_workspace_deps(
                 &manifest.abs_path,
                 &manifest.relative_dir,
-                &cargo_workspace_deps,
+                &ws.cargo_deps,
             ) {
                 Ok(pkg) => {
                     parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                    upsert_package(&conn, &pkg)?;
+                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -579,16 +573,15 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             continue;
         }
 
-        for parser in &parsers {
+        for parser in parsers {
             if parser.filename() == filename {
                 match parser.parse(&manifest.abs_path, &manifest.relative_dir) {
                     Ok(mut pkg) => {
-                        // Annotate Go packages that are go.work members
-                        if pkg.kind == "go" && go_workspace_dirs.contains(&manifest.relative_dir) {
+                        if pkg.kind == "go" && ws.go_dirs.contains(&manifest.relative_dir) {
                             pkg.metadata = Some(serde_json::json!({"go_workspace": true}));
                         }
                         parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                        upsert_package(&conn, &pkg)?;
+                        upsert_package(conn, &pkg)?;
                     }
                     Err(e) => {
                         failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -599,9 +592,12 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         }
     }
 
-    // Phase 4: Remove packages from deleted manifests
-    for manifest_key in &diff.removed {
-        // Look up which package came from this path
+    Ok((parsed_packages, failures))
+}
+
+/// Phase 4: Remove packages whose manifests were deleted.
+fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
+    for manifest_key in removed {
         let relative_dir = manifest_key
             .rsplit_once('/')
             .map(|(dir, _)| dir)
@@ -624,43 +620,53 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             [manifest_key.as_str()],
         )?;
     }
+    Ok(())
+}
 
-    // Phase 5: Recompute is_internal for ALL deps
-    if num_added > 0 || num_changed > 0 || num_removed > 0 {
-        recompute_is_internal(&conn)?;
-    }
-
-    // Phase 6: Update stored hashes for new + changed manifests
+/// Phase 6: Store manifest hashes for parsed manifests.
+fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result<()> {
     let mut hash_stmt = conn.prepare(
         "INSERT OR REPLACE INTO manifest_hashes (path, content_hash) VALUES (?1, ?2)",
     )?;
-    for manifest in &to_parse {
+    for manifest in to_parse {
         hash_stmt.execute((&manifest.manifest_key, &manifest.content_hash))?;
     }
+    Ok(())
+}
 
-    // Phase 7: Extract symbols for new/changed packages
-    for (pkg_name, pkg_path, pkg_kind) in &parsed_packages {
+/// Phase 7: Extract symbols for new/changed packages.
+fn phase_extract_symbols(
+    conn: &Connection,
+    repo_root: &Path,
+    parsed_packages: &[(String, String, String)],
+) -> Result<()> {
+    for (pkg_name, pkg_path, pkg_kind) in parsed_packages {
         match symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind) {
             Ok(syms) => {
-                upsert_symbols(&conn, pkg_name, &syms)?;
+                upsert_symbols(conn, pkg_name, &syms)?;
             }
             Err(e) => {
                 eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
             }
         }
-        // Store source hash for manifest-changed packages
         if let Ok(src_hash) = hash::compute_source_hash(repo_root, pkg_path, pkg_kind) {
-            let _ = upsert_source_hash(&conn, pkg_name, &src_hash);
+            let _ = upsert_source_hash(conn, pkg_name, &src_hash);
         }
     }
+    Ok(())
+}
 
-    // Phase 8: Source-level incremental — re-extract symbols for unchanged packages
-    // whose source files have changed
-    let mut num_source_reextracted: usize = 0;
-    for manifest in &diff.unchanged {
+/// Phase 8: Re-extract symbols for unchanged packages whose source files changed.
+fn phase_source_incremental(
+    conn: &Connection,
+    repo_root: &Path,
+    unchanged: &[&WalkedManifest],
+) -> Result<usize> {
+    let mut num_reextracted: usize = 0;
+
+    for manifest in unchanged {
         let relative_dir = &manifest.relative_dir;
 
-        // Look up the package from DB by path
         let pkg_info: Option<(String, String)> = conn
             .query_row(
                 "SELECT name, kind FROM packages WHERE path = ?1",
@@ -671,16 +677,14 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
 
         let (pkg_name, pkg_kind) = match pkg_info {
             Some(info) => info,
-            None => continue, // no package for this manifest (e.g., go.work)
+            None => continue,
         };
 
-        // Compute current source hash
         let current_hash = match hash::compute_source_hash(repo_root, relative_dir, &pkg_kind) {
             Ok(h) => h,
             Err(_) => continue,
         };
 
-        // Load stored source hash
         let stored_hash: Option<String> = conn
             .query_row(
                 "SELECT content_hash FROM source_hashes WHERE package = ?1",
@@ -689,22 +693,29 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             )
             .ok();
 
-        // Re-extract if hash differs or no stored hash
         if stored_hash.as_deref() != Some(&current_hash) {
             match symbols::extract_symbols_for_package(repo_root, relative_dir, &pkg_kind) {
                 Ok(syms) => {
-                    upsert_symbols(&conn, &pkg_name, &syms)?;
-                    num_source_reextracted += 1;
+                    upsert_symbols(conn, &pkg_name, &syms)?;
+                    num_reextracted += 1;
                 }
                 Err(e) => {
                     eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
                 }
             }
-            let _ = upsert_source_hash(&conn, &pkg_name, &current_hash);
+            let _ = upsert_source_hash(conn, &pkg_name, &current_hash);
         }
     }
 
-    // Phase 9: Index files — walk all files, associate with packages, insert
+    Ok(num_reextracted)
+}
+
+/// Phase 9: Walk all files, associate with packages, and insert into DB.
+fn phase_index_files(
+    conn: &Connection,
+    repo_root: &Path,
+    config: &Config,
+) -> Result<usize> {
     let all_packages: Vec<(String, String)> = conn
         .prepare("SELECT name, path FROM packages")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -713,9 +724,12 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     let walked_files = walk_files(repo_root, config)?;
     let associated_files = associate_files_with_packages(&walked_files, &all_packages);
     let num_files = associated_files.len();
-    upsert_files(&conn, &associated_files)?;
+    upsert_files(conn, &associated_files)?;
+    Ok(num_files)
+}
 
-    // Apply config overrides
+/// Apply config overrides (custom package descriptions).
+fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
     for override_pkg in &config.packages {
         if let Some(desc) = &override_pkg.description {
             let rows = conn.execute(
@@ -730,8 +744,11 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             }
         }
     }
+    Ok(())
+}
 
-    // Store metadata
+/// Store build metadata in shire_meta.
+fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -> Result<()> {
     let git_commit = match std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_root)
@@ -753,32 +770,21 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         }
     };
 
-    let total_packages: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM packages",
-        [],
-        |row| row.get(0),
-    )?;
-    let total_symbols: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM symbols",
-        [],
-        |row| row.get(0),
-    )?;
-
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
         [chrono::Utc::now().to_rfc3339()],
     )?;
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('package_count', ?1)",
-        [total_packages.to_string()],
+        [summary.total_packages.to_string()],
     )?;
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('symbol_count', ?1)",
-        [total_symbols.to_string()],
+        [summary.total_symbols.to_string()],
     )?;
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_count', ?1)",
-        [num_files.to_string()],
+        [summary.num_files.to_string()],
     )?;
     if let Some(commit) = git_commit {
         conn.execute(
@@ -786,10 +792,14 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             [commit],
         )?;
     }
+    Ok(())
+}
 
-    if !failures.is_empty() {
-        eprintln!("{} manifest(s) failed to parse:", failures.len());
-        for (path, err) in &failures {
+/// Print build summary to stdout/stderr.
+fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, force: bool) {
+    if !summary.failures.is_empty() {
+        eprintln!("{} manifest(s) failed to parse:", summary.failures.len());
+        for (path, err) in &summary.failures {
             eprintln!("  {}: {}", path, err);
         }
     }
@@ -797,22 +807,111 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     if is_full_build || force {
         println!(
             "Indexed {} packages, {} symbols, {} files into {}",
-            total_packages, total_symbols, num_files,
+            summary.total_packages, summary.total_symbols, summary.num_files,
             db_path.display()
         );
-    } else if num_source_reextracted > 0 {
+    } else if summary.num_source_reextracted > 0 {
         println!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} files into {}",
-            total_packages, num_added, num_changed, num_removed, num_skipped, num_source_reextracted, total_symbols, num_files,
+            summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
+            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols, summary.num_files,
             db_path.display()
         );
     } else {
         println!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} files into {}",
-            total_packages, num_added, num_changed, num_removed, num_skipped, total_symbols, num_files,
+            summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
+            summary.num_skipped, summary.total_symbols, summary.num_files,
             db_path.display()
         );
     }
+}
+
+pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
+    let db_dir = repo_root.join(".shire");
+    let db_path = db_dir.join("index.db");
+    let conn = db::open_or_create(&db_path)?;
+
+    if force {
+        conn.execute("DELETE FROM manifest_hashes", [])?;
+        conn.execute("DELETE FROM symbols", [])?;
+        conn.execute("DELETE FROM source_hashes", [])?;
+    }
+
+    let parsers: Vec<Box<dyn ManifestParser>> = vec![
+        Box::new(npm::NpmParser),
+        Box::new(go::GoParser),
+        Box::new(cargo::CargoParser),
+        Box::new(python::PythonParser),
+        Box::new(maven::MavenParser),
+        Box::new(gradle::GradleParser),
+        Box::new(gradle::GradleKtsParser),
+    ];
+
+    // Phase 1+1.5: Walk manifests and collect workspace context
+    let (walked, ws_ctx) = phase_walk_and_context(repo_root, config, &parsers)?;
+
+    // Phase 2: Diff against stored hashes
+    let stored_hashes = load_stored_hashes(&conn)?;
+    let diff = diff_manifests(&walked, &stored_hashes);
+    let is_full_build = stored_hashes.is_empty();
+
+    let to_parse: Vec<&WalkedManifest> = diff
+        .new
+        .iter()
+        .chain(diff.changed.iter())
+        .copied()
+        .collect();
+
+    let num_added = diff.new.len();
+    let num_changed = diff.changed.len();
+    let num_removed = diff.removed.len();
+    let num_skipped = diff.unchanged.len();
+
+    // Phase 3: Parse new + changed manifests
+    let (parsed_packages, failures) = phase_parse(&to_parse, &conn, &parsers, &ws_ctx)?;
+
+    // Phase 4: Remove deleted packages
+    phase_remove_deleted(&conn, &diff.removed)?;
+
+    // Phase 5: Recompute is_internal
+    if num_added > 0 || num_changed > 0 || num_removed > 0 {
+        recompute_is_internal(&conn)?;
+    }
+
+    // Phase 6: Store manifest hashes
+    phase_store_hashes(&conn, &to_parse)?;
+
+    // Phase 7: Extract symbols for new/changed packages
+    phase_extract_symbols(&conn, repo_root, &parsed_packages)?;
+
+    // Phase 8: Source-level incremental
+    let num_source_reextracted = phase_source_incremental(&conn, repo_root, &diff.unchanged)?;
+
+    // Phase 9: Index files
+    let num_files = phase_index_files(&conn, repo_root, config)?;
+
+    // Post-build: config overrides, metadata, summary
+    apply_config_overrides(&conn, config)?;
+
+    let total_packages: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))?;
+    let total_symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+
+    let summary = BuildSummary {
+        num_added,
+        num_changed,
+        num_removed,
+        num_skipped,
+        num_source_reextracted,
+        num_files,
+        total_packages,
+        total_symbols,
+        failures,
+    };
+
+    store_metadata(&conn, repo_root, &summary)?;
+    print_summary(&summary, &db_path, is_full_build, force);
+
     Ok(())
 }
 

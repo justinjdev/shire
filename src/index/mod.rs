@@ -833,6 +833,7 @@ fn phase_source_incremental(
 
     // Sequential DB writes
     let mut num_reextracted: usize = 0;
+    let mut hash_entries: Vec<(&str, &str)> = Vec::new();
     for result in &results {
         match result {
             SourceCheckResult::Changed(pkg_name, syms, current_hash) => {
@@ -845,14 +846,17 @@ fn phase_source_incremental(
                         eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
                     }
                 }
-                let _ = upsert_source_hash(conn, pkg_name, current_hash);
+                hash_entries.push((pkg_name, current_hash.as_str()));
             }
             SourceCheckResult::Unchanged(pkg_name, current_hash) => {
                 // Update hashed_at to reflect the new computation time
-                let _ = upsert_source_hash(conn, pkg_name, current_hash);
+                hash_entries.push((pkg_name, current_hash.as_str()));
             }
         }
     }
+
+    // Batch-upsert all source hashes collected in this phase
+    batch_upsert_source_hashes(conn, &hash_entries)?;
 
     Ok(num_reextracted)
 }
@@ -1575,5 +1579,81 @@ anyhow = "1"
             )
             .unwrap();
         assert!(cli_meta.is_none());
+    }
+
+    #[test]
+    fn test_parse_hashed_at_valid_rfc3339() {
+        let result = parse_hashed_at("2026-02-25T10:00:00.000Z");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_hashed_at_invalid() {
+        assert!(parse_hashed_at("not-a-timestamp").is_none());
+        assert!(parse_hashed_at("").is_none());
+    }
+
+    #[test]
+    fn test_mtime_precheck_stores_hashed_at() {
+        let dir = tempfile::TempDir::new().unwrap();
+        create_test_monorepo(dir.path());
+        let config = Config::default();
+
+        build_index(dir.path(), &config, false).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+
+        // All packages should have hashed_at set after first build
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_hashes WHERE hashed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM source_hashes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, total);
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn test_mtime_precheck_skips_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        create_test_monorepo(dir.path());
+        let config = Config::default();
+
+        // First build -- computes all hashes
+        build_index(dir.path(), &config, false).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+
+        // Record hashed_at timestamps after first build
+        let hashed_at_1: String = conn
+            .query_row(
+                "SELECT hashed_at FROM source_hashes WHERE package = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        // Second build -- nothing changed, mtime precheck should skip
+        build_index(dir.path(), &config, false).unwrap();
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let hashed_at_2: String = conn
+            .query_row(
+                "SELECT hashed_at FROM source_hashes WHERE package = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // hashed_at should NOT be updated when mtime precheck skips
+        assert_eq!(hashed_at_1, hashed_at_2);
     }
 }

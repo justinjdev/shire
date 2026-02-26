@@ -17,6 +17,8 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 | `go.work` | go | `use` directives parsed for workspace context |
 | `Cargo.toml` | cargo | `workspace = true` deps resolved from root |
 | `pyproject.toml` | python | — |
+| `pom.xml` | maven | Parent POM inheritance (groupId, version) |
+| `build.gradle` / `build.gradle.kts` | gradle | `settings.gradle` project inclusion |
 
 ## Install
 
@@ -77,7 +79,7 @@ Drop a `shire.toml` in the repo root to customize discovery:
 
 ```toml
 [discovery]
-manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml"]
+manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
 exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire"]
 
 # Override package descriptions
@@ -105,7 +107,10 @@ src/
 │   ├── go.rs        # go.mod parser
 │   ├── go_work.rs   # go.work parser (workspace use directives)
 │   ├── cargo.rs     # Cargo.toml parser (workspace dep resolution)
-│   └── python.rs    # pyproject.toml parser
+│   ├── python.rs    # pyproject.toml parser
+│   ├── maven.rs     # pom.xml parser (parent POM inheritance)
+│   ├── gradle.rs    # build.gradle / build.gradle.kts parser
+│   └── gradle_settings.rs # settings.gradle parser (project inclusion)
 ├── symbols/
 │   ├── mod.rs       # Symbol types, orchestrator (dispatch by package kind)
 │   ├── walker.rs    # Source file discovery (extension filtering, excludes)

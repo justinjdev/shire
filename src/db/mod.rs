@@ -75,6 +75,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
             content_hash TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS source_hashes (
+            package      TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS symbols (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             package       TEXT NOT NULL REFERENCES packages(name),
@@ -149,6 +154,7 @@ mod tests {
         assert!(tables.contains(&"dependencies".to_string()));
         assert!(tables.contains(&"shire_meta".to_string()));
         assert!(tables.contains(&"manifest_hashes".to_string()));
+        assert!(tables.contains(&"source_hashes".to_string()));
         assert!(tables.contains(&"symbols".to_string()));
     }
 

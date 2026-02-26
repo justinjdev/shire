@@ -37,7 +37,7 @@ shire build --root /path/to/repo --force
 shire serve
 ```
 
-The index is written to `.shire/index.db` inside the repo root. Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. The server reads from this database in read-only mode.
+The index is written to `.shire/index.db` inside the repo root. Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. The server reads from this database in read-only mode.
 
 ### MCP tools
 

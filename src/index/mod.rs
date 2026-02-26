@@ -226,6 +226,15 @@ fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]
     Ok(())
 }
 
+/// Store or update a source hash for a package.
+fn upsert_source_hash(conn: &Connection, package: &str, hash: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO source_hashes (package, content_hash) VALUES (?1, ?2)",
+        (package, hash),
+    )?;
+    Ok(())
+}
+
 /// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
 fn collect_cargo_workspace_context(walked: &[WalkedManifest]) -> HashMap<String, String> {
     let mut all_ws_deps = HashMap::new();
@@ -285,6 +294,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
     if force {
         conn.execute("DELETE FROM manifest_hashes", [])?;
         conn.execute("DELETE FROM symbols", [])?;
+        conn.execute("DELETE FROM source_hashes", [])?;
     }
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
@@ -381,6 +391,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             .map(|(dir, _)| dir)
             .unwrap_or("");
         conn.execute(
+            "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+            [relative_dir],
+        )?;
+        conn.execute(
             "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
             [relative_dir],
         )?;
@@ -417,6 +431,60 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             Err(e) => {
                 eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
             }
+        }
+        // Store source hash for manifest-changed packages
+        if let Ok(src_hash) = hash::compute_source_hash(repo_root, pkg_path, pkg_kind) {
+            let _ = upsert_source_hash(&conn, pkg_name, &src_hash);
+        }
+    }
+
+    // Phase 8: Source-level incremental — re-extract symbols for unchanged packages
+    // whose source files have changed
+    let mut num_source_reextracted: usize = 0;
+    for manifest in &diff.unchanged {
+        let relative_dir = &manifest.relative_dir;
+
+        // Look up the package from DB by path
+        let pkg_info: Option<(String, String)> = conn
+            .query_row(
+                "SELECT name, kind FROM packages WHERE path = ?1",
+                [relative_dir.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        let (pkg_name, pkg_kind) = match pkg_info {
+            Some(info) => info,
+            None => continue, // no package for this manifest (e.g., go.work)
+        };
+
+        // Compute current source hash
+        let current_hash = match hash::compute_source_hash(repo_root, relative_dir, &pkg_kind) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        // Load stored source hash
+        let stored_hash: Option<String> = conn
+            .query_row(
+                "SELECT content_hash FROM source_hashes WHERE package = ?1",
+                [&pkg_name],
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Re-extract if hash differs or no stored hash
+        if stored_hash.as_deref() != Some(&current_hash) {
+            match symbols::extract_symbols_for_package(repo_root, relative_dir, &pkg_kind) {
+                Ok(syms) => {
+                    upsert_symbols(&conn, &pkg_name, &syms)?;
+                    num_source_reextracted += 1;
+                }
+                Err(e) => {
+                    eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
+                }
+            }
+            let _ = upsert_source_hash(&conn, &pkg_name, &current_hash);
         }
     }
 
@@ -499,6 +567,12 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         println!(
             "Indexed {} packages, {} symbols into {}",
             total_packages, total_symbols,
+            db_path.display()
+        );
+    } else if num_source_reextracted > 0 {
+        println!(
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols into {}",
+            total_packages, num_added, num_changed, num_removed, num_skipped, num_source_reextracted, total_symbols,
             db_path.display()
         );
     } else {

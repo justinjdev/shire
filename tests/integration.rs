@@ -546,6 +546,290 @@ fn test_symbol_fts_search() {
 }
 
 #[test]
+fn test_source_change_triggers_reextraction() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build — symbols extracted, source hashes stored
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let initial_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(initial_count > 0);
+    // Verify source hash was stored
+    let has_hash: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM source_hashes WHERE package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_hash, "source hash should be stored after first build");
+    drop(conn);
+
+    // Modify a source file WITHOUT touching the manifest
+    let auth_ts = dir.path().join("services/auth/src/auth.ts");
+    let mut content = fs::read_to_string(&auth_ts).unwrap();
+    content.push_str("\nexport function revokeToken(tokenId: string): void {}\n");
+    fs::write(&auth_ts, content).unwrap();
+
+    // Second build — manifest unchanged, but source hash differs → Phase 8 re-extracts
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("source-updated"),
+        "Should report source-updated in summary: {stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let updated_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        updated_count > initial_count,
+        "Should have more symbols after adding function: {} vs {}",
+        updated_count, initial_count
+    );
+
+    // Verify the new symbol is present
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'revokeToken' AND package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "revokeToken should be extracted via source-level incremental");
+}
+
+#[test]
+fn test_no_source_change_skips_reextraction() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Second build — nothing changed at all
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("source-updated"),
+        "Should NOT report source-updated when nothing changed: {stdout}"
+    );
+}
+
+#[test]
+fn test_force_clears_and_recomputes_source_hashes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build — stores source hashes
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let hash_count_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_hashes", [], |row| row.get(0))
+        .unwrap();
+    assert!(hash_count_before > 0, "should have source hashes after first build");
+    drop(conn);
+
+    // Force rebuild
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap(), "--force"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Source hashes should be recomputed (same count as before)
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let hash_count_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM source_hashes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        hash_count_before, hash_count_after,
+        "source hashes should be recomputed after --force"
+    );
+}
+
+#[test]
+fn test_delete_package_removes_source_hash() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let has_gateway_hash: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM source_hashes WHERE package = 'gateway'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_gateway_hash, "gateway should have a source hash");
+    drop(conn);
+
+    // Delete the gateway package manifest
+    fs::remove_file(dir.path().join("services/gateway/go.mod")).unwrap();
+
+    // Rebuild
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let has_gateway_hash: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM source_hashes WHERE package = 'gateway'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!has_gateway_hash, "gateway source hash should be removed after package deletion");
+
+    // Also verify the package itself is gone
+    let pkg_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE name = 'gateway'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg_count, 0);
+}
+
+#[test]
+fn test_add_source_file_updates_symbols() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let initial_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    // Add a new source file to auth-service (without touching package.json)
+    let auth_src = dir.path().join("services/auth/src");
+    fs::File::create(auth_src.join("permissions.ts"))
+        .unwrap()
+        .write_all(
+            br#"export function checkPermission(userId: string, resource: string): boolean {
+    return true;
+}
+
+export class PermissionManager {
+    public grant(userId: string, permission: string): void {}
+}
+"#,
+        )
+        .unwrap();
+
+    // Rebuild — source hash changes due to new file, Phase 8 re-extracts
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let updated_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        updated_count > initial_count,
+        "Should have more symbols after adding new file: {} vs {}",
+        updated_count, initial_count
+    );
+
+    // Verify the new file's exports are present
+    let check_perm: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'checkPermission' AND package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(check_perm, 1, "checkPermission should be extracted from new file");
+
+    let perm_mgr: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'PermissionManager' AND package = 'auth-service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(perm_mgr, 1, "PermissionManager should be extracted from new file");
+}
+
+#[test]
 fn test_serve_fails_without_index() {
     let dir = tempfile::TempDir::new().unwrap();
     let bin = cargo_bin();

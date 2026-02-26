@@ -1,6 +1,9 @@
 // Stub - will be implemented by Tasks 3, 4, 6
+pub mod cargo;
+pub mod go;
 pub mod manifest;
 pub mod npm;
+pub mod python;
 
 use crate::config::Config;
 use anyhow::Result;

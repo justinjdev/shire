@@ -182,9 +182,18 @@ fn diff_manifests<'a>(
 
 /// Insert a package and its dependencies into the DB.
 fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
+    // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
+    // implicit DELETE that triggers FK violations on child tables (dependencies,
+    // symbols) which reference packages(name).
     conn.execute(
-        "INSERT OR REPLACE INTO packages (name, path, kind, version, description, metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO packages (name, path, kind, version, description, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(name) DO UPDATE SET
+            path = excluded.path,
+            kind = excluded.kind,
+            version = excluded.version,
+            description = excluded.description,
+            metadata = excluded.metadata",
         (
             &pkg.name,
             &pkg.path,

@@ -1449,6 +1449,69 @@ fn test_maven_incremental_rebuild() {
     assert_eq!(version, "2.0.0");
 }
 
+/// Regression test for https://github.com/justinjdev/shire/issues/1
+/// INSERT OR REPLACE INTO packages acts as DELETE+INSERT, which triggers FK
+/// violations on child tables (dependencies, symbols) that reference the old row.
+/// The fix uses ON CONFLICT ... DO UPDATE instead.
+#[test]
+fn test_rebuild_no_fk_violation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+
+    // First build — populates packages, dependencies, symbols
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "First build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify child rows exist so a DELETE on the parent would violate FKs
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let dep_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
+        .unwrap();
+    assert!(dep_count > 0, "Should have dependencies after first build");
+    let sym_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        .unwrap();
+    assert!(sym_count > 0, "Should have symbols after first build");
+    drop(conn);
+
+    // Force rebuild — this would trigger FK violation with INSERT OR REPLACE
+    let output = Command::new(&bin)
+        .args([
+            "build",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Force rebuild should not fail with FK violation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify data is still intact after rebuild
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let pkg_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(pkg_count > 0, "Packages should still exist after rebuild");
+    let dep_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
+        .unwrap();
+    assert!(dep_count > 0, "Dependencies should still exist after rebuild");
+}
+
 #[test]
 fn test_serve_fails_without_index() {
     let dir = tempfile::TempDir::new().unwrap();

@@ -5,6 +5,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
+    pub db_path: Option<String>,
+    #[serde(default)]
     pub discovery: DiscoveryConfig,
     #[serde(default)]
     pub packages: Vec<PackageOverride>,
@@ -102,6 +104,19 @@ description = "Deprecated auth service"
         assert_eq!(config.discovery.manifests.len(), 2);
         assert_eq!(config.packages.len(), 1);
         assert_eq!(config.packages[0].name, "legacy-auth");
+    }
+
+    #[test]
+    fn test_parse_config_with_db_path() {
+        let toml_str = r#"
+db_path = "/tmp/custom-index.db"
+
+[discovery]
+manifests = ["package.json"]
+exclude = ["vendor"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.db_path.as_deref(), Some("/tmp/custom-index.db"));
     }
 
     #[test]

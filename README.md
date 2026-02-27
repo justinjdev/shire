@@ -57,7 +57,14 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 ## Install
 
-**From prebuilt binary** (macOS, Linux, Windows):
+**Homebrew** (macOS, Linux):
+
+```sh
+brew tap justinjdev/shire
+brew install shire
+```
+
+**From prebuilt binary** (macOS, Linux):
 
 Download the latest release from [GitHub Releases](https://github.com/justinjdev/shire/releases) and add to your PATH.
 
@@ -299,4 +306,4 @@ src/
 
 ## License
 
-MIT
+Apache-2.0

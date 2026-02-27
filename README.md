@@ -50,6 +50,8 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 | `pyproject.toml` | python | — |
 | `pom.xml` | maven | Parent POM inheritance (groupId, version) |
 | `build.gradle` / `build.gradle.kts` | gradle | `settings.gradle` project inclusion |
+| `cpanfile` | perl | `requires` / `on 'test'` blocks |
+| `Gemfile` | ruby | `gem` / `group :test` blocks |
 
 ## Install
 
@@ -140,8 +142,12 @@ Drop a `shire.toml` in the repo root to customize behavior:
 db_path = "/path/to/custom/index.db"
 
 [discovery]
-manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
-exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire"]
+manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile"]
+exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire", ".gradle", "build"]
+
+# Skip symbol extraction for specific file types
+[symbols]
+exclude_extensions = [".proto", ".pl"]
 
 # Override package descriptions
 [[packages]]
@@ -171,14 +177,21 @@ src/
 │   ├── python.rs    # pyproject.toml parser
 │   ├── maven.rs     # pom.xml parser (parent POM inheritance)
 │   ├── gradle.rs    # build.gradle / build.gradle.kts parser
-│   └── gradle_settings.rs # settings.gradle parser (project inclusion)
+│   ├── gradle_settings.rs # settings.gradle parser (project inclusion)
+│   ├── perl.rs      # cpanfile parser (requires, on 'test')
+│   └── ruby.rs      # Gemfile parser (gem, group blocks)
 ├── symbols/
-│   ├── mod.rs       # Symbol types, orchestrator (dispatch by package kind)
+│   ├── mod.rs       # Symbol types, kind-agnostic extraction orchestrator
 │   ├── walker.rs    # Source file discovery (extension filtering, excludes)
 │   ├── typescript.rs # TS/JS extractor (tree-sitter)
 │   ├── go.rs        # Go extractor (tree-sitter)
 │   ├── rust_lang.rs # Rust extractor (tree-sitter)
-│   └── python.rs    # Python extractor (tree-sitter)
+│   ├── python.rs    # Python extractor (tree-sitter)
+│   ├── proto.rs     # Protobuf extractor (tree-sitter)
+│   ├── java.rs      # Java extractor (tree-sitter)
+│   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
+│   ├── perl.rs      # Perl extractor (regex-based)
+│   └── ruby.rs      # Ruby extractor (tree-sitter)
 └── mcp/
     ├── mod.rs       # MCP server setup (rmcp, stdio transport)
     └── tools.rs     # 13 tool handlers

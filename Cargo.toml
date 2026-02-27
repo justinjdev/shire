@@ -3,7 +3,7 @@ name = "shire"
 version = "0.1.5-beta"
 edition = "2024"
 description = "One index to rule them all — Search, Hierarchy, Index, Repo Explorer, a monorepo MCP-first indexer"
-license = "MIT"
+license = "Apache-2.0"
 keywords = ["monorepo", "mcp", "index", "search"]
 categories = ["command-line-utilities", "development-tools"]
 

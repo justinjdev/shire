@@ -245,6 +245,42 @@ fn recompute_is_internal(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Post-build safety net: clean up any orphaned child rows that reference
+/// non-existent packages. This handles edge cases that slip through the
+/// per-phase FK management.
+fn validate_referential_integrity(conn: &Connection) -> Result<()> {
+    let orphaned_syms: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+        |row| row.get(0),
+    )?;
+    let orphaned_deps: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if orphaned_syms > 0 || orphaned_deps > 0 {
+        eprintln!(
+            "Warning: cleaning up {} orphaned symbol(s) and {} orphaned dependency(ies)",
+            orphaned_syms, orphaned_deps
+        );
+        conn.execute(
+            "DELETE FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE files SET package = NULL WHERE package IS NOT NULL AND package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Clear and re-insert symbols for a package using batched multi-row INSERTs.
 fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
@@ -1091,6 +1127,11 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         })?;
     }
 
+    // Disable FK enforcement during build — the multi-phase pipeline manages
+    // referential integrity manually, and a post-build validation pass cleans
+    // up any orphaned rows.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
         Box::new(go::GoParser),
@@ -1211,6 +1252,12 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             [total_duration.as_millis().to_string()],
         )?;
         Ok(())
+    })?;
+
+    // Re-enable FK enforcement and validate integrity
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    with_transaction(&conn, || {
+        validate_referential_integrity(&conn)
     })?;
 
     print_summary(&summary, &db_path, is_full_build, force);

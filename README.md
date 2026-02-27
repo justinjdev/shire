@@ -1,6 +1,7 @@
 # shire
 
-```
+<div align="center">
+<pre>
                        .,:lccc:,.
                   .,codxkkOOOOkkxdoc,.
               .;ldkkOOOOOOOOOOOOOOOkkdl;.
@@ -27,7 +28,8 @@
               .;ldkkOOOOOOOOOOOOOOOkkdl;.
                   .,codxkkOOOOkkxdoc,.
                        .,:lccc:,.
-```
+</pre>
+</div>
 
 *One index to rule them all.*
 

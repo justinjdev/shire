@@ -25,6 +25,9 @@ enum Commands {
         /// Force a full rebuild, ignoring cached manifest hashes
         #[arg(long)]
         force: bool,
+        /// Path to the index database (overrides shire.toml db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
     },
     /// Start the MCP server over stdio
     Serve {
@@ -38,10 +41,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build { root, force } => {
+        Commands::Build { root, force, db } => {
             let root = std::fs::canonicalize(&root)?;
             let config = config::load_config(&root)?;
-            index::build_index(&root, &config, force)
+            index::build_index(&root, &config, force, db.as_deref())
         }
         Commands::Serve { db } => {
             let db_path = db.unwrap_or_else(|| PathBuf::from(".shire/index.db"));

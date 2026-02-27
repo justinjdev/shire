@@ -1109,12 +1109,17 @@ fn print_timings(timings: &[(&str, Duration)], total: Duration) {
     eprintln!("  {:<20} {}ms", "total", total.as_millis());
 }
 
-pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
+pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
 
-    let db_dir = repo_root.join(".shire");
-    let db_path = db_dir.join("index.db");
+    let db_path = if let Some(p) = db_override {
+        p.to_path_buf()
+    } else if let Some(ref p) = config.db_path {
+        PathBuf::from(p)
+    } else {
+        repo_root.join(".shire").join("index.db")
+    };
     let conn = db::open_or_create(&db_path)?;
 
     if force {
@@ -1302,7 +1307,7 @@ mod tests {
         create_test_monorepo(dir.path());
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         assert!(db_path.exists());
@@ -1331,7 +1336,7 @@ mod tests {
         create_test_monorepo(dir.path());
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1367,12 +1372,12 @@ mod tests {
         let config = Config::default();
 
         // First build
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
         assert_eq!(hash_count(dir.path()), 3);
 
         // Second build — nothing changed
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
     }
 
@@ -1382,7 +1387,7 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         // Modify auth-service version
         let auth_path = dir.path().join("services/auth/package.json");
@@ -1391,7 +1396,7 @@ mod tests {
             br#"{"name": "auth-service", "version": "2.0.0", "description": "Auth v2", "dependencies": {"shared-types": "^1.0"}}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1412,13 +1417,13 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
 
         // Delete the Go package
         fs::remove_file(dir.path().join("services/gateway/go.mod")).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 2);
         assert_eq!(hash_count(dir.path()), 2);
     }
@@ -1429,7 +1434,7 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
 
         // Add a new npm package
@@ -1440,7 +1445,7 @@ mod tests {
             br#"{"name": "billing", "version": "1.0.0", "description": "Billing service"}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 4);
         assert_eq!(hash_count(dir.path()), 4);
     }
@@ -1458,7 +1463,7 @@ mod tests {
         ).unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1480,7 +1485,7 @@ mod tests {
             br#"{"name": "billing", "version": "1.0.0"}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let conn = db::open_readonly(&db_path).unwrap();
         let is_internal: bool = conn
@@ -1499,11 +1504,11 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(hash_count(dir.path()), 3);
 
         // Force rebuild — should still work and produce same result
-        build_index(dir.path(), &config, true).unwrap();
+        build_index(dir.path(), &config, true, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
         assert_eq!(hash_count(dir.path()), 3);
     }
@@ -1546,7 +1551,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(root, &config, false).unwrap();
+        build_index(root, &config, false, None).unwrap();
 
         let db_path = root.join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1605,7 +1610,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1650,7 +1655,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1696,7 +1701,7 @@ anyhow = "1"
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1723,7 +1728,7 @@ anyhow = "1"
         let config = Config::default();
 
         // First build -- computes all hashes
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1739,7 +1744,7 @@ anyhow = "1"
         drop(conn);
 
         // Second build -- nothing changed, mtime precheck should skip
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let conn = db::open_readonly(&db_path).unwrap();
         let hashed_at_2: String = conn

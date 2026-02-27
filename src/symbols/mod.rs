@@ -1,6 +1,10 @@
 pub mod go;
+pub mod java;
+pub mod kotlin;
+pub mod perl;
 pub mod proto;
 pub mod python;
+pub mod ruby;
 pub mod rust_lang;
 pub mod typescript;
 pub mod walker;
@@ -122,6 +126,10 @@ pub fn extract_symbols_for_package(
             "rs" => rust_lang::extract(&source, &relative_path),
             "py" => python::extract(&source, &relative_path),
             "proto" => proto::extract(&source, &relative_path),
+            "java" => java::extract(&source, &relative_path),
+            "kt" => kotlin::extract(&source, &relative_path),
+            "pm" | "pl" => perl::extract(&source, &relative_path),
+            "rb" => ruby::extract(&source, &relative_path),
             _ => Vec::new(),
         };
 

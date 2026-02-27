@@ -33,6 +33,8 @@ pub fn extensions_for_kind(kind: &str) -> Vec<&'static str> {
         "cargo" => vec!["rs"],
         "python" => vec!["py"],
         "maven" | "gradle" => vec!["java", "kt"],
+        "perl" => vec!["pm", "pl"],
+        "ruby" => vec!["rb"],
         _ => vec![],
     }
 }
@@ -46,6 +48,8 @@ pub fn all_extensions() -> Vec<&'static str> {
         "py",                       // Python
         "java", "kt",              // Java/Kotlin
         "proto",                    // Protobuf
+        "pm", "pl",                // Perl
+        "rb",                      // Ruby
     ]
 }
 

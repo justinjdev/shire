@@ -7,7 +7,9 @@ pub mod hash;
 pub mod manifest;
 pub mod maven;
 pub mod npm;
+pub mod perl;
 pub mod python;
+pub mod ruby;
 
 use crate::config::Config;
 use crate::db;
@@ -1147,6 +1149,8 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
         Box::new(maven::MavenParser),
         Box::new(gradle::GradleParser),
         Box::new(gradle::GradleKtsParser),
+        Box::new(perl::CpanfileParser),
+        Box::new(ruby::RubyParser),
     ];
 
     // Phase 1: Walk manifests

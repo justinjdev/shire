@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 #[derive(Debug)]
 pub struct ShireService {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     pub tool_router: ToolRouter<ShireService>,
 }
 
@@ -23,7 +23,7 @@ impl ShireService {
         }
     }
 
-    fn mcp_err(msg: String) -> ErrorData {
+    pub(crate) fn mcp_err(msg: String) -> ErrorData {
         ErrorData {
             code: ErrorCode(-32603),
             message: Cow::from(msg),

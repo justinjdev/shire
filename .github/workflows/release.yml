@@ -22,9 +22,6 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
 
     runs-on: ${{ matrix.os }}
 
@@ -45,12 +42,6 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../shire-${{ matrix.target }}.tar.gz shire
           cd ../../..
-
-      - name: Package (windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/shire.exe -DestinationPath shire-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -79,4 +70,3 @@ jobs:
             artifacts/shire-x86_64-unknown-linux-gnu/shire-x86_64-unknown-linux-gnu.tar.gz
             artifacts/shire-aarch64-apple-darwin/shire-aarch64-apple-darwin.tar.gz
             artifacts/shire-x86_64-apple-darwin/shire-x86_64-apple-darwin.tar.gz
-            artifacts/shire-x86_64-pc-windows-msvc/shire-x86_64-pc-windows-msvc.zip

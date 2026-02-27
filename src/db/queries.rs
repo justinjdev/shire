@@ -626,12 +626,14 @@ pub fn reverse_dependency_graph(
 
 /// Find all packages whose path starts with the given prefix.
 pub fn packages_by_path_prefix(conn: &Connection, prefix: &str) -> Result<Vec<PackageRow>> {
-    let pattern = format!("{}%", prefix);
+    let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("{escaped}%");
     let mut stmt = conn.prepare(
         "SELECT name, path, kind, version, description, metadata
          FROM packages
-         WHERE path LIKE ?1
-         ORDER BY path",
+         WHERE path LIKE ?1 ESCAPE '\\'
+         ORDER BY path
+         LIMIT 50",
     )?;
     let rows = stmt.query_map([&pattern], |row| {
         Ok(PackageRow {

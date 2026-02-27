@@ -62,7 +62,11 @@ impl ServerHandler for tools::ShireService {
                 })
                 .collect();
             prompts::handle(&conn, &request.name, &args)
-                .map_err(|msg| tools::ShireService::mcp_err(msg))
+                .map_err(|e| match e {
+                    prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+                    prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
+                    prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
+                })
         })();
 
         std::future::ready(result)

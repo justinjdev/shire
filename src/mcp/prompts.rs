@@ -4,7 +4,13 @@ use rmcp::model::{
     PromptMessageRole,
 };
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub enum PromptError {
+    InvalidParams(String),
+    NotFound(String),
+    Internal(String),
+}
 
 pub fn list() -> Vec<Prompt> {
     vec![
@@ -72,7 +78,7 @@ pub fn handle(
     conn: &Connection,
     name: &str,
     args: &HashMap<String, String>,
-) -> Result<GetPromptResult, String> {
+) -> Result<GetPromptResult, PromptError> {
     match name {
         "explore" => handle_explore(conn, args),
         "explore-package" => handle_explore_package(conn, args),
@@ -80,22 +86,22 @@ pub fn handle(
         "onboard" => handle_onboard(conn),
         "impact-analysis" => handle_impact_analysis(conn, args),
         "understand-dependency" => handle_understand_dependency(conn, args),
-        _ => Err(format!("Unknown prompt: {name}")),
+        _ => Err(PromptError::InvalidParams(format!("Unknown prompt: {name}"))),
     }
 }
 
-fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str, String> {
+fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str, PromptError> {
     args.get(key)
         .map(|s| s.as_str())
-        .ok_or_else(|| format!("Missing required argument: {key}"))
+        .ok_or_else(|| PromptError::InvalidParams(format!("Missing required argument: {key}")))
 }
 
-fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, String> {
+fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let query = require_arg(args, "query")?;
 
-    let packages = queries::search_packages(conn, query).map_err(|e| e.to_string())?;
-    let symbols = queries::search_symbols(conn, query, None, None).map_err(|e| e.to_string())?;
-    let files = queries::search_files(conn, query, None, None).map_err(|e| e.to_string())?;
+    let packages = queries::search_packages(conn, query).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let symbols = queries::search_symbols(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let files = queries::search_files(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Codebase exploration: \"{query}\"\n\n");
 
@@ -148,7 +154,7 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
         }
 
         // Symbols not in matched packages
-        let matched_pkg_names: std::collections::HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+        let matched_pkg_names: HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
         let orphan_symbols: Vec<_> = symbols.iter().filter(|s| !matched_pkg_names.contains(s.package.as_str())).collect();
         if !orphan_symbols.is_empty() {
             text.push_str(&format!("## Additional symbol matches ({})\n\n", orphan_symbols.len()));
@@ -185,17 +191,17 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
     })
 }
 
-fn handle_explore_package(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, String> {
+fn handle_explore_package(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let name = require_arg(args, "name")?;
 
     let pkg = queries::get_package(conn, name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Package '{name}' not found"))?;
+        .map_err(|e| PromptError::Internal(e.to_string()))?
+        .ok_or_else(|| PromptError::NotFound(format!("Package '{name}' not found")))?;
 
-    let internal_deps = queries::package_dependencies(conn, name, true).map_err(|e| e.to_string())?;
-    let dependents = queries::package_dependents(conn, name).map_err(|e| e.to_string())?;
-    let symbols = queries::get_package_symbols(conn, name, None).map_err(|e| e.to_string())?;
-    let files = queries::list_package_files(conn, name, None).map_err(|e| e.to_string())?;
+    let internal_deps = queries::package_dependencies(conn, name, true).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let dependents = queries::package_dependents(conn, name).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let symbols = queries::get_package_symbols(conn, name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let files = queries::list_package_files(conn, name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Package: {}\n\n", pkg.name);
 
@@ -278,10 +284,10 @@ fn handle_explore_package(conn: &Connection, args: &HashMap<String, String>) -> 
     })
 }
 
-fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, String> {
+fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let path = require_arg(args, "path")?;
 
-    let packages = queries::packages_by_path_prefix(conn, path).map_err(|e| e.to_string())?;
+    let packages = queries::packages_by_path_prefix(conn, path).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Area: `{path}`\n\n");
 
@@ -297,7 +303,7 @@ fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Res
             }
 
             // Symbol summary per package
-            let symbols = queries::get_package_symbols(conn, &pkg.name, None).map_err(|e| e.to_string())?;
+            let symbols = queries::get_package_symbols(conn, &pkg.name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
             if !symbols.is_empty() {
                 let mut kind_counts: HashMap<&str, usize> = HashMap::new();
                 for sym in &symbols {
@@ -310,7 +316,7 @@ fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Res
             }
 
             // File count
-            let files = queries::list_package_files(conn, &pkg.name, None).map_err(|e| e.to_string())?;
+            let files = queries::list_package_files(conn, &pkg.name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
             if !files.is_empty() {
                 text.push_str(&format!("- **Files:** {}\n", files.len()));
             }
@@ -327,10 +333,10 @@ fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Res
     })
 }
 
-fn handle_onboard(conn: &Connection) -> Result<GetPromptResult, String> {
-    let status = queries::index_status(conn).map_err(|e| e.to_string())?;
-    let all_packages = queries::list_packages(conn, None).map_err(|e| e.to_string())?;
-    let ext_dist = queries::extension_distribution(conn).map_err(|e| e.to_string())?;
+fn handle_onboard(conn: &Connection) -> Result<GetPromptResult, PromptError> {
+    let status = queries::index_status(conn).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let all_packages = queries::list_packages(conn, None).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let ext_dist = queries::extension_distribution(conn).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = String::from("# Repository Overview\n\n");
 
@@ -402,24 +408,24 @@ fn handle_onboard(conn: &Connection) -> Result<GetPromptResult, String> {
     })
 }
 
-fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, String> {
+fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let name = require_arg(args, "name")?;
 
     // Verify the package exists
     let pkg = queries::get_package(conn, name)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Package '{name}' not found"))?;
+        .map_err(|e| PromptError::Internal(e.to_string()))?
+        .ok_or_else(|| PromptError::NotFound(format!("Package '{name}' not found")))?;
 
-    let direct_dependents = queries::package_dependents(conn, name).map_err(|e| e.to_string())?;
-    let reverse_edges = queries::reverse_dependency_graph(conn, name, 10).map_err(|e| e.to_string())?;
+    let direct_dependents = queries::package_dependents(conn, name).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let reverse_edges = queries::reverse_dependency_graph(conn, name, 10).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     // Collect all unique transitively affected packages
-    let mut all_affected: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut all_affected: HashSet<&str> = HashSet::new();
     for edge in &reverse_edges {
         all_affected.insert(&edge.from);
     }
 
-    let direct_names: std::collections::HashSet<&str> = direct_dependents.iter().map(|d| d.package.as_str()).collect();
+    let direct_names: HashSet<&str> = direct_dependents.iter().map(|d| d.package.as_str()).collect();
     let transitive_only: Vec<&str> = all_affected.iter().filter(|n| !direct_names.contains(**n)).copied().collect();
 
     let mut text = format!("# Impact analysis: {}\n\n", pkg.name);
@@ -454,7 +460,7 @@ fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> 
     }
 
     // Full blast radius
-    text.push_str(&format!("## Blast radius\n\n"));
+    text.push_str("## Blast radius\n\n");
     text.push_str(&format!("- **Direct:** {}\n", direct_dependents.len()));
     text.push_str(&format!("- **Transitive:** {}\n", transitive_only.len()));
     text.push_str(&format!("- **Total affected:** {}\n", all_affected.len()));
@@ -476,23 +482,23 @@ fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> 
     })
 }
 
-fn handle_understand_dependency(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, String> {
+fn handle_understand_dependency(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let from = require_arg(args, "from")?;
     let to = require_arg(args, "to")?;
 
     // Get both packages
     let from_pkg = queries::get_package(conn, from)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Package '{from}' not found"))?;
+        .map_err(|e| PromptError::Internal(e.to_string()))?
+        .ok_or_else(|| PromptError::NotFound(format!("Package '{from}' not found")))?;
     let to_pkg = queries::get_package(conn, to)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Package '{to}' not found"))?;
+        .map_err(|e| PromptError::Internal(e.to_string()))?
+        .ok_or_else(|| PromptError::NotFound(format!("Package '{to}' not found")))?;
 
     // Get full dependency graph from `from` and filter to paths reaching `to`
-    let all_edges = queries::dependency_graph(conn, from, 10, false).map_err(|e| e.to_string())?;
+    let all_edges = queries::dependency_graph(conn, from, 10, false).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     // BFS backwards from `to` through the edges to find all paths
-    let mut reaches_target: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut reaches_target: HashSet<&str> = HashSet::new();
     reaches_target.insert(to);
 
     // Iterate until stable — mark nodes that can reach `to`
@@ -548,15 +554,23 @@ fn handle_understand_dependency(conn: &Connection, args: &HashMap<String, String
         if !intermediates.is_empty() {
             text.push_str(&format!("## Intermediate packages ({})\n\n", intermediates.len()));
             for name in &intermediates {
-                if let Ok(Some(pkg)) = queries::get_package(conn, name) {
-                    let desc = pkg.description.as_deref().unwrap_or("");
-                    text.push_str(&format!("- **{}** ({}) — `{}`", pkg.name, pkg.kind, pkg.path));
-                    if !desc.is_empty() {
-                        text.push_str(&format!(" — {desc}"));
+                match queries::get_package(conn, name) {
+                    Ok(Some(pkg)) => {
+                        let desc = pkg.description.as_deref().unwrap_or("");
+                        text.push_str(&format!("- **{}** ({}) — `{}`", pkg.name, pkg.kind, pkg.path));
+                        if !desc.is_empty() {
+                            text.push_str(&format!(" — {desc}"));
+                        }
+                        text.push('\n');
                     }
-                    text.push('\n');
-                } else {
-                    text.push_str(&format!("- **{name}**\n"));
+                    Ok(None) => {
+                        text.push_str(&format!("- **{name}**\n"));
+                    }
+                    Err(e) => {
+                        return Err(PromptError::Internal(
+                            format!("Failed to look up package '{name}': {e}"),
+                        ));
+                    }
                 }
             }
             text.push('\n');

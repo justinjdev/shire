@@ -583,6 +583,103 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
     })
 }
 
+/// BFS traversal of the reverse dependency graph starting from `root`, up to `max_depth` levels.
+/// Finds all packages that transitively depend on `root`.
+pub fn reverse_dependency_graph(
+    conn: &Connection,
+    root: &str,
+    max_depth: u32,
+) -> Result<Vec<GraphEdge>> {
+    let sql = "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1";
+
+    let mut edges = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+
+    visited.insert(root.to_string());
+    queue.push_back((root.to_string(), 0));
+
+    let mut stmt = conn.prepare(sql)?;
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let rows = stmt.query_map([&current], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (dependent, kind) = row?;
+            edges.push(GraphEdge {
+                from: dependent.clone(),
+                to: current.clone(),
+                dep_kind: kind,
+            });
+            if visited.insert(dependent.clone()) {
+                queue.push_back((dependent, depth + 1));
+            }
+        }
+    }
+
+    Ok(edges)
+}
+
+/// Find all packages whose path starts with the given prefix.
+pub fn packages_by_path_prefix(conn: &Connection, prefix: &str) -> Result<Vec<PackageRow>> {
+    let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let mut stmt = conn.prepare(
+        "SELECT name, path, kind, version, description, metadata
+         FROM packages
+         WHERE path LIKE ?1 ESCAPE '\\'
+         ORDER BY path
+         LIMIT 50",
+    )?;
+    let rows = stmt.query_map([&pattern], |row| {
+        Ok(PackageRow {
+            name: row.get(0)?,
+            path: row.get(1)?,
+            kind: row.get(2)?,
+            version: row.get(3)?,
+            description: row.get(4)?,
+            metadata: row.get(5)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExtensionCount {
+    pub extension: String,
+    pub count: i64,
+}
+
+/// Count files grouped by extension, ordered by count descending.
+pub fn extension_distribution(conn: &Connection) -> Result<Vec<ExtensionCount>> {
+    let mut stmt = conn.prepare(
+        "SELECT extension, COUNT(*) as cnt
+         FROM files
+         WHERE extension != ''
+         GROUP BY extension
+         ORDER BY cnt DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ExtensionCount {
+            extension: row.get(0)?,
+            count: row.get(1)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,5 +1095,62 @@ mod tests {
         let results = list_package_files(&conn, "auth-service", Some("ts")).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|f| f.extension == "ts"));
+    }
+
+    #[test]
+    fn test_reverse_dependency_graph() {
+        let conn = test_db();
+        // shared-types is depended on by auth-service, which is depended on by api-gateway
+        let edges = reverse_dependency_graph(&conn, "shared-types", 10).unwrap();
+        assert_eq!(edges.len(), 2);
+        // First level: auth-service depends on shared-types
+        assert_eq!(edges[0].from, "auth-service");
+        assert_eq!(edges[0].to, "shared-types");
+        // Second level: api-gateway depends on auth-service
+        assert_eq!(edges[1].from, "api-gateway");
+        assert_eq!(edges[1].to, "auth-service");
+    }
+
+    #[test]
+    fn test_reverse_dependency_graph_depth_limit() {
+        let conn = test_db();
+        let edges = reverse_dependency_graph(&conn, "shared-types", 1).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "auth-service");
+        assert_eq!(edges[0].to, "shared-types");
+    }
+
+    #[test]
+    fn test_reverse_dependency_graph_no_dependents() {
+        let conn = test_db();
+        let edges = reverse_dependency_graph(&conn, "api-gateway", 10).unwrap();
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_packages_by_path_prefix() {
+        let conn = test_db();
+        let results = packages_by_path_prefix(&conn, "services/").unwrap();
+        assert_eq!(results.len(), 2);
+        let names: Vec<&str> = results.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"auth-service"));
+        assert!(names.contains(&"api-gateway"));
+    }
+
+    #[test]
+    fn test_packages_by_path_prefix_no_match() {
+        let conn = test_db();
+        let results = packages_by_path_prefix(&conn, "nonexistent/").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_extension_distribution() {
+        let conn = test_db_with_files();
+        let dist = extension_distribution(&conn).unwrap();
+        assert!(!dist.is_empty());
+        // ts files are most common (3 of them)
+        assert_eq!(dist[0].extension, "ts");
+        assert_eq!(dist[0].count, 3);
     }
 }

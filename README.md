@@ -79,6 +79,13 @@ shire build --root /path/to/repo --db /tmp/my-index.db
 
 # Start the MCP server
 shire serve
+
+# Auto-rebuild: start watch daemon, then stop it
+shire watch --root /path/to/repo
+shire watch --root /path/to/repo --stop
+
+# Signal a rebuild (from a hook or manually)
+shire rebuild --root /path/to/repo
 ```
 
 The index is written to `.shire/index.db` inside the repo root by default. You can override this with `--db` on the build command or `db_path` in `shire.toml` (see [Configuration](#configuration)). Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build. File indexing is also incremental — a file-tree hash detects structural changes, skipping Phase 9 entirely when no files have been added, removed, or resized. Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput. A per-phase **timing breakdown** is printed to stderr after each build. The server reads from this database in read-only mode.
@@ -101,6 +108,19 @@ The index is written to `.shire/index.db` inside the repo root by default. You c
 | `list_package_files` | List all files belonging to a package, with optional extension filter |
 | `index_status` | When the index was built, git commit, package/symbol/file counts, build duration |
 
+### MCP prompts
+
+Prompts are pre-built templates for semantic codebase exploration. They compose multiple queries into structured context, giving your AI a map of where concepts live in the codebase.
+
+| Prompt | Args | Description |
+|---|---|---|
+| `explore` | `query` | Search packages, symbols, and files for a concept — returns a structured context map organized by package |
+| `explore-package` | `name` | Deep dive into a specific package — metadata, internal deps, dependents, public API surface, file tree |
+| `explore-area` | `path` | Explore a directory subtree — packages, files, and symbol summaries under a path prefix |
+| `onboard` | — | Repository overview for onboarding — tech stack, package counts by language, file distribution, index freshness |
+| `impact-analysis` | `name` | Blast radius analysis — direct dependents, transitive dependents, full dependency chain |
+| `understand-dependency` | `from`, `to` | Trace the dependency path between two packages |
+
 ### Claude Code
 
 Add to your project's `.claude/settings.json`:
@@ -118,6 +138,21 @@ Add to your project's `.claude/settings.json`:
 
 Or add globally in `~/.claude/settings.json` to use across all projects.
 
+To keep the index fresh during a session, add a `PostToolUse` hook that signals the watch daemon after file-modifying tools:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|Bash",
+        "hooks": [{ "type": "command", "command": "shire rebuild --stdin" }]
+      }
+    ]
+  }
+}
+```
+
 ### Claude Desktop
 
 Add to your `claude_desktop_config.json`:
@@ -132,6 +167,26 @@ Add to your `claude_desktop_config.json`:
   }
 }
 ```
+
+### Watch daemon
+
+`shire watch` starts a background daemon that auto-rebuilds the index when files change. It uses Unix domain socket IPC with configurable debounce (default 2s).
+
+```sh
+# Start the daemon (idempotent — safe to call multiple times)
+shire watch --root /path/to/repo
+
+# Signal a rebuild manually
+shire rebuild --root /path/to/repo
+
+# Signal a rebuild from a Claude Code hook (reads JSON from stdin, uses cwd as repo root)
+shire rebuild --stdin
+
+# Stop the daemon
+shire watch --root /path/to/repo --stop
+```
+
+Smart filtering avoids unnecessary rebuilds: Edit/Write tools check file extension relevance and repo boundary; Bash commands are filtered against a denylist of known read-only commands (`ls`, `git status`, `cargo test`, etc.) — unknown commands default to rebuild.
 
 ## Configuration
 
@@ -198,7 +253,7 @@ Custom discovery runs alongside manifest-based discovery. Directories already fo
 
 ```
 src/
-├── main.rs          # CLI (clap): build and serve subcommands
+├── main.rs          # CLI (clap): build, serve, watch, rebuild subcommands
 ├── config.rs        # shire.toml parsing
 ├── db/
 │   ├── mod.rs       # SQLite schema, open/create
@@ -230,9 +285,14 @@ src/
 │   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
 │   ├── perl.rs      # Perl extractor (regex-based)
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
-└── mcp/
-    ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-    └── tools.rs     # 13 tool handlers
+├── mcp/
+│   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
+│   ├── tools.rs     # 13 tool handlers
+│   └── prompts.rs   # 6 prompt templates for semantic codebase exploration
+└── watch/
+    ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
+    ├── daemon.rs    # Process management (start/stop/is_running via PID)
+    └── protocol.rs  # Hook input parsing, Bash read-only denylist
 ```
 
 ## License

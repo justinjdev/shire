@@ -903,8 +903,23 @@ fn phase_index_files(
         .collect::<Result<Vec<_>, _>>()?;
 
     let associated_files = associate_files_with_packages(&walked_files, &all_packages);
-    let num_files = associated_files.len();
-    upsert_files(conn, &associated_files)?;
+
+    // Validate package associations against actual DB state to avoid FK violations
+    let known_packages: std::collections::HashSet<String> = conn
+        .prepare("SELECT name FROM packages")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+
+    let validated_files: Vec<_> = associated_files
+        .into_iter()
+        .map(|(path, pkg, ext, size)| {
+            let valid_pkg = pkg.filter(|p| known_packages.contains(p));
+            (path, valid_pkg, ext, size)
+        })
+        .collect();
+
+    let num_files = validated_files.len();
+    upsert_files(conn, &validated_files)?;
 
     // Store the new file-tree hash
     conn.execute(

@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]
     pub db_path: Option<String>,
@@ -12,12 +12,32 @@ pub struct Config {
     pub packages: Vec<PackageOverride>,
     #[serde(default)]
     pub symbols: SymbolsConfig,
+    #[serde(default)]
+    pub watch: WatchConfig,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct SymbolsConfig {
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
+}
+
+fn default_debounce_ms() -> u64 {
+    2000
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WatchConfig {
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: default_debounce_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -36,7 +56,7 @@ pub struct CustomDiscoveryRule {
     pub extensions: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DiscoveryConfig {
     #[serde(default = "default_manifests")]
     pub manifests: Vec<String>,
@@ -87,7 +107,7 @@ fn default_exclude() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PackageOverride {
     pub name: String,
     pub description: Option<String>,

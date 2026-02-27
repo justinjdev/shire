@@ -185,6 +185,21 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
     // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
     // implicit DELETE that triggers FK violations on child tables (dependencies,
     // symbols) which reference packages(name).
+    // Also handle path conflicts: if two manifest parsers produce different
+    // package names for the same directory, delete the old row first to avoid
+    // a UNIQUE constraint violation on packages.path.
+    conn.execute(
+        "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
+        [&pkg.path, &pkg.name],
+    )?;
+    conn.execute(
+        "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
+        [&pkg.path, &pkg.name],
+    )?;
+    conn.execute(
+        "DELETE FROM packages WHERE path = ?1 AND name != ?2",
+        [&pkg.path, &pkg.name],
+    )?;
     conn.execute(
         "INSERT INTO packages (name, path, kind, version, description, metadata)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)

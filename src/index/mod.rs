@@ -181,7 +181,7 @@ fn diff_manifests<'a>(
 }
 
 /// Insert a package and its dependencies into the DB.
-fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
+fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
     // implicit DELETE that triggers FK violations on child tables (dependencies,
     // symbols) which reference packages(name).
@@ -229,7 +229,7 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
     for dep in &pkg.dependencies {
         dep_stmt.execute((&pkg.name, &dep.name, dep.dep_kind.as_str(), &dep.version_req))?;
     }
-    Ok(())
+    Ok(pkg.name.clone())
 }
 
 /// Recompute is_internal for all dependencies using a single SQL UPDATE.
@@ -608,12 +608,12 @@ fn phase_parse(
                 &ws.maven_parents,
             ) {
                 Ok(pkg) => {
+                    let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((
-                        pkg.name.clone(),
+                        winner,
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -639,12 +639,12 @@ fn phase_parse(
                     if gradle_dirs.contains(&manifest.relative_dir) {
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
+                    let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((
-                        pkg.name.clone(),
+                        winner,
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -661,8 +661,8 @@ fn phase_parse(
                 &ws.cargo_deps,
             ) {
                 Ok(pkg) => {
-                    parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                    upsert_package(conn, &pkg)?;
+                    let winner = upsert_package(conn, &pkg)?;
+                    parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -678,8 +678,8 @@ fn phase_parse(
                         if pkg.kind == "go" && ws.go_dirs.contains(&manifest.relative_dir) {
                             pkg.metadata = Some(serde_json::json!({"go_workspace": true}));
                         }
-                        parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                        upsert_package(conn, &pkg)?;
+                        let winner = upsert_package(conn, &pkg)?;
+                        parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
                     Err(e) => {
                         failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -688,6 +688,17 @@ fn phase_parse(
                 break;
             }
         }
+    }
+
+    // Dedup by path — keep only the last (winning) entry per path.
+    // This handles cases where two manifest parsers produce different
+    // package names for the same directory.
+    {
+        let mut by_path: HashMap<String, (String, String, String)> = HashMap::new();
+        for entry in parsed_packages.drain(..) {
+            by_path.insert(entry.1.clone(), entry);
+        }
+        parsed_packages = by_path.into_values().collect();
     }
 
     Ok((parsed_packages, failures))

@@ -2,7 +2,7 @@
 name = "shire"
 version = "0.1.4-beta"
 edition = "2024"
-description = "Search, Hierarchy, Index, Repo Explorer - monorepo package index and MCP server"
+description = "One index to rule them all — Search, Hierarchy, Index, Repo Explorer, a monorepo MCP-first indexer"
 license = "MIT"
 keywords = ["monorepo", "mcp", "index", "search"]
 categories = ["command-line-utilities", "development-tools"]
@@ -30,6 +30,7 @@ tree-sitter-javascript = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
+tree-sitter-proto = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

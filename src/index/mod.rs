@@ -803,11 +803,12 @@ fn phase_extract_symbols(
     conn: &Connection,
     repo_root: &Path,
     parsed_packages: &[(String, String, String)],
+    exclude_extensions: &[String],
 ) -> Result<()> {
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind);
+            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
             let src_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind);
             (pkg_name, syms, src_hash)
         })
@@ -854,6 +855,7 @@ fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
+    exclude_extensions: &[String],
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, and hashed_at from DB
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>)> = unchanged
@@ -897,7 +899,7 @@ fn phase_source_incremental(
                 // Content unchanged — update hashed_at only
                 return Some(SourceCheckResult::Unchanged(pkg_name.as_str(), current_hash));
             }
-            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind);
+            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
             Some(SourceCheckResult::Changed(pkg_name.as_str(), syms, current_hash))
         })
         .collect();
@@ -1215,8 +1217,8 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     // Phase 7+8: Extract symbols + source-level re-extraction (transaction-wrapped)
     let t = Instant::now();
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages)?;
-        phase_source_incremental(&conn, repo_root, &diff.unchanged)
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions)?;
+        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions)
     })?;
     timings.push(("extract-symbols", t.elapsed()));
 

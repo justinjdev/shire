@@ -10,6 +10,14 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     #[serde(default)]
     pub packages: Vec<PackageOverride>,
+    #[serde(default)]
+    pub symbols: SymbolsConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SymbolsConfig {
+    #[serde(default)]
+    pub exclude_extensions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +125,16 @@ exclude = ["vendor"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.db_path.as_deref(), Some("/tmp/custom-index.db"));
+    }
+
+    #[test]
+    fn test_parse_config_with_symbols() {
+        let toml_str = r#"
+[symbols]
+exclude_extensions = [".proto", ".pl"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.symbols.exclude_extensions, vec![".proto", ".pl"]);
     }
 
     #[test]

@@ -37,6 +37,18 @@ pub fn extensions_for_kind(kind: &str) -> Vec<&'static str> {
     }
 }
 
+/// Return ALL registered source file extensions (the union of all languages).
+pub fn all_extensions() -> Vec<&'static str> {
+    vec![
+        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
+        "go",                       // Go
+        "rs",                       // Rust
+        "py",                       // Python
+        "java", "kt",              // Java/Kotlin
+        "proto",                    // Protobuf
+    ]
+}
+
 /// Walk a directory and collect source files matching the given extensions,
 /// skipping excluded directories and generated/test files.
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
@@ -99,6 +111,17 @@ pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_all_extensions() {
+        let exts = all_extensions();
+        assert!(exts.contains(&"ts"));
+        assert!(exts.contains(&"go"));
+        assert!(exts.contains(&"rs"));
+        assert!(exts.contains(&"py"));
+        assert!(exts.contains(&"java"));
+        assert!(exts.contains(&"proto"));
+    }
 
     #[test]
     fn test_extensions_for_kind() {

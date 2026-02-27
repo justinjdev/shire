@@ -1,4 +1,5 @@
 pub mod go;
+pub mod proto;
 pub mod python;
 pub mod rust_lang;
 pub mod typescript;
@@ -77,14 +78,22 @@ pub struct Parameter {
 pub fn extract_symbols_for_package(
     repo_root: &Path,
     package_path: &str,
-    package_kind: &str,
+    _package_kind: &str,
+    exclude_extensions: &[String],
 ) -> Result<Vec<SymbolInfo>> {
     let package_dir = repo_root.join(package_path);
     if !package_dir.is_dir() {
         return Ok(Vec::new());
     }
 
-    let extensions = walker::extensions_for_kind(package_kind);
+    let all_exts = walker::all_extensions();
+    let extensions: Vec<&str> = all_exts
+        .into_iter()
+        .filter(|ext| {
+            let with_dot = format!(".{}", ext);
+            !exclude_extensions.contains(&with_dot)
+        })
+        .collect();
     let source_files = walker::walk_source_files(&package_dir, &extensions)?;
 
     let mut symbols = Vec::new();
@@ -112,6 +121,7 @@ pub fn extract_symbols_for_package(
             "go" => go::extract(&source, &relative_path),
             "rs" => rust_lang::extract(&source, &relative_path),
             "py" => python::extract(&source, &relative_path),
+            "proto" => proto::extract(&source, &relative_path),
             _ => Vec::new(),
         };
 

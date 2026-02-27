@@ -1646,3 +1646,152 @@ fn test_dual_manifest_same_directory_no_fk_violation() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_kind_agnostic_symbol_extraction_proto_in_gradle() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // Gradle package with a proto file inside
+    let svc_dir = dir.path().join("services/api");
+    fs::create_dir_all(&svc_dir).unwrap();
+    fs::write(
+        svc_dir.join("build.gradle"),
+        "group = 'com.example'\nversion = '1.0.0'\n",
+    )
+    .unwrap();
+
+    // Proto file in the same package directory
+    let proto_dir = svc_dir.join("src/main/proto");
+    fs::create_dir_all(&proto_dir).unwrap();
+    fs::write(
+        proto_dir.join("service.proto"),
+        r#"syntax = "proto3";
+package com.example.api;
+
+message PaymentRequest {
+  string currency = 1;
+  double amount = 2;
+}
+
+service PaymentAPI {
+  rpc ProcessPayment(PaymentRequest) returns (PaymentResponse) {}
+}
+
+message PaymentResponse {
+  bool success = 1;
+}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Proto message extracted as struct
+    let kind: String = conn
+        .query_row(
+            "SELECT kind FROM symbols WHERE name = 'PaymentRequest'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "struct");
+
+    // Proto service extracted as interface
+    let kind: String = conn
+        .query_row(
+            "SELECT kind FROM symbols WHERE name = 'PaymentAPI'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "interface");
+
+    // Proto RPC extracted as method with parent
+    let parent: String = conn
+        .query_row(
+            "SELECT parent_symbol FROM symbols WHERE name = 'ProcessPayment'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent, "PaymentAPI");
+
+    // All symbols belong to the gradle package
+    let pkg: String = conn
+        .query_row(
+            "SELECT package FROM symbols WHERE name = 'PaymentRequest'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg, "com.example:api");
+}
+
+#[test]
+fn test_exclude_extensions_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bin = cargo_bin();
+
+    // Gradle package with a proto file
+    let svc_dir = dir.path().join("services/api");
+    fs::create_dir_all(&svc_dir).unwrap();
+    fs::write(
+        svc_dir.join("build.gradle"),
+        "group = 'com.example'\nversion = '1.0.0'\n",
+    )
+    .unwrap();
+    fs::write(
+        svc_dir.join("service.proto"),
+        r#"syntax = "proto3";
+message Ignored {
+  string field = 1;
+}
+"#,
+    )
+    .unwrap();
+
+    // Config to exclude proto
+    fs::write(
+        dir.path().join("shire.toml"),
+        r#"
+[symbols]
+exclude_extensions = [".proto"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Proto symbols should NOT be extracted
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'Ignored'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "Proto symbols should be excluded by config");
+}

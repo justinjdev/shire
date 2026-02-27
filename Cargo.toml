@@ -1,6 +1,6 @@
 [package]
 name = "shire"
-version = "0.1.0"
+version = "0.1.2-beta"
 edition = "2024"
 description = "Search, Hierarchy, Index, Repo Explorer - monorepo package index and MCP server"
 license = "MIT"

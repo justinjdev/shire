@@ -80,6 +80,44 @@ dependencies = ["torch>=2.0", "numpy"]
         )
         .unwrap();
 
+    // Hybrid directory with BOTH package.json and go.mod — triggers path dedup
+    let hybrid = dir.join("services/hybrid");
+    fs::create_dir_all(&hybrid).unwrap();
+    fs::File::create(hybrid.join("package.json"))
+        .unwrap()
+        .write_all(
+            br#"{"name": "hybrid-js", "version": "1.0.0", "description": "JS side of hybrid service", "dependencies": {"shared-types": "^1.0"}}"#,
+        )
+        .unwrap();
+    fs::File::create(hybrid.join("go.mod"))
+        .unwrap()
+        .write_all(
+            b"module github.com/company/hybrid\n\ngo 1.22\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n",
+        )
+        .unwrap();
+
+    // Source files in hybrid for symbol extraction (both languages)
+    fs::File::create(hybrid.join("index.ts"))
+        .unwrap()
+        .write_all(
+            br#"export function hybridHandler(req: Request): Response {
+    return new Response("ok");
+}
+"#,
+        )
+        .unwrap();
+    fs::File::create(hybrid.join("main.go"))
+        .unwrap()
+        .write_all(
+            br#"package main
+
+func HybridServe(addr string) error {
+    return nil
+}
+"#,
+        )
+        .unwrap();
+
     // A node_modules dir that should be skipped
     let nm = dir.join("services/auth/node_modules/leftpad");
     fs::create_dir_all(&nm).unwrap();
@@ -179,8 +217,8 @@ fn test_build_command_indexes_fixture() {
         "shire build failed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stdout.contains("Indexed 5 packages"),
-        "Expected 5 packages in output, got: {stdout}"
+        stdout.contains("Indexed 6 packages"),
+        "Expected 6 packages in output, got: {stdout}"
     );
     assert!(
         stdout.contains("symbols"),
@@ -206,11 +244,11 @@ fn test_build_command_indexes_fixture() {
         .unwrap();
     assert_eq!(count, 0, "node_modules should be excluded");
 
-    // Verify all 5 packages indexed
+    // Verify all 6 packages indexed (5 original + 1 from hybrid dir path-dedup winner)
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(total, 5);
+    assert_eq!(total, 6);
 
     // Verify internal dependency detection
     let internal_count: i64 = conn
@@ -1530,5 +1568,81 @@ fn test_serve_fails_without_index() {
     assert!(
         stderr.contains("Index not found") || stderr.contains("not found"),
         "Should error about missing index, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_dual_manifest_same_directory_no_fk_violation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Build should succeed with dual manifests.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Exactly one package should exist at path services/hybrid
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let hybrid_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE path = 'services/hybrid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        hybrid_count, 1,
+        "Path dedup should keep exactly one package for services/hybrid"
+    );
+
+    // The surviving package should have symbols
+    let winner: String = conn
+        .query_row(
+            "SELECT name FROM packages WHERE path = 'services/hybrid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let sym_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package = ?1",
+            [&winner],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        sym_count > 0,
+        "Surviving package '{}' should have symbols, got {}",
+        winner,
+        sym_count
+    );
+
+    // No orphaned symbols should reference the loser
+    let orphaned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphaned, 0, "No orphaned symbols should exist");
+
+    // Force rebuild should also succeed
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap(), "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Force rebuild with dual manifests should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

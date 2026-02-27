@@ -181,7 +181,7 @@ fn diff_manifests<'a>(
 }
 
 /// Insert a package and its dependencies into the DB.
-fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
+fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
     // implicit DELETE that triggers FK violations on child tables (dependencies,
     // symbols) which reference packages(name).
@@ -229,7 +229,7 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<()> {
     for dep in &pkg.dependencies {
         dep_stmt.execute((&pkg.name, &dep.name, dep.dep_kind.as_str(), &dep.version_req))?;
     }
-    Ok(())
+    Ok(pkg.name.clone())
 }
 
 /// Recompute is_internal for all dependencies using a single SQL UPDATE.
@@ -242,6 +242,42 @@ fn recompute_is_internal(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    Ok(())
+}
+
+/// Post-build safety net: clean up any orphaned child rows that reference
+/// non-existent packages. This handles edge cases that slip through the
+/// per-phase FK management.
+fn validate_referential_integrity(conn: &Connection) -> Result<()> {
+    let orphaned_syms: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+        |row| row.get(0),
+    )?;
+    let orphaned_deps: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if orphaned_syms > 0 || orphaned_deps > 0 {
+        eprintln!(
+            "Warning: cleaning up {} orphaned symbol(s) and {} orphaned dependency(ies)",
+            orphaned_syms, orphaned_deps
+        );
+        conn.execute(
+            "DELETE FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE files SET package = NULL WHERE package IS NOT NULL AND package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -608,12 +644,12 @@ fn phase_parse(
                 &ws.maven_parents,
             ) {
                 Ok(pkg) => {
+                    let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((
-                        pkg.name.clone(),
+                        winner,
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -639,12 +675,12 @@ fn phase_parse(
                     if gradle_dirs.contains(&manifest.relative_dir) {
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
+                    let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((
-                        pkg.name.clone(),
+                        winner,
                         pkg.path.clone(),
                         pkg.kind.to_string(),
                     ));
-                    upsert_package(conn, &pkg)?;
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -661,8 +697,8 @@ fn phase_parse(
                 &ws.cargo_deps,
             ) {
                 Ok(pkg) => {
-                    parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                    upsert_package(conn, &pkg)?;
+                    let winner = upsert_package(conn, &pkg)?;
+                    parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -678,8 +714,8 @@ fn phase_parse(
                         if pkg.kind == "go" && ws.go_dirs.contains(&manifest.relative_dir) {
                             pkg.metadata = Some(serde_json::json!({"go_workspace": true}));
                         }
-                        parsed_packages.push((pkg.name.clone(), pkg.path.clone(), pkg.kind.to_string()));
-                        upsert_package(conn, &pkg)?;
+                        let winner = upsert_package(conn, &pkg)?;
+                        parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
                     Err(e) => {
                         failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -688,6 +724,17 @@ fn phase_parse(
                 break;
             }
         }
+    }
+
+    // Dedup by path — keep only the last (winning) entry per path.
+    // This handles cases where two manifest parsers produce different
+    // package names for the same directory.
+    {
+        let mut by_path: HashMap<String, (String, String, String)> = HashMap::new();
+        for entry in parsed_packages.drain(..) {
+            by_path.insert(entry.1.clone(), entry);
+        }
+        parsed_packages = by_path.into_values().collect();
     }
 
     Ok((parsed_packages, failures))
@@ -1062,12 +1109,17 @@ fn print_timings(timings: &[(&str, Duration)], total: Duration) {
     eprintln!("  {:<20} {}ms", "total", total.as_millis());
 }
 
-pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()> {
+pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
 
-    let db_dir = repo_root.join(".shire");
-    let db_path = db_dir.join("index.db");
+    let db_path = if let Some(p) = db_override {
+        p.to_path_buf()
+    } else if let Some(ref p) = config.db_path {
+        PathBuf::from(p)
+    } else {
+        repo_root.join(".shire").join("index.db")
+    };
     let conn = db::open_or_create(&db_path)?;
 
     if force {
@@ -1079,6 +1131,11 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
             Ok(())
         })?;
     }
+
+    // Disable FK enforcement during build — the multi-phase pipeline manages
+    // referential integrity manually, and a post-build validation pass cleans
+    // up any orphaned rows.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
@@ -1202,6 +1259,12 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool) -> Result<()>
         Ok(())
     })?;
 
+    // Re-enable FK enforcement and validate integrity
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    with_transaction(&conn, || {
+        validate_referential_integrity(&conn)
+    })?;
+
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
 
@@ -1244,7 +1307,7 @@ mod tests {
         create_test_monorepo(dir.path());
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         assert!(db_path.exists());
@@ -1273,7 +1336,7 @@ mod tests {
         create_test_monorepo(dir.path());
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1309,12 +1372,12 @@ mod tests {
         let config = Config::default();
 
         // First build
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
         assert_eq!(hash_count(dir.path()), 3);
 
         // Second build — nothing changed
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
     }
 
@@ -1324,7 +1387,7 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         // Modify auth-service version
         let auth_path = dir.path().join("services/auth/package.json");
@@ -1333,7 +1396,7 @@ mod tests {
             br#"{"name": "auth-service", "version": "2.0.0", "description": "Auth v2", "dependencies": {"shared-types": "^1.0"}}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1354,13 +1417,13 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
 
         // Delete the Go package
         fs::remove_file(dir.path().join("services/gateway/go.mod")).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 2);
         assert_eq!(hash_count(dir.path()), 2);
     }
@@ -1371,7 +1434,7 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
 
         // Add a new npm package
@@ -1382,7 +1445,7 @@ mod tests {
             br#"{"name": "billing", "version": "1.0.0", "description": "Billing service"}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 4);
         assert_eq!(hash_count(dir.path()), 4);
     }
@@ -1400,7 +1463,7 @@ mod tests {
         ).unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1422,7 +1485,7 @@ mod tests {
             br#"{"name": "billing", "version": "1.0.0"}"#,
         ).unwrap();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let conn = db::open_readonly(&db_path).unwrap();
         let is_internal: bool = conn
@@ -1441,11 +1504,11 @@ mod tests {
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(hash_count(dir.path()), 3);
 
         // Force rebuild — should still work and produce same result
-        build_index(dir.path(), &config, true).unwrap();
+        build_index(dir.path(), &config, true, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 3);
         assert_eq!(hash_count(dir.path()), 3);
     }
@@ -1488,7 +1551,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(root, &config, false).unwrap();
+        build_index(root, &config, false, None).unwrap();
 
         let db_path = root.join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1547,7 +1610,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1592,7 +1655,7 @@ anyhow = "1"
         .unwrap();
 
         let config = Config::default();
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1638,7 +1701,7 @@ anyhow = "1"
         create_test_monorepo(dir.path());
         let config = Config::default();
 
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1665,7 +1728,7 @@ anyhow = "1"
         let config = Config::default();
 
         // First build -- computes all hashes
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let db_path = dir.path().join(".shire/index.db");
         let conn = db::open_readonly(&db_path).unwrap();
@@ -1681,7 +1744,7 @@ anyhow = "1"
         drop(conn);
 
         // Second build -- nothing changed, mtime precheck should skip
-        build_index(dir.path(), &config, false).unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
 
         let conn = db::open_readonly(&db_path).unwrap();
         let hashed_at_2: String = conn

@@ -1,4 +1,5 @@
 pub mod cargo;
+pub mod custom_discovery;
 pub mod go;
 pub mod go_work;
 pub mod gradle;
@@ -1189,10 +1190,52 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
 
     // Phase 3: Parse new + changed manifests (transaction-wrapped)
     let t = Instant::now();
-    let (parsed_packages, failures) = with_transaction(&conn, || {
+    let (mut parsed_packages, failures) = with_transaction(&conn, || {
         phase_parse(&to_parse, &conn, &parsers, &ws_ctx)
     })?;
     timings.push(("parse", t.elapsed()));
+
+    // Phase 3.5: Custom package discovery
+    let t = Instant::now();
+    if !config.discovery.custom.is_empty() {
+        let known_paths: HashSet<String> = parsed_packages
+            .iter()
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        // Also include unchanged packages from DB
+        let db_paths: HashSet<String> = conn
+            .prepare("SELECT path FROM packages")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let all_known: HashSet<String> = known_paths.union(&db_paths).cloned().collect();
+
+        let global_excludes: HashSet<String> =
+            config.discovery.exclude.iter().cloned().collect();
+
+        let custom_pkgs = custom_discovery::discover_custom_packages(
+            repo_root,
+            &config.discovery.custom,
+            &global_excludes,
+            &all_known,
+        )?;
+
+        if !custom_pkgs.is_empty() {
+            with_transaction(&conn, || {
+                for pkg in &custom_pkgs {
+                    let winner = upsert_package(&conn, pkg)?;
+                    parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
+                }
+                Ok(())
+            })?;
+            eprintln!(
+                "Custom discovery: {} package(s) from {} rule(s)",
+                custom_pkgs.len(),
+                config.discovery.custom.len()
+            );
+        }
+    }
+    timings.push(("custom-discovery", t.elapsed()));
 
     // Phase 4: Remove deleted packages (transaction-wrapped)
     let t = Instant::now();

@@ -132,22 +132,36 @@ Prompts are pre-built templates for semantic codebase exploration. They compose 
 
 ### Claude Code
 
-Add to your project's `.claude/settings.json`:
+**Quick setup** — one command configures shire globally for all projects:
+
+```sh
+shire init --global
+```
+
+This creates:
+- `~/.claude/shire.toml` with `db_path = "~/.claude/shire/{repo}/index.db"` (auto-namespaced per repo)
+- `mcpServers.shire` entry in `~/.claude/settings.json`
+- `PostToolUse` hook for auto-rebuilding the index after file edits
+
+Run `shire init` (without `--global`) inside a repo to create a project-level `shire.toml` instead.
+
+<details>
+<summary>Manual setup</summary>
+
+Add to `~/.claude/settings.json` (or project-level `.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
     "shire": {
       "command": "shire",
-      "args": ["serve", "--db", "/path/to/repo/.shire/index.db"]
+      "args": ["serve", "--config", "~/.claude/shire.toml"]
     }
   }
 }
 ```
 
-Or add globally in `~/.claude/settings.json` to use across all projects.
-
-To keep the index fresh during a session, add a `PostToolUse` hook that signals the watch daemon after file-modifying tools:
+To keep the index fresh during a session, add a `PostToolUse` hook:
 
 ```json
 {
@@ -161,6 +175,8 @@ To keep the index fresh during a session, add a `PostToolUse` hook that signals 
   }
 }
 ```
+
+</details>
 
 ### Claude Desktop
 
@@ -199,11 +215,17 @@ Smart filtering avoids unnecessary rebuilds: Edit/Write tools check file extensi
 
 ## Configuration
 
-Drop a `shire.toml` in the repo root to customize behavior:
+Drop a `shire.toml` in the repo root to customize behavior. You can also point to a shared config with `--config`:
+
+```sh
+shire serve --config ~/.claude/shire.toml
+shire build --config ~/.claude/shire.toml
+```
 
 ```toml
 # Custom database location (default: .shire/index.db)
-db_path = "/path/to/custom/index.db"
+# Supports ~ expansion, $ENV_VARs, and {repo} (replaced with repo dir name)
+db_path = "~/.claude/shire/{repo}/index.db"
 
 [discovery]
 manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile"]

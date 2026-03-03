@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod config;
 mod db;
 mod index;
+mod init;
 mod mcp;
 mod symbols;
 mod watch;
@@ -29,12 +30,18 @@ enum Commands {
         /// Path to the index database (overrides shire.toml db_path)
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Start the MCP server over stdio
     Serve {
         /// Path to the index database (defaults to .shire/index.db)
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Path to config file (defaults to ./shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Start the watch daemon for automatic index rebuilds
     Watch {
@@ -50,6 +57,9 @@ enum Commands {
         /// Path to the index database (overrides shire.toml db_path)
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Signal the watch daemon to rebuild the index
     Rebuild {
@@ -63,19 +73,34 @@ enum Commands {
         #[arg(long)]
         stdin: bool,
     },
+    /// Initialize shire configuration
+    Init {
+        /// Root directory for the project config (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Set up global config in ~/.claude/ for all projects
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build { root, force, db } => {
+        Commands::Build { root, force, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;
-            let config = config::load_config(&root)?;
+            let config = config::load_config_from(cfg_path.as_deref(), &root)?;
             index::build_index(&root, &config, force, db.as_deref())
         }
-        Commands::Serve { db } => {
-            let db_path = db.unwrap_or_else(|| PathBuf::from(".shire/index.db"));
+        Commands::Serve { db, config: cfg_path } => {
+            let root = std::fs::canonicalize(".")?;
+            let db_path = if let Some(p) = db {
+                p
+            } else {
+                let cfg = config::load_config_from(cfg_path.as_deref(), &root)?;
+                config::resolve_db_path(&cfg, &root)?
+            };
             if !db_path.exists() {
                 anyhow::bail!(
                     "Index not found at {}. Run `shire build` first.",
@@ -89,15 +114,24 @@ async fn main() -> Result<()> {
             stop,
             foreground,
             db,
+            config: cfg_path,
         } => {
             let root = std::fs::canonicalize(&root)?;
             if stop {
                 watch::daemon::stop_daemon(&root)
             } else if foreground {
-                let config = config::load_config(&root)?;
+                let config = config::load_config_from(cfg_path.as_deref(), &root)?;
                 watch::run_daemon(root, config, db).await
             } else {
-                watch::daemon::start_daemon(&root, db.as_deref())
+                watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())
+            }
+        }
+        Commands::Init { root, global } => {
+            if global {
+                init::run_init_global()
+            } else {
+                let root = std::fs::canonicalize(&root)?;
+                init::run_init(&root)
             }
         }
         Commands::Rebuild {

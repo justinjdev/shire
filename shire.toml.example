@@ -1,5 +1,9 @@
 # Shire configuration (optional - defaults work for most repos)
 
+# Custom database location (default: .shire/index.db)
+# Supports ~ expansion, $ENV_VARs, and {repo} (replaced with repo dir name)
+# db_path = "~/.claude/shire/{repo}/index.db"
+
 [discovery]
 # Which manifest files to look for
 manifests = ["package.json", "go.mod", "Cargo.toml", "pyproject.toml"]

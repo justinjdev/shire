@@ -1120,10 +1120,8 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
 
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()
-    } else if let Some(ref p) = config.db_path {
-        PathBuf::from(p)
     } else {
-        repo_root.join(".shire").join("index.db")
+        crate::config::resolve_db_path(config, repo_root)
     };
     let conn = db::open_or_create(&db_path)?;
 

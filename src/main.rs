@@ -75,7 +75,13 @@ async fn main() -> Result<()> {
             index::build_index(&root, &config, force, db.as_deref())
         }
         Commands::Serve { db } => {
-            let db_path = db.unwrap_or_else(|| PathBuf::from(".shire/index.db"));
+            let db_path = if let Some(p) = db {
+                p
+            } else {
+                let root = std::fs::canonicalize(".")?;
+                let cfg = config::load_config(&root)?;
+                config::resolve_db_path(&cfg, &root)
+            };
             if !db_path.exists() {
                 anyhow::bail!(
                     "Index not found at {}. Run `shire build` first.",

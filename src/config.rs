@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct Config {
@@ -113,6 +113,15 @@ pub struct PackageOverride {
     pub description: Option<String>,
 }
 
+/// Resolve the db_path with shell expansion (~ and $ENV_VAR).
+/// Falls back to `<repo_root>/.shire/index.db` if not set in config.
+pub fn resolve_db_path(config: &Config, repo_root: &Path) -> PathBuf {
+    match &config.db_path {
+        Some(p) => PathBuf::from(shellexpand::full(p).unwrap_or(p.into()).into_owned()),
+        None => repo_root.join(".shire").join("index.db"),
+    }
+}
+
 pub fn load_config(repo_root: &Path) -> Result<Config> {
     let config_path = repo_root.join("shire.toml");
     if config_path.exists() {
@@ -166,6 +175,47 @@ exclude = ["vendor"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.db_path.as_deref(), Some("/tmp/custom-index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_absolute() {
+        let config = Config {
+            db_path: Some("/tmp/custom.db".into()),
+            ..Config::default()
+        };
+        let resolved = resolve_db_path(&config, Path::new("/repo"));
+        assert_eq!(resolved, PathBuf::from("/tmp/custom.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_tilde() {
+        let config = Config {
+            db_path: Some("~/.claude/shire/index.db".into()),
+            ..Config::default()
+        };
+        let resolved = resolve_db_path(&config, Path::new("/repo"));
+        assert!(!resolved.to_str().unwrap().contains('~'));
+        assert!(resolved.to_str().unwrap().ends_with("/.claude/shire/index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_default() {
+        let config = Config::default();
+        let resolved = resolve_db_path(&config, Path::new("/repo"));
+        assert_eq!(resolved, PathBuf::from("/repo/.shire/index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_env_var() {
+        // SAFETY: test is single-threaded; no other thread reads this var.
+        unsafe { std::env::set_var("SHIRE_TEST_DIR", "/tmp/shire-test") };
+        let config = Config {
+            db_path: Some("$SHIRE_TEST_DIR/index.db".into()),
+            ..Config::default()
+        };
+        let resolved = resolve_db_path(&config, Path::new("/repo"));
+        assert_eq!(resolved, PathBuf::from("/tmp/shire-test/index.db"));
+        unsafe { std::env::remove_var("SHIRE_TEST_DIR") };
     }
 
     #[test]

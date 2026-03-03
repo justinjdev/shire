@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
                 p
             } else {
                 let cfg = config::load_config_from(cfg_path.as_deref(), &root)?;
-                config::resolve_db_path(&cfg, &root)
+                config::resolve_db_path(&cfg, &root)?
             };
             if !db_path.exists() {
                 anyhow::bail!(
@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
                 let config = config::load_config_from(cfg_path.as_deref(), &root)?;
                 watch::run_daemon(root, config, db).await
             } else {
-                watch::daemon::start_daemon(&root, db.as_deref())
+                watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())
             }
         }
         Commands::Init { root, global } => {

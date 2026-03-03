@@ -35,7 +35,7 @@ pub fn is_running(root: &Path) -> bool {
 
 /// Start the daemon by re-exec'ing this binary with `watch --foreground`.
 /// Idempotent: returns Ok(()) if already running.
-pub fn start_daemon(root: &Path, db: Option<&Path>) -> Result<()> {
+pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Result<()> {
     if is_running(root) {
         return Ok(());
     }
@@ -56,6 +56,10 @@ pub fn start_daemon(root: &Path, db: Option<&Path>) -> Result<()> {
 
     if let Some(db_path) = db {
         cmd.arg("--db").arg(db_path);
+    }
+
+    if let Some(cfg_path) = config {
+        cmd.arg("--config").arg(cfg_path);
     }
 
     cmd.stdin(std::process::Stdio::null())

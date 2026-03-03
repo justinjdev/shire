@@ -1121,7 +1121,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()
     } else {
-        crate::config::resolve_db_path(config, repo_root)
+        crate::config::resolve_db_path(config, repo_root)?
     };
     let conn = db::open_or_create(&db_path)?;
 

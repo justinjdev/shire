@@ -2690,6 +2690,7 @@ dependencies = [
  "fastembed",
  "glob",
  "ignore",
+ "indicatif",
  "quick-xml",
  "rayon",
  "regex",

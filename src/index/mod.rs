@@ -1175,6 +1175,20 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     } else {
         crate::config::resolve_db_path(config, repo_root)?
     };
+
+    // Seed from main worktree's DB if this is a new worktree build
+    if !db_path.exists() {
+        if let Some(seed_path) = crate::config::seed_db_path(config, repo_root)? {
+            if seed_path.exists() {
+                if let Some(parent) = db_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&seed_path, &db_path)?;
+                eprintln!("Seeded DB from {}", seed_path.display());
+            }
+        }
+    }
+
     let conn = db::open_or_create(&db_path, config.rag.enabled)?;
 
     if force {

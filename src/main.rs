@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 mod config;
 mod db;
+mod git;
 mod index;
 mod init;
 mod mcp;

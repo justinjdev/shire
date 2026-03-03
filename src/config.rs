@@ -138,9 +138,18 @@ pub struct PackageOverride {
 }
 
 /// Resolve the db_path with shell expansion (~, $ENV_VAR) and
-/// `{repo}` placeholder substitution (replaced with repo directory name).
+/// placeholder substitution (`{repo}` → main repo name, `{worktree}` → worktree identifier).
 /// Falls back to `<repo_root>/.shire/index.db` if not set in config.
 pub fn resolve_db_path(config: &Config, repo_root: &Path) -> Result<PathBuf> {
+    resolve_db_path_with_identity(config, repo_root, &crate::git::repo_identity(repo_root))
+}
+
+/// Inner implementation that accepts a pre-computed `RepoIdentity` (for testability).
+fn resolve_db_path_with_identity(
+    config: &Config,
+    repo_root: &Path,
+    identity: &crate::git::RepoIdentity,
+) -> Result<PathBuf> {
     match &config.db_path {
         Some(p) => {
             let expanded = shellexpand::full(p)
@@ -148,8 +157,10 @@ pub fn resolve_db_path(config: &Config, repo_root: &Path) -> Result<PathBuf> {
                     format!("Failed to expand db_path '{p}'. Check that all environment variables are set.")
                 })?
                 .into_owned();
-            let repo_name = repo_name_from_path(repo_root)?;
-            let path = PathBuf::from(expanded.replace("{repo}", &repo_name));
+            let resolved = expanded
+                .replace("{repo}", &identity.repo_name)
+                .replace("{worktree}", &identity.worktree_name);
+            let path = PathBuf::from(resolved);
             // Resolve relative paths against repo_root
             if path.is_relative() {
                 Ok(repo_root.join(path))
@@ -161,17 +172,32 @@ pub fn resolve_db_path(config: &Config, repo_root: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Extract the repo directory name from a path, for `{repo}` placeholder substitution.
-fn repo_name_from_path(repo_root: &Path) -> Result<String> {
-    repo_root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .with_context(|| {
-            format!(
-                "Cannot determine repository name from '{}' for {{repo}} placeholder in db_path",
-                repo_root.display()
-            )
-        })
+/// Compute the seed DB path (main worktree's DB) for a given resolved db_path.
+/// Returns `None` if the db_path doesn't contain a worktree-specific segment
+/// or if the resolved path is already the main worktree's path.
+pub fn seed_db_path(config: &Config, repo_root: &Path) -> Result<Option<PathBuf>> {
+    seed_db_path_with_identity(config, repo_root, &crate::git::repo_identity(repo_root))
+}
+
+fn seed_db_path_with_identity(
+    config: &Config,
+    repo_root: &Path,
+    identity: &crate::git::RepoIdentity,
+) -> Result<Option<PathBuf>> {
+    if identity.worktree_name == "main" {
+        return Ok(None);
+    }
+    match &config.db_path {
+        Some(p) if p.contains("{worktree}") => {
+            let main_identity = crate::git::RepoIdentity {
+                repo_name: identity.repo_name.clone(),
+                worktree_name: "main".to_string(),
+            };
+            let main_path = resolve_db_path_with_identity(config, repo_root, &main_identity)?;
+            Ok(Some(main_path))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[allow(dead_code)]
@@ -335,27 +361,61 @@ exclude = ["vendor"]
         assert!(msg.contains("Failed to expand db_path"));
     }
 
+    fn test_identity(repo: &str, worktree: &str) -> crate::git::RepoIdentity {
+        crate::git::RepoIdentity {
+            repo_name: repo.to_string(),
+            worktree_name: worktree.to_string(),
+        }
+    }
+
     #[test]
     fn test_resolve_db_path_repo_placeholder() {
         let config = Config {
             db_path: Some("~/.claude/shire/{repo}/index.db".into()),
             ..Config::default()
         };
-        let resolved = resolve_db_path(&config, Path::new("/home/user/git/my-monorepo")).unwrap();
+        let identity = test_identity("my-monorepo", "main");
+        let resolved =
+            resolve_db_path_with_identity(&config, Path::new("/home/user/git/my-monorepo"), &identity).unwrap();
         assert!(resolved.to_str().unwrap().contains("/my-monorepo/"));
         assert!(resolved.to_str().unwrap().ends_with("/my-monorepo/index.db"));
     }
 
     #[test]
-    fn test_resolve_db_path_root_path_errors() {
+    fn test_resolve_db_path_worktree_placeholder() {
         let config = Config {
-            db_path: Some("~/.claude/shire/{repo}/index.db".into()),
+            db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
             ..Config::default()
         };
-        let result = resolve_db_path(&config, Path::new("/"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Cannot determine repository name"));
+        let identity = test_identity("my-repo", "feat-xyz");
+        let resolved =
+            resolve_db_path_with_identity(&config, Path::new("/some/path"), &identity).unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/feat-xyz/index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_worktree_main() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "main");
+        let resolved =
+            resolve_db_path_with_identity(&config, Path::new("/some/path"), &identity).unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/main/index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_no_worktree_placeholder_preserves_behavior() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "feat-xyz");
+        let resolved =
+            resolve_db_path_with_identity(&config, Path::new("/some/path"), &identity).unwrap();
+        // No {worktree} in path — worktrees share the same DB
+        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/index.db"));
     }
 
     #[test]
@@ -428,6 +488,45 @@ max_depth = 4
         assert_eq!(proto.requires, vec!["*.proto", "buf.yaml"]);
         assert!(proto.exclude.is_empty());
         assert!(proto.name_prefix.is_none());
+    }
+
+    #[test]
+    fn test_seed_db_path_returns_main_path_for_worktree() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "feat-xyz");
+        let seed = seed_db_path_with_identity(&config, Path::new("/some/path"), &identity)
+            .unwrap();
+        assert_eq!(
+            seed,
+            Some(PathBuf::from("/tmp/shire/my-repo/main/index.db"))
+        );
+    }
+
+    #[test]
+    fn test_seed_db_path_returns_none_for_main_worktree() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "main");
+        let seed = seed_db_path_with_identity(&config, Path::new("/some/path"), &identity)
+            .unwrap();
+        assert!(seed.is_none());
+    }
+
+    #[test]
+    fn test_seed_db_path_returns_none_without_worktree_placeholder() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "feat-xyz");
+        let seed = seed_db_path_with_identity(&config, Path::new("/some/path"), &identity)
+            .unwrap();
+        assert!(seed.is_none());
     }
 
     #[test]

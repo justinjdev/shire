@@ -1,3 +1,4 @@
 /target
 .shire/
 docs/book/
+.claude/settings.local.json

@@ -17,11 +17,13 @@ use crate::db;
 use crate::symbols;
 use anyhow::Result;
 use ignore::WalkBuilder;
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Execute a closure within an explicit SQLite transaction.
@@ -807,12 +809,16 @@ fn phase_extract_symbols(
     repo_root: &Path,
     parsed_packages: &[(String, String, String)],
     exclude_extensions: &[String],
+    progress: &Option<Arc<ProgressBar>>,
 ) -> Result<()> {
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
             let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
             let src_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind);
+            if let Some(pb) = progress {
+                pb.inc(1);
+            }
             (pkg_name, syms, src_hash)
         })
         .collect();
@@ -859,6 +865,7 @@ fn phase_source_incremental(
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
     exclude_extensions: &[String],
+    progress: &Option<Arc<ProgressBar>>,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, and hashed_at from DB
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>)> = unchanged
@@ -887,23 +894,29 @@ fn phase_source_incremental(
     let results: Vec<SourceCheckResult> = unchanged_pkgs
         .par_iter()
         .filter_map(|(pkg_name, pkg_path, pkg_kind, stored_hash, hashed_at)| {
-            // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
-            if let Some(ts_str) = hashed_at {
-                if let Some(since) = parse_hashed_at(ts_str) {
-                    if !hash::has_newer_source_files(repo_root, pkg_path, pkg_kind, since) {
-                        return None; // No files changed — skip hash computation
+            let result = (|| {
+                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
+                if let Some(ts_str) = hashed_at {
+                    if let Some(since) = parse_hashed_at(ts_str) {
+                        if !hash::has_newer_source_files(repo_root, pkg_path, pkg_kind, since) {
+                            return None; // No files changed — skip hash computation
+                        }
                     }
                 }
-            }
 
-            // Mtime says check needed (or no hashed_at) — compute full hash
-            let current_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind).ok()?;
-            if stored_hash.as_deref() == Some(current_hash.as_str()) {
-                // Content unchanged — update hashed_at only
-                return Some(SourceCheckResult::Unchanged(pkg_name.as_str(), current_hash));
+                // Mtime says check needed (or no hashed_at) — compute full hash
+                let current_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind).ok()?;
+                if stored_hash.as_deref() == Some(current_hash.as_str()) {
+                    // Content unchanged — update hashed_at only
+                    return Some(SourceCheckResult::Unchanged(pkg_name.as_str(), current_hash));
+                }
+                let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
+                Some(SourceCheckResult::Changed(pkg_name.as_str(), syms, current_hash))
+            })();
+            if let Some(pb) = progress {
+                pb.inc(1);
             }
-            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
-            Some(SourceCheckResult::Changed(pkg_name.as_str(), syms, current_hash))
+            result
         })
         .collect();
 
@@ -1114,9 +1127,48 @@ fn print_timings(timings: &[(&str, Duration)], total: Duration) {
     eprintln!("  {:<20} {}ms", "total", total.as_millis());
 }
 
+/// Create a spinner-style progress bar attached to the MultiProgress.
+fn make_spinner(mp: &MultiProgress, msg: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new_spinner());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+/// Create a sized progress bar attached to the MultiProgress.
+fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new(len));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("━╸─"),
+    );
+    pb.set_message(msg.to_string());
+    pb
+}
+
 pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+    build_index_inner(repo_root, config, force, db_override, true)
+}
+
+pub fn build_index_quiet(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+    build_index_inner(repo_root, config, force, db_override, false)
+}
+
+fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>, progress: bool) -> Result<()> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
+    let mp = if progress {
+        MultiProgress::new()
+    } else {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    };
 
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()
@@ -1153,11 +1205,14 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     ];
 
     // Phase 1: Walk manifests
+    let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
     let walked = walk_manifests(repo_root, config, &parsers)?;
     timings.push(("walk", t.elapsed()));
+    sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
     // Phase 1.5: Workspace context
+    let sp = make_spinner(&mp, "Building workspace context…");
     let t = Instant::now();
     let ws_ctx = WorkspaceContext {
         cargo_deps: collect_cargo_workspace_context(&walked),
@@ -1166,8 +1221,10 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
         gradle_settings: collect_gradle_settings_context(&walked),
     };
     timings.push(("workspace-context", t.elapsed()));
+    sp.finish_with_message("Workspace context ready");
 
     // Phase 2: Diff against stored hashes
+    let sp = make_spinner(&mp, "Diffing manifests…");
     let t = Instant::now();
     let stored_hashes = load_stored_hashes(&conn)?;
     let diff = diff_manifests(&walked, &stored_hashes);
@@ -1185,15 +1242,29 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     let num_removed = diff.removed.len();
     let num_skipped = diff.unchanged.len();
     timings.push(("diff", t.elapsed()));
+    sp.finish_with_message(format!(
+        "Diff: {} new, {} changed, {} removed, {} unchanged",
+        num_added, num_changed, num_removed, num_skipped
+    ));
 
     // Phase 3: Parse new + changed manifests (transaction-wrapped)
     let t = Instant::now();
+    let pb_parse = if !to_parse.is_empty() {
+        let pb = make_progress(&mp, to_parse.len() as u64, "Parsing manifests");
+        Some(pb)
+    } else {
+        None
+    };
     let (mut parsed_packages, failures) = with_transaction(&conn, || {
         phase_parse(&to_parse, &conn, &parsers, &ws_ctx)
     })?;
+    if let Some(pb) = pb_parse {
+        pb.finish_with_message(format!("Parsed {} manifests", to_parse.len()));
+    }
     timings.push(("parse", t.elapsed()));
 
     // Phase 3.5: Custom package discovery
+    let sp = make_spinner(&mp, "Custom discovery…");
     let t = Instant::now();
     if !config.discovery.custom.is_empty() {
         let known_paths: HashSet<String> = parsed_packages
@@ -1226,23 +1297,28 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
                 }
                 Ok(())
             })?;
-            eprintln!(
-                "Custom discovery: {} package(s) from {} rule(s)",
-                custom_pkgs.len(),
-                config.discovery.custom.len()
-            );
         }
     }
     timings.push(("custom-discovery", t.elapsed()));
+    sp.finish_with_message("Custom discovery done");
 
     // Phase 4: Remove deleted packages (transaction-wrapped)
     let t = Instant::now();
-    with_transaction(&conn, || {
-        phase_remove_deleted(&conn, &diff.removed)
-    })?;
+    if !diff.removed.is_empty() {
+        let pb = make_progress(&mp, diff.removed.len() as u64, "Removing deleted");
+        with_transaction(&conn, || {
+            phase_remove_deleted(&conn, &diff.removed)
+        })?;
+        pb.finish_with_message(format!("Removed {} packages", diff.removed.len()));
+    } else {
+        with_transaction(&conn, || {
+            phase_remove_deleted(&conn, &diff.removed)
+        })?;
+    }
     timings.push(("remove-deleted", t.elapsed()));
 
     // Phase 5: Recompute is_internal (transaction-wrapped)
+    let sp = make_spinner(&mp, "Recomputing internals…");
     let t = Instant::now();
     with_transaction(&conn, || {
         if num_added > 0 || num_changed > 0 || num_removed > 0 {
@@ -1251,20 +1327,40 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
         Ok(())
     })?;
     timings.push(("recompute-internals", t.elapsed()));
+    sp.finish_with_message("Internals recomputed");
 
     // Phase 6: Store manifest hashes (transaction-wrapped)
     let t = Instant::now();
-    with_transaction(&conn, || {
-        phase_store_hashes(&conn, &to_parse)
-    })?;
+    if !to_parse.is_empty() {
+        let pb = make_progress(&mp, to_parse.len() as u64, "Storing hashes");
+        with_transaction(&conn, || {
+            phase_store_hashes(&conn, &to_parse)
+        })?;
+        pb.finish_with_message(format!("Stored {} hashes", to_parse.len()));
+    } else {
+        with_transaction(&conn, || {
+            phase_store_hashes(&conn, &to_parse)
+        })?;
+    }
     timings.push(("update-hashes", t.elapsed()));
 
     // Phase 7+8: Extract symbols + source-level re-extraction (transaction-wrapped)
     let t = Instant::now();
+    let pb_sym = if !parsed_packages.is_empty() || !diff.unchanged.is_empty() {
+        let total = parsed_packages.len() + diff.unchanged.len();
+        let pb = make_progress(&mp, total as u64, "Extracting symbols");
+        Some(Arc::new(pb))
+    } else {
+        None
+    };
+    let pb_sym_clone = pb_sym.clone();
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions)?;
-        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions)
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &pb_sym_clone)?;
+        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &pb_sym_clone)
     })?;
+    if let Some(pb) = pb_sym {
+        pb.finish_with_message("Symbols extracted");
+    }
     timings.push(("extract-symbols", t.elapsed()));
 
     // Phase 8.5: RAG embedding (optional)
@@ -1359,11 +1455,13 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     }
 
     // Phase 9: Index files (transaction-wrapped)
+    let sp = make_spinner(&mp, "Indexing files…");
     let t = Instant::now();
     let num_files = with_transaction(&conn, || {
         phase_index_files(&conn, repo_root, config)
     })?;
     timings.push(("index-files", t.elapsed()));
+    sp.finish_with_message(format!("Indexed {} files", num_files));
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
     with_transaction(&conn, || {
@@ -1402,6 +1500,9 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     with_transaction(&conn, || {
         validate_referential_integrity(&conn)
     })?;
+
+    // Clear progress bars before printing summary
+    mp.clear()?;
 
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);

@@ -39,6 +39,7 @@ shellexpand = "3"
 fastembed = { version = "4", optional = true }
 sqlite-vec = { version = "0.1", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
+indicatif = "0.17"
 
 [features]
 default = []

@@ -5,7 +5,16 @@ use crate::db;
 use anyhow::Result;
 use rmcp::{model::*, service::RequestContext, tool_handler, RoleServer, ServiceExt, ServerHandler};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Build context for on-demand reindexing. When present, the MCP server
+/// can rebuild the index before answering queries.
+#[derive(Clone)]
+pub struct BuildContext {
+    pub repo_root: PathBuf,
+    pub config: crate::config::Config,
+    pub db_path: PathBuf,
+}
 
 #[tool_handler]
 impl ServerHandler for tools::ShireService {
@@ -73,9 +82,15 @@ impl ServerHandler for tools::ShireService {
     }
 }
 
-pub async fn run_server(db_path: &Path, rag_config: &crate::config::RagConfig) -> Result<()> {
-    let conn = db::open_readonly(db_path)?;
-    let service = tools::ShireService::new(conn, rag_config);
+pub async fn run_server(db_path: &Path, rag_config: &crate::config::RagConfig, build_ctx: Option<BuildContext>) -> Result<()> {
+    let conn = if db_path.exists() {
+        db::open_readonly(db_path)?
+    } else {
+        // On-demand mode with no DB yet — create an in-memory placeholder.
+        // The first tool call will trigger a build and reopen the real DB.
+        rusqlite::Connection::open_in_memory()?
+    };
+    let service = tools::ShireService::new(conn, rag_config, build_ctx);
     let server = service.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())

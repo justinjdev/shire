@@ -15,7 +15,7 @@ pub mod ruby;
 use crate::config::Config;
 use crate::db;
 use crate::symbols;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
@@ -1170,21 +1170,55 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     };
 
+    let identity = crate::git::repo_identity(repo_root);
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()
     } else {
-        crate::config::resolve_db_path(config, repo_root)?
+        crate::config::resolve_db_path_with_identity(config, repo_root, &identity)?
     };
 
-    // Seed from main worktree's DB if this is a new worktree build
+    // Seed from main worktree's DB if this is a new worktree build.
+    // Uses SQLite backup API to correctly handle WAL-mode databases.
     if !db_path.exists() {
-        if let Some(seed_path) = crate::config::seed_db_path(config, repo_root)? {
+        if let Some(seed_path) = crate::config::seed_db_path_with_identity(config, repo_root, &identity)? {
             if seed_path.exists() {
                 if let Some(parent) = db_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!(
+                            "Failed to create directory '{}' for worktree DB seed",
+                            parent.display()
+                        ))?;
                 }
-                std::fs::copy(&seed_path, &db_path)?;
+                let src_conn = rusqlite::Connection::open_with_flags(
+                    &seed_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ).with_context(|| format!(
+                    "Failed to open seed DB '{}'", seed_path.display()
+                ))?;
+                let mut dst_conn = rusqlite::Connection::open(&db_path)
+                    .with_context(|| format!(
+                        "Failed to create worktree DB '{}'", db_path.display()
+                    ))?;
+                let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+                    .with_context(|| format!(
+                        "Failed to seed worktree DB: backup '{}' -> '{}'",
+                        seed_path.display(), db_path.display()
+                    ))?;
+                backup.run_to_completion(100, std::time::Duration::ZERO, None)
+                    .with_context(|| format!(
+                        "Failed to complete seed backup '{}' -> '{}'",
+                        seed_path.display(), db_path.display()
+                    ))?;
+                drop(backup);
+                drop(dst_conn);
+                drop(src_conn);
                 eprintln!("Seeded DB from {}", seed_path.display());
+            } else {
+                eprintln!(
+                    "Note: seed DB not found at {} (build the main worktree first for faster bootstrapping)",
+                    seed_path.display()
+                );
             }
         }
     }

@@ -23,36 +23,73 @@ pub fn repo_identity(path: &Path) -> RepoIdentity {
 
 fn detect_git_identity(path: &Path) -> Option<RepoIdentity> {
     // Get the worktree root (toplevel of whichever worktree we're in)
-    let toplevel = Command::new("git")
+    let toplevel = match Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .output()
-        .ok()?;
-    if !toplevel.status.success() {
-        return None;
-    }
-    let toplevel_path = Path::new(std::str::from_utf8(&toplevel.stdout).ok()?.trim());
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                return None; // Not a git repo — expected
+            }
+            output
+        }
+        Err(e) => {
+            eprintln!("Warning: could not run git: {e}");
+            return None;
+        }
+    };
+    let toplevel_str = match std::str::from_utf8(&toplevel.stdout) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            eprintln!("Warning: git rev-parse --show-toplevel returned non-UTF-8 output: {e}");
+            return None;
+        }
+    };
+    let toplevel_path = Path::new(toplevel_str);
 
     // Get the common git dir (shared .git directory for all worktrees)
-    let common_dir = Command::new("git")
+    let common_dir = match Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(path)
         .output()
-        .ok()?;
-    if !common_dir.status.success() {
-        return None;
-    }
-    let common_dir_raw = std::str::from_utf8(&common_dir.stdout).ok()?.trim();
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!("Warning: git rev-parse --git-common-dir failed");
+                return None;
+            }
+            output
+        }
+        Err(e) => {
+            eprintln!("Warning: could not run git: {e}");
+            return None;
+        }
+    };
+    let common_dir_raw = match std::str::from_utf8(&common_dir.stdout) {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            eprintln!("Warning: git rev-parse --git-common-dir returned non-UTF-8 output: {e}");
+            return None;
+        }
+    };
 
-    // Resolve the common dir relative to the toplevel
+    // Resolve the common dir relative to the current directory (where git ran)
     let common_dir_path = if Path::new(common_dir_raw).is_absolute() {
         std::path::PathBuf::from(common_dir_raw)
     } else {
-        toplevel_path.join(common_dir_raw)
+        path.join(common_dir_raw)
     };
-    let common_dir_path = common_dir_path
-        .canonicalize()
-        .unwrap_or(common_dir_path);
+    let common_dir_path = match common_dir_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not canonicalize git common dir '{}': {e}",
+                common_dir_path.display()
+            );
+            return None;
+        }
+    };
 
     // The main repo root is the parent of the common .git dir
     let main_repo_root = common_dir_path.parent()?;
@@ -63,8 +100,26 @@ fn detect_git_identity(path: &Path) -> Option<RepoIdentity> {
 
     // Determine worktree name: if toplevel == main repo root, it's "main";
     // otherwise use the basename of the worktree directory
-    let toplevel_canon = toplevel_path.canonicalize().unwrap_or(toplevel_path.to_path_buf());
-    let main_canon = main_repo_root.canonicalize().unwrap_or(main_repo_root.to_path_buf());
+    let toplevel_canon = match toplevel_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not canonicalize worktree path '{}': {e}",
+                toplevel_path.display()
+            );
+            return None;
+        }
+    };
+    let main_canon = match main_repo_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: could not canonicalize main repo path '{}': {e}",
+                main_repo_root.display()
+            );
+            return None;
+        }
+    };
 
     let worktree_name = if toplevel_canon == main_canon {
         "main".to_string()
@@ -170,5 +225,12 @@ mod tests {
         let id1 = repo_identity(&repo);
         let id2 = repo_identity(&repo);
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_fallback_identity_root_path() {
+        let identity = super::fallback_identity(Path::new("/"));
+        assert_eq!(identity.repo_name, "unknown");
+        assert_eq!(identity.worktree_name, "main");
     }
 }

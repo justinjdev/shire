@@ -145,13 +145,20 @@ pub fn resolve_db_path(config: &Config, repo_root: &Path) -> Result<PathBuf> {
 }
 
 /// Inner implementation that accepts a pre-computed `RepoIdentity` (for testability).
-fn resolve_db_path_with_identity(
+pub(crate) fn resolve_db_path_with_identity(
     config: &Config,
     repo_root: &Path,
     identity: &crate::git::RepoIdentity,
 ) -> Result<PathBuf> {
     match &config.db_path {
         Some(p) => {
+            if p.contains("{repo}") && identity.repo_name == "unknown" {
+                anyhow::bail!(
+                    "Cannot determine repository name from '{}' for {{repo}} placeholder in db_path. \
+                     Ensure the path is a valid directory.",
+                    repo_root.display()
+                );
+            }
             let expanded = shellexpand::full(p)
                 .with_context(|| {
                     format!("Failed to expand db_path '{p}'. Check that all environment variables are set.")
@@ -175,11 +182,7 @@ fn resolve_db_path_with_identity(
 /// Compute the seed DB path (main worktree's DB) for a given resolved db_path.
 /// Returns `None` if the db_path doesn't contain a worktree-specific segment
 /// or if the resolved path is already the main worktree's path.
-pub fn seed_db_path(config: &Config, repo_root: &Path) -> Result<Option<PathBuf>> {
-    seed_db_path_with_identity(config, repo_root, &crate::git::repo_identity(repo_root))
-}
-
-fn seed_db_path_with_identity(
+pub(crate) fn seed_db_path_with_identity(
     config: &Config,
     repo_root: &Path,
     identity: &crate::git::RepoIdentity,
@@ -527,6 +530,39 @@ max_depth = 4
         let seed = seed_db_path_with_identity(&config, Path::new("/some/path"), &identity)
             .unwrap();
         assert!(seed.is_none());
+    }
+
+    #[test]
+    fn test_seed_db_path_returns_none_for_default_config() {
+        let config = Config::default();
+        let identity = test_identity("my-repo", "feat-xyz");
+        let seed = seed_db_path_with_identity(&config, Path::new("/some/path"), &identity)
+            .unwrap();
+        assert!(seed.is_none());
+    }
+
+    #[test]
+    fn test_resolve_db_path_worktree_with_spaces() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("my-repo", "feat branch");
+        let resolved =
+            resolve_db_path_with_identity(&config, Path::new("/x"), &identity).unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/feat branch/index.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_unknown_repo_errors() {
+        let config = Config {
+            db_path: Some("/tmp/shire/{repo}/index.db".into()),
+            ..Config::default()
+        };
+        let identity = test_identity("unknown", "main");
+        let result = resolve_db_path_with_identity(&config, Path::new("/"), &identity);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot determine repository name"));
     }
 
     #[test]

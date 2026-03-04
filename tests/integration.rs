@@ -2060,3 +2060,114 @@ fn test_build_linked_worktree_db_path() {
         .unwrap();
     assert!(count > 0, "Worktree DB should have packages");
 }
+
+#[test]
+fn test_worktree_seed_from_main_db() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("seed-project");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    create_minimal_fixture(&repo);
+
+    let db_base = dir.path().join("dbs");
+    let config_content = format!(
+        "db_path = \"{}/{{repo}}/{{worktree}}/index.db\"\n",
+        db_base.display()
+    );
+    fs::write(repo.join("shire.toml"), &config_content).unwrap();
+
+    // Commit everything so it's available in the worktree
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "add fixture"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .unwrap();
+
+    // Step 1: Build the main worktree first
+    let output = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build on main");
+    assert!(
+        output.status.success(),
+        "Main build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let main_db = db_base.join("seed-project").join("main").join("index.db");
+    assert!(main_db.exists(), "Main DB should exist at {}", main_db.display());
+
+    let main_conn = rusqlite::Connection::open(&main_db).unwrap();
+    let main_pkg_count: i64 = main_conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(main_pkg_count > 0, "Main DB should have packages");
+    drop(main_conn);
+
+    // Step 2: Create a linked worktree and build in it
+    let wt_path = dir.path().join("seed-branch");
+    let output = Command::new("git")
+        .args([
+            "worktree", "add", wt_path.to_str().unwrap(), "-b", "seed-branch",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build on worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Worktree build failed: {stderr}",
+    );
+
+    // Step 3: Verify seeding occurred
+    assert!(
+        stderr.contains("Seeded DB from"),
+        "Should print seed message, got stderr: {stderr}"
+    );
+
+    // Step 4: Verify the worktree DB has data
+    let wt_db = db_base.join("seed-project").join("seed-branch").join("index.db");
+    assert!(wt_db.exists(), "Worktree DB should exist at {}", wt_db.display());
+
+    let wt_conn = rusqlite::Connection::open(&wt_db).unwrap();
+    let wt_pkg_count: i64 = wt_conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(wt_pkg_count > 0, "Worktree DB should have packages from seed");
+    drop(wt_conn);
+
+    // Step 5: Rebuild the worktree — should NOT re-seed (DB already exists)
+    let output = Command::new(&bin)
+        .args(["build", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire rebuild on worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Worktree rebuild failed: {stderr}",
+    );
+    assert!(
+        !stderr.contains("Seeded DB from"),
+        "Should NOT re-seed on second build, got stderr: {stderr}"
+    );
+}

@@ -244,28 +244,14 @@ pub struct DepsParams {
     /// If true, only return dependencies that are also packages in this repo
     #[serde(default)]
     pub internal_only: bool,
+    /// Maximum depth to traverse (default None = direct deps only; set to 2+ for transitive graph)
+    pub depth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DependentsParams {
     /// Package name to find dependents of
     pub name: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GraphParams {
-    /// Root package to start the graph from
-    pub name: String,
-    /// Maximum depth to traverse (default 3)
-    #[serde(default = "default_depth")]
-    pub depth: u32,
-    /// If true, only follow internal dependencies
-    #[serde(default)]
-    pub internal_only: bool,
-}
-
-fn default_depth() -> u32 {
-    3
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -293,29 +279,11 @@ pub struct GetPackageSymbolsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GetSymbolParams {
-    /// Exact symbol name to look up
-    pub name: String,
-    /// Filter to a specific package
-    pub package: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetFileSymbolsParams {
     /// File path relative to repo root (e.g., "services/auth/src/auth.ts")
     pub file_path: String,
     /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
     pub kind: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SearchFilesParams {
-    /// Search query to find files by path or name
-    pub query: String,
-    /// Filter to files from a specific package
-    pub package: Option<String>,
-    /// Filter by file extension (e.g., "ts", "go", "rs")
-    pub extension: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -369,18 +337,30 @@ impl ShireService {
         }
     }
 
-    #[tool(description = "List what a package depends on. Set internal_only=true to see only dependencies that are other packages in this repo.")]
+    #[tool(description = "List what a package depends on. Set internal_only=true to see only dependencies that are other packages in this repo. Set depth=N (N>1) for transitive BFS traversal.")]
     fn package_dependencies(
         &self,
         Parameters(params): Parameters<DepsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::package_dependencies(&conn, &params.name, params.internal_only)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string_pretty(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        match params.depth {
+            Some(n) if n > 1 => {
+                let depth = n.min(20);
+                let edges = queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
+                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let json = serde_json::to_string_pretty(&edges)
+                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            _ => {
+                let results = queries::package_dependencies(&conn, &params.name, params.internal_only)
+                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let json = serde_json::to_string_pretty(&results)
+                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+        }
     }
 
     #[tool(description = "Find all packages that depend on this package (reverse dependency lookup)")]
@@ -393,21 +373,6 @@ impl ShireService {
         let results = queries::package_dependents(&conn, &params.name)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string_pretty(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
-    #[tool(description = "Get the transitive dependency graph starting from a package. Returns a list of edges. Set internal_only=true to only follow dependencies within this repo.")]
-    fn dependency_graph(
-        &self,
-        Parameters(mut params): Parameters<GraphParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.maybe_rebuild();
-        params.depth = params.depth.min(20);
-        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let edges = queries::dependency_graph(&conn, &params.name, params.depth, params.internal_only)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string_pretty(&edges)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -487,24 +452,6 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Get details for a specific symbol by exact name. Returns all symbols matching that name across packages, with file location, signature, parameters, and return type.")]
-    fn get_symbol(
-        &self,
-        Parameters(params): Parameters<GetSymbolParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.maybe_rebuild();
-        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::get_symbol(
-            &conn,
-            &params.name,
-            params.package.as_deref(),
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string_pretty(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
     #[tool(description = "List all symbols defined in a specific file. Useful for understanding what a file exports — its functions, classes, types, and methods.")]
     fn get_file_symbols(
         &self,
@@ -516,30 +463,6 @@ impl ShireService {
             &conn,
             &params.file_path,
             params.kind.as_deref(),
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string_pretty(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
-    #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
-    fn search_files(
-        &self,
-        Parameters(params): Parameters<SearchFilesParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.maybe_rebuild();
-        if params.query.trim().is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Search query must not be empty",
-            )]));
-        }
-        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::search_files(
-            &conn,
-            &params.query,
-            params.package.as_deref(),
-            params.extension.as_deref(),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string_pretty(&results)

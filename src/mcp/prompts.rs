@@ -33,20 +33,6 @@ pub fn list() -> Vec<Prompt> {
             }]),
         ),
         Prompt::new(
-            "explore-area",
-            Some("Explore a directory subtree — list packages, files, and symbol summaries under a path prefix"),
-            Some(vec![PromptArgument {
-                name: "path".into(),
-                description: Some("Directory prefix to explore (e.g. \"services/auth/\", \"proto/\")".into()),
-                required: Some(true),
-            }]),
-        ),
-        Prompt::new(
-            "onboard",
-            Some("Repository overview for onboarding — tech stack, package counts by language, file distribution, index freshness"),
-            None,
-        ),
-        Prompt::new(
             "impact-analysis",
             Some("Analyze blast radius — what breaks if this package changes? Shows direct and transitive dependents"),
             Some(vec![PromptArgument {
@@ -54,22 +40,6 @@ pub fn list() -> Vec<Prompt> {
                 description: Some("Package name to analyze impact for".into()),
                 required: Some(true),
             }]),
-        ),
-        Prompt::new(
-            "understand-dependency",
-            Some("Understand how one package depends on another — trace the dependency path between two packages"),
-            Some(vec![
-                PromptArgument {
-                    name: "from".into(),
-                    description: Some("Source package (the one that depends)".into()),
-                    required: Some(true),
-                },
-                PromptArgument {
-                    name: "to".into(),
-                    description: Some("Target package (the dependency)".into()),
-                    required: Some(true),
-                },
-            ]),
         ),
     ]
 }
@@ -82,10 +52,7 @@ pub fn handle(
     match name {
         "explore" => handle_explore(conn, args),
         "explore-package" => handle_explore_package(conn, args),
-        "explore-area" => handle_explore_area(conn, args),
-        "onboard" => handle_onboard(conn),
         "impact-analysis" => handle_impact_analysis(conn, args),
-        "understand-dependency" => handle_understand_dependency(conn, args),
         _ => Err(PromptError::InvalidParams(format!("Unknown prompt: {name}"))),
     }
 }
@@ -284,130 +251,6 @@ fn handle_explore_package(conn: &Connection, args: &HashMap<String, String>) -> 
     })
 }
 
-fn handle_explore_area(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
-    let path = require_arg(args, "path")?;
-
-    let packages = queries::packages_by_path_prefix(conn, path).map_err(|e| PromptError::Internal(e.to_string()))?;
-
-    let mut text = format!("# Area: `{path}`\n\n");
-
-    if packages.is_empty() {
-        text.push_str("No packages found under this path.\n");
-    } else {
-        text.push_str(&format!("## Packages ({})\n\n", packages.len()));
-        for pkg in &packages {
-            text.push_str(&format!("### {} ({})\n", pkg.name, pkg.kind));
-            text.push_str(&format!("- **Path:** `{}`\n", pkg.path));
-            if let Some(d) = &pkg.description {
-                text.push_str(&format!("- **Description:** {d}\n"));
-            }
-
-            // Symbol summary per package
-            let symbols = queries::get_package_symbols(conn, &pkg.name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-            if !symbols.is_empty() {
-                let mut kind_counts: HashMap<&str, usize> = HashMap::new();
-                for sym in &symbols {
-                    *kind_counts.entry(&sym.kind).or_default() += 1;
-                }
-                let mut counts: Vec<_> = kind_counts.into_iter().collect();
-                counts.sort_by(|a, b| b.1.cmp(&a.1));
-                let summary: Vec<String> = counts.iter().map(|(k, c)| format!("{c} {k}s")).collect();
-                text.push_str(&format!("- **Symbols:** {}\n", summary.join(", ")));
-            }
-
-            // File count
-            let files = queries::list_package_files(conn, &pkg.name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-            if !files.is_empty() {
-                text.push_str(&format!("- **Files:** {}\n", files.len()));
-            }
-            text.push('\n');
-        }
-    }
-
-    Ok(GetPromptResult {
-        description: Some(format!("Area exploration for \"{path}\"")),
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    })
-}
-
-fn handle_onboard(conn: &Connection) -> Result<GetPromptResult, PromptError> {
-    let status = queries::index_status(conn).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let all_packages = queries::list_packages(conn, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let ext_dist = queries::extension_distribution(conn).map_err(|e| PromptError::Internal(e.to_string()))?;
-
-    let mut text = String::from("# Repository Overview\n\n");
-
-    // Index status
-    text.push_str("## Index Status\n\n");
-    if let Some(t) = &status.indexed_at {
-        text.push_str(&format!("- **Indexed at:** {t}\n"));
-    }
-    if let Some(c) = &status.git_commit {
-        text.push_str(&format!("- **Git commit:** {c}\n"));
-    }
-    if let Some(n) = &status.package_count {
-        text.push_str(&format!("- **Packages:** {n}\n"));
-    }
-    if let Some(n) = &status.symbol_count {
-        text.push_str(&format!("- **Symbols:** {n}\n"));
-    }
-    if let Some(n) = &status.file_count {
-        text.push_str(&format!("- **Files:** {n}\n"));
-    }
-    if let Some(ms) = &status.total_duration_ms {
-        text.push_str(&format!("- **Build duration:** {ms}ms\n"));
-    }
-    text.push('\n');
-
-    // Packages by kind
-    let mut by_kind: HashMap<&str, Vec<&queries::PackageRow>> = HashMap::new();
-    for pkg in &all_packages {
-        by_kind.entry(&pkg.kind).or_default().push(pkg);
-    }
-    let mut kinds: Vec<_> = by_kind.keys().copied().collect();
-    kinds.sort();
-
-    text.push_str("## Packages by ecosystem\n\n");
-    if kinds.is_empty() {
-        text.push_str("No packages indexed.\n\n");
-    } else {
-        for kind in &kinds {
-            let pkgs = &by_kind[kind];
-            text.push_str(&format!("### {} ({})\n\n", kind, pkgs.len()));
-            for pkg in pkgs {
-                let desc = pkg.description.as_deref().unwrap_or("");
-                if desc.is_empty() {
-                    text.push_str(&format!("- **{}** — `{}`\n", pkg.name, pkg.path));
-                } else {
-                    text.push_str(&format!("- **{}** — `{}` — {}\n", pkg.name, pkg.path, desc));
-                }
-            }
-            text.push('\n');
-        }
-    }
-
-    // File extension distribution
-    if !ext_dist.is_empty() {
-        text.push_str("## File types\n\n");
-        text.push_str("| Extension | Count |\n|---|---|\n");
-        for ext in &ext_dist {
-            text.push_str(&format!("| .{} | {} |\n", ext.extension, ext.count));
-        }
-        text.push('\n');
-    }
-
-    Ok(GetPromptResult {
-        description: Some("Repository onboarding overview".into()),
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    })
-}
-
 fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let name = require_arg(args, "name")?;
 
@@ -482,106 +325,3 @@ fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> 
     })
 }
 
-fn handle_understand_dependency(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
-    let from = require_arg(args, "from")?;
-    let to = require_arg(args, "to")?;
-
-    // Get both packages
-    let from_pkg = queries::get_package(conn, from)
-        .map_err(|e| PromptError::Internal(e.to_string()))?
-        .ok_or_else(|| PromptError::NotFound(format!("Package '{from}' not found")))?;
-    let to_pkg = queries::get_package(conn, to)
-        .map_err(|e| PromptError::Internal(e.to_string()))?
-        .ok_or_else(|| PromptError::NotFound(format!("Package '{to}' not found")))?;
-
-    // Get full dependency graph from `from` and filter to paths reaching `to`
-    let all_edges = queries::dependency_graph(conn, from, 10, false).map_err(|e| PromptError::Internal(e.to_string()))?;
-
-    // BFS backwards from `to` through the edges to find all paths
-    let mut reaches_target: HashSet<&str> = HashSet::new();
-    reaches_target.insert(to);
-
-    // Iterate until stable — mark nodes that can reach `to`
-    loop {
-        let before = reaches_target.len();
-        for edge in &all_edges {
-            if reaches_target.contains(edge.to.as_str()) {
-                reaches_target.insert(&edge.from);
-            }
-        }
-        if reaches_target.len() == before {
-            break;
-        }
-    }
-
-    let relevant_edges: Vec<_> = all_edges.iter().filter(|e| {
-        reaches_target.contains(e.from.as_str()) && reaches_target.contains(e.to.as_str())
-    }).collect();
-
-    let mut text = format!("# Dependency path: {} → {}\n\n", from, to);
-
-    // Package summaries
-    text.push_str("## Source package\n\n");
-    text.push_str(&format!("- **{}** ({}) — `{}`\n", from_pkg.name, from_pkg.kind, from_pkg.path));
-    if let Some(d) = &from_pkg.description {
-        text.push_str(&format!("- {d}\n"));
-    }
-    text.push('\n');
-
-    text.push_str("## Target package\n\n");
-    text.push_str(&format!("- **{}** ({}) — `{}`\n", to_pkg.name, to_pkg.kind, to_pkg.path));
-    if let Some(d) = &to_pkg.description {
-        text.push_str(&format!("- {d}\n"));
-    }
-    text.push('\n');
-
-    // Path
-    if relevant_edges.is_empty() {
-        text.push_str("## No dependency path found\n\n");
-        text.push_str(&format!("{from} does not depend on {to} (directly or transitively).\n"));
-    } else {
-        text.push_str(&format!("## Dependency edges ({})\n\n", relevant_edges.len()));
-        for edge in &relevant_edges {
-            text.push_str(&format!("- {} → {} ({})\n", edge.from, edge.to, edge.dep_kind));
-        }
-        text.push('\n');
-
-        // Intermediate packages
-        let intermediates: Vec<&str> = reaches_target.iter()
-            .filter(|n| **n != from && **n != to)
-            .copied()
-            .collect();
-        if !intermediates.is_empty() {
-            text.push_str(&format!("## Intermediate packages ({})\n\n", intermediates.len()));
-            for name in &intermediates {
-                match queries::get_package(conn, name) {
-                    Ok(Some(pkg)) => {
-                        let desc = pkg.description.as_deref().unwrap_or("");
-                        text.push_str(&format!("- **{}** ({}) — `{}`", pkg.name, pkg.kind, pkg.path));
-                        if !desc.is_empty() {
-                            text.push_str(&format!(" — {desc}"));
-                        }
-                        text.push('\n');
-                    }
-                    Ok(None) => {
-                        text.push_str(&format!("- **{name}**\n"));
-                    }
-                    Err(e) => {
-                        return Err(PromptError::Internal(
-                            format!("Failed to look up package '{name}': {e}"),
-                        ));
-                    }
-                }
-            }
-            text.push('\n');
-        }
-    }
-
-    Ok(GetPromptResult {
-        description: Some(format!("Dependency path from \"{from}\" to \"{to}\"")),
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    })
-}

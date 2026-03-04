@@ -42,14 +42,12 @@ impl ServerHandler for tools::ShireService {
                  - `search_files` — find files by path or name\n\
                  - `get_file_symbols` — list all symbols in a file (functions, classes, types). Use to understand \
                  a file's exports without reading the entire file\n\
-                 - `get_package_symbols` — list a package's full public API\n\
                  - `list_package_files` — list files in a package, optionally filtered by extension\n\
                  - `explore` — broad semantic search across packages, symbols, and files for a concept. \
-                 Returns a structured context map. Use when exploring unfamiliar code\n\
-                 - `explore_package` — deep dive into a package: metadata, deps, dependents, API, files\n\n\
+                 Returns a structured context map. Use when exploring unfamiliar code\n\n\
                  ## Dependency graph (unique to Shire)\n\n\
-                 - `package_dependencies` / `package_dependents` — navigate the dependency graph\n\
-                 - `impact_analysis` — blast radius analysis: what breaks if a package changes?\n\n\
+                 - `package_dependencies` / `package_dependents` — navigate the dependency graph. \
+                 Set depth>1 on package_dependencies for transitive graph\n\n\
                  ## When to fall back to Grep/Glob\n\n\
                  Use Grep when searching for literal strings, log messages, or content inside function bodies. \
                  Shire indexes symbol definitions, not implementations."

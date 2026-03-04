@@ -21,7 +21,7 @@ Use Shire tools before falling back to Grep/Glob:
 - **Find a package:** `search_packages` — searches by name or description
 - **Explore a concept:** `explore` — broad semantic search returning a structured context map
 - **Understand a file:** `get_file_symbols` — list all symbols without reading the file
-- **Understand a package:** `explore_package` — metadata, deps, API surface, files
+- **Understand a package's API:** `search_symbols` with a package filter — list all exported symbols
 
 ## Use Grep/Glob when
 
@@ -32,7 +32,7 @@ Use Shire tools before falling back to Grep/Glob:
 ## Before modifying shared code
 
 - `package_dependents` — check what depends on the package you're changing
-- `impact_analysis` — full blast radius with transitive dependents
+- `package_dependencies` with depth>1 — see the full transitive dependency chain
 "#;
 
 /// Escape special characters for TOML string values.
@@ -49,6 +49,7 @@ pub struct InitOptions {
     pub db_path: String,
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
+    pub generate_rules: bool,
     /// When true, skip interactive prompts for existing files.
     pub non_interactive: bool,
 }
@@ -60,6 +61,7 @@ impl InitOptions {
             db_path: ".shire/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            generate_rules: true,
             non_interactive: true,
         }
     }
@@ -70,6 +72,7 @@ impl InitOptions {
             db_path: "~/.claude/shire/{repo}/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            generate_rules: true,
             non_interactive: true,
         }
     }
@@ -119,11 +122,18 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(false)
         .interact()?;
 
+    // 5. Generate .claude/rules/shire.md
+    let generate_rules = Confirm::new()
+        .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
+        .default(true)
+        .interact()?;
+
     Ok(InitOptions {
         use_hook,
         db_path,
         extra_excludes,
         rag_enabled,
+        generate_rules,
         non_interactive: false,
     })
 }
@@ -224,8 +234,10 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     }
 
     // 4. Write .claude/rules/shire.md
-    let rules_dir = root.join(".claude/rules");
-    write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
+    if opts.generate_rules {
+        let rules_dir = root.join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
+    }
 
     if opts.use_hook {
         println!("\nNext: run `shire build` in this repo to create the index.");
@@ -306,8 +318,10 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     }
 
     // 4. Write ~/.claude/rules/shire.md
-    let rules_dir = claude_dir.join("rules");
-    write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
+    if opts.generate_rules {
+        let rules_dir = claude_dir.join("rules");
+        write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
+    }
 
     if opts.use_hook {
         println!("\nNext: run `shire build` in each repo you want to index.");
@@ -875,6 +889,7 @@ mod tests {
             db_path: "/custom/path.db".into(),
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
+            generate_rules: true,
             non_interactive: true,
         };
         let toml = generate_config_toml(&opts, false);

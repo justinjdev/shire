@@ -178,9 +178,14 @@ impl ShireService {
     ) -> Result<Vec<queries::SymbolRow>, ErrorData> {
         use std::collections::HashMap;
 
+        let query_text = params.query.as_deref().unwrap_or("");
+        if query_text.is_empty() {
+            return Ok(fts_results.to_vec());
+        }
+
         // Embed the query
         let query_embeddings = embedder
-            .embed(vec![params.query.clone().unwrap_or_default()])
+            .embed(vec![query_text.to_string()])
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let query_vec = query_embeddings
             .into_iter()
@@ -221,7 +226,8 @@ impl ShireService {
             })
             .collect();
 
-        Ok(queries::rrf_merge(fts_results, &vec_symbols, 50))
+        let limit = params.limit.unwrap_or(20) as usize;
+        Ok(queries::rrf_merge(fts_results, &vec_symbols, limit))
     }
 }
 
@@ -229,6 +235,8 @@ impl ShireService {
 pub struct SearchParams {
     /// Search query
     pub query: String,
+    /// Max results (default 20)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -250,7 +258,7 @@ pub struct DependentsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {
-    /// Filter by package kind
+    /// Filter by package kind: "npm", "go", "cargo", "python", "maven", "gradle", "perl", "ruby"
     pub kind: Option<String>,
 }
 
@@ -260,15 +268,17 @@ pub struct SearchSymbolsParams {
     pub query: Option<String>,
     /// Filter to a specific package
     pub package: Option<String>,
-    /// Filter by symbol kind
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
     pub kind: Option<String>,
+    /// Max results (default 20)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetFileSymbolsParams {
     /// File path relative to repo root
     pub file_path: String,
-    /// Filter by symbol kind
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
     pub kind: Option<String>,
 }
 
@@ -294,14 +304,15 @@ impl ShireService {
             )]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::search_packages(&conn, &params.query)
+        let limit = params.limit.unwrap_or(20);
+        let results = queries::search_packages(&conn, &params.query, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string(&results)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List a package's dependencies. Set depth>1 for transitive graph.")]
+    #[tool(description = "List a package's dependencies. Set depth>1 for transitive graph (returns edge list with different schema).")]
     fn package_dependencies(
         &self,
         Parameters(params): Parameters<DepsParams>,
@@ -361,6 +372,7 @@ impl ShireService {
         Parameters(params): Parameters<SearchSymbolsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.maybe_rebuild();
+        let limit = params.limit.unwrap_or(20);
         let query = params.query.as_deref().unwrap_or("").trim();
         if query.is_empty() {
             // No query: list all symbols in a package
@@ -384,6 +396,7 @@ impl ShireService {
             query,
             params.package.as_deref(),
             params.kind.as_deref(),
+            limit,
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 

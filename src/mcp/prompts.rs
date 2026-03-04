@@ -66,8 +66,8 @@ fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a s
 fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let query = require_arg(args, "query")?;
 
-    let packages = queries::search_packages(conn, query).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let symbols = queries::search_symbols(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let packages = queries::search_packages(conn, query, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let symbols = queries::search_symbols(conn, query, None, None, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
     let files = queries::search_files(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Codebase exploration: \"{query}\"\n\n");

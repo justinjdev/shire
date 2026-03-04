@@ -36,8 +36,8 @@ src/
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 13 tool handlers
-│   └── prompts.rs   # 6 prompt templates for semantic codebase exploration
+│   ├── tools.rs     # 8 tool handlers
+│   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)

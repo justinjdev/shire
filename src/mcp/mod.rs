@@ -32,7 +32,7 @@ impl ServerHandler for tools::ShireService {
             instructions: Some(
                 "Shire indexes monorepo packages and their dependency graph. \
                  Use search_packages to find packages, package_dependencies/package_dependents \
-                 to navigate the graph (set depth=N on package_dependencies for transitive traversal). \
+                 to navigate the graph, and search_symbols to find or list symbols. \
                  Use prompts for semantic codebase exploration: 'explore' a concept, \
                  'explore-package' for a deep dive, or 'impact-analysis' to understand blast radius."
                     .into(),

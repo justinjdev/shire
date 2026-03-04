@@ -53,7 +53,7 @@ pub struct SymbolRow {
     pub parameters: Option<String>,
 }
 
-/// FTS5 search across symbol names and signatures. Returns up to 50 results.
+/// FTS5 search across symbol names and signatures. Returns up to 20 results.
 pub fn search_symbols(
     conn: &Connection,
     query: &str,
@@ -72,7 +72,7 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string())],
         ),
         (Some(pkg), None) => (
@@ -81,7 +81,7 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
         ),
         (None, Some(kind)) => (
@@ -90,7 +90,7 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.kind = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string())],
         ),
         (None, None) => (
@@ -99,7 +99,7 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
         ),
     };
@@ -309,7 +309,7 @@ pub struct FileRow {
     pub size_bytes: i64,
 }
 
-/// FTS5 search across file paths. Returns up to 50 results.
+/// FTS5 search across file paths. Returns up to 20 results.
 pub fn search_files(
     conn: &Connection,
     query: &str,
@@ -327,7 +327,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2 AND f.extension = ?3
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string())],
         ),
         (Some(pkg), None) => (
@@ -335,7 +335,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
         ),
         (None, Some(ext)) => (
@@ -343,7 +343,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.extension = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string())],
         ),
         (None, None) => (
@@ -351,7 +351,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
         ),
     };

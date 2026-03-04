@@ -12,6 +12,7 @@ This creates:
 - `~/.claude/shire.toml` — shared config with `db_path = "~/.claude/shire/{repo}/index.db"` (auto-namespaced per repo)
 - `mcpServers.shire` in `~/.claude/settings.json` — serves the index via `shire serve --config ~/.claude/shire.toml`
 - `PostToolUse` hook — auto-rebuilds the index after file edits (`Edit`, `Write`, `NotebookEdit`, `Bash`)
+- `~/.claude/rules/shire.md` — [rules file](#rules-file) guiding Claude Code to prefer Shire tools
 
 The `{repo}` placeholder is replaced with the repository directory name at runtime, so each repo gets its own index file automatically.
 
@@ -22,6 +23,12 @@ shire build
 ```
 
 The index is ready. Claude Code will automatically use it via the MCP server.
+
+## Rules file
+
+`shire init` creates `.claude/rules/shire.md` (or `~/.claude/rules/shire.md` for global setup) with guidance on when to use Shire tools vs Grep/Glob. This helps Claude Code default to Shire for codebase searches, so you spend fewer tool calls on broad exploration.
+
+The file is only written once — if it already exists, `shire init` leaves it untouched, so your customizations are preserved.
 
 ## Project-level setup
 

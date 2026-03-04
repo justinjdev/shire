@@ -290,6 +290,22 @@ pub struct ListPackageFilesParams {
     pub extension: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchFilesParams {
+    /// Search query to find files by path or name
+    pub query: String,
+    /// Filter to files from a specific package
+    pub package: Option<String>,
+    /// Filter by file extension (e.g., "ts", "go", "rs")
+    pub extension: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExploreParams {
+    /// Concept to explore (e.g. "authentication", "error handling", "messaging interfaces")
+    pub query: String,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description")]
@@ -466,6 +482,53 @@ impl ShireService {
         let json = serde_json::to_string(&status)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
+    fn search_files(
+        &self,
+        Parameters(params): Parameters<SearchFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::search_files(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            params.extension.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Semantic codebase exploration — search packages, symbols, and files for a concept. Returns a structured context map organized by package. Faster than Grep for broad searches.")]
+    fn explore(
+        &self,
+        Parameters(params): Parameters<ExploreParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let mut args = std::collections::HashMap::new();
+        args.insert("query".into(), params.query);
+        let text = crate::mcp::prompts::call_prompt(&conn, "explore", &args)
+            .map_err(|e| match e {
+                crate::mcp::prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+                crate::mcp::prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
+                crate::mcp::prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
+            })?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
 

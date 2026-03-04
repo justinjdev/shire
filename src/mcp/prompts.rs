@@ -23,24 +23,6 @@ pub fn list() -> Vec<Prompt> {
                 required: Some(true),
             }]),
         ),
-        Prompt::new(
-            "explore-package",
-            Some("Deep dive into a specific package — metadata, internal dependencies, dependents, public API surface, and file tree"),
-            Some(vec![PromptArgument {
-                name: "name".into(),
-                description: Some("Exact package name".into()),
-                required: Some(true),
-            }]),
-        ),
-        Prompt::new(
-            "impact-analysis",
-            Some("Analyze blast radius — what breaks if this package changes? Shows direct and transitive dependents"),
-            Some(vec![PromptArgument {
-                name: "name".into(),
-                description: Some("Package name to analyze impact for".into()),
-                required: Some(true),
-            }]),
-        ),
     ]
 }
 
@@ -51,9 +33,26 @@ pub fn handle(
 ) -> Result<GetPromptResult, PromptError> {
     match name {
         "explore" => handle_explore(conn, args),
-        "explore-package" => handle_explore_package(conn, args),
-        "impact-analysis" => handle_impact_analysis(conn, args),
         _ => Err(PromptError::InvalidParams(format!("Unknown prompt: {name}"))),
+    }
+}
+
+/// Call a prompt handler and extract the markdown text result.
+/// Used by MCP tools that expose prompts as callable tools.
+pub fn call_prompt(
+    conn: &Connection,
+    name: &str,
+    args: &HashMap<String, String>,
+) -> Result<String, PromptError> {
+    let result = handle(conn, name, args)?;
+    let msg = result
+        .messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| PromptError::Internal("Prompt returned no messages".into()))?;
+    match msg.content {
+        PromptMessageContent::Text { text, .. } => Ok(text),
+        _ => Err(PromptError::Internal("Prompt returned non-text content".into())),
     }
 }
 
@@ -157,171 +156,3 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
         }],
     })
 }
-
-fn handle_explore_package(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
-    let name = require_arg(args, "name")?;
-
-    let pkg = queries::get_package(conn, name)
-        .map_err(|e| PromptError::Internal(e.to_string()))?
-        .ok_or_else(|| PromptError::NotFound(format!("Package '{name}' not found")))?;
-
-    let internal_deps = queries::package_dependencies(conn, name, true).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let dependents = queries::package_dependents(conn, name).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let symbols = queries::get_package_symbols(conn, name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let files = queries::list_package_files(conn, name, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-
-    let mut text = format!("# Package: {}\n\n", pkg.name);
-
-    // Metadata
-    text.push_str("## Metadata\n\n");
-    text.push_str(&format!("- **Kind:** {}\n", pkg.kind));
-    text.push_str(&format!("- **Path:** `{}`\n", pkg.path));
-    if let Some(v) = &pkg.version {
-        text.push_str(&format!("- **Version:** {v}\n"));
-    }
-    if let Some(d) = &pkg.description {
-        text.push_str(&format!("- **Description:** {d}\n"));
-    }
-    text.push('\n');
-
-    // Internal dependencies
-    text.push_str(&format!("## Internal dependencies ({})\n\n", internal_deps.len()));
-    if internal_deps.is_empty() {
-        text.push_str("None.\n\n");
-    } else {
-        for dep in &internal_deps {
-            let ver = dep.version_req.as_deref().unwrap_or("");
-            text.push_str(&format!("- **{}** ({}) {}\n", dep.dependency, dep.dep_kind, ver));
-        }
-        text.push('\n');
-    }
-
-    // Dependents
-    let internal_dependents: Vec<_> = dependents.iter().filter(|d| d.is_internal).collect();
-    text.push_str(&format!("## Depended on by ({})\n\n", internal_dependents.len()));
-    if internal_dependents.is_empty() {
-        text.push_str("No internal packages depend on this.\n\n");
-    } else {
-        for dep in &internal_dependents {
-            text.push_str(&format!("- **{}** ({})\n", dep.package, dep.dep_kind));
-        }
-        text.push('\n');
-    }
-
-    // Symbols (public API surface)
-    text.push_str(&format!("## Symbols ({})\n\n", symbols.len()));
-    if symbols.is_empty() {
-        text.push_str("No symbols extracted.\n\n");
-    } else {
-        // Group by kind
-        let mut by_kind: HashMap<&str, Vec<&queries::SymbolRow>> = HashMap::new();
-        for sym in &symbols {
-            by_kind.entry(&sym.kind).or_default().push(sym);
-        }
-        let mut kinds: Vec<_> = by_kind.keys().copied().collect();
-        kinds.sort();
-        for kind in kinds {
-            let syms = &by_kind[kind];
-            text.push_str(&format!("### {} ({})\n\n", kind, syms.len()));
-            for sym in syms {
-                let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                text.push_str(&format!("- `{}` — `{}:{}`\n", sig, sym.file_path, sym.line));
-            }
-            text.push('\n');
-        }
-    }
-
-    // Files
-    text.push_str(&format!("## Files ({})\n\n", files.len()));
-    if files.is_empty() {
-        text.push_str("No files indexed.\n\n");
-    } else {
-        for f in &files {
-            text.push_str(&format!("- `{}`\n", f.path));
-        }
-        text.push('\n');
-    }
-
-    Ok(GetPromptResult {
-        description: Some(format!("Deep dive into package \"{name}\"")),
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    })
-}
-
-fn handle_impact_analysis(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
-    let name = require_arg(args, "name")?;
-
-    // Verify the package exists
-    let pkg = queries::get_package(conn, name)
-        .map_err(|e| PromptError::Internal(e.to_string()))?
-        .ok_or_else(|| PromptError::NotFound(format!("Package '{name}' not found")))?;
-
-    let direct_dependents = queries::package_dependents(conn, name).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let reverse_edges = queries::reverse_dependency_graph(conn, name, 10).map_err(|e| PromptError::Internal(e.to_string()))?;
-
-    // Collect all unique transitively affected packages
-    let mut all_affected: HashSet<&str> = HashSet::new();
-    for edge in &reverse_edges {
-        all_affected.insert(&edge.from);
-    }
-
-    let direct_names: HashSet<&str> = direct_dependents.iter().map(|d| d.package.as_str()).collect();
-    let transitive_only: Vec<&str> = all_affected.iter().filter(|n| !direct_names.contains(**n)).copied().collect();
-
-    let mut text = format!("# Impact analysis: {}\n\n", pkg.name);
-
-    text.push_str(&format!("- **Path:** `{}`\n", pkg.path));
-    text.push_str(&format!("- **Kind:** {}\n", pkg.kind));
-    if let Some(d) = &pkg.description {
-        text.push_str(&format!("- **Description:** {d}\n"));
-    }
-    text.push('\n');
-
-    // Direct dependents
-    text.push_str(&format!("## Direct dependents ({})\n\n", direct_dependents.len()));
-    if direct_dependents.is_empty() {
-        text.push_str("No packages directly depend on this.\n\n");
-    } else {
-        for dep in &direct_dependents {
-            let internal = if dep.is_internal { "" } else { " (external)" };
-            text.push_str(&format!("- **{}** ({}){}\n", dep.package, dep.dep_kind, internal));
-        }
-        text.push('\n');
-    }
-
-    // Transitive-only dependents
-    if !transitive_only.is_empty() {
-        text.push_str(&format!("## Transitive dependents ({})\n\n", transitive_only.len()));
-        text.push_str("These packages don't depend directly but are affected through the dependency chain:\n\n");
-        for name in &transitive_only {
-            text.push_str(&format!("- **{name}**\n"));
-        }
-        text.push('\n');
-    }
-
-    // Full blast radius
-    text.push_str("## Blast radius\n\n");
-    text.push_str(&format!("- **Direct:** {}\n", direct_dependents.len()));
-    text.push_str(&format!("- **Transitive:** {}\n", transitive_only.len()));
-    text.push_str(&format!("- **Total affected:** {}\n", all_affected.len()));
-
-    if !reverse_edges.is_empty() {
-        text.push_str("\n## Dependency chain\n\n");
-        for edge in &reverse_edges {
-            text.push_str(&format!("- {} → {} ({})\n", edge.from, edge.to, edge.dep_kind));
-        }
-        text.push('\n');
-    }
-
-    Ok(GetPromptResult {
-        description: Some(format!("Impact analysis for \"{name}\"")),
-        messages: vec![PromptMessage {
-            role: PromptMessageRole::User,
-            content: PromptMessageContent::text(text),
-        }],
-    })
-}
-

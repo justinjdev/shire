@@ -30,11 +30,27 @@ impl ServerHandler for tools::ShireService {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             instructions: Some(
-                "Shire indexes monorepo packages and their dependency graph. \
-                 Use search_packages to find packages, package_dependencies/package_dependents \
-                 to navigate the graph, and search_symbols to find or list symbols. \
-                 Use prompts for semantic codebase exploration: 'explore' a concept, \
-                 'explore-package' for a deep dive, or 'impact-analysis' to understand blast radius."
+                "Shire is a pre-built search index for codebases. It indexes packages, symbols \
+                 (functions, classes, types, methods), files, and the dependency graph into SQLite \
+                 with FTS5 full-text search.\n\n\
+                 ## When to use Shire\n\n\
+                 **Default to Shire for codebase search.** Index lookups are faster than scanning files \
+                 with Grep/Glob and return structured results (symbol kind, signature, file path, line number).\n\n\
+                 - `search_symbols` — find functions, classes, types by name or signature. Use instead of Grep \
+                 for \"where is function X defined?\" or \"what functions match pattern Y?\"\n\
+                 - `search_packages` — find packages by name or description\n\
+                 - `search_files` — find files by path or name\n\
+                 - `get_file_symbols` — list all symbols in a file (functions, classes, types). Use to understand \
+                 a file's exports without reading the entire file\n\
+                 - `list_package_files` — list files in a package, optionally filtered by extension\n\
+                 - `explore` — broad semantic search across packages, symbols, and files for a concept. \
+                 Returns a structured context map. Use when exploring unfamiliar code\n\n\
+                 ## Dependency graph (unique to Shire)\n\n\
+                 - `package_dependencies` / `package_dependents` — navigate the dependency graph. \
+                 Set depth>1 on package_dependencies for transitive graph\n\n\
+                 ## When to fall back to Grep/Glob\n\n\
+                 Use Grep when searching for literal strings, log messages, or content inside function bodies. \
+                 Shire indexes symbol definitions, not implementations."
                     .into(),
             ),
         }

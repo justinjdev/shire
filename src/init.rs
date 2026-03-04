@@ -7,6 +7,34 @@ use std::path::{Path, PathBuf};
 
 use crate::config::default_exclude;
 
+const RULES_CONTENT: &str = r#"# Shire — codebase search index
+
+Shire provides a pre-built search index (FTS5 + optional vector search) for this codebase.
+It indexes packages, symbols, files, and the dependency graph.
+
+## Default to Shire for search
+
+Use Shire tools before falling back to Grep/Glob:
+
+- **Find a function/class/type:** `search_symbols` — returns structured results with signature, file path, and line number
+- **Find a file:** `search_files` — searches by path or name
+- **Find a package:** `search_packages` — searches by name or description
+- **Explore a concept:** `explore` — broad semantic search returning a structured context map
+- **Understand a file:** `get_file_symbols` — list all symbols without reading the file
+- **Understand a package's API:** `search_symbols` with a package filter — list all exported symbols
+
+## Use Grep/Glob when
+
+- Searching for literal strings, log messages, or error text
+- Searching inside function bodies (Shire indexes definitions, not implementations)
+- Pattern matching on file contents
+
+## Before modifying shared code
+
+- `package_dependents` — check what depends on the package you're changing
+- `package_dependencies` with depth>1 — see the full transitive dependency chain
+"#;
+
 /// Escape special characters for TOML string values.
 fn escape_toml_string(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -21,6 +49,7 @@ pub struct InitOptions {
     pub db_path: String,
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
+    pub generate_rules: bool,
     /// When true, skip interactive prompts for existing files.
     pub non_interactive: bool,
 }
@@ -32,6 +61,7 @@ impl InitOptions {
             db_path: ".shire/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            generate_rules: true,
             non_interactive: true,
         }
     }
@@ -42,6 +72,7 @@ impl InitOptions {
             db_path: "~/.claude/shire/{repo}/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            generate_rules: true,
             non_interactive: true,
         }
     }
@@ -91,11 +122,18 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(false)
         .interact()?;
 
+    // 5. Generate .claude/rules/shire.md
+    let generate_rules = Confirm::new()
+        .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
+        .default(true)
+        .interact()?;
+
     Ok(InitOptions {
         use_hook,
         db_path,
         extra_excludes,
         rag_enabled,
+        generate_rules,
         non_interactive: false,
     })
 }
@@ -195,6 +233,12 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         patch_claude_hooks(&settings_path, ".claude/settings.json", "shire init")?;
     }
 
+    // 4. Write .claude/rules/shire.md
+    if opts.generate_rules {
+        let rules_dir = root.join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
+    }
+
     if opts.use_hook {
         println!("\nNext: run `shire build` in this repo to create the index.");
     } else {
@@ -271,6 +315,12 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     if opts.use_hook {
         let settings_path = claude_dir.join("settings.json");
         patch_claude_hooks(&settings_path, "~/.claude/settings.json", "shire init --global")?;
+    }
+
+    // 4. Write ~/.claude/rules/shire.md
+    if opts.generate_rules {
+        let rules_dir = claude_dir.join("rules");
+        write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
     }
 
     if opts.use_hook {
@@ -460,6 +510,21 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     Ok(())
 }
 
+/// Write .claude/rules/shire.md with Shire usage guidance.
+fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
+    fs::create_dir_all(rules_dir)
+        .with_context(|| format!("Failed to create directory {}", rules_dir.display()))?;
+    let rules_path = rules_dir.join("shire.md");
+    if rules_path.exists() {
+        println!("{display_path} already exists, skipping");
+        return Ok(());
+    }
+    fs::write(&rules_path, RULES_CONTENT)
+        .with_context(|| format!("Failed to write {}", rules_path.display()))?;
+    println!("Created {display_path}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +555,12 @@ mod tests {
         let settings: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(settings["hooks"]["PostToolUse"].is_array());
+
+        // .claude/rules/shire.md created
+        let rules_path = dir.path().join(".claude/rules/shire.md");
+        assert!(rules_path.exists());
+        let content = fs::read_to_string(&rules_path).unwrap();
+        assert!(content.contains("Default to Shire for search"));
     }
 
     #[test]
@@ -605,6 +676,12 @@ mod tests {
         let settings: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(settings["hooks"]["PostToolUse"].is_array());
+
+        // ~/.claude/rules/shire.md created
+        let rules_path = claude_dir.join("rules/shire.md");
+        assert!(rules_path.exists());
+        let content = fs::read_to_string(&rules_path).unwrap();
+        assert!(content.contains("Default to Shire for search"));
     }
 
     #[test]
@@ -812,6 +889,7 @@ mod tests {
             db_path: "/custom/path.db".into(),
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
+            generate_rules: true,
             non_interactive: true,
         };
         let toml = generate_config_toml(&opts, false);
@@ -820,5 +898,20 @@ mod tests {
         assert!(toml.contains("\"gen\""));
         assert!(toml.contains("[rag]"));
         assert!(toml.contains("enabled = true"));
+    }
+
+    #[test]
+    fn test_init_rules_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_init(dir.path(), false, true).unwrap();
+
+        // Modify the rules file
+        let rules_path = dir.path().join(".claude/rules/shire.md");
+        fs::write(&rules_path, "custom content").unwrap();
+
+        // Re-run init — should not overwrite
+        run_init(dir.path(), false, true).unwrap();
+        let content = fs::read_to_string(&rules_path).unwrap();
+        assert_eq!(content, "custom content");
     }
 }

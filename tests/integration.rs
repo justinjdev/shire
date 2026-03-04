@@ -15,6 +15,18 @@ fn cargo_bin() -> std::path::PathBuf {
     path
 }
 
+fn cargo_bin_rag() -> std::path::PathBuf {
+    let status = Command::new("cargo")
+        .args(["build", "--features", "rag"])
+        .status()
+        .expect("Failed to build with rag feature");
+    assert!(status.success());
+
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("target/debug/shire");
+    path
+}
+
 fn create_fixture_monorepo(dir: &Path) {
     // npm packages
     let auth = dir.join("services/auth");
@@ -1794,4 +1806,98 @@ exclude_extensions = [".proto"]
         )
         .unwrap();
     assert_eq!(count, 0, "Proto symbols should be excluded by config");
+}
+
+// RAG integration tests — require network for model download on first run.
+// Run with: cargo test --test integration rag -- --ignored
+
+#[test]
+#[ignore]
+fn test_rag_build_populates_embeddings() {
+    let bin = cargo_bin_rag();
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    // Write config with RAG enabled
+    fs::File::create(dir.path().join("shire.toml"))
+        .unwrap()
+        .write_all(
+            br#"
+[rag]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // Verify symbol_embeddings table exists and is populated
+    let embed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_embeddings",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        embed_count > 0,
+        "Expected symbol_embeddings to be populated, got {embed_count}"
+    );
+
+    // Verify embedding count roughly matches symbol count
+    let symbol_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        embed_count, symbol_count,
+        "Expected one embedding per symbol: {embed_count} embeddings vs {symbol_count} symbols"
+    );
+
+    eprintln!(
+        "RAG build: {symbol_count} symbols, {embed_count} embeddings"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_rag_disabled_no_embeddings() {
+    let bin = cargo_bin_rag();
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    // No [rag] section → disabled by default
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success());
+
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    // symbol_embeddings table should not exist when RAG is disabled
+    // (vec0 extension is loaded but init_table is skipped)
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbol_embeddings'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0;
+    assert!(
+        !table_exists,
+        "symbol_embeddings should not exist when RAG is disabled"
+    );
 }

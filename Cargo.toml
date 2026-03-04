@@ -36,6 +36,13 @@ tree-sitter-java = "0.23"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-ruby = "0.23"
 shellexpand = "3"
+fastembed = { version = "4", optional = true }
+sqlite-vec = { version = "0.1", optional = true }
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
+
+[features]
+default = []
+rag = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -73,9 +73,9 @@ impl ServerHandler for tools::ShireService {
     }
 }
 
-pub async fn run_server(db_path: &Path) -> Result<()> {
+pub async fn run_server(db_path: &Path, rag_config: &crate::config::RagConfig) -> Result<()> {
     let conn = db::open_readonly(db_path)?;
-    let service = tools::ShireService::new(conn);
+    let service = tools::ShireService::new(conn, rag_config);
     let server = service.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())

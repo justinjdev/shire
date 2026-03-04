@@ -9,17 +9,61 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::sync::Mutex;
 
-#[derive(Debug)]
 pub struct ShireService {
     pub(crate) conn: Mutex<Connection>,
     pub tool_router: ToolRouter<ShireService>,
+    #[cfg(feature = "rag")]
+    rag_embedder: Option<crate::rag::embedder::Embedder>,
+}
+
+impl std::fmt::Debug for ShireService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ShireService");
+        d.field("conn", &self.conn);
+        d.field("tool_router", &self.tool_router);
+        #[cfg(feature = "rag")]
+        d.field("rag_embedder", &self.rag_embedder.as_ref().map(|_| "Embedder(...)"));
+        d.finish()
+    }
 }
 
 impl ShireService {
-    pub fn new(conn: Connection) -> Self {
+    pub fn new(conn: Connection, rag_config: &crate::config::RagConfig) -> Self {
+        #[cfg(feature = "rag")]
+        let rag_embedder = if rag_config.enabled {
+            match crate::rag::embedder::Embedder::new(rag_config) {
+                Ok(e) => {
+                    // Verify vector table exists before enabling hybrid search
+                    let table_exists = conn
+                        .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0")
+                        .is_ok();
+                    if !table_exists {
+                        eprintln!(
+                            "Warning: RAG enabled but symbol_embeddings table not found. \
+                             Run `shire build` with [rag] enabled to generate embeddings."
+                        );
+                        None
+                    } else {
+                        Some(e)
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Warning: RAG embedder init failed: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "rag"))]
+        let _ = rag_config;
+
         Self {
             conn: Mutex::new(conn),
             tool_router: Self::tool_router(),
+            #[cfg(feature = "rag")]
+            rag_embedder,
         }
     }
 
@@ -29,6 +73,62 @@ impl ShireService {
             message: Cow::from(msg),
             data: None,
         }
+    }
+
+    /// Merge FTS5 and vector search results using Reciprocal Rank Fusion (RRF).
+    #[cfg(feature = "rag")]
+    fn hybrid_search(
+        conn: &Connection,
+        embedder: &crate::rag::embedder::Embedder,
+        params: &SearchSymbolsParams,
+        fts_results: &[queries::SymbolRow],
+    ) -> Result<Vec<queries::SymbolRow>, ErrorData> {
+        use std::collections::HashMap;
+
+        // Embed the query
+        let query_embeddings = embedder
+            .embed(vec![params.query.clone()])
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let query_vec = query_embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| Self::mcp_err("No embedding returned".into()))?;
+
+        // Vector search
+        let vec_results = crate::rag::storage::search_similar(conn, &query_vec, 50)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+
+        if vec_results.is_empty() {
+            return Ok(fts_results.to_vec());
+        }
+
+        // Fetch symbol rows for vector results; rank order preserved by iterating vec_results below
+        let vec_ids: Vec<i64> = vec_results.iter().map(|(id, _)| *id).collect();
+        let id_symbol_pairs = queries::get_symbols_by_ids(conn, &vec_ids)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let id_to_symbol: HashMap<i64, queries::SymbolRow> =
+            id_symbol_pairs.into_iter().collect();
+
+        // Build filtered vector result list in rank order
+        let vec_symbols: Vec<queries::SymbolRow> = vec_results
+            .iter()
+            .filter_map(|(symbol_id, _)| {
+                let sym = id_to_symbol.get(symbol_id)?;
+                if let Some(ref pkg) = params.package {
+                    if sym.package != *pkg {
+                        return None;
+                    }
+                }
+                if let Some(ref kind) = params.kind {
+                    if sym.kind != *kind {
+                        return None;
+                    }
+                }
+                Some(sym.clone())
+            })
+            .collect();
+
+        Ok(queries::rrf_merge(fts_results, &vec_symbols, 50))
     }
 }
 
@@ -238,13 +338,32 @@ impl ShireService {
             )]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::search_symbols(
+
+        let fts_results = queries::search_symbols(
             &conn,
             &params.query,
             params.package.as_deref(),
             params.kind.as_deref(),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
+
+        #[cfg(feature = "rag")]
+        let results = if let Some(ref embedder) = self.rag_embedder {
+            // Falls back to FTS-only on hybrid search error
+            match Self::hybrid_search(&conn, embedder, &params, &fts_results) {
+                Ok(merged) => merged,
+                Err(e) => {
+                    eprintln!("Warning: hybrid search failed, falling back to FTS-only: {}", e.message);
+                    fts_results
+                }
+            }
+        } else {
+            fts_results
+        };
+
+        #[cfg(not(feature = "rag"))]
+        let results = fts_results;
+
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))

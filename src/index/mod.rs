@@ -1123,7 +1123,7 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
     } else {
         crate::config::resolve_db_path(config, repo_root)?
     };
-    let conn = db::open_or_create(&db_path)?;
+    let conn = db::open_or_create(&db_path, config.rag.enabled)?;
 
     if force {
         with_transaction(&conn, || {
@@ -1266,6 +1266,97 @@ pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: 
         phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions)
     })?;
     timings.push(("extract-symbols", t.elapsed()));
+
+    // Phase 8.5: RAG embedding (optional)
+    #[cfg(feature = "rag")]
+    {
+        if config.rag.enabled {
+            let t = Instant::now();
+            match crate::rag::embedder::Embedder::new(&config.rag) {
+                Ok(embedder) => {
+                    // Get all changed package names
+                    let changed_packages: Vec<&str> = parsed_packages
+                        .iter()
+                        .map(|(name, _, _)| name.as_str())
+                        .collect();
+
+                    if !changed_packages.is_empty() {
+                        // For each changed package, delete old embeddings and regenerate
+                        for pkg_name in &changed_packages {
+                            // Get symbol IDs for this package to delete old embeddings
+                            let old_ids: Vec<i64> = conn
+                                .prepare("SELECT id FROM symbols WHERE package = ?1")?
+                                .query_map([pkg_name], |row| row.get(0))?
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            if !old_ids.is_empty() {
+                                crate::rag::storage::delete_embeddings_for_symbols(
+                                    &conn, &old_ids,
+                                )?;
+                            }
+
+                            // Get full symbol info for embedding
+                            let symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = conn
+                                .prepare(
+                                    "SELECT id, name, kind, signature, package, file_path \
+                                     FROM symbols WHERE package = ?1",
+                                )?
+                                .query_map([pkg_name], |row| {
+                                    Ok(crate::rag::embedder::SymbolForEmbedding {
+                                        id: row.get(0)?,
+                                        name: row.get(1)?,
+                                        kind: row.get(2)?,
+                                        signature: row.get(3)?,
+                                        package: row.get(4)?,
+                                        file_path: row.get(5)?,
+                                    })
+                                })?
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            if !symbols.is_empty() {
+                                match crate::rag::embedder::embed_symbols(&embedder, &symbols) {
+                                    Ok(embeddings) => {
+                                        crate::rag::storage::insert_embeddings(
+                                            &conn, &embeddings,
+                                        )?;
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Warning: Failed to embed symbols for {}: {}",
+                                            pkg_name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        match conn.query_row(
+                            "SELECT COUNT(*) FROM symbol_embeddings",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        ) {
+                            Ok(embed_count) => {
+                                eprintln!(
+                                    "RAG: Embedded symbols for {} package(s) ({} total embeddings)",
+                                    changed_packages.len(),
+                                    embed_count
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Could not count embeddings (table may not exist): {e}"
+                                );
+                            }
+                        }
+                    }
+                    timings.push(("rag-embed", t.elapsed()));
+                }
+                Err(e) => {
+                    eprintln!("Warning: RAG embedding skipped (model init failed): {}", e);
+                }
+            }
+        }
+    }
 
     // Phase 9: Index files (transaction-wrapped)
     let t = Instant::now();

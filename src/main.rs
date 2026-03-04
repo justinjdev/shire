@@ -7,6 +7,7 @@ mod db;
 mod index;
 mod init;
 mod mcp;
+mod rag;
 mod symbols;
 mod watch;
 
@@ -87,6 +88,12 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    #[cfg(feature = "rag")]
+    if let Err(e) = rag::storage::load_extension() {
+        eprintln!("Warning: {e}");
+    }
+
     match cli.command {
         Commands::Build { root, force, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;
@@ -95,10 +102,10 @@ async fn main() -> Result<()> {
         }
         Commands::Serve { db, config: cfg_path } => {
             let root = std::fs::canonicalize(".")?;
+            let cfg = config::load_config_from(cfg_path.as_deref(), &root)?;
             let db_path = if let Some(p) = db {
                 p
             } else {
-                let cfg = config::load_config_from(cfg_path.as_deref(), &root)?;
                 config::resolve_db_path(&cfg, &root)?
             };
             if !db_path.exists() {
@@ -107,7 +114,7 @@ async fn main() -> Result<()> {
                     db_path.display()
                 );
             }
-            mcp::run_server(&db_path).await
+            mcp::run_server(&db_path, &cfg.rag).await
         }
         Commands::Watch {
             root,

@@ -3,13 +3,21 @@ pub mod queries;
 use anyhow::Result;
 use rusqlite::Connection;
 
-pub fn open_or_create(path: &std::path::Path) -> Result<Connection> {
+pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     create_schema(&conn)?;
+
+    #[cfg(feature = "rag")]
+    if rag_enabled {
+        crate::rag::storage::init_table(&conn)?;
+    }
+
+    let _ = rag_enabled;
+
     Ok(conn)
 }
 

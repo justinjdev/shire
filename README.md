@@ -41,6 +41,8 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 `shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
 
+Optionally, shire can augment symbol search with **vector similarity** (RAG). When enabled, symbols are embedded at index time using [fastembed](https://github.com/Anush008/fastembed-rs) (BAAI/bge-small-en-v1.5, fully offline after first model download) and stored via [sqlite-vec](https://github.com/asg017/sqlite-vec). Queries like "find the auth middleware" can then match `verify_jwt_token` even without keyword overlap. Results are merged with FTS5 using Reciprocal Rank Fusion. See [RAG vector search](#rag-vector-search) for setup.
+
 **Supported ecosystems:**
 
 | Manifest | Kind | Workspace support |
@@ -72,6 +74,9 @@ Download the latest release from [GitHub Releases](https://github.com/justinjdev
 
 ```sh
 cargo install --path .
+
+# With RAG vector search support (~30-50MB larger binary due to ONNX Runtime):
+cargo install --path . --features rag
 ```
 
 ## Usage
@@ -95,7 +100,31 @@ shire watch --root /path/to/repo --stop
 
 # Signal a rebuild (from a hook or manually)
 shire rebuild --root /path/to/repo
+
+# Initialize config
+shire init              # project-level shire.toml
+shire init --global     # global ~/.claude/ config for all projects
 ```
+
+### CLI reference
+
+| Command | Flag | Description |
+|---|---|---|
+| `build` | `--root <DIR>` | Repository root (default: `.`) |
+| | `--force` | Full rebuild, ignore cached hashes |
+| | `--db <PATH>` | Database path (overrides `shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`) |
+| `serve` | `--db <PATH>` | Database path (default: `.shire/index.db`) |
+| | `--config <PATH>` | Config file path (default: `./shire.toml`) |
+| `watch` | `--root <DIR>` | Repository root (default: `.`) |
+| | `--stop` | Stop the running daemon |
+| | `--db <PATH>` | Database path (overrides `shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`) |
+| `rebuild` | `--root <DIR>` | Repository root (default: `.`) |
+| | `--file <PATH>` | Specific changed file (repeatable) |
+| | `--stdin` | Read Claude Code hook JSON from stdin |
+| `init` | `--root <DIR>` | Project root (default: `.`) |
+| | `--global` | Set up global config in `~/.claude/` |
 
 The index is written to `.shire/index.db` inside the repo root by default. You can override this with `--db` on the build command or `db_path` in `shire.toml` (see [Configuration](#configuration)). Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build. File indexing is also incremental — a file-tree hash detects structural changes, skipping Phase 9 entirely when no files have been added, removed, or resized. Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput. A per-phase **timing breakdown** is printed to stderr after each build. The server reads from this database in read-only mode.
 
@@ -109,7 +138,7 @@ The index is written to `.shire/index.db` inside the repo root by default. You c
 | `package_dependencies` | What a package depends on (optionally internal-only) |
 | `package_dependents` | Reverse lookup — what depends on this package |
 | `dependency_graph` | Transitive BFS traversal from a root package |
-| `search_symbols` | Full-text search across symbol names and signatures |
+| `search_symbols` | Full-text search across symbol names and signatures (with optional vector similarity when RAG is enabled) |
 | `get_package_symbols` | List all symbols in a package (functions, classes, types, methods) |
 | `get_symbol` | Exact name lookup for a symbol across packages |
 | `get_file_symbols` | List all symbols defined in a specific file |
@@ -243,6 +272,29 @@ description = "Deprecated auth service — do not add new dependencies"
 
 All fields are optional. Defaults are shown above. The `--db` CLI flag takes precedence over `db_path` in config.
 
+### RAG vector search
+
+RAG adds semantic vector search to `search_symbols`. It requires compiling with the `rag` feature flag and enabling it in config.
+
+**Build with RAG support:**
+
+```sh
+cargo install --path . --features rag
+```
+
+**Enable in `shire.toml`:**
+
+```toml
+[rag]
+enabled = true
+# model = "BAAI/bge-small-en-v1.5"   # default, only supported model currently
+# cache_dir = "~/.cache/shire-rag"    # optional, for model file storage
+```
+
+When enabled, `shire build` embeds all symbols after extraction. The first build downloads the model (~33MB) automatically. Subsequent builds are incremental — only changed packages get re-embedded.
+
+RAG is non-fatal: if the model fails to load or embeddings fail, shire falls back to FTS-only search with a warning. If the `rag` feature is not compiled in, the `[rag]` config section is silently ignored.
+
 ### Custom package discovery
 
 For codebases where packages aren't defined by standard manifest files — Go single-module monorepos, repos that use `ownership.yml` + build files, or any non-standard convention — you can define custom discovery rules:
@@ -316,9 +368,13 @@ src/
 │   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
 │   ├── perl.rs      # Perl extractor (regex-based)
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
+├── rag/             # Optional RAG vector search (behind `rag` feature flag)
+│   ├── mod.rs       # Feature-gated module root
+│   ├── embedder.rs  # fastembed wrapper, symbol text formatting, batch embedding
+│   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 13 tool handlers
+│   ├── tools.rs     # 13 tool handlers (+ hybrid search when RAG enabled)
 │   └── prompts.rs   # 6 prompt templates for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

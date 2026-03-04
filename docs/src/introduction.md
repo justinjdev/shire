@@ -40,3 +40,5 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 ## What it does
 
 `shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
+
+Optionally, shire can augment symbol search with **vector similarity** (RAG). When enabled, symbols are embedded at index time using [fastembed](https://github.com/Anush008/fastembed-rs) (BAAI/bge-small-en-v1.5, fully offline after first model download) and stored via [sqlite-vec](https://github.com/asg017/sqlite-vec). Queries like "find the auth middleware" can then match `verify_jwt_token` even without keyword overlap. Results are merged with FTS5 using Reciprocal Rank Fusion. See [Configuration](./configuration.md#rag-vector-search) for setup.

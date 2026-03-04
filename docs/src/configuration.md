@@ -58,3 +58,26 @@ max_depth = 4
 | `extensions` | no | Override which file extensions get symbol extraction |
 
 Custom discovery runs alongside manifest-based discovery. Directories already found by manifest parsers are skipped. Subdirectories of matched directories are also skipped to prevent nested matches.
+
+## RAG vector search
+
+RAG adds semantic vector search to `search_symbols`. It requires compiling with the `rag` feature flag and enabling it in config.
+
+**Build with RAG support:**
+
+```sh
+cargo install --path . --features rag
+```
+
+**Enable in `shire.toml`:**
+
+```toml
+[rag]
+enabled = true
+# model = "BAAI/bge-small-en-v1.5"   # default, only supported model currently
+# cache_dir = "~/.cache/shire-rag"    # optional, for model file storage
+```
+
+When enabled, `shire build` embeds all symbols after extraction. The first build downloads the model (~33MB) automatically. Subsequent builds are incremental — only changed packages get re-embedded.
+
+RAG is non-fatal: if the model fails to load or embeddings fail, shire falls back to FTS-only search with a warning. If the `rag` feature is not compiled in, the `[rag]` config section is silently ignored.

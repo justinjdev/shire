@@ -34,9 +34,13 @@ src/
 │   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
 │   ├── perl.rs      # Perl extractor (regex-based)
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
+├── rag/             # Optional RAG vector search (behind `rag` feature flag)
+│   ├── mod.rs       # Feature-gated module root
+│   ├── embedder.rs  # fastembed wrapper, symbol text formatting, batch embedding
+│   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 8 tool handlers
+│   ├── tools.rs     # 8 tool handlers (+ hybrid search when RAG enabled)
 │   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

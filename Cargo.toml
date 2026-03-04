@@ -1,6 +1,6 @@
 [package]
 name = "shire"
-version = "0.1.8-beta"
+version = "0.1.9-beta"
 edition = "2024"
 description = "One index to rule them all — Search, Hierarchy, Index, Repo Explorer, a monorepo MCP-first indexer"
 license = "Apache-2.0"

@@ -54,21 +54,6 @@ impl SymbolKind {
             SymbolKind::Constant => "constant",
         }
     }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "function" => Some(SymbolKind::Function),
-            "class" => Some(SymbolKind::Class),
-            "struct" => Some(SymbolKind::Struct),
-            "interface" => Some(SymbolKind::Interface),
-            "type" => Some(SymbolKind::Type),
-            "enum" => Some(SymbolKind::Enum),
-            "trait" => Some(SymbolKind::Trait),
-            "method" => Some(SymbolKind::Method),
-            "constant" => Some(SymbolKind::Constant),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

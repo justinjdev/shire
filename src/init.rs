@@ -7,6 +7,15 @@ use std::path::{Path, PathBuf};
 
 use crate::config::default_exclude;
 
+/// Escape special characters for TOML string values.
+fn escape_toml_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 pub struct InitOptions {
     pub use_hook: bool,
     pub db_path: String,
@@ -102,16 +111,7 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
     }
     lines.push(String::new());
 
-    let default_db = if global {
-        "~/.claude/shire/{repo}/index.db"
-    } else {
-        ".shire/index.db"
-    };
-    if opts.db_path != default_db {
-        lines.push(format!("db_path = \"{}\"", opts.db_path));
-    } else {
-        lines.push(format!("db_path = \"{}\"", opts.db_path));
-    }
+    lines.push(format!("db_path = \"{}\"", escape_toml_string(&opts.db_path)));
     lines.push(String::new());
 
     if !opts.extra_excludes.is_empty() {
@@ -122,7 +122,7 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
             }
         }
         lines.push("[discovery]".into());
-        let quoted: Vec<String> = all_excludes.iter().map(|e| format!("\"{}\"", e)).collect();
+        let quoted: Vec<String> = all_excludes.iter().map(|e| format!("\"{}\"", escape_toml_string(e))).collect();
         lines.push(format!("exclude = [{}]", quoted.join(", ")));
         lines.push(String::new());
     }
@@ -155,7 +155,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     let config_path = root.join("shire.toml");
     let config_exists = config_path.exists();
     let should_write = if config_exists {
-        if yes || !std::io::stdin().is_terminal() {
+        if opts.non_interactive {
             println!("shire.toml already exists, skipping");
             false
         } else {
@@ -255,7 +255,9 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     }
 
     // 2. Write MCP server to ~/.claude.json (user-scoped MCP config)
-    let home = claude_dir.parent().unwrap_or(claude_dir);
+    let home = claude_dir
+        .parent()
+        .context("Cannot determine parent directory of ~/.claude")?;
     let claude_json_path = home.join(".claude.json");
     let serve_args = if opts.use_hook {
         json!(["serve"])

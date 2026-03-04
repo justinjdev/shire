@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -159,8 +159,10 @@ async fn main() -> Result<()> {
             if global {
                 init::run_init_global(no_hook, yes)
             } else {
-                std::fs::create_dir_all(&root)?;
-                let root = std::fs::canonicalize(&root)?;
+                std::fs::create_dir_all(&root)
+                    .with_context(|| format!("Failed to create directory {}", root.display()))?;
+                let root = std::fs::canonicalize(&root)
+                    .with_context(|| format!("Failed to resolve path {}", root.display()))?;
                 init::run_init(&root, no_hook, yes)
             }
         }

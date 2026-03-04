@@ -1368,7 +1368,10 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     {
         if config.rag.enabled {
             let t = Instant::now();
-            match crate::rag::embedder::Embedder::new(&config.rag) {
+            let sp = make_spinner(&mp, "Loading embedding model\u{2026}");
+            let embedder_result = crate::rag::embedder::Embedder::new(&config.rag);
+            sp.finish_and_clear();
+            match embedder_result {
                 Ok(embedder) => {
                     // Get all changed package names
                     let changed_packages: Vec<&str> = parsed_packages
@@ -1377,6 +1380,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                         .collect();
 
                     if !changed_packages.is_empty() {
+                        let pb = make_progress(&mp, changed_packages.len() as u64, "Embedding symbols");
                         // For each changed package, delete old embeddings and regenerate
                         for pkg_name in &changed_packages {
                             // Get symbol IDs for this package to delete old embeddings
@@ -1424,6 +1428,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                                     }
                                 }
                             }
+                            pb.inc(1);
                         }
 
                         match conn.query_row(
@@ -1432,13 +1437,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                             |row| row.get::<_, i64>(0),
                         ) {
                             Ok(embed_count) => {
-                                eprintln!(
-                                    "RAG: Embedded symbols for {} package(s) ({} total embeddings)",
-                                    changed_packages.len(),
-                                    embed_count
-                                );
+                                pb.finish_with_message(format!(
+                                    "Embedded {} symbols across {} packages",
+                                    embed_count, changed_packages.len()
+                                ));
                             }
                             Err(e) => {
+                                pb.finish_and_clear();
                                 eprintln!(
                                     "Warning: Could not count embeddings (table may not exist): {e}"
                                 );

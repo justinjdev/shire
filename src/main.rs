@@ -88,6 +88,9 @@ enum Commands {
         /// Use on-demand reindexing instead of PostToolUse hooks
         #[arg(long)]
         no_hook: bool,
+        /// Skip interactive prompts and use defaults
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 
@@ -152,12 +155,13 @@ async fn main() -> Result<()> {
                 watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())
             }
         }
-        Commands::Init { root, global, no_hook } => {
+        Commands::Init { root, global, no_hook, yes } => {
             if global {
-                init::run_init_global(no_hook)
+                init::run_init_global(no_hook, yes)
             } else {
+                std::fs::create_dir_all(&root)?;
                 let root = std::fs::canonicalize(&root)?;
-                init::run_init(&root, no_hook)
+                init::run_init(&root, no_hook, yes)
             }
         }
         Commands::Rebuild {

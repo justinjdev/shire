@@ -134,19 +134,14 @@ The index is written to `.shire/index.db` inside the repo root by default. You c
 
 | Tool | Description |
 |---|---|
-| `search_packages` | Full-text search across package names, descriptions, and paths |
-| `get_package` | Exact name lookup for a single package |
-| `list_packages` | List all packages, optionally filtered by kind |
-| `package_dependencies` | What a package depends on (optionally internal-only) |
-| `package_dependents` | Reverse lookup — what depends on this package |
-| `dependency_graph` | Transitive BFS traversal from a root package |
-| `search_symbols` | Full-text search across symbol names and signatures (with optional vector similarity when RAG is enabled) |
-| `get_package_symbols` | List all symbols in a package (functions, classes, types, methods) |
-| `get_symbol` | Exact name lookup for a symbol across packages |
+| `search_packages` | Search packages by name or description |
+| `list_packages` | List all indexed packages, optionally filtered by kind |
+| `package_dependencies` | List a package's dependencies (set `depth>1` for transitive graph) |
+| `package_dependents` | Find all packages that depend on this package |
+| `search_symbols` | Search symbols by name or signature; omit query with a package filter to list all symbols in that package |
 | `get_file_symbols` | List all symbols defined in a specific file |
-| `search_files` | Full-text search across file paths, with optional package/extension filter |
-| `list_package_files` | List all files belonging to a package, with optional extension filter |
-| `index_status` | When the index was built, git commit, package/symbol/file counts, build duration |
+| `list_package_files` | List all files in a package, optionally filtered by extension |
+| `index_status` | Index build metadata: timestamp, git commit, counts |
 
 ### MCP prompts
 
@@ -156,10 +151,7 @@ Prompts are pre-built templates for semantic codebase exploration. They compose 
 |---|---|---|
 | `explore` | `query` | Search packages, symbols, and files for a concept — returns a structured context map organized by package |
 | `explore-package` | `name` | Deep dive into a specific package — metadata, internal deps, dependents, public API surface, file tree |
-| `explore-area` | `path` | Explore a directory subtree — packages, files, and symbol summaries under a path prefix |
-| `onboard` | — | Repository overview for onboarding — tech stack, package counts by language, file distribution, index freshness |
 | `impact-analysis` | `name` | Blast radius analysis — direct dependents, transitive dependents, full dependency chain |
-| `understand-dependency` | `from`, `to` | Trace the dependency path between two packages |
 
 ### Claude Code
 
@@ -388,8 +380,8 @@ src/
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 13 tool handlers (+ hybrid search when RAG enabled)
-│   └── prompts.rs   # 6 prompt templates for semantic codebase exploration
+│   ├── tools.rs     # 8 tool handlers (+ hybrid search when RAG enabled)
+│   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)

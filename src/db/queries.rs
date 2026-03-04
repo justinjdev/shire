@@ -53,53 +53,55 @@ pub struct SymbolRow {
     pub parameters: Option<String>,
 }
 
-/// FTS5 search across symbol names and signatures. Returns up to 50 results.
+/// FTS5 search across symbol names and signatures.
 pub fn search_symbols(
     conn: &Connection,
     query: &str,
     package_filter: Option<&str>,
     kind_filter: Option<&str>,
+    limit: u32,
 ) -> Result<Vec<SymbolRow>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
+    let limit = limit.min(200) as i64;
 
     let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
         (Some(pkg), Some(kind)) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
-             LIMIT 50".to_string(),
+             LIMIT {limit}"),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string())],
         ),
         (Some(pkg), None) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             LIMIT 50".to_string(),
+             LIMIT {limit}"),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
         ),
         (None, Some(kind)) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.kind = ?2
-             LIMIT 50".to_string(),
+             LIMIT {limit}"),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string())],
         ),
         (None, None) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             LIMIT 50".to_string(),
+             LIMIT {limit}"),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
         ),
     };
@@ -218,50 +220,6 @@ pub fn get_file_symbols(
     Ok(result)
 }
 
-/// Look up symbols by exact name, optionally scoped to a package.
-pub fn get_symbol(
-    conn: &Connection,
-    name: &str,
-    package_filter: Option<&str>,
-) -> Result<Vec<SymbolRow>> {
-    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match package_filter {
-        Some(pkg) => (
-            "SELECT name, kind, signature, package, file_path, line,
-                    visibility, parent_symbol, return_type, parameters
-             FROM symbols
-             WHERE name = ?1 AND package = ?2",
-            vec![Box::new(name.to_string()), Box::new(pkg.to_string())],
-        ),
-        None => (
-            "SELECT name, kind, signature, package, file_path, line,
-                    visibility, parent_symbol, return_type, parameters
-             FROM symbols
-             WHERE name = ?1",
-            vec![Box::new(name.to_string())],
-        ),
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        Ok(SymbolRow {
-            name: row.get(0)?,
-            kind: row.get(1)?,
-            signature: row.get(2)?,
-            package: row.get(3)?,
-            file_path: row.get(4)?,
-            line: row.get(5)?,
-            visibility: row.get(6)?,
-            parent_symbol: row.get(7)?,
-            return_type: row.get(8)?,
-            parameters: row.get(9)?,
-        })
-    })?;
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
 /// Fetch symbols by their id (primary key). Used by hybrid search to look up
 /// vector search results. Returns results in unspecified order.
 #[allow(dead_code)]
@@ -353,7 +311,7 @@ pub struct FileRow {
     pub size_bytes: i64,
 }
 
-/// FTS5 search across file paths. Returns up to 50 results.
+/// FTS5 search across file paths. Returns up to 20 results.
 pub fn search_files(
     conn: &Connection,
     query: &str,
@@ -371,7 +329,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2 AND f.extension = ?3
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string())],
         ),
         (Some(pkg), None) => (
@@ -379,7 +337,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
         ),
         (None, Some(ext)) => (
@@ -387,7 +345,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.extension = ?2
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string())],
         ),
         (None, None) => (
@@ -395,7 +353,7 @@ pub fn search_files(
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1
-             LIMIT 50".to_string(),
+             LIMIT 20".to_string(),
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
         ),
     };
@@ -454,19 +412,20 @@ pub fn list_package_files(
     Ok(result)
 }
 
-/// FTS5 search across package name, description, and path. Returns up to 20 results.
-pub fn search_packages(conn: &Connection, query: &str) -> Result<Vec<PackageRow>> {
+/// FTS5 search across package name, description, and path.
+pub fn search_packages(conn: &Connection, query: &str, limit: u32) -> Result<Vec<PackageRow>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
     // Sanitize for FTS5: wrap in double quotes, escape internal quotes
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
+    let limit = limit.min(200) as i64;
     let mut stmt = conn.prepare(
-        "SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
+        &format!("SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
          FROM packages_fts f
          JOIN packages p ON p.name = f.name
          WHERE packages_fts MATCH ?1
-         LIMIT 20",
+         LIMIT {limit}"),
     )?;
     let rows = stmt.query_map([&sanitized], |row| {
         Ok(PackageRow {
@@ -707,62 +666,6 @@ pub fn reverse_dependency_graph(
     Ok(edges)
 }
 
-/// Find all packages whose path starts with the given prefix.
-pub fn packages_by_path_prefix(conn: &Connection, prefix: &str) -> Result<Vec<PackageRow>> {
-    let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-    let pattern = format!("{escaped}%");
-    let mut stmt = conn.prepare(
-        "SELECT name, path, kind, version, description, metadata
-         FROM packages
-         WHERE path LIKE ?1 ESCAPE '\\'
-         ORDER BY path
-         LIMIT 50",
-    )?;
-    let rows = stmt.query_map([&pattern], |row| {
-        Ok(PackageRow {
-            name: row.get(0)?,
-            path: row.get(1)?,
-            kind: row.get(2)?,
-            version: row.get(3)?,
-            description: row.get(4)?,
-            metadata: row.get(5)?,
-        })
-    })?;
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExtensionCount {
-    pub extension: String,
-    pub count: i64,
-}
-
-/// Count files grouped by extension, ordered by count descending.
-pub fn extension_distribution(conn: &Connection) -> Result<Vec<ExtensionCount>> {
-    let mut stmt = conn.prepare(
-        "SELECT extension, COUNT(*) as cnt
-         FROM files
-         WHERE extension != ''
-         GROUP BY extension
-         ORDER BY cnt DESC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(ExtensionCount {
-            extension: row.get(0)?,
-            count: row.get(1)?,
-        })
-    })?;
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,7 +730,7 @@ mod tests {
     #[test]
     fn test_search_packages_finds_by_name() {
         let conn = test_db();
-        let results = search_packages(&conn, "auth").unwrap();
+        let results = search_packages(&conn, "auth", 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "auth-service");
     }
@@ -835,7 +738,7 @@ mod tests {
     #[test]
     fn test_search_packages_finds_by_description() {
         let conn = test_db();
-        let results = search_packages(&conn, "TypeScript").unwrap();
+        let results = search_packages(&conn, "TypeScript", 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "shared-types");
     }
@@ -843,7 +746,7 @@ mod tests {
     #[test]
     fn test_search_packages_no_match() {
         let conn = test_db();
-        let results = search_packages(&conn, "nonexistent").unwrap();
+        let results = search_packages(&conn, "nonexistent", 20).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1025,7 +928,7 @@ mod tests {
     #[test]
     fn test_search_symbols_by_name() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "AuthService", None, None).unwrap();
+        let results = search_symbols(&conn, "AuthService", None, None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "AuthService");
         assert_eq!(results[0].package, "auth-service");
@@ -1034,7 +937,7 @@ mod tests {
     #[test]
     fn test_search_symbols_by_signature() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "token", None, None).unwrap();
+        let results = search_symbols(&conn, "token", None, None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
     }
@@ -1042,28 +945,28 @@ mod tests {
     #[test]
     fn test_search_symbols_filter_by_package() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "interface", Some("shared-types"), None).unwrap();
+        let results = search_symbols(&conn, "interface", Some("shared-types"), None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "UserConfig");
 
-        let results = search_symbols(&conn, "interface", Some("auth-service"), None).unwrap();
+        let results = search_symbols(&conn, "interface", Some("auth-service"), None, 20).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_symbols_filter_by_kind() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "AuthService", None, Some("class")).unwrap();
+        let results = search_symbols(&conn, "AuthService", None, Some("class"), 20).unwrap();
         assert_eq!(results.len(), 1);
 
-        let results = search_symbols(&conn, "AuthService", None, Some("function")).unwrap();
+        let results = search_symbols(&conn, "AuthService", None, Some("function"), 20).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_symbols_empty_query() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "", None, None).unwrap();
+        let results = search_symbols(&conn, "", None, None, 20).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1076,22 +979,6 @@ mod tests {
         let results = get_package_symbols(&conn, "auth-service", Some("method")).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
-    }
-
-    #[test]
-    fn test_get_symbol() {
-        let conn = test_db_with_symbols();
-        let results = get_symbol(&conn, "AuthService", None).unwrap();
-        assert_eq!(results.len(), 1);
-
-        let results = get_symbol(&conn, "AuthService", Some("auth-service")).unwrap();
-        assert_eq!(results.len(), 1);
-
-        let results = get_symbol(&conn, "AuthService", Some("shared-types")).unwrap();
-        assert!(results.is_empty());
-
-        let results = get_symbol(&conn, "nonexistent", None).unwrap();
-        assert!(results.is_empty());
     }
 
     fn seed_file_data(conn: &Connection) {
@@ -1208,33 +1095,6 @@ mod tests {
         let conn = test_db();
         let edges = reverse_dependency_graph(&conn, "api-gateway", 10).unwrap();
         assert!(edges.is_empty());
-    }
-
-    #[test]
-    fn test_packages_by_path_prefix() {
-        let conn = test_db();
-        let results = packages_by_path_prefix(&conn, "services/").unwrap();
-        assert_eq!(results.len(), 2);
-        let names: Vec<&str> = results.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"auth-service"));
-        assert!(names.contains(&"api-gateway"));
-    }
-
-    #[test]
-    fn test_packages_by_path_prefix_no_match() {
-        let conn = test_db();
-        let results = packages_by_path_prefix(&conn, "nonexistent/").unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_extension_distribution() {
-        let conn = test_db_with_files();
-        let dist = extension_distribution(&conn).unwrap();
-        assert!(!dist.is_empty());
-        // ts files are most common (3 of them)
-        assert_eq!(dist[0].extension, "ts");
-        assert_eq!(dist[0].count, 3);
     }
 
     fn make_symbol(name: &str, package: &str, line: i64) -> SymbolRow {

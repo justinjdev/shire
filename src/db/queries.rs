@@ -39,7 +39,7 @@ pub struct IndexStatus {
     pub total_duration_ms: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SymbolRow {
     pub name: String,
     pub kind: String,
@@ -260,6 +260,87 @@ pub fn get_symbol(
         result.push(row?);
     }
     Ok(result)
+}
+
+/// Fetch symbols by their rowid (primary key). Used by hybrid search to look up
+/// vector search results. Returns results in unspecified order.
+pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, SymbolRow)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT rowid, name, kind, signature, package, file_path, line,
+                visibility, parent_symbol, return_type, parameters
+         FROM symbols
+         WHERE rowid IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            SymbolRow {
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+                package: row.get(4)?,
+                file_path: row.get(5)?,
+                line: row.get(6)?,
+                visibility: row.get(7)?,
+                parent_symbol: row.get(8)?,
+                return_type: row.get(9)?,
+                parameters: row.get(10)?,
+            },
+        ))
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Merge two ranked result lists using Reciprocal Rank Fusion (RRF) with k=60.
+/// Results appearing in both lists score higher. Returns merged list sorted by
+/// RRF score descending, truncated to `limit`.
+pub fn rrf_merge(
+    fts_results: &[SymbolRow],
+    vec_results: &[SymbolRow],
+    limit: usize,
+) -> Vec<SymbolRow> {
+    use std::collections::HashMap;
+
+    type SymKey = (String, String, String, i64);
+    fn sym_key(s: &SymbolRow) -> SymKey {
+        (s.name.clone(), s.package.clone(), s.file_path.clone(), s.line)
+    }
+
+    let k = 60.0_f64;
+    let mut scores: HashMap<SymKey, f64> = HashMap::new();
+    let mut symbols: HashMap<SymKey, SymbolRow> = HashMap::new();
+
+    for (rank, sym) in fts_results.iter().enumerate() {
+        let key = sym_key(sym);
+        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
+        symbols.entry(key).or_insert_with(|| sym.clone());
+    }
+
+    for (rank, sym) in vec_results.iter().enumerate() {
+        let key = sym_key(sym);
+        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
+        symbols.entry(key).or_insert_with(|| sym.clone());
+    }
+
+    let mut scored: Vec<(SymKey, f64)> = scores.into_iter().collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    scored
+        .into_iter()
+        .take(limit)
+        .filter_map(|(key, _)| symbols.remove(&key))
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1152,5 +1233,98 @@ mod tests {
         // ts files are most common (3 of them)
         assert_eq!(dist[0].extension, "ts");
         assert_eq!(dist[0].count, 3);
+    }
+
+    fn make_symbol(name: &str, package: &str, line: i64) -> SymbolRow {
+        SymbolRow {
+            name: name.into(),
+            kind: "function".into(),
+            signature: None,
+            package: package.into(),
+            file_path: format!("src/{name}.rs"),
+            line,
+            visibility: "public".into(),
+            parent_symbol: None,
+            return_type: None,
+            parameters: None,
+        }
+    }
+
+    #[test]
+    fn test_rrf_merge_overlapping_results() {
+        let fts = vec![
+            make_symbol("alpha", "pkg-a", 10),   // rank 0 in FTS
+            make_symbol("beta", "pkg-a", 20),    // rank 1 in FTS
+            make_symbol("gamma", "pkg-b", 30),   // rank 2 in FTS
+        ];
+        let vec = vec![
+            make_symbol("beta", "pkg-a", 20),    // rank 0 in vec (also in FTS)
+            make_symbol("delta", "pkg-b", 40),   // rank 1 in vec
+            make_symbol("alpha", "pkg-a", 10),   // rank 2 in vec (also in FTS)
+        ];
+
+        let merged = rrf_merge(&fts, &vec, 50);
+        assert_eq!(merged.len(), 4);
+
+        // beta appears in both at high ranks → highest RRF score
+        // alpha appears in both → second highest
+        // Overlapping results should rank higher than single-source
+        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names[0], "beta");  // rank 0 in vec + rank 1 in FTS
+        assert_eq!(names[1], "alpha"); // rank 0 in FTS + rank 2 in vec
+        // gamma and delta are single-source, order depends on rank
+    }
+
+    #[test]
+    fn test_rrf_merge_disjoint_results() {
+        let fts = vec![
+            make_symbol("alpha", "pkg-a", 10),
+            make_symbol("beta", "pkg-a", 20),
+        ];
+        let vec = vec![
+            make_symbol("gamma", "pkg-b", 30),
+            make_symbol("delta", "pkg-b", 40),
+        ];
+
+        let merged = rrf_merge(&fts, &vec, 50);
+        assert_eq!(merged.len(), 4);
+
+        // All single-source, rank 0 items from each list tie at 1/(60+1) ≈ 0.01639
+        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
+        // Both rank-0 items tie, both rank-1 items tie
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
+        assert!(names.contains(&"delta"));
+    }
+
+    #[test]
+    fn test_rrf_merge_respects_limit() {
+        let fts = vec![
+            make_symbol("a", "pkg", 1),
+            make_symbol("b", "pkg", 2),
+            make_symbol("c", "pkg", 3),
+        ];
+        let vec = vec![
+            make_symbol("d", "pkg", 4),
+            make_symbol("e", "pkg", 5),
+        ];
+
+        let merged = rrf_merge(&fts, &vec, 3);
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn test_rrf_merge_empty_inputs() {
+        let fts: Vec<SymbolRow> = vec![];
+        let vec = vec![make_symbol("alpha", "pkg", 10)];
+
+        let merged = rrf_merge(&fts, &vec, 50);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "alpha");
+
+        let merged = rrf_merge(&vec, &fts, 50);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "alpha");
     }
 }

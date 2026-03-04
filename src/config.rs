@@ -14,12 +14,34 @@ pub struct Config {
     pub symbols: SymbolsConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    #[serde(default)]
+    pub rag: RagConfig,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct SymbolsConfig {
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RagConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+}
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            cache_dir: None,
+        }
+    }
 }
 
 fn default_debounce_ms() -> u64 {
@@ -386,5 +408,31 @@ requires = ["main.go"]
         assert!(rule.max_depth.is_none());
         assert!(rule.name_prefix.is_none());
         assert!(rule.extensions.is_none());
+    }
+
+    #[test]
+    fn test_parse_config_with_rag() {
+        let toml_str = r#"
+[rag]
+enabled = true
+model = "text-embedding-3-small"
+cache_dir = "/tmp/shire-rag"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.rag.enabled);
+        assert_eq!(config.rag.model.as_deref(), Some("text-embedding-3-small"));
+        assert_eq!(config.rag.cache_dir.as_deref(), Some("/tmp/shire-rag"));
+    }
+
+    #[test]
+    fn test_rag_config_defaults_to_disabled() {
+        let toml_str = r#"
+[discovery]
+manifests = ["package.json"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.rag.enabled);
+        assert!(config.rag.model.is_none());
+        assert!(config.rag.cache_dir.is_none());
     }
 }

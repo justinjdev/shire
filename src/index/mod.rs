@@ -17,7 +17,7 @@ use crate::db;
 use crate::symbols;
 use anyhow::Result;
 use ignore::WalkBuilder;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -1154,9 +1154,21 @@ fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
 }
 
 pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+    build_index_inner(repo_root, config, force, db_override, true)
+}
+
+pub fn build_index_quiet(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+    build_index_inner(repo_root, config, force, db_override, false)
+}
+
+fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>, progress: bool) -> Result<()> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
-    let mp = MultiProgress::new();
+    let mp = if progress {
+        MultiProgress::new()
+    } else {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    };
 
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()

@@ -182,7 +182,7 @@ pub async fn run_daemon(
 
                 eprintln!("[watch] triggering rebuild...");
                 let result = tokio::task::spawn_blocking(move || {
-                    index::build_index(
+                    index::build_index_quiet(
                         &build_root,
                         &build_config,
                         false,

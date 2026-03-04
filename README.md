@@ -113,13 +113,13 @@ shire init --global     # global ~/.claude/ config for all projects
 | `build` | `--root <DIR>` | Repository root (default: `.`) |
 | | `--force` | Full rebuild, ignore cached hashes |
 | | `--db <PATH>` | Database path (overrides `shire.toml`) |
-| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `serve` | `--db <PATH>` | Database path (default: `.shire/index.db`) |
-| | `--config <PATH>` | Config file path (default: `./shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `./shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `watch` | `--root <DIR>` | Repository root (default: `.`) |
 | | `--stop` | Stop the running daemon |
 | | `--db <PATH>` | Database path (overrides `shire.toml`) |
-| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `rebuild` | `--root <DIR>` | Repository root (default: `.`) |
 | | `--file <PATH>` | Specific changed file (repeatable) |
 | | `--stdin` | Read Claude Code hook JSON from stdin |
@@ -172,19 +172,27 @@ This creates:
 - `mcpServers.shire` entry in `~/.claude/settings.json`
 - `PostToolUse` hook for auto-rebuilding the index after file edits
 
-Run `shire init` (without `--global`) inside a repo to create a project-level `shire.toml` instead.
+**Per-repo setup** — for project-level config (creates `shire.toml` and `.claude/settings.local.json`):
+
+```sh
+cd /path/to/repo
+shire init
+shire build
+```
+
+Config is resolved with a fallback chain: `./shire.toml` → `~/.claude/shire.toml` → defaults. This means `shire build`, `shire serve`, and `shire watch` automatically pick up global config when no local config exists. Relative `db_path` values (e.g., `tmp/index.db`) are resolved against the repo root.
 
 <details>
 <summary>Manual setup</summary>
 
-Add to `~/.claude/settings.json` (or project-level `.claude/settings.json`):
+Add to `~/.claude/settings.json` (global) or `.claude/settings.local.json` (per-repo):
 
 ```json
 {
   "mcpServers": {
     "shire": {
       "command": "shire",
-      "args": ["serve", "--config", "~/.claude/shire.toml"]
+      "args": ["serve"]
     }
   }
 }
@@ -244,12 +252,7 @@ Smart filtering avoids unnecessary rebuilds: Edit/Write tools check file extensi
 
 ## Configuration
 
-Drop a `shire.toml` in the repo root to customize behavior. You can also point to a shared config with `--config`:
-
-```sh
-shire serve --config ~/.claude/shire.toml
-shire build --config ~/.claude/shire.toml
-```
+Drop a `shire.toml` in the repo root to customize behavior. Without a local config, shire falls back to `~/.claude/shire.toml` (created by `shire init --global`). You can also point to a specific config with `--config`.
 
 ```toml
 # Custom database location (default: .shire/index.db)

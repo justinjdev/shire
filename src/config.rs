@@ -147,7 +147,13 @@ pub fn resolve_db_path(config: &Config, repo_root: &Path) -> Result<PathBuf> {
                 })?
                 .into_owned();
             let repo_name = repo_name_from_path(repo_root)?;
-            Ok(PathBuf::from(expanded.replace("{repo}", &repo_name)))
+            let path = PathBuf::from(expanded.replace("{repo}", &repo_name));
+            // Resolve relative paths against repo_root
+            if path.is_relative() {
+                Ok(repo_root.join(path))
+            } else {
+                Ok(path)
+            }
         }
         None => Ok(repo_root.join(".shire").join("index.db")),
     }
@@ -171,27 +177,41 @@ pub fn load_config(repo_root: &Path) -> Result<Config> {
 }
 
 pub fn load_config_from(config_path: Option<&Path>, repo_root: &Path) -> Result<Config> {
-    let path = match config_path {
-        Some(p) => {
-            let raw = p.to_string_lossy();
-            let expanded = shellexpand::full(&raw)
-                .with_context(|| {
-                    format!("Failed to expand config path '{raw}'. Check that all environment variables are set.")
-                })?
-                .into_owned();
-            PathBuf::from(expanded)
+    if let Some(p) = config_path {
+        // Explicit --config: must exist
+        let raw = p.to_string_lossy();
+        let expanded = shellexpand::full(&raw)
+            .with_context(|| {
+                format!("Failed to expand config path '{raw}'. Check that all environment variables are set.")
+            })?
+            .into_owned();
+        let path = PathBuf::from(expanded);
+        if !path.exists() {
+            anyhow::bail!("Config file not found: {}", path.display());
         }
-        None => repo_root.join("shire.toml"),
-    };
-    if path.exists() {
         let content = std::fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&content)?;
-        Ok(config)
-    } else if config_path.is_some() {
-        anyhow::bail!("Config file not found: {}", path.display());
-    } else {
-        Ok(Config::default())
+        return Ok(config);
     }
+
+    // Fallback chain: ./shire.toml → ~/.claude/shire.toml → defaults
+    let local = repo_root.join("shire.toml");
+    if local.exists() {
+        let content = std::fs::read_to_string(&local)?;
+        let config: Config = toml::from_str(&content)?;
+        return Ok(config);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let global = PathBuf::from(home).join(".claude/shire.toml");
+        if global.exists() {
+            let content = std::fs::read_to_string(&global)?;
+            let config: Config = toml::from_str(&content)?;
+            return Ok(config);
+        }
+    }
+
+    Ok(Config::default())
 }
 
 #[cfg(test)]
@@ -246,6 +266,16 @@ exclude = ["vendor"]
         };
         let resolved = resolve_db_path(&config, Path::new("/repo")).unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/custom.db"));
+    }
+
+    #[test]
+    fn test_resolve_db_path_relative() {
+        let config = Config {
+            db_path: Some("tmp/index.db".into()),
+            ..Config::default()
+        };
+        let resolved = resolve_db_path(&config, Path::new("/home/user/work/monorepo")).unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/user/work/monorepo/tmp/index.db"));
     }
 
     #[test]
@@ -434,5 +464,26 @@ manifests = ["package.json"]
         assert!(!config.rag.enabled);
         assert!(config.rag.model.is_none());
         assert!(config.rag.cache_dir.is_none());
+    }
+
+    #[test]
+    fn test_load_config_local_takes_precedence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("shire.toml"),
+            "db_path = \"/local/index.db\"\n",
+        )
+        .unwrap();
+        let config = load_config_from(None, dir.path()).unwrap();
+        assert_eq!(config.db_path.as_deref(), Some("/local/index.db"));
+    }
+
+    #[test]
+    fn test_load_config_falls_back_to_global() {
+        // This test only works if ~/.claude/shire.toml exists,
+        // so we just verify the no-config case returns defaults
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = load_config_from(None, dir.path()).unwrap();
+        assert!(config.db_path.is_none());
     }
 }

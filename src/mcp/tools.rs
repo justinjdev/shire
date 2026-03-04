@@ -80,9 +80,12 @@ impl ShireService {
     /// Read indexed_at from shire_meta and parse to SystemTime.
     fn read_indexed_at(conn: &Connection) -> Option<SystemTime> {
         let ts: String = conn
-            .query_row("SELECT indexed_at FROM shire_meta LIMIT 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'indexed_at'",
+                [],
+                |row| row.get(0),
+            )
             .ok()?;
-        // indexed_at is ISO 8601 UTC, e.g. "2025-03-01T12:00:00Z"
         let dt = chrono::DateTime::parse_from_rfc3339(&ts).ok()?;
         Some(SystemTime::from(dt))
     }
@@ -131,16 +134,26 @@ impl ShireService {
                 // Reopen connection read-only
                 match crate::db::open_readonly(&ctx.db_path) {
                     Ok(new_conn) => {
-                        if let Ok(mut conn) = self.conn.lock() {
-                            let now = Self::read_indexed_at(&new_conn);
-                            *conn = new_conn;
-                            if let Ok(mut li) = self.last_indexed.lock() {
-                                *li = now;
+                        match self.conn.lock() {
+                            Ok(mut conn) => {
+                                let now = Self::read_indexed_at(&new_conn)
+                                    .or_else(|| Some(SystemTime::now()));
+                                *conn = new_conn;
+                                if let Ok(mut li) = self.last_indexed.lock() {
+                                    *li = now;
+                                }
+                                eprintln!("[shire] Index rebuilt");
                             }
+                            Err(e) => eprintln!("[shire] Warning: index rebuilt but failed to swap connection: {e}"),
                         }
-                        eprintln!("[shire] Index rebuilt");
                     }
-                    Err(e) => eprintln!("[shire] Warning: failed to reopen index after rebuild: {e}"),
+                    Err(e) => {
+                        // Prevent infinite rebuild loop: mark as indexed even if reopen fails
+                        if let Ok(mut li) = self.last_indexed.lock() {
+                            *li = Some(SystemTime::now());
+                        }
+                        eprintln!("[shire] Warning: failed to reopen index after rebuild: {e}");
+                    }
                 }
             }
             Err(e) => eprintln!("[shire] Warning: rebuild failed: {e}"),
@@ -645,5 +658,29 @@ mod tests {
         let svc = make_service_readonly();
         // Should not panic or error — just a no-op
         svc.maybe_rebuild();
+    }
+
+    #[test]
+    fn test_read_indexed_at_parses_db_timestamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        let ts = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
+            [&ts],
+        )
+        .unwrap();
+        let result = ShireService::read_indexed_at(&conn);
+        assert!(result.is_some(), "should parse indexed_at from shire_meta");
+    }
+
+    #[test]
+    fn test_read_indexed_at_none_when_no_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        let result = ShireService::read_indexed_at(&conn);
+        assert!(result.is_none(), "should return None when shire_meta doesn't exist");
     }
 }

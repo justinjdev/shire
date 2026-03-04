@@ -300,13 +300,11 @@ pub struct SearchFilesParams {
     pub extension: Option<String>,
 }
 
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExploreParams {
     /// Concept to explore (e.g. "authentication", "error handling", "messaging interfaces")
     pub query: String,
 }
-
 
 #[tool_router]
 impl ShireService {
@@ -492,6 +490,11 @@ impl ShireService {
         Parameters(params): Parameters<SearchFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.maybe_rebuild();
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::search_files(
             &conn,
@@ -511,14 +514,22 @@ impl ShireService {
         Parameters(params): Parameters<ExploreParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.maybe_rebuild();
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let mut args = std::collections::HashMap::new();
         args.insert("query".into(), params.query);
         let text = crate::mcp::prompts::call_prompt(&conn, "explore", &args)
-            .map_err(|e| Self::mcp_err(e))?;
+            .map_err(|e| match e {
+                crate::mcp::prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+                crate::mcp::prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
+                crate::mcp::prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
+            })?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
-
 }
 
 #[cfg(test)]

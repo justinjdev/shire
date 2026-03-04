@@ -43,21 +43,17 @@ pub fn call_prompt(
     conn: &Connection,
     name: &str,
     args: &HashMap<String, String>,
-) -> Result<String, String> {
-    let result = handle(conn, name, args).map_err(|e| match e {
-        PromptError::InvalidParams(msg) => msg,
-        PromptError::NotFound(msg) => msg,
-        PromptError::Internal(msg) => msg,
-    })?;
-    Ok(result
+) -> Result<String, PromptError> {
+    let result = handle(conn, name, args)?;
+    let msg = result
         .messages
         .into_iter()
         .next()
-        .map(|m| match m.content {
-            PromptMessageContent::Text { text, .. } => text,
-            _ => String::new(),
-        })
-        .unwrap_or_default())
+        .ok_or_else(|| PromptError::Internal("Prompt returned no messages".into()))?;
+    match msg.content {
+        PromptMessageContent::Text { text, .. } => Ok(text),
+        _ => Err(PromptError::Internal("Prompt returned non-text content".into())),
+    }
 }
 
 fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str, PromptError> {
@@ -160,5 +156,3 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
         }],
     })
 }
-
-

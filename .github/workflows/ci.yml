@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+env:
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   test:
     runs-on: ubuntu-latest

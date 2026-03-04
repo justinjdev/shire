@@ -25,6 +25,7 @@ pub struct SymbolsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct RagConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -63,6 +64,7 @@ impl Default for WatchConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct CustomDiscoveryRule {
     pub name: String,
     pub kind: String,
@@ -172,6 +174,7 @@ fn repo_name_from_path(repo_root: &Path) -> Result<String> {
         })
 }
 
+#[allow(dead_code)]
 pub fn load_config(repo_root: &Path) -> Result<Config> {
     load_config_from(None, repo_root)
 }

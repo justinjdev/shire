@@ -264,6 +264,7 @@ pub fn get_symbol(
 
 /// Fetch symbols by their id (primary key). Used by hybrid search to look up
 /// vector search results. Returns results in unspecified order.
+#[allow(dead_code)]
 pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, SymbolRow)>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -305,6 +306,7 @@ pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, Sy
 /// Merge two ranked result lists using Reciprocal Rank Fusion (RRF) with k=60.
 /// Results appearing in both lists score higher. Returns merged list sorted by
 /// RRF score descending, truncated to `limit`.
+#[allow(dead_code)]
 pub fn rrf_merge(
     fts_results: &[SymbolRow],
     vec_results: &[SymbolRow],

@@ -114,7 +114,8 @@ shire init --global     # global ~/.claude/ config for all projects
 | | `--force` | Full rebuild, ignore cached hashes |
 | | `--db <PATH>` | Database path (overrides `shire.toml`) |
 | | `--config <PATH>` | Config file path (default: `<root>/shire.toml`, falls back to `~/.claude/shire.toml`) |
-| `serve` | `--db <PATH>` | Database path (default: `.shire/index.db`) |
+| `serve` | `--root <DIR>` | Repository root for on-demand reindexing (auto-rebuilds before queries) |
+| | `--db <PATH>` | Database path (default: `.shire/index.db`) |
 | | `--config <PATH>` | Config file path (default: `./shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `watch` | `--root <DIR>` | Repository root (default: `.`) |
 | | `--stop` | Stop the running daemon |
@@ -125,6 +126,7 @@ shire init --global     # global ~/.claude/ config for all projects
 | | `--stdin` | Read Claude Code hook JSON from stdin |
 | `init` | `--root <DIR>` | Project root (default: `.`) |
 | | `--global` | Set up global config in `~/.claude/` |
+| | `--no-hook` | Use on-demand reindexing instead of PostToolUse hooks |
 
 The index is written to `.shire/index.db` inside the repo root by default. You can override this with `--db` on the build command or `db_path` in `shire.toml` (see [Configuration](#configuration)). Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build. File indexing is also incremental — a file-tree hash detects structural changes, skipping Phase 9 entirely when no files have been added, removed, or resized. Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput. A per-phase **timing breakdown** is printed to stderr after each build. The server reads from this database in read-only mode.
 
@@ -172,11 +174,20 @@ This creates:
 - `mcpServers.shire` entry in `~/.claude/settings.json`
 - `PostToolUse` hook for auto-rebuilding the index after file edits
 
+**On-demand mode** — skip hooks and let the MCP server rebuild automatically:
+
+```sh
+shire init --global --no-hook
+```
+
+With `--no-hook`, the MCP server starts with `--root .` and checks whether the index is stale before each query by comparing `.git/index` mtime against the last build timestamp. If stale, it rebuilds automatically. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
+
 **Per-repo setup** — for project-level config (creates `shire.toml` and `.claude/settings.local.json`):
 
 ```sh
 cd /path/to/repo
-shire init
+shire init          # with PostToolUse hook (default)
+shire init --no-hook  # or with on-demand reindexing
 shire build
 ```
 

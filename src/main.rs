@@ -37,6 +37,9 @@ enum Commands {
     },
     /// Start the MCP server over stdio
     Serve {
+        /// Repository root for on-demand reindexing (enables auto-rebuild before queries)
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Path to the index database (defaults to .shire/index.db)
         #[arg(long)]
         db: Option<PathBuf>,
@@ -82,6 +85,9 @@ enum Commands {
         /// Set up global config in ~/.claude/ for all projects
         #[arg(long)]
         global: bool,
+        /// Use on-demand reindexing instead of PostToolUse hooks
+        #[arg(long)]
+        no_hook: bool,
     },
 }
 
@@ -100,21 +106,34 @@ async fn main() -> Result<()> {
             let config = config::load_config_from(cfg_path.as_deref(), &root)?;
             index::build_index(&root, &config, force, db.as_deref())
         }
-        Commands::Serve { db, config: cfg_path } => {
-            let root = std::fs::canonicalize(".")?;
-            let cfg = config::load_config_from(cfg_path.as_deref(), &root)?;
+        Commands::Serve { root, db, config: cfg_path } => {
+            let cwd = std::fs::canonicalize(".")?;
+            let repo_root = root.as_ref().map(|r| std::fs::canonicalize(r)).transpose()?;
+            let effective_root = repo_root.as_deref().unwrap_or(&cwd);
+            let cfg = config::load_config_from(cfg_path.as_deref(), effective_root)?;
             let db_path = if let Some(p) = db {
                 p
             } else {
-                config::resolve_db_path(&cfg, &root)?
+                config::resolve_db_path(&cfg, effective_root)?
             };
-            if !db_path.exists() {
-                anyhow::bail!(
-                    "Index not found at {}. Run `shire build` first.",
-                    db_path.display()
-                );
-            }
-            mcp::run_server(&db_path, &cfg.rag).await
+            let build_ctx = if let Some(ref repo_root) = repo_root {
+                // On-demand mode: allow missing DB (first tool call triggers build)
+                Some(mcp::BuildContext {
+                    repo_root: repo_root.clone(),
+                    config: cfg.clone(),
+                    db_path: db_path.clone(),
+                })
+            } else {
+                // Read-only mode: DB must exist
+                if !db_path.exists() {
+                    anyhow::bail!(
+                        "Index not found at {}. Run `shire build` first.",
+                        db_path.display()
+                    );
+                }
+                None
+            };
+            mcp::run_server(&db_path, &cfg.rag, build_ctx).await
         }
         Commands::Watch {
             root,
@@ -133,12 +152,12 @@ async fn main() -> Result<()> {
                 watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())
             }
         }
-        Commands::Init { root, global } => {
+        Commands::Init { root, global, no_hook } => {
             if global {
-                init::run_init_global()
+                init::run_init_global(no_hook)
             } else {
                 let root = std::fs::canonicalize(&root)?;
-                init::run_init(&root)
+                init::run_init(&root, no_hook)
             }
         }
         Commands::Rebuild {

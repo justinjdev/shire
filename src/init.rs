@@ -26,7 +26,7 @@ const DEFAULT_GLOBAL_CONFIG: &str = r#"# Shire global configuration — shared a
 db_path = "~/.claude/shire/{repo}/index.db"
 "#;
 
-pub fn run_init(root: &Path) -> Result<()> {
+pub fn run_init(root: &Path, no_hook: bool) -> Result<()> {
     // 1. Create shire.toml
     let config_path = root.join("shire.toml");
     if config_path.exists() {
@@ -42,15 +42,26 @@ pub fn run_init(root: &Path) -> Result<()> {
     fs::create_dir_all(&claude_dir)
         .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
     let settings_path = claude_dir.join("settings.local.json");
+    let serve_args = if no_hook {
+        json!(["serve", "--root", "."])
+    } else {
+        json!(["serve"])
+    };
     patch_claude_settings(
         &settings_path,
-        json!(["serve"]),
+        serve_args,
         ".claude/settings.local.json",
         "shire init",
+        !no_hook,
     )
     .context("Failed to configure .claude/settings.local.json. shire.toml was created successfully. Fix the issue above and re-run `shire init`.")?;
 
-    println!("\nNext: run `shire build` in this repo to create the index.");
+    if no_hook {
+        println!("\nOn-demand reindexing enabled. The MCP server will rebuild the index automatically when needed.");
+        println!("No PostToolUse hook installed.");
+    } else {
+        println!("\nNext: run `shire build` in this repo to create the index.");
+    }
     Ok(())
 }
 
@@ -60,12 +71,12 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME environment variable not set")
 }
 
-pub fn run_init_global() -> Result<()> {
+pub fn run_init_global(no_hook: bool) -> Result<()> {
     let claude_dir = home_dir()?.join(".claude");
-    run_init_global_in(&claude_dir)
+    run_init_global_in(&claude_dir, no_hook)
 }
 
-fn run_init_global_in(claude_dir: &Path) -> Result<()> {
+fn run_init_global_in(claude_dir: &Path, no_hook: bool) -> Result<()> {
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
 
@@ -81,24 +92,36 @@ fn run_init_global_in(claude_dir: &Path) -> Result<()> {
 
     // 2. Patch settings.json
     let settings_path = claude_dir.join("settings.json");
+    let serve_args = if no_hook {
+        json!(["serve", "--root", "."])
+    } else {
+        json!(["serve"])
+    };
     patch_claude_settings(
         &settings_path,
-        json!(["serve"]),
+        serve_args,
         "~/.claude/settings.json",
         "shire init --global",
+        !no_hook,
     )
     .context("Failed to configure ~/.claude/settings.json. ~/.claude/shire.toml was created successfully. Fix the issue above and re-run `shire init --global`.")?;
 
-    println!("\nNext: run `shire build` in each repo you want to index.");
+    if no_hook {
+        println!("\nOn-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed.");
+        println!("No PostToolUse hook installed.");
+    } else {
+        println!("\nNext: run `shire build` in each repo you want to index.");
+    }
     Ok(())
 }
 
-/// Patch a Claude Code settings JSON file with mcpServers.shire and hooks.PostToolUse.
+/// Patch a Claude Code settings JSON file with mcpServers.shire and optionally hooks.PostToolUse.
 fn patch_claude_settings(
     settings_path: &Path,
     serve_args: Value,
     display_path: &str,
     reinit_cmd: &str,
+    install_hook: bool,
 ) -> Result<()> {
     let mut settings: Map<String, Value> = if settings_path.exists() {
         let content = fs::read_to_string(settings_path)
@@ -136,57 +159,59 @@ fn patch_claude_settings(
         );
     }
 
-    // Add hooks.PostToolUse for rebuild
-    let hooks = settings
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    if let Some(hooks_obj) = hooks.as_object_mut() {
-        let has_shire_hook = hooks_obj
-            .get("PostToolUse")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter().any(|entry| {
-                    entry
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|hooks| {
-                            hooks.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .is_some_and(|c| c.contains("shire rebuild"))
+    // Add hooks.PostToolUse for rebuild (only in hook mode)
+    if install_hook {
+        let hooks = settings
+            .entry("hooks")
+            .or_insert_with(|| json!({}));
+        if let Some(hooks_obj) = hooks.as_object_mut() {
+            let has_shire_hook = hooks_obj
+                .get("PostToolUse")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|entry| {
+                        entry
+                            .get("hooks")
+                            .and_then(|h| h.as_array())
+                            .map(|hooks| {
+                                hooks.iter().any(|h| {
+                                    h.get("command")
+                                        .and_then(|c| c.as_str())
+                                        .is_some_and(|c| c.contains("shire rebuild"))
+                                })
                             })
-                        })
-                        .unwrap_or(false)
+                            .unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false);
 
-        if has_shire_hook {
-            println!("hooks.PostToolUse shire rebuild already configured in {display_path}, skipping");
-        } else {
-            let hook_entry = json!({
-                "matcher": "Edit|Write|NotebookEdit|Bash",
-                "hooks": [{ "type": "command", "command": "shire rebuild --stdin" }]
-            });
-            let post_tool_use = hooks_obj
-                .entry("PostToolUse")
-                .or_insert_with(|| json!([]));
-            if let Some(arr) = post_tool_use.as_array_mut() {
-                arr.push(hook_entry);
-                println!("Added hooks.PostToolUse shire rebuild to {display_path}");
-                changed = true;
+            if has_shire_hook {
+                println!("hooks.PostToolUse shire rebuild already configured in {display_path}, skipping");
             } else {
-                anyhow::bail!(
-                    "{display_path} has 'hooks.PostToolUse' as a non-array type. \
-                     Please fix it manually or delete the key and re-run `{reinit_cmd}`."
-                );
+                let hook_entry = json!({
+                    "matcher": "Edit|Write|NotebookEdit|Bash",
+                    "hooks": [{ "type": "command", "command": "shire rebuild --stdin" }]
+                });
+                let post_tool_use = hooks_obj
+                    .entry("PostToolUse")
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = post_tool_use.as_array_mut() {
+                    arr.push(hook_entry);
+                    println!("Added hooks.PostToolUse shire rebuild to {display_path}");
+                    changed = true;
+                } else {
+                    anyhow::bail!(
+                        "{display_path} has 'hooks.PostToolUse' as a non-array type. \
+                         Please fix it manually or delete the key and re-run `{reinit_cmd}`."
+                    );
+                }
             }
+        } else {
+            anyhow::bail!(
+                "{display_path} has 'hooks' as a non-object type. \
+                 Please fix it manually or delete the key and re-run `{reinit_cmd}`."
+            );
         }
-    } else {
-        anyhow::bail!(
-            "{display_path} has 'hooks' as a non-object type. \
-             Please fix it manually or delete the key and re-run `{reinit_cmd}`."
-        );
     }
 
     if changed {
@@ -217,7 +242,7 @@ mod tests {
     #[test]
     fn test_init_creates_config_and_mcp() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
 
         // shire.toml created
         let config_path = dir.path().join("shire.toml");
@@ -241,7 +266,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("shire.toml");
         fs::write(&config_path, "existing").unwrap();
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
 
         // shire.toml unchanged
         let content = fs::read_to_string(&config_path).unwrap();
@@ -255,8 +280,8 @@ mod tests {
     #[test]
     fn test_init_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path()).unwrap();
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
+        run_init(dir.path(), false).unwrap();
 
         let settings_path = dir.path().join(".claude/settings.local.json");
         let parsed: Map<String, Value> =
@@ -293,7 +318,7 @@ mod tests {
         });
         fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -307,7 +332,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let claude_dir = dir.path().join(".claude");
 
-        run_init_global_in(&claude_dir).unwrap();
+        run_init_global_in(&claude_dir, false).unwrap();
 
         // Config file created with {repo} placeholder
         let config_path = claude_dir.join("shire.toml");
@@ -330,8 +355,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let claude_dir = dir.path().join(".claude");
 
-        run_init_global_in(&claude_dir).unwrap();
-        run_init_global_in(&claude_dir).unwrap();
+        run_init_global_in(&claude_dir, false).unwrap();
+        run_init_global_in(&claude_dir, false).unwrap();
 
         // Should still have exactly one shire hook entry
         let settings_path = claude_dir.join("settings.json");
@@ -380,7 +405,7 @@ mod tests {
         )
         .unwrap();
 
-        run_init_global_in(&claude_dir).unwrap();
+        run_init_global_in(&claude_dir, false).unwrap();
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -399,7 +424,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         fs::write(claude_dir.join("settings.json"), "not valid json{{{").unwrap();
 
-        let result = run_init_global_in(&claude_dir);
+        let result = run_init_global_in(&claude_dir, false);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
@@ -417,10 +442,53 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_init_global_in(&claude_dir);
+        let result = run_init_global_in(&claude_dir, false);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
         assert!(chain.contains("non-object type"), "expected 'non-object type' in: {chain}");
+    }
+
+    #[test]
+    fn test_init_no_hook_creates_mcp_with_root_and_no_hook() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_init(dir.path(), true).unwrap();
+
+        let settings_path = dir.path().join(".claude/settings.local.json");
+        let parsed: Map<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let mcp = &parsed["mcpServers"]["shire"];
+        assert_eq!(mcp["command"], "shire");
+        assert_eq!(mcp["args"], json!(["serve", "--root", "."]));
+        // No hooks key should be present
+        assert!(parsed.get("hooks").is_none(), "hooks should not be present in no-hook mode");
+    }
+
+    #[test]
+    fn test_init_no_hook_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_init(dir.path(), true).unwrap();
+        run_init(dir.path(), true).unwrap();
+
+        let settings_path = dir.path().join(".claude/settings.local.json");
+        let parsed: Map<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(parsed["mcpServers"]["shire"].is_object());
+        assert!(parsed.get("hooks").is_none(), "hooks should not be present in no-hook mode");
+    }
+
+    #[test]
+    fn test_init_with_hook_still_installs_hook() {
+        let dir = tempfile::TempDir::new().unwrap();
+        run_init(dir.path(), false).unwrap();
+
+        let settings_path = dir.path().join(".claude/settings.local.json");
+        let parsed: Map<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let mcp = &parsed["mcpServers"]["shire"];
+        assert_eq!(mcp["args"], json!(["serve"]));
+        assert!(parsed["hooks"]["PostToolUse"].is_array());
+        let hooks = parsed["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(!hooks.is_empty(), "PostToolUse hooks should be present");
     }
 }

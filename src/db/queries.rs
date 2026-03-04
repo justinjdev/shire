@@ -445,6 +445,7 @@ pub fn search_packages(conn: &Connection, query: &str, limit: u32) -> Result<Vec
 }
 
 /// Exact name lookup for a single package.
+#[allow(dead_code)]
 pub fn get_package(conn: &Connection, name: &str) -> Result<Option<PackageRow>> {
     let mut stmt = conn.prepare(
         "SELECT name, path, kind, version, description, metadata
@@ -627,6 +628,7 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
 
 /// BFS traversal of the reverse dependency graph starting from `root`, up to `max_depth` levels.
 /// Finds all packages that transitively depend on `root`.
+#[allow(dead_code)]
 pub fn reverse_dependency_graph(
     conn: &Connection,
     root: &str,

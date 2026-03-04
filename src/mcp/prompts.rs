@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 pub enum PromptError {
     InvalidParams(String),
+    #[allow(dead_code)]
     NotFound(String),
     Internal(String),
 }

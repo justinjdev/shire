@@ -90,7 +90,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     #[cfg(feature = "rag")]
-    rag::storage::load_extension();
+    if let Err(e) = rag::storage::load_extension() {
+        eprintln!("Warning: {e}");
+    }
 
     match cli.command {
         Commands::Build { root, force, db, config: cfg_path } => {

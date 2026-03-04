@@ -16,7 +16,6 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
         crate::rag::storage::init_table(&conn)?;
     }
 
-    // Suppress unused variable warning when rag feature is not enabled
     let _ = rag_enabled;
 
     Ok(conn)

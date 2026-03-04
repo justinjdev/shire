@@ -262,7 +262,7 @@ pub fn get_symbol(
     Ok(result)
 }
 
-/// Fetch symbols by their rowid (primary key). Used by hybrid search to look up
+/// Fetch symbols by their id (primary key). Used by hybrid search to look up
 /// vector search results. Returns results in unspecified order.
 pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, SymbolRow)>> {
     if ids.is_empty() {
@@ -270,10 +270,10 @@ pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, Sy
     }
     let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT rowid, name, kind, signature, package, file_path, line,
+        "SELECT id, name, kind, signature, package, file_path, line,
                 visibility, parent_symbol, return_type, parameters
          FROM symbols
-         WHERE rowid IN ({placeholders})"
+         WHERE id IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -1326,5 +1326,71 @@ mod tests {
         let merged = rrf_merge(&vec, &fts, 50);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "alpha");
+    }
+
+    #[test]
+    fn test_rrf_merge_both_empty() {
+        let fts: Vec<SymbolRow> = vec![];
+        let vec: Vec<SymbolRow> = vec![];
+        let merged = rrf_merge(&fts, &vec, 50);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_get_symbols_by_ids_returns_matching() {
+        let conn = test_db_with_symbols();
+        let all_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM symbols")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!all_ids.is_empty());
+
+        let results = get_symbols_by_ids(&conn, &all_ids).unwrap();
+        assert_eq!(results.len(), all_ids.len());
+
+        for (id, sym) in &results {
+            assert!(all_ids.contains(id));
+            assert!(!sym.name.is_empty());
+            assert!(!sym.package.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_get_symbols_by_ids_empty_input() {
+        let conn = test_db_with_symbols();
+        let results = get_symbols_by_ids(&conn, &[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_symbols_by_ids_nonexistent() {
+        let conn = test_db_with_symbols();
+        let results = get_symbols_by_ids(&conn, &[99999, 99998]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_symbols_by_ids_field_mapping() {
+        let conn = test_db_with_symbols();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM symbols WHERE name = 'validate'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+
+        let results = get_symbols_by_ids(&conn, &ids).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, sym) = &results[0];
+        assert_eq!(sym.name, "validate");
+        assert_eq!(sym.kind, "method");
+        assert_eq!(sym.package, "auth-service");
+        assert_eq!(sym.parent_symbol.as_deref(), Some("AuthService"));
+        assert_eq!(sym.return_type.as_deref(), Some("Promise<boolean>"));
     }
 }

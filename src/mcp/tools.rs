@@ -32,7 +32,21 @@ impl ShireService {
         #[cfg(feature = "rag")]
         let rag_embedder = if rag_config.enabled {
             match crate::rag::embedder::Embedder::new(rag_config) {
-                Ok(e) => Some(e),
+                Ok(e) => {
+                    // Verify vector table exists before enabling hybrid search
+                    let table_exists = conn
+                        .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0")
+                        .is_ok();
+                    if !table_exists {
+                        eprintln!(
+                            "Warning: RAG enabled but symbol_embeddings table not found. \
+                             Run `shire build` with [rag] enabled to generate embeddings."
+                        );
+                        None
+                    } else {
+                        Some(e)
+                    }
+                }
                 Err(err) => {
                     eprintln!("Warning: RAG embedder init failed: {err}");
                     None
@@ -62,7 +76,6 @@ impl ShireService {
     }
 
     /// Merge FTS5 and vector search results using Reciprocal Rank Fusion (RRF).
-    /// Falls back to FTS-only results on any error.
     #[cfg(feature = "rag")]
     fn hybrid_search(
         conn: &Connection,
@@ -89,7 +102,7 @@ impl ShireService {
             return Ok(fts_results.to_vec());
         }
 
-        // Fetch symbol rows for vector results, preserving rank order via id map
+        // Fetch symbol rows for vector results; rank order preserved by iterating vec_results below
         let vec_ids: Vec<i64> = vec_results.iter().map(|(id, _)| *id).collect();
         let id_symbol_pairs = queries::get_symbols_by_ids(conn, &vec_ids)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -326,7 +339,6 @@ impl ShireService {
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        // FTS5 search (existing)
         let fts_results = queries::search_symbols(
             &conn,
             &params.query,
@@ -335,12 +347,15 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        // Try hybrid search if RAG is available
         #[cfg(feature = "rag")]
         let results = if let Some(ref embedder) = self.rag_embedder {
+            // Falls back to FTS-only on hybrid search error
             match Self::hybrid_search(&conn, embedder, &params, &fts_results) {
                 Ok(merged) => merged,
-                Err(_) => fts_results, // fallback to FTS-only
+                Err(e) => {
+                    eprintln!("Warning: hybrid search failed, falling back to FTS-only: {}", e.message);
+                    fts_results
+                }
             }
         } else {
             fts_results

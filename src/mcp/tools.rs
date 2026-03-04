@@ -290,6 +290,24 @@ pub struct ListPackageFilesParams {
     pub extension: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExploreParams {
+    /// Concept to explore (e.g. "authentication", "error handling", "messaging interfaces")
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExplorePackageParams {
+    /// Exact package name
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImpactAnalysisParams {
+    /// Package name to analyze impact for
+    pub name: String,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description")]
@@ -466,6 +484,48 @@ impl ShireService {
         let json = serde_json::to_string(&status)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Semantic codebase exploration — search packages, symbols, and files for a concept. Returns a structured context map organized by package. Faster than Grep for broad searches.")]
+    fn explore(
+        &self,
+        Parameters(params): Parameters<ExploreParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let mut args = std::collections::HashMap::new();
+        args.insert("query".into(), params.query);
+        let text = crate::mcp::prompts::call_prompt(&conn, "explore", &args)
+            .map_err(|e| Self::mcp_err(e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(description = "Deep dive into a specific package — metadata, dependencies, dependents, public API surface, and file tree")]
+    fn explore_package(
+        &self,
+        Parameters(params): Parameters<ExplorePackageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let mut args = std::collections::HashMap::new();
+        args.insert("name".into(), params.name);
+        let text = crate::mcp::prompts::call_prompt(&conn, "explore-package", &args)
+            .map_err(|e| Self::mcp_err(e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(description = "Analyze blast radius — what breaks if this package changes? Shows direct and transitive dependents")]
+    fn impact_analysis(
+        &self,
+        Parameters(params): Parameters<ImpactAnalysisParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let mut args = std::collections::HashMap::new();
+        args.insert("name".into(), params.name);
+        let text = crate::mcp::prompts::call_prompt(&conn, "impact-analysis", &args)
+            .map_err(|e| Self::mcp_err(e))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
 

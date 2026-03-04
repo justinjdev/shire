@@ -57,6 +57,29 @@ pub fn handle(
     }
 }
 
+/// Call a prompt handler and extract the markdown text result.
+/// Used by MCP tools that expose prompts as callable tools.
+pub fn call_prompt(
+    conn: &Connection,
+    name: &str,
+    args: &HashMap<String, String>,
+) -> Result<String, String> {
+    let result = handle(conn, name, args).map_err(|e| match e {
+        PromptError::InvalidParams(msg) => msg,
+        PromptError::NotFound(msg) => msg,
+        PromptError::Internal(msg) => msg,
+    })?;
+    Ok(result
+        .messages
+        .into_iter()
+        .next()
+        .map(|m| match m.content {
+            PromptMessageContent::Text { text, .. } => text,
+            _ => String::new(),
+        })
+        .unwrap_or_default())
+}
+
 fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a str, PromptError> {
     args.get(key)
         .map(|s| s.as_str())

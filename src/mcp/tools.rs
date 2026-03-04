@@ -291,6 +291,41 @@ pub struct ListPackageFilesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchFilesParams {
+    /// Search query to find files by path or name
+    pub query: String,
+    /// Filter to files from a specific package
+    pub package: Option<String>,
+    /// Filter by file extension (e.g., "ts", "go", "rs")
+    pub extension: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPackageParams {
+    /// Exact package name
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPackageSymbolsParams {
+    /// Exact package name to get symbols for
+    pub package: String,
+    /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DependencyGraphParams {
+    /// Root package to start the graph from
+    pub name: String,
+    /// If true, only follow internal dependencies
+    #[serde(default)]
+    pub internal_only: bool,
+    /// Maximum depth to traverse (default 3)
+    pub depth: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExploreParams {
     /// Concept to explore (e.g. "authentication", "error handling", "messaging interfaces")
     pub query: String,
@@ -482,6 +517,75 @@ impl ShireService {
         let status = queries::index_status(&conn)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string(&status)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
+    fn search_files(
+        &self,
+        Parameters(params): Parameters<SearchFilesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::search_files(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            params.extension.as_deref(),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Get full details for a specific package by exact name")]
+    fn get_package(
+        &self,
+        Parameters(params): Parameters<GetPackageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let result = queries::get_package(&conn, &params.name)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        match result {
+            Some(pkg) => {
+                let json = serde_json::to_string(&pkg)
+                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => Ok(CallToolResult::success(vec![Content::text(
+                format!("Package '{}' not found", params.name),
+            )])),
+        }
+    }
+
+    #[tool(description = "List all symbols in a package. Useful for understanding a package's public API — its exported functions, classes, types, and methods.")]
+    fn get_package_symbols(
+        &self,
+        Parameters(params): Parameters<GetPackageSymbolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results = queries::get_package_symbols(&conn, &params.package, params.kind.as_deref())
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Get the transitive dependency graph starting from a package. Returns a list of edges. Set internal_only=true to only follow dependencies within this repo.")]
+    fn dependency_graph(
+        &self,
+        Parameters(params): Parameters<DependencyGraphParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let depth = params.depth.unwrap_or(3).min(20);
+        let edges = queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&edges)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

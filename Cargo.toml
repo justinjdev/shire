@@ -40,9 +40,10 @@ fastembed = { version = "4", optional = true }
 sqlite-vec = { version = "0.1", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
 indicatif = "0.17"
+dialoguer = "0.11"
 
 [features]
-default = []
+default = ["rag"]
 rag = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
 
 [dev-dependencies]

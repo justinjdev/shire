@@ -117,7 +117,7 @@ fn default_manifests() -> Vec<String> {
     ]
 }
 
-fn default_exclude() -> Vec<String> {
+pub(crate) fn default_exclude() -> Vec<String> {
     vec![
         "node_modules".into(),
         "vendor".into(),

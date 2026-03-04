@@ -189,25 +189,36 @@ pub fn load_config_from(config_path: Option<&Path>, repo_root: &Path) -> Result<
         if !path.exists() {
             anyhow::bail!("Config file not found: {}", path.display());
         }
-        let content = std::fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file {}", path.display()))?;
+        let config: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file {}", path.display()))?;
         return Ok(config);
     }
 
     // Fallback chain: ./shire.toml → ~/.claude/shire.toml → defaults
     let local = repo_root.join("shire.toml");
     if local.exists() {
-        let content = std::fs::read_to_string(&local)?;
-        let config: Config = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(&local)
+            .with_context(|| format!("Failed to read config file {}", local.display()))?;
+        let config: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file {}", local.display()))?;
         return Ok(config);
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let global = PathBuf::from(home).join(".claude/shire.toml");
-        if global.exists() {
-            let content = std::fs::read_to_string(&global)?;
-            let config: Config = toml::from_str(&content)?;
-            return Ok(config);
+    match std::env::var("HOME") {
+        Ok(home) => {
+            let global = PathBuf::from(home).join(".claude/shire.toml");
+            if global.exists() {
+                let content = std::fs::read_to_string(&global)
+                    .with_context(|| format!("Failed to read config file {}", global.display()))?;
+                let config: Config = toml::from_str(&content)
+                    .with_context(|| format!("Failed to parse config file {}", global.display()))?;
+                return Ok(config);
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not read HOME environment variable ({e}), skipping global config fallback");
         }
     }
 
@@ -480,8 +491,47 @@ manifests = ["package.json"]
 
     #[test]
     fn test_load_config_falls_back_to_global() {
-        // This test only works if ~/.claude/shire.toml exists,
-        // so we just verify the no-config case returns defaults
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = home_dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("shire.toml"),
+            "db_path = \"/global/index.db\"\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("HOME", home_dir.path()) };
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        let config = load_config_from(None, repo_dir.path()).unwrap();
+        assert_eq!(config.db_path.as_deref(), Some("/global/index.db"));
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn test_load_config_local_takes_precedence_over_global() {
+        let home_dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = home_dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("shire.toml"),
+            "db_path = \"/global/index.db\"\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("HOME", home_dir.path()) };
+        let repo_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            repo_dir.path().join("shire.toml"),
+            "db_path = \"/local/index.db\"\n",
+        )
+        .unwrap();
+        let config = load_config_from(None, repo_dir.path()).unwrap();
+        assert_eq!(config.db_path.as_deref(), Some("/local/index.db"));
+        unsafe { std::env::remove_var("HOME") };
+    }
+
+    #[test]
+    fn test_load_config_no_config_returns_defaults() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = load_config_from(None, dir.path()).unwrap();
         assert!(config.db_path.is_none());

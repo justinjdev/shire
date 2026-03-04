@@ -47,7 +47,8 @@ pub fn run_init(root: &Path) -> Result<()> {
         json!(["serve"]),
         ".claude/settings.local.json",
         "shire init",
-    )?;
+    )
+    .context("Failed to configure .claude/settings.local.json. shire.toml was created successfully. Fix the issue above and re-run `shire init`.")?;
 
     println!("\nNext: run `shire build` in this repo to create the index.");
     Ok(())
@@ -85,7 +86,8 @@ fn run_init_global_in(claude_dir: &Path) -> Result<()> {
         json!(["serve"]),
         "~/.claude/settings.json",
         "shire init --global",
-    )?;
+    )
+    .context("Failed to configure ~/.claude/settings.json. ~/.claude/shire.toml was created successfully. Fix the issue above and re-run `shire init --global`.")?;
 
     println!("\nNext: run `shire build` in each repo you want to index.");
     Ok(())
@@ -188,12 +190,21 @@ fn patch_claude_settings(
     }
 
     if changed {
-        let output = serde_json::to_string_pretty(&Value::Object(settings))?;
+        let output = serde_json::to_string_pretty(&Value::Object(settings))
+            .context("Failed to serialize settings to JSON")?;
         let tmp_path = settings_path.with_extension("json.tmp");
         fs::write(&tmp_path, format!("{output}\n"))
             .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &settings_path)
-            .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), settings_path.display()))?;
+        if let Err(e) = fs::rename(&tmp_path, settings_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to rename {} to {}",
+                    tmp_path.display(),
+                    settings_path.display()
+                )
+            });
+        }
     }
 
     Ok(())
@@ -390,7 +401,9 @@ mod tests {
 
         let result = run_init_global_in(&claude_dir);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Failed to parse"));
+        let err = result.unwrap_err();
+        let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
+        assert!(chain.contains("Failed to parse"), "expected 'Failed to parse' in: {chain}");
     }
 
     #[test]
@@ -406,6 +419,8 @@ mod tests {
 
         let result = run_init_global_in(&claude_dir);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("non-object type"));
+        let err = result.unwrap_err();
+        let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
+        assert!(chain.contains("non-object type"), "expected 'non-object type' in: {chain}");
     }
 }

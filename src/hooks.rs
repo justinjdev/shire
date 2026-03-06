@@ -23,9 +23,13 @@ pub fn detect_hooks_dir(repo_root: &Path) -> Result<PathBuf> {
                 } else {
                     repo_root.join(p)
                 };
-                if resolved.is_dir() {
-                    return Ok(resolved);
+                if resolved.exists() && !resolved.is_dir() {
+                    anyhow::bail!(
+                        "core.hooksPath '{}' exists but is not a directory",
+                        resolved.display()
+                    );
                 }
+                return Ok(resolved);
             }
         }
     }

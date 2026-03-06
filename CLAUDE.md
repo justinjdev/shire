@@ -18,7 +18,7 @@ The integration test (`tests/integration.rs`) builds the binary and runs it agai
 
 ## Architecture
 
-Rust CLI (edition 2024) with five subcommands: `build`, `serve`, `watch`, `rebuild`, `init`.
+Rust CLI (edition 2024) with six subcommands: `build`, `serve`, `watch`, `rebuild`, `worktree`, `init`.
 
 **Data flow:** `config::load_config()` → `index::build_index()` → SQLite DB → `mcp::run_server()` (read-only, or on-demand rebuild with `--root`)
 
@@ -26,9 +26,11 @@ Rust CLI (edition 2024) with five subcommands: `build`, `serve`, `watch`, `rebui
 
 - **index/** — Build orchestrator. Walks the repo, discovers manifests, parses them via the `ManifestParser` trait (one impl per ecosystem: npm, go, cargo, python, maven, gradle, perl, ruby), extracts symbols, writes to SQLite. Builds are incremental via SHA-256 content hashing of manifests and source files, with mtime pre-checks to skip unchanged packages entirely.
 - **symbols/** — Source code symbol extraction. Uses tree-sitter for most languages, regex for Perl. Parallelized across packages with rayon. All extractors produce the same `SymbolInfo` struct.
-- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files), triggers to maintain FTS indexes, batched multi-row INSERTs in transactions.
-- **mcp/** — MCP server over stdio using the `rmcp` crate. 8 tools + 3 prompt templates for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
+- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files), triggers to maintain FTS indexes, batched multi-row INSERTs in transactions. `seed_db()` copies a DB via the SQLite backup API for worktree seeding.
+- **mcp/** — MCP server over stdio using the `rmcp` crate. 13 tools + 6 prompt templates for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
+- **hooks/** — Git hook detection and installation. Detects hook directory (core.hooksPath > .githooks/ > .git/hooks/) and installs post-checkout hooks for worktree support.
 - **watch/** — Unix-only background daemon. Uses Unix domain sockets (`.shire/watch.sock`) for IPC, PID file for process management, configurable debounce. Filters rebuilds by file relevance.
+- **git/** — Git worktree detection. Resolves `RepoIdentity` (repo name + worktree name) via `git rev-parse` for per-worktree DB paths.
 
 ### Adding a new manifest parser
 

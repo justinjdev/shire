@@ -104,6 +104,9 @@ shire rebuild --root /path/to/repo
 # Initialize config
 shire init              # project-level shire.toml
 shire init --global     # global ~/.claude/ config for all projects
+
+# Set up a worktree: seed DB from main + incremental build
+shire worktree --root /path/to/worktree
 ```
 
 ### CLI reference
@@ -162,7 +165,7 @@ shire init --global
 ```
 
 This creates:
-- `~/.claude/shire.toml` with `db_path = "~/.claude/shire/{repo}/index.db"` (auto-namespaced per repo)
+- `~/.claude/shire.toml` with `db_path = "~/.claude/shire/{repo}/{worktree}/index.db"` (auto-namespaced per repo and worktree)
 - `mcpServers.shire` entry in `~/.claude/settings.json`
 - `PostToolUse` hook for auto-rebuilding the index after file edits
 
@@ -184,6 +187,8 @@ shire build
 ```
 
 Config is resolved with a fallback chain: `./shire.toml` → `~/.claude/shire.toml` → defaults. This means `shire build`, `shire serve`, and `shire watch` automatically pick up global config when no local config exists. Relative `db_path` values (e.g., `tmp/index.db`) are resolved against the repo root.
+
+Run `shire init` (without `--global`) inside a repo to also optionally install git hooks for worktree support.
 
 <details>
 <summary>Manual setup</summary>

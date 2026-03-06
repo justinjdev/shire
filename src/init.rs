@@ -188,6 +188,19 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
 }
 
 pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
+    // In interactive mode, ask local vs global first
+    if !yes && std::io::stdin().is_terminal() {
+        let items = &["Local (this project only)", "Global (all projects)"];
+        let selection = Select::new()
+            .with_prompt("Install scope")
+            .items(items)
+            .default(0)
+            .interact()?;
+        if selection == 1 {
+            return run_init_global(no_hook, false);
+        }
+    }
+
     let opts = if yes || !std::io::stdin().is_terminal() {
         let mut defaults = InitOptions::default_local();
         if no_hook {

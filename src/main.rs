@@ -93,6 +93,18 @@ enum Commands {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Set up a worktree: seed DB from main and run incremental build
+    Worktree {
+        /// Root directory of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Path to the index database (overrides shire.toml db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -166,6 +178,41 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("Failed to resolve path {}", root.display()))?;
                 init::run_init(&root, no_hook, yes)
             }
+        }
+        Commands::Worktree { root, db, config: cfg_path } => {
+            let root = std::fs::canonicalize(&root)?;
+            let identity = git::repo_identity(&root);
+            if identity.worktree_name == "main" {
+                anyhow::bail!(
+                    "Not a linked worktree. `shire worktree` should be run from a git worktree, not the main working tree."
+                );
+            }
+            let config = config::load_config_from(cfg_path.as_deref(), &root)?;
+            let db_path = if let Some(p) = db {
+                p
+            } else {
+                config::resolve_db_path(&config, &root)?
+            };
+            // Seed from main if DB doesn't exist
+            if !db_path.exists() {
+                if let Some(seed_path) = config::seed_db_path_with_identity(
+                    &config, &root, &identity,
+                )? {
+                    if seed_path.exists() {
+                        db::seed_db(&seed_path, &db_path)?;
+                        eprintln!("Seeded worktree DB from {}", seed_path.display());
+                    } else {
+                        eprintln!(
+                            "Note: main DB not found at {} — will do a full build",
+                            seed_path.display()
+                        );
+                    }
+                }
+            } else {
+                eprintln!("Worktree DB already exists at {}", db_path.display());
+            }
+            // Run incremental build
+            index::build_index(&root, &config, false, Some(&db_path))
         }
         Commands::Rebuild {
             root,

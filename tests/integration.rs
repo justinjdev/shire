@@ -2171,3 +2171,122 @@ fn test_worktree_seed_from_main_db() {
         "Should NOT re-seed on second build, got stderr: {stderr}"
     );
 }
+
+#[test]
+fn test_worktree_subcommand() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("wt-cmd-project");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    create_minimal_fixture(&repo);
+
+    let db_base = dir.path().join("dbs");
+    let config_content = format!(
+        "db_path = \"{}/{{repo}}/{{worktree}}/index.db\"\n",
+        db_base.display()
+    );
+    fs::write(repo.join("shire.toml"), &config_content).unwrap();
+
+    // Commit everything so config is available in worktree
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "add fixture"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .unwrap();
+
+    // Build main index first (so there's something to seed from)
+    let output = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build on main");
+    assert!(
+        output.status.success(),
+        "Main build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let main_db = db_base.join("wt-cmd-project").join("main").join("index.db");
+    assert!(main_db.exists(), "Main DB should exist");
+
+    // Create a linked worktree
+    let wt_path = dir.path().join("wt-feat");
+    let output = Command::new("git")
+        .args([
+            "worktree", "add", wt_path.to_str().unwrap(), "-b", "wt-feat",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run `shire worktree` from the linked worktree
+    let output = Command::new(&bin)
+        .args(["worktree", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "shire worktree failed: {stderr}",
+    );
+
+    // Should have seeded
+    assert!(
+        stderr.contains("Seeded worktree DB from"),
+        "Should print seed message, got stderr: {stderr}"
+    );
+
+    // Verify worktree DB exists and has data
+    let wt_db = db_base.join("wt-cmd-project").join("wt-feat").join("index.db");
+    assert!(wt_db.exists(), "Worktree DB should exist at {}", wt_db.display());
+
+    let conn = rusqlite::Connection::open(&wt_db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(count > 0, "Worktree DB should have packages");
+    drop(conn);
+
+    // Running shire worktree again should say DB already exists (no re-seed)
+    let output = Command::new(&bin)
+        .args(["worktree", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire worktree again");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "shire worktree second run failed: {stderr}",
+    );
+    assert!(
+        stderr.contains("Worktree DB already exists"),
+        "Should say DB already exists on second run, got stderr: {stderr}"
+    );
+
+    // Running from main working tree should fail
+    let output = Command::new(&bin)
+        .args(["worktree", "--root", repo.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire worktree from main");
+    assert!(
+        !output.status.success(),
+        "shire worktree should fail from main working tree"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Not a linked worktree"),
+        "Should say not a linked worktree, got: {stderr}"
+    );
+}

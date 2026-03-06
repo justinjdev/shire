@@ -54,6 +54,15 @@ pub struct InitOptions {
     pub non_interactive: bool,
 }
 
+/// Install git hooks for worktree support.
+/// Called interactively from `shire init` when the user opts in.
+pub fn install_hooks(repo_root: &Path) -> Result<()> {
+    let hooks_dir = crate::hooks::detect_hooks_dir(repo_root)?;
+    crate::hooks::install_post_checkout_hook(&hooks_dir)?;
+    println!("Installed post-checkout hook in {}", hooks_dir.display());
+    Ok(())
+}
+
 impl InitOptions {
     pub fn default_local() -> Self {
         Self {
@@ -761,6 +770,36 @@ mod tests {
         let err = result.unwrap_err();
         let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
         assert!(chain.contains("Failed to parse"), "expected 'Failed to parse' in: {chain}");
+    }
+
+    #[test]
+    fn test_install_hooks_in_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+
+        install_hooks(&repo).unwrap();
+
+        let hooks_dir = repo.join(".git").join("hooks");
+        let hook_path = hooks_dir.join("post-checkout");
+        assert!(hook_path.exists());
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert!(content.contains("shire worktree"));
     }
 
     #[test]

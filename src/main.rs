@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod config;
 mod db;
 mod git;
+mod hooks;
 mod index;
 mod init;
 mod mcp;

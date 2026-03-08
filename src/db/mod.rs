@@ -170,6 +170,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
 
 /// Copy a SQLite database using the backup API.
 /// Handles WAL-mode databases correctly. Creates parent directories for `dest`.
+/// Uses a temporary file + rename to avoid leaving a partial DB on failure.
 pub fn seed_db(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     use anyhow::Context;
 
@@ -177,30 +178,46 @@ pub fn seed_db(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
     }
-    let src_conn = Connection::open_with_flags(
-        source,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("Failed to open seed DB '{}'", source.display()))?;
-    let mut dst_conn = Connection::open(dest)
-        .with_context(|| format!("Failed to create DB '{}'", dest.display()))?;
-    let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
-        .with_context(|| {
-            format!(
-                "Failed to init backup '{}' -> '{}'",
-                source.display(),
-                dest.display()
-            )
-        })?;
-    backup
-        .run_to_completion(100, std::time::Duration::ZERO, None)
-        .with_context(|| {
-            format!(
-                "Failed to complete backup '{}' -> '{}'",
-                source.display(),
-                dest.display()
-            )
-        })?;
+
+    // Write to a temp file in the same directory so rename is atomic.
+    let tmp_dest = dest.with_extension("db.seed-tmp");
+
+    let result = (|| -> Result<()> {
+        let src_conn = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("Failed to open seed DB '{}'", source.display()))?;
+        let mut dst_conn = Connection::open(&tmp_dest)
+            .with_context(|| format!("Failed to create DB '{}'", tmp_dest.display()))?;
+        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+            .with_context(|| {
+                format!(
+                    "Failed to init backup '{}' -> '{}'",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        backup
+            .run_to_completion(100, std::time::Duration::ZERO, None)
+            .with_context(|| {
+                format!(
+                    "Failed to complete backup '{}' -> '{}'",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        Ok(())
+    })();
+
+    if let Err(e) = &result {
+        let _ = std::fs::remove_file(&tmp_dest);
+        return Err(anyhow::anyhow!("{e:#}"));
+    }
+
+    std::fs::rename(&tmp_dest, dest)
+        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_dest.display(), dest.display()))?;
+
     Ok(())
 }
 

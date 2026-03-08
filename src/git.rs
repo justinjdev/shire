@@ -13,7 +13,7 @@ pub struct WorktreeInfo {
 
 impl WorktreeInfo {
     pub fn is_linked(&self) -> bool {
-        self.worktree_name != "main"
+        self.main_root.is_some()
     }
 }
 
@@ -79,9 +79,13 @@ fn parse_linked_worktree(dot_git_file: &Path, repo_root: &Path) -> Option<Worktr
     }
     let main_repo_root = git_dir.parent()?;
 
+    // Use Git's stable worktree ID (the directory name under .git/worktrees/<id>)
+    // rather than the checkout directory basename, which could collide or be "main".
+    let worktree_id = gitdir.file_name()?.to_str()?.to_owned();
+
     Some(WorktreeInfo {
         repo_name: dir_name(main_repo_root),
-        worktree_name: dir_name(repo_root),
+        worktree_name: worktree_id,
         main_root: Some(main_repo_root.to_path_buf()),
     })
 }

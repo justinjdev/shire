@@ -198,7 +198,8 @@ pub(crate) fn seed_db_path(
                 worktree_name: "main".into(),
                 main_root: None,
             };
-            let main_path = resolve_db_path_with_info(config, repo_root, &main_info)?;
+            let main_repo_root = info.main_root.as_deref().unwrap_or(repo_root);
+            let main_path = resolve_db_path_with_info(config, main_repo_root, &main_info)?;
             Ok(Some(main_path))
         }
         _ => Ok(None),
@@ -374,6 +375,14 @@ exclude = ["vendor"]
         }
     }
 
+    fn test_linked_info(repo: &str, worktree: &str, main_root: &str) -> crate::git::WorktreeInfo {
+        crate::git::WorktreeInfo {
+            repo_name: repo.into(),
+            worktree_name: worktree.into(),
+            main_root: Some(PathBuf::from(main_root)),
+        }
+    }
+
     #[test]
     fn test_resolve_db_path_repo_placeholder() {
         let config = Config {
@@ -437,7 +446,7 @@ exclude = ["vendor"]
             db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("my-repo", "feat-xyz");
+        let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
         let seed = seed_db_path(&config, Path::new("/some/path"), &info).unwrap();
         assert_eq!(seed, Some(PathBuf::from("/tmp/shire/my-repo/main/index.db")));
     }
@@ -458,14 +467,14 @@ exclude = ["vendor"]
             db_path: Some("/tmp/shire/{repo}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("my-repo", "feat-xyz");
+        let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
         assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
     }
 
     #[test]
     fn test_seed_db_path_none_for_default_config() {
         let config = Config::default();
-        let info = test_info("my-repo", "feat-xyz");
+        let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
         assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
     }
 

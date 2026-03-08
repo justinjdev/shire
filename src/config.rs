@@ -182,7 +182,7 @@ pub(crate) fn resolve_db_path_with_info(
 /// Compute the seed DB path (main worktree's DB) for a linked worktree.
 /// Returns `None` if:
 /// - This is the main worktree (nothing to seed from)
-/// - The db_path doesn't use `{worktree}` (worktrees share a single DB)
+/// - The current and main worktree resolve to the same DB path (shared DB)
 pub(crate) fn seed_db_path(
     config: &Config,
     repo_root: &Path,
@@ -191,18 +191,19 @@ pub(crate) fn seed_db_path(
     if !info.is_linked() {
         return Ok(None);
     }
-    match &config.db_path {
-        Some(p) if p.contains("{worktree}") => {
-            let main_info = crate::git::WorktreeInfo {
-                repo_name: info.repo_name.clone(),
-                worktree_name: "main".into(),
-                main_root: None,
-            };
-            let main_repo_root = info.main_root.as_deref().unwrap_or(repo_root);
-            let main_path = resolve_db_path_with_info(config, main_repo_root, &main_info)?;
-            Ok(Some(main_path))
-        }
-        _ => Ok(None),
+    let main_info = crate::git::WorktreeInfo {
+        repo_name: info.repo_name.clone(),
+        worktree_name: "main".into(),
+        main_root: None,
+    };
+    let main_repo_root = info.main_root.as_deref().unwrap_or(repo_root);
+    let current_path = resolve_db_path_with_info(config, repo_root, info)?;
+    let main_path = resolve_db_path_with_info(config, main_repo_root, &main_info)?;
+
+    if current_path == main_path {
+        Ok(None)
+    } else {
+        Ok(Some(main_path))
     }
 }
 
@@ -472,10 +473,13 @@ exclude = ["vendor"]
     }
 
     #[test]
-    fn test_seed_db_path_none_for_default_config() {
+    fn test_seed_db_path_seeds_for_default_config() {
+        // Default db_path (None) resolves to repo_root/.shire/index.db, which differs
+        // between the linked worktree and main worktree roots, so seeding should apply.
         let config = Config::default();
         let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
-        assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
+        let seed = seed_db_path(&config, Path::new("/some/path"), &info).unwrap();
+        assert_eq!(seed, Some(PathBuf::from("/main/repo/.shire/index.db")));
     }
 
     #[test]

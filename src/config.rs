@@ -483,6 +483,19 @@ exclude = ["vendor"]
     }
 
     #[test]
+    fn test_seed_db_path_seeds_for_explicit_relative_path() {
+        // Explicit relative db_path without {worktree} resolves against different
+        // repo_roots for linked vs main worktrees, so seeding should apply.
+        let config = Config {
+            db_path: Some(".shire/index.db".into()),
+            ..Config::default()
+        };
+        let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
+        let seed = seed_db_path(&config, Path::new("/some/path"), &info).unwrap();
+        assert_eq!(seed, Some(PathBuf::from("/main/repo/.shire/index.db")));
+    }
+
+    #[test]
     fn test_load_config_from_explicit_path() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg_path = dir.path().join("custom-shire.toml");

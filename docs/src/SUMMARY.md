@@ -13,6 +13,7 @@
 - [MCP Tools](./mcp-tools.md)
 - [MCP Prompts](./mcp-prompts.md)
 - [Watch Daemon](./watch-daemon.md)
+- [Git Worktrees](./worktrees.md)
 
 # Integration
 

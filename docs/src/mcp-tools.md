@@ -1,4 +1,6 @@
-# MCP Tools
+# MCP Tools & Prompts
+
+## Tools
 
 Shire exposes the following tools over the Model Context Protocol:
 
@@ -14,3 +16,11 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_package_files` | List all files in a package, optionally filtered by extension |
 | `explore` | Semantic codebase exploration — search packages, symbols, and files for a concept |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
+
+## Prompts
+
+Prompts are pre-built templates that compose multiple queries into structured context. They give your AI a map of where concepts live in the codebase.
+
+| Prompt | Args | Description |
+|---|---|---|
+| `explore` | `query` | Search packages, symbols, and files for a concept — returns a structured context map organized by package |

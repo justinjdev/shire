@@ -2,8 +2,10 @@
 
 ```
 src/
-├── main.rs          # CLI (clap): build, serve, watch, rebuild subcommands
+├── main.rs          # CLI (clap): build, serve, watch, rebuild, init subcommands
 ├── config.rs        # shire.toml parsing
+├── git.rs           # Git worktree detection and repo root resolution
+├── init.rs          # `shire init` setup (config, MCP server, hooks, rules)
 ├── db/
 │   ├── mod.rs       # SQLite schema, open/create
 │   └── queries.rs   # FTS search, dependency graph BFS, listing
@@ -40,8 +42,8 @@ src/
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 8 tool handlers (+ hybrid search when RAG enabled)
-│   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
+│   ├── tools.rs     # 10 tool handlers (+ hybrid search when RAG enabled)
+│   └── prompts.rs   # explore prompt template for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)

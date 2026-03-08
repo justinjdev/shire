@@ -20,6 +20,13 @@ name = "legacy-auth"
 description = "Deprecated auth service — do not add new dependencies"
 ```
 
+## Watch daemon
+
+```toml
+[watch]
+debounce_ms = 2000  # milliseconds to wait after last change before rebuilding
+```
+
 All fields are optional. Defaults are shown above. The `--db` CLI flag takes precedence over `db_path` in config.
 
 ## Custom package discovery

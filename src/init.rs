@@ -143,7 +143,7 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
 
     if global {
         lines.push("# Shire global configuration — shared across all repositories".into());
-        lines.push("# {repo} = repository name, {worktree} = worktree name (\"main\" for primary)".into());
+        lines.push("# {repo} = repository name, {worktree} = worktree name (\"_primary\" for primary)".into());
     } else {
         lines.push("# Shire configuration".into());
     }

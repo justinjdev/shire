@@ -4,12 +4,17 @@ use std::path::{Path, PathBuf};
 pub struct WorktreeInfo {
     /// Name of the main repository (directory basename of the main working tree).
     pub repo_name: String,
-    /// Worktree identifier: "main" for the primary working tree, or the directory
-    /// basename for linked worktrees.
+    /// Worktree identifier: `PRIMARY_WORKTREE_NAME` for the primary working tree,
+    /// or Git's stable worktree ID (from `.git/worktrees/<id>`) for linked worktrees.
     pub worktree_name: String,
     /// Absolute path to the main repository root (for resolving seed DB paths).
     pub main_root: Option<PathBuf>,
 }
+
+/// Reserved worktree name for the primary (non-linked) working tree.
+/// Uses a leading underscore to avoid collisions with Git worktree IDs,
+/// which are derived from branch names.
+pub const PRIMARY_WORKTREE_NAME: &str = "_primary";
 
 impl WorktreeInfo {
     pub fn is_linked(&self) -> bool {
@@ -30,7 +35,7 @@ pub fn worktree_info(repo_root: &Path) -> WorktreeInfo {
         // Main working tree
         return WorktreeInfo {
             repo_name: dir_name(repo_root),
-            worktree_name: "main".into(),
+            worktree_name: PRIMARY_WORKTREE_NAME.into(),
             main_root: None,
         };
     }
@@ -44,7 +49,7 @@ pub fn worktree_info(repo_root: &Path) -> WorktreeInfo {
     // Not a git repo or unrecognizable structure
     WorktreeInfo {
         repo_name: dir_name(repo_root),
-        worktree_name: "main".into(),
+        worktree_name: PRIMARY_WORKTREE_NAME.into(),
         main_root: None,
     }
 }
@@ -110,7 +115,7 @@ mod tests {
 
         let info = worktree_info(&repo);
         assert_eq!(info.repo_name, "my-repo");
-        assert_eq!(info.worktree_name, "main");
+        assert_eq!(info.worktree_name, PRIMARY_WORKTREE_NAME);
         assert!(!info.is_linked());
         assert!(info.main_root.is_none());
     }
@@ -179,7 +184,7 @@ mod tests {
 
         let info = worktree_info(&plain);
         assert_eq!(info.repo_name, "plain-dir");
-        assert_eq!(info.worktree_name, "main");
+        assert_eq!(info.worktree_name, PRIMARY_WORKTREE_NAME);
         assert!(!info.is_linked());
     }
 
@@ -192,7 +197,7 @@ mod tests {
 
         let info = worktree_info(&repo);
         assert_eq!(info.repo_name, "bad-repo");
-        assert_eq!(info.worktree_name, "main");
+        assert_eq!(info.worktree_name, PRIMARY_WORKTREE_NAME);
     }
 
     #[test]
@@ -205,6 +210,38 @@ mod tests {
         let i1 = worktree_info(&repo);
         let i2 = worktree_info(&repo);
         assert_eq!(i1, i2);
+    }
+
+    #[test]
+    fn test_linked_worktree_named_main_does_not_collide() {
+        // Regression: a linked worktree with Git ID "main" must not collide
+        // with the primary worktree's reserved name.
+        let dir = TempDir::new().unwrap();
+
+        let main_repo = dir.path().join("my-repo");
+        let git_dir = main_repo.join(".git");
+        // Git assigns worktree ID "main" under .git/worktrees/main
+        let wt_git_dir = git_dir.join("worktrees").join("main");
+        std::fs::create_dir_all(&wt_git_dir).unwrap();
+
+        let wt_dir = dir.path().join("main-checkout");
+        std::fs::create_dir(&wt_dir).unwrap();
+        std::fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", wt_git_dir.display()),
+        )
+        .unwrap();
+
+        let linked = worktree_info(&wt_dir);
+        assert!(linked.is_linked());
+        assert_eq!(linked.worktree_name, "main");
+
+        let primary = worktree_info(&main_repo);
+        assert!(!primary.is_linked());
+        assert_eq!(primary.worktree_name, PRIMARY_WORKTREE_NAME);
+
+        // The two worktree names must differ
+        assert_ne!(linked.worktree_name, primary.worktree_name);
     }
 
     #[test]

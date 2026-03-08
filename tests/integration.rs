@@ -1956,7 +1956,7 @@ fn test_build_main_worktree_db_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let expected_db = db_base.join("my-project").join("main").join("index.db");
+    let expected_db = db_base.join("my-project").join("_primary").join("index.db");
     assert!(
         expected_db.exists(),
         "Expected DB at {} but it doesn't exist",
@@ -2067,7 +2067,7 @@ fn test_worktree_seed_from_main_db() {
         .expect("Failed to run shire build on main");
     assert!(output.status.success(), "Main build failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    let main_db = db_base.join("seed-project").join("main").join("index.db");
+    let main_db = db_base.join("seed-project").join("_primary").join("index.db");
     assert!(main_db.exists(), "Main DB should exist at {}", main_db.display());
 
     // Create a linked worktree and build

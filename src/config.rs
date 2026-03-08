@@ -193,7 +193,7 @@ pub(crate) fn seed_db_path(
     }
     let main_info = crate::git::WorktreeInfo {
         repo_name: info.repo_name.clone(),
-        worktree_name: "main".into(),
+        worktree_name: crate::git::PRIMARY_WORKTREE_NAME.into(),
         main_root: None,
     };
     let main_repo_root = info.main_root.as_deref().unwrap_or(repo_root);
@@ -390,7 +390,7 @@ exclude = ["vendor"]
             db_path: Some("~/.claude/shire/{repo}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("my-monorepo", "main");
+        let info = test_info("my-monorepo", crate::git::PRIMARY_WORKTREE_NAME);
         let resolved = resolve_db_path_with_info(&config, Path::new("/home/user/git/my-monorepo"), &info).unwrap();
         assert!(resolved.to_str().unwrap().contains("/my-monorepo/"));
         assert!(resolved.to_str().unwrap().ends_with("/my-monorepo/index.db"));
@@ -413,9 +413,9 @@ exclude = ["vendor"]
             db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("my-repo", "main");
+        let info = test_info("my-repo", crate::git::PRIMARY_WORKTREE_NAME);
         let resolved = resolve_db_path_with_info(&config, Path::new("/some/path"), &info).unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/main/index.db"));
+        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/_primary/index.db"));
     }
 
     #[test]
@@ -435,7 +435,7 @@ exclude = ["vendor"]
             db_path: Some("/tmp/shire/{repo}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("unknown", "main");
+        let info = test_info("unknown", crate::git::PRIMARY_WORKTREE_NAME);
         let result = resolve_db_path_with_info(&config, Path::new("/"), &info);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Cannot determine repository name"));
@@ -449,7 +449,7 @@ exclude = ["vendor"]
         };
         let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
         let seed = seed_db_path(&config, Path::new("/some/path"), &info).unwrap();
-        assert_eq!(seed, Some(PathBuf::from("/tmp/shire/my-repo/main/index.db")));
+        assert_eq!(seed, Some(PathBuf::from("/tmp/shire/my-repo/_primary/index.db")));
     }
 
     #[test]
@@ -458,7 +458,7 @@ exclude = ["vendor"]
             db_path: Some("/tmp/shire/{repo}/{worktree}/index.db".into()),
             ..Config::default()
         };
-        let info = test_info("my-repo", "main");
+        let info = test_info("my-repo", crate::git::PRIMARY_WORKTREE_NAME);
         assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
     }
 

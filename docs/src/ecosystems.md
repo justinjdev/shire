@@ -11,3 +11,19 @@
 | `build.gradle` / `build.gradle.kts` | gradle | `settings.gradle` project inclusion |
 | `cpanfile` | perl | `requires` / `on 'test'` blocks |
 | `Gemfile` | ruby | `gem` / `group :test` blocks |
+
+## Symbol extraction
+
+Shire extracts public symbols (functions, classes, types, methods, interfaces) from source files using [tree-sitter](https://tree-sitter.github.io/tree-sitter/), with full signatures, parameters, and return types.
+
+| Language | Extractor |
+|---|---|
+| TypeScript / JavaScript | tree-sitter |
+| Go | tree-sitter |
+| Rust | tree-sitter |
+| Python | tree-sitter |
+| Java | tree-sitter |
+| Kotlin | tree-sitter |
+| Ruby | tree-sitter |
+| Protobuf | tree-sitter |
+| Perl | regex-based |

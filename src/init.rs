@@ -69,7 +69,7 @@ impl InitOptions {
     pub fn default_global() -> Self {
         Self {
             use_hook: true,
-            db_path: "~/.claude/shire/{repo}/index.db".into(),
+            db_path: "~/.claude/shire/{repo}/{worktree}/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
             generate_rules: true,
@@ -143,7 +143,7 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
 
     if global {
         lines.push("# Shire global configuration — shared across all repositories".into());
-        lines.push("# The {repo} placeholder is replaced with the repository directory name".into());
+        lines.push("# {repo} = repository name, {worktree} = worktree name (\"main\" for primary)".into());
     } else {
         lines.push("# Shire configuration".into());
     }
@@ -857,6 +857,7 @@ mod tests {
         let toml = generate_config_toml(&opts, true);
         assert!(toml.contains("# Shire global configuration"));
         assert!(toml.contains("{repo}"));
+        assert!(toml.contains("{worktree}"));
         assert!(!toml.contains("[discovery]"));
         assert!(!toml.contains("[rag]"));
     }

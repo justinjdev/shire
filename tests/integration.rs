@@ -1901,3 +1901,206 @@ fn test_rag_disabled_no_embeddings() {
         "symbol_embeddings should not exist when RAG is disabled"
     );
 }
+
+fn git_init_repo(dir: &Path) {
+    let output = Command::new("git")
+        .args(["init"])
+        .current_dir(dir)
+        .output()
+        .expect("git init failed");
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .expect("git commit failed");
+    assert!(output.status.success());
+}
+
+fn create_minimal_fixture(dir: &Path) {
+    let pkg = dir.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::File::create(pkg.join("package.json"))
+        .unwrap()
+        .write_all(br#"{"name": "test-pkg", "version": "1.0.0", "description": "A test"}"#)
+        .unwrap();
+}
+
+#[test]
+fn test_build_main_worktree_db_path() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("my-project");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    create_minimal_fixture(&repo);
+
+    let db_base = dir.path().join("dbs");
+    let config_content = format!(
+        "db_path = \"{}/{{repo}}/{{worktree}}/index.db\"\n",
+        db_base.display()
+    );
+    fs::write(repo.join("shire.toml"), &config_content).unwrap();
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let expected_db = db_base.join("my-project").join("_primary").join("index.db");
+    assert!(
+        expected_db.exists(),
+        "Expected DB at {} but it doesn't exist",
+        expected_db.display()
+    );
+
+    let conn = rusqlite::Connection::open(&expected_db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(count > 0, "DB should have packages");
+}
+
+#[test]
+fn test_build_linked_worktree_db_path() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("my-project");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    create_minimal_fixture(&repo);
+
+    let db_base = dir.path().join("dbs");
+    let config_content = format!(
+        "db_path = \"{}/{{repo}}/{{worktree}}/index.db\"\n",
+        db_base.display()
+    );
+    fs::write(repo.join("shire.toml"), &config_content).unwrap();
+
+    // Commit so config is available in worktree
+    Command::new("git").args(["add", "."]).current_dir(&repo).output().unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "add fixture"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .unwrap();
+
+    // Create a linked worktree
+    let wt_path = dir.path().join("feat-branch");
+    let output = Command::new("git")
+        .args(["worktree", "add", wt_path.to_str().unwrap(), "-b", "feat-branch"])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(output.status.success(), "git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // Build from the worktree
+    let output = Command::new(&bin)
+        .args(["build", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(
+        output.status.success(),
+        "Build in worktree failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // DB should be at <db_base>/my-project/feat-branch/index.db
+    let expected_db = db_base.join("my-project").join("feat-branch").join("index.db");
+    assert!(expected_db.exists(), "Expected DB at {} but it doesn't exist", expected_db.display());
+
+    // {repo} should resolve to main repo name, not worktree dir name
+    let wrong_db = db_base.join("feat-branch").join("feat-branch").join("index.db");
+    assert!(!wrong_db.exists(), "DB should NOT be at {} (wrong repo name)", wrong_db.display());
+
+    let conn = rusqlite::Connection::open(&expected_db).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
+    assert!(count > 0, "Worktree DB should have packages");
+}
+
+#[test]
+fn test_worktree_seed_from_main_db() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("seed-project");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    create_minimal_fixture(&repo);
+
+    let db_base = dir.path().join("dbs");
+    let config_content = format!(
+        "db_path = \"{}/{{repo}}/{{worktree}}/index.db\"\n",
+        db_base.display()
+    );
+    fs::write(repo.join("shire.toml"), &config_content).unwrap();
+
+    Command::new("git").args(["add", "."]).current_dir(&repo).output().unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "add fixture"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .unwrap();
+
+    // Build main worktree first
+    let output = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build on main");
+    assert!(output.status.success(), "Main build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let main_db = db_base.join("seed-project").join("_primary").join("index.db");
+    assert!(main_db.exists(), "Main DB should exist at {}", main_db.display());
+
+    // Create a linked worktree and build
+    let wt_path = dir.path().join("seed-branch");
+    let output = Command::new("git")
+        .args(["worktree", "add", wt_path.to_str().unwrap(), "-b", "seed-branch"])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(output.status.success());
+
+    let output = Command::new(&bin)
+        .args(["build", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build on worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "Worktree build failed: {stderr}");
+    assert!(stderr.contains("Seeded DB from"), "Should print seed message, got stderr: {stderr}");
+
+    // Verify worktree DB has data
+    let wt_db = db_base.join("seed-project").join("seed-branch").join("index.db");
+    assert!(wt_db.exists());
+    let conn = rusqlite::Connection::open(&wt_db).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0)).unwrap();
+    assert!(count > 0, "Worktree DB should have packages from seed");
+    drop(conn);
+
+    // Rebuild should NOT re-seed
+    let output = Command::new(&bin)
+        .args(["build", "--root", wt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire rebuild on worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success());
+    assert!(!stderr.contains("Seeded DB from"), "Should NOT re-seed on second build");
+}

@@ -168,6 +168,59 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Copy a SQLite database using the backup API.
+/// Handles WAL-mode databases correctly. Creates parent directories for `dest`.
+/// Uses a temporary file + rename to avoid leaving a partial DB on failure.
+pub fn seed_db(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    use anyhow::Context;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
+    }
+
+    // Write to a temp file in the same directory so rename is atomic.
+    let tmp_dest = dest.with_extension("db.seed-tmp");
+
+    let result = (|| -> Result<()> {
+        let src_conn = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("Failed to open seed DB '{}'", source.display()))?;
+        let mut dst_conn = Connection::open(&tmp_dest)
+            .with_context(|| format!("Failed to create DB '{}'", tmp_dest.display()))?;
+        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+            .with_context(|| {
+                format!(
+                    "Failed to init backup '{}' -> '{}'",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        backup
+            .run_to_completion(100, std::time::Duration::ZERO, None)
+            .with_context(|| {
+                format!(
+                    "Failed to complete backup '{}' -> '{}'",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        Ok(())
+    })();
+
+    if let Err(e) = &result {
+        let _ = std::fs::remove_file(&tmp_dest);
+        return Err(anyhow::anyhow!("{e:#}"));
+    }
+
+    std::fs::rename(&tmp_dest, dest)
+        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_dest.display(), dest.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn create_schema_for_test(conn: &Connection) {
     create_schema(conn).unwrap();
@@ -226,5 +279,52 @@ mod tests {
     fn test_schema_is_idempotent() {
         let conn = in_memory_db();
         create_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_seed_db_copies_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src_path = dir.path().join("source.db");
+        let src_conn = Connection::open(&src_path).unwrap();
+        create_schema(&src_conn).unwrap();
+        src_conn
+            .execute(
+                "INSERT INTO packages (name, path, kind) VALUES (?1, ?2, ?3)",
+                ("test-pkg", "packages/test", "npm"),
+            )
+            .unwrap();
+        drop(src_conn);
+
+        let dst_path = dir.path().join("dest.db");
+        seed_db(&src_path, &dst_path).unwrap();
+
+        let dst_conn = Connection::open(&dst_path).unwrap();
+        let name: String = dst_conn
+            .query_row("SELECT name FROM packages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(name, "test-pkg");
+    }
+
+    #[test]
+    fn test_seed_db_creates_parent_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src_path = dir.path().join("source.db");
+        let src_conn = Connection::open(&src_path).unwrap();
+        create_schema(&src_conn).unwrap();
+        drop(src_conn);
+
+        let dst_path = dir.path().join("deep").join("nested").join("dest.db");
+        seed_db(&src_path, &dst_path).unwrap();
+        assert!(dst_path.exists());
+    }
+
+    #[test]
+    fn test_seed_db_source_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = seed_db(
+            &dir.path().join("nonexistent.db"),
+            &dir.path().join("dest.db"),
+        );
+        assert!(result.is_err());
     }
 }

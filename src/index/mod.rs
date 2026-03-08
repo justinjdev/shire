@@ -1170,11 +1170,23 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     };
 
+    let wt_info = crate::git::worktree_info(repo_root);
     let db_path = if let Some(p) = db_override {
         p.to_path_buf()
     } else {
-        crate::config::resolve_db_path(config, repo_root)?
+        crate::config::resolve_db_path_with_info(config, repo_root, &wt_info)?
     };
+
+    // Seed from main worktree's DB if this is a new linked-worktree build.
+    if !db_path.exists() {
+        if let Some(seed_path) = crate::config::seed_db_path(config, repo_root, &wt_info)? {
+            if seed_path.exists() {
+                crate::db::seed_db(&seed_path, &db_path)?;
+                eprintln!("Seeded DB from {}", seed_path.display());
+            }
+        }
+    }
+
     let conn = db::open_or_create(&db_path, config.rag.enabled)?;
 
     if force {

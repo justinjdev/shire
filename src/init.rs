@@ -252,6 +252,9 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
     }
 
+    // 5. Ensure .shire is in .gitignore
+    ensure_gitignore(root)?;
+
     if opts.use_hook {
         println!("\nNext: run `shire build` in this repo to create the index.");
     } else {
@@ -520,6 +523,30 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
         });
     }
     println!("Added mcpServers.shire to ~/.claude.json");
+    Ok(())
+}
+
+/// Ensure `.shire` is listed in `.gitignore` at the project root.
+/// Creates the file if it doesn't exist, appends if `.shire` isn't already ignored.
+fn ensure_gitignore(root: &Path) -> Result<()> {
+    let gitignore_path = root.join(".gitignore");
+    if gitignore_path.exists() {
+        let content = fs::read_to_string(&gitignore_path)
+            .with_context(|| format!("Failed to read {}", gitignore_path.display()))?;
+        // Check if .shire is already ignored (exact line match)
+        if content.lines().any(|line| line.trim() == ".shire" || line.trim() == ".shire/") {
+            return Ok(());
+        }
+        // Append .shire to existing .gitignore
+        let separator = if content.ends_with('\n') { "" } else { "\n" };
+        fs::write(&gitignore_path, format!("{content}{separator}.shire\n"))
+            .with_context(|| format!("Failed to update {}", gitignore_path.display()))?;
+        println!("Added .shire to .gitignore");
+    } else {
+        fs::write(&gitignore_path, ".shire\n")
+            .with_context(|| format!("Failed to create {}", gitignore_path.display()))?;
+        println!("Created .gitignore with .shire");
+    }
     Ok(())
 }
 

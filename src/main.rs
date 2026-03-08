@@ -93,6 +93,18 @@ enum Commands {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Remove the index database and all shire artifacts for a project
+    Clean {
+        /// Root directory of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Path to the index database (overrides shire.toml db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -166,6 +178,45 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("Failed to resolve path {}", root.display()))?;
                 init::run_init(&root, no_hook, yes)
             }
+        }
+        Commands::Clean { root, db, config: cfg_path } => {
+            let root = std::fs::canonicalize(&root)?;
+            let config = config::load_config_from(cfg_path.as_deref(), &root)?;
+
+            // Stop the watch daemon if running
+            if watch::daemon::is_running(&root) {
+                eprintln!("Stopping watch daemon...");
+                watch::daemon::stop_daemon(&root)?;
+            }
+
+            // Resolve and remove the database file
+            let db_path = if let Some(p) = db {
+                p
+            } else {
+                config::resolve_db_path(&config, &root)?
+            };
+            if db_path.exists() {
+                std::fs::remove_file(&db_path)
+                    .with_context(|| format!("Failed to remove database {}", db_path.display()))?;
+                eprintln!("Removed {}", db_path.display());
+                // Also remove WAL/SHM files that SQLite may leave behind
+                for suffix in &["-wal", "-shm"] {
+                    let mut p = db_path.as_os_str().to_owned();
+                    p.push(suffix);
+                    let _ = std::fs::remove_file(PathBuf::from(p));
+                }
+            }
+
+            // Remove the .shire directory
+            let shire_dir = root.join(".shire");
+            if shire_dir.exists() {
+                std::fs::remove_dir_all(&shire_dir)
+                    .with_context(|| format!("Failed to remove {}", shire_dir.display()))?;
+                eprintln!("Removed {}", shire_dir.display());
+            }
+
+            eprintln!("Clean complete.");
+            Ok(())
         }
         Commands::Rebuild {
             root,

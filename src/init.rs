@@ -43,15 +43,15 @@ fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
         return None;
     }
     let parent = path.parent()?;
-    let mut components = parent.components().peekable();
-    // Skip leading `.` (CurDir) from paths like `./build/...`
-    while matches!(components.peek(), Some(std::path::Component::CurDir)) {
-        components.next();
+    let mut parts: Vec<String> = Vec::new();
+    for component in parent.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(s) => parts.push(s.to_str()?.to_string()),
+            _ => return None,
+        }
     }
-    match components.next() {
-        Some(std::path::Component::Normal(s)) => s.to_str().map(|s| s.to_string()),
-        _ => None,
-    }
+    if parts.is_empty() { None } else { Some(parts.join("/")) }
 }
 
 /// Escape special characters for TOML string values.
@@ -1002,5 +1002,95 @@ mod tests {
         run_init(dir.path(), false, true).unwrap();
         let content = fs::read_to_string(&rules_path).unwrap();
         assert_eq!(content, "custom content");
+    }
+
+    // --- gitignore_dir_from_db_path ---
+
+    #[test]
+    fn test_gitignore_dir_simple() {
+        assert_eq!(gitignore_dir_from_db_path(".shire/index.db").as_deref(), Some(".shire"));
+        assert_eq!(gitignore_dir_from_db_path("build/shire.db").as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_nested() {
+        // Full parent path, not just the first segment
+        assert_eq!(gitignore_dir_from_db_path("src/db/index.db").as_deref(), Some("src/db"));
+        assert_eq!(gitignore_dir_from_db_path("a/b/c/index.db").as_deref(), Some("a/b/c"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_with_leading_dot_slash() {
+        // CurDir prefix is stripped
+        assert_eq!(gitignore_dir_from_db_path("./build/shire.db").as_deref(), Some("build"));
+        assert_eq!(gitignore_dir_from_db_path("./src/db/index.db").as_deref(), Some("src/db"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_bare_filename_is_none() {
+        // No directory component — nothing to ignore
+        assert_eq!(gitignore_dir_from_db_path("index.db"), None);
+    }
+
+    #[test]
+    fn test_gitignore_dir_absolute_is_none() {
+        assert_eq!(gitignore_dir_from_db_path("/abs/path/index.db"), None);
+    }
+
+    #[test]
+    fn test_gitignore_dir_tilde_is_none() {
+        assert_eq!(gitignore_dir_from_db_path("~/.claude/shire.db"), None);
+    }
+
+    // --- ensure_gitignore idempotency ---
+
+    #[test]
+    fn test_ensure_gitignore_creates_anchored_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("/.shire/"), "should contain anchored entry");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_idempotent_anchored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-existing anchored entry
+        fs::write(dir.path().join(".gitignore"), "/.shire/\n").unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content.matches("/.shire/").count(), 1, "should not duplicate");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_idempotent_legacy_unanchored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for existing in &[".shire", ".shire/", "/.shire"] {
+            let gitignore = dir.path().join(".gitignore");
+            fs::write(&gitignore, format!("{existing}\n")).unwrap();
+            ensure_gitignore(dir.path(), ".shire").unwrap();
+            let content = fs::read_to_string(&gitignore).unwrap();
+            assert!(
+                !content.contains("/.shire/"),
+                "should not add anchored entry when legacy variant '{existing}' present"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ensure_gitignore_nested_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        ensure_gitignore(dir.path(), "src/db").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("/src/db/"));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_appends_without_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join(".gitignore"), "node_modules").unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("node_modules\n/.shire/\n"));
     }
 }

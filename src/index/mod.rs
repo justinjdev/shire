@@ -1392,10 +1392,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                         .collect();
 
                     if !changed_packages.is_empty() {
-                        let pb = make_progress(&mp, changed_packages.len() as u64, "Embedding symbols");
-                        // For each changed package, delete old embeddings and regenerate
+                        // Collect all symbols and delete stale embeddings across all changed
+                        // packages before embedding. This lets fastembed run a single batched
+                        // inference call instead of N per-package calls, which is much faster.
+                        let mut all_symbols: Vec<crate::rag::embedder::SymbolForEmbedding> =
+                            Vec::new();
+
                         for pkg_name in &changed_packages {
-                            // Get symbol IDs for this package to delete old embeddings
                             let old_ids: Vec<i64> = conn
                                 .prepare("SELECT id FROM symbols WHERE package = ?1")?
                                 .query_map([pkg_name], |row| row.get(0))?
@@ -1407,7 +1410,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                                 )?;
                             }
 
-                            // Get full symbol info for embedding
                             let symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = conn
                                 .prepare(
                                     "SELECT id, name, kind, signature, package, file_path \
@@ -1425,40 +1427,24 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                                 })?
                                 .collect::<Result<Vec<_>, _>>()?;
 
-                            if !symbols.is_empty() {
-                                match crate::rag::embedder::embed_symbols(&embedder, &symbols) {
-                                    Ok(embeddings) => {
-                                        crate::rag::storage::insert_embeddings(
-                                            &conn, &embeddings,
-                                        )?;
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Warning: Failed to embed symbols for {}: {}",
-                                            pkg_name, e
-                                        );
-                                    }
-                                }
-                            }
-                            pb.inc(1);
+                            all_symbols.extend(symbols);
                         }
 
-                        match conn.query_row(
-                            "SELECT COUNT(*) FROM symbol_embeddings",
-                            [],
-                            |row| row.get::<_, i64>(0),
-                        ) {
-                            Ok(embed_count) => {
-                                pb.finish_with_message(format!(
-                                    "Embedded {} symbols across {} packages",
-                                    embed_count, changed_packages.len()
-                                ));
-                            }
-                            Err(e) => {
-                                pb.finish_and_clear();
-                                eprintln!(
-                                    "Warning: Could not count embeddings (table may not exist): {e}"
-                                );
+                        if !all_symbols.is_empty() {
+                            let pb = make_spinner(&mp, "Embedding symbols\u{2026}");
+                            match crate::rag::embedder::embed_symbols(&embedder, &all_symbols) {
+                                Ok(embeddings) => {
+                                    crate::rag::storage::insert_embeddings(&conn, &embeddings)?;
+                                    pb.finish_with_message(format!(
+                                        "Embedded {} symbols across {} packages",
+                                        embeddings.len(),
+                                        changed_packages.len()
+                                    ));
+                                }
+                                Err(e) => {
+                                    pb.finish_and_clear();
+                                    eprintln!("Warning: Failed to embed symbols: {}", e);
+                                }
                             }
                         }
                     }

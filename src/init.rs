@@ -35,6 +35,25 @@ Use Shire tools before falling back to Grep/Glob:
 - `package_dependencies` with depth>1 — see the full transitive dependency chain
 "#;
 
+/// Extract the top-level directory component from a relative db_path.
+/// Returns `None` for absolute paths or paths starting with `~`.
+fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
+    let path = Path::new(db_path);
+    if path.is_absolute() || db_path.starts_with('~') {
+        return None;
+    }
+    let parent = path.parent()?;
+    let mut parts: Vec<String> = Vec::new();
+    for component in parent.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(s) => parts.push(s.to_str()?.to_string()),
+            _ => return None,
+        }
+    }
+    if parts.is_empty() { None } else { Some(parts.join("/")) }
+}
+
 /// Escape special characters for TOML string values.
 fn escape_toml_string(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -50,6 +69,8 @@ pub struct InitOptions {
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
     pub generate_rules: bool,
+    /// When true, add the db directory to .gitignore.
+    pub gitignore_db_dir: bool,
     /// When true, skip interactive prompts for existing files.
     pub non_interactive: bool,
 }
@@ -62,6 +83,7 @@ impl InitOptions {
             extra_excludes: Vec::new(),
             rag_enabled: false,
             generate_rules: true,
+            gitignore_db_dir: true,
             non_interactive: true,
         }
     }
@@ -73,6 +95,7 @@ impl InitOptions {
             extra_excludes: Vec::new(),
             rag_enabled: false,
             generate_rules: true,
+            gitignore_db_dir: false,
             non_interactive: true,
         }
     }
@@ -104,7 +127,21 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(defaults.db_path.clone())
         .interact_text()?;
 
-    // 3. Additional exclude directories
+    // 3. Gitignore the db directory? (local only — global init has no project .gitignore)
+    let gitignore_db_dir = if !global {
+        if let Some(dir) = gitignore_dir_from_db_path(&db_path) {
+            Confirm::new()
+                .with_prompt(format!("Add `{dir}` to .gitignore?"))
+                .default(true)
+                .interact()?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // 4. Additional exclude directories
     let extra_input: String = Input::new()
         .with_prompt("Additional exclude directories (comma-separated, or empty)")
         .default(String::new())
@@ -116,13 +153,13 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // 4. Enable RAG vector search
+    // 5. Enable RAG vector search
     let rag_enabled = Confirm::new()
         .with_prompt("Enable RAG vector search?")
         .default(false)
         .interact()?;
 
-    // 5. Generate .claude/rules/shire.md
+    // 6. Generate .claude/rules/shire.md
     let generate_rules = Confirm::new()
         .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
         .default(true)
@@ -134,6 +171,7 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         extra_excludes,
         rag_enabled,
         generate_rules,
+        gitignore_db_dir,
         non_interactive: false,
     })
 }
@@ -252,8 +290,12 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
     }
 
-    // 5. Ensure .shire is in .gitignore
-    ensure_gitignore(root)?;
+    // 5. Ensure the db directory is in .gitignore (only when config was actually written)
+    if should_write && opts.gitignore_db_dir {
+        if let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
+            ensure_gitignore(root, &dir)?;
+        }
+    }
 
     if opts.use_hook {
         println!("\nNext: run `shire build` in this repo to create the index.");
@@ -526,26 +568,31 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     Ok(())
 }
 
-/// Ensure `.shire` is listed in `.gitignore` at the project root.
-/// Creates the file if it doesn't exist, appends if `.shire` isn't already ignored.
-fn ensure_gitignore(root: &Path) -> Result<()> {
+/// Ensure `dir` is listed in `.gitignore` at the project root.
+/// Creates the file if it doesn't exist, appends if the entry isn't already present.
+fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
     let gitignore_path = root.join(".gitignore");
+    // Use anchored form `/{dir}/` so it only matches the root-level directory,
+    // not directories of the same name nested deeper in the tree.
+    let entry = format!("/{dir}/");
     if gitignore_path.exists() {
         let content = fs::read_to_string(&gitignore_path)
             .with_context(|| format!("Failed to read {}", gitignore_path.display()))?;
-        // Check if .shire is already ignored (exact line match)
-        if content.lines().any(|line| line.trim() == ".shire" || line.trim() == ".shire/") {
+        // Accept any variant (anchored or legacy unanchored) as already-present.
+        if content.lines().any(|line| {
+            let t = line.trim();
+            t == entry || t == format!("/{dir}") || t == dir || t == format!("{dir}/")
+        }) {
             return Ok(());
         }
-        // Append .shire to existing .gitignore
         let separator = if content.ends_with('\n') { "" } else { "\n" };
-        fs::write(&gitignore_path, format!("{content}{separator}.shire\n"))
+        fs::write(&gitignore_path, format!("{content}{separator}{entry}\n"))
             .with_context(|| format!("Failed to update {}", gitignore_path.display()))?;
-        println!("Added .shire to .gitignore");
+        println!("Added {entry} to .gitignore");
     } else {
-        fs::write(&gitignore_path, ".shire\n")
+        fs::write(&gitignore_path, format!("{entry}\n"))
             .with_context(|| format!("Failed to create {}", gitignore_path.display()))?;
-        println!("Created .gitignore with .shire");
+        println!("Created .gitignore with {entry}");
     }
     Ok(())
 }
@@ -931,6 +978,7 @@ mod tests {
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
             generate_rules: true,
+            gitignore_db_dir: false,
             non_interactive: true,
         };
         let toml = generate_config_toml(&opts, false);
@@ -954,5 +1002,95 @@ mod tests {
         run_init(dir.path(), false, true).unwrap();
         let content = fs::read_to_string(&rules_path).unwrap();
         assert_eq!(content, "custom content");
+    }
+
+    // --- gitignore_dir_from_db_path ---
+
+    #[test]
+    fn test_gitignore_dir_simple() {
+        assert_eq!(gitignore_dir_from_db_path(".shire/index.db").as_deref(), Some(".shire"));
+        assert_eq!(gitignore_dir_from_db_path("build/shire.db").as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_nested() {
+        // Full parent path, not just the first segment
+        assert_eq!(gitignore_dir_from_db_path("src/db/index.db").as_deref(), Some("src/db"));
+        assert_eq!(gitignore_dir_from_db_path("a/b/c/index.db").as_deref(), Some("a/b/c"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_with_leading_dot_slash() {
+        // CurDir prefix is stripped
+        assert_eq!(gitignore_dir_from_db_path("./build/shire.db").as_deref(), Some("build"));
+        assert_eq!(gitignore_dir_from_db_path("./src/db/index.db").as_deref(), Some("src/db"));
+    }
+
+    #[test]
+    fn test_gitignore_dir_bare_filename_is_none() {
+        // No directory component — nothing to ignore
+        assert_eq!(gitignore_dir_from_db_path("index.db"), None);
+    }
+
+    #[test]
+    fn test_gitignore_dir_absolute_is_none() {
+        assert_eq!(gitignore_dir_from_db_path("/abs/path/index.db"), None);
+    }
+
+    #[test]
+    fn test_gitignore_dir_tilde_is_none() {
+        assert_eq!(gitignore_dir_from_db_path("~/.claude/shire.db"), None);
+    }
+
+    // --- ensure_gitignore idempotency ---
+
+    #[test]
+    fn test_ensure_gitignore_creates_anchored_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("/.shire/"), "should contain anchored entry");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_idempotent_anchored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-existing anchored entry
+        fs::write(dir.path().join(".gitignore"), "/.shire/\n").unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content.matches("/.shire/").count(), 1, "should not duplicate");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_idempotent_legacy_unanchored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for existing in &[".shire", ".shire/", "/.shire"] {
+            let gitignore = dir.path().join(".gitignore");
+            fs::write(&gitignore, format!("{existing}\n")).unwrap();
+            ensure_gitignore(dir.path(), ".shire").unwrap();
+            let content = fs::read_to_string(&gitignore).unwrap();
+            assert!(
+                !content.contains("/.shire/"),
+                "should not add anchored entry when legacy variant '{existing}' present"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ensure_gitignore_nested_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        ensure_gitignore(dir.path(), "src/db").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("/src/db/"));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_appends_without_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join(".gitignore"), "node_modules").unwrap();
+        ensure_gitignore(dir.path(), ".shire").unwrap();
+        let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("node_modules\n/.shire/\n"));
     }
 }

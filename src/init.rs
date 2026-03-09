@@ -42,13 +42,16 @@ fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
     if path.is_absolute() || db_path.starts_with('~') {
         return None;
     }
-    path.components().next().and_then(|c| {
-        if let std::path::Component::Normal(s) = c {
-            s.to_str().map(|s| s.to_string())
-        } else {
-            None
-        }
-    })
+    let parent = path.parent()?;
+    let mut components = parent.components().peekable();
+    // Skip leading `.` (CurDir) from paths like `./build/...`
+    while matches!(components.peek(), Some(std::path::Component::CurDir)) {
+        components.next();
+    }
+    match components.next() {
+        Some(std::path::Component::Normal(s)) => s.to_str().map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 /// Escape special characters for TOML string values.
@@ -124,12 +127,16 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(defaults.db_path.clone())
         .interact_text()?;
 
-    // 3. Gitignore the db directory?
-    let gitignore_db_dir = if let Some(dir) = gitignore_dir_from_db_path(&db_path) {
-        Confirm::new()
-            .with_prompt(format!("Add `{dir}` to .gitignore?"))
-            .default(true)
-            .interact()?
+    // 3. Gitignore the db directory? (local only — global init has no project .gitignore)
+    let gitignore_db_dir = if !global {
+        if let Some(dir) = gitignore_dir_from_db_path(&db_path) {
+            Confirm::new()
+                .with_prompt(format!("Add `{dir}` to .gitignore?"))
+                .default(true)
+                .interact()?
+        } else {
+            false
+        }
     } else {
         false
     };
@@ -283,8 +290,8 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
     }
 
-    // 5. Ensure the db directory is in .gitignore
-    if opts.gitignore_db_dir {
+    // 5. Ensure the db directory is in .gitignore (only when config was actually written)
+    if should_write && opts.gitignore_db_dir {
         if let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
             ensure_gitignore(root, &dir)?;
         }
@@ -565,21 +572,27 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
 /// Creates the file if it doesn't exist, appends if the entry isn't already present.
 fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
     let gitignore_path = root.join(".gitignore");
-    let trailing = format!("{dir}/");
+    // Use anchored form `/{dir}/` so it only matches the root-level directory,
+    // not directories of the same name nested deeper in the tree.
+    let entry = format!("/{dir}/");
     if gitignore_path.exists() {
         let content = fs::read_to_string(&gitignore_path)
             .with_context(|| format!("Failed to read {}", gitignore_path.display()))?;
-        if content.lines().any(|line| line.trim() == dir || line.trim() == trailing) {
+        // Accept any variant (anchored or legacy unanchored) as already-present.
+        if content.lines().any(|line| {
+            let t = line.trim();
+            t == entry || t == format!("/{dir}") || t == dir || t == format!("{dir}/")
+        }) {
             return Ok(());
         }
         let separator = if content.ends_with('\n') { "" } else { "\n" };
-        fs::write(&gitignore_path, format!("{content}{separator}{dir}\n"))
+        fs::write(&gitignore_path, format!("{content}{separator}{entry}\n"))
             .with_context(|| format!("Failed to update {}", gitignore_path.display()))?;
-        println!("Added {dir} to .gitignore");
+        println!("Added {entry} to .gitignore");
     } else {
-        fs::write(&gitignore_path, format!("{dir}\n"))
+        fs::write(&gitignore_path, format!("{entry}\n"))
             .with_context(|| format!("Failed to create {}", gitignore_path.display()))?;
-        println!("Created .gitignore with {dir}");
+        println!("Created .gitignore with {entry}");
     }
     Ok(())
 }

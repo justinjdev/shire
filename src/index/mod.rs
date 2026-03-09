@@ -1431,11 +1431,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                         }
 
                         if !all_symbols.is_empty() {
-                            let pb = make_progress(
-                                &mp,
-                                all_symbols.len() as u64,
-                                "Embedding symbols",
-                            );
+                            let pb = make_spinner(&mp, "Embedding symbols\u{2026}");
                             match crate::rag::embedder::embed_symbols(&embedder, &all_symbols) {
                                 Ok(embeddings) => {
                                     crate::rag::storage::insert_embeddings(&conn, &embeddings)?;

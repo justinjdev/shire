@@ -18,7 +18,7 @@ The integration test (`tests/integration.rs`) builds the binary and runs it agai
 
 ## Architecture
 
-Rust CLI (edition 2024) with five subcommands: `build`, `serve`, `watch`, `rebuild`, `init`.
+Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, `init`, `install`, `uninstall`, `clean`.
 
 **Data flow:** `config::load_config()` → `index::build_index()` → SQLite DB → `mcp::run_server()` (read-only, or on-demand rebuild with `--root`)
 

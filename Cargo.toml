@@ -41,6 +41,7 @@ sqlite-vec = { version = "0.1", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
 indicatif = "0.17"
 dialoguer = "0.11"
+which = "7"
 
 [features]
 default = ["rag"]

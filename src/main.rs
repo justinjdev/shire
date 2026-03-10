@@ -7,6 +7,7 @@ mod db;
 mod git;
 mod index;
 mod init;
+mod install;
 mod mcp;
 mod rag;
 mod symbols;
@@ -93,6 +94,21 @@ enum Commands {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Register shire as an MCP server with all detected AI tools
+    Install {
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing registrations (useful after binary path changes)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove shire MCP registration from all detected AI tools
+    Uninstall {
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove the index database and all shire artifacts for a project
     Clean {
         /// Root directory of the repository (defaults to current directory)
@@ -107,6 +123,19 @@ enum Commands {
     },
 }
 
+/// Program entry point that parses command-line arguments and dispatches the selected subcommand.
+///
+/// This function drives the CLI behavior (build, serve, watch, init, install, uninstall, clean,
+/// rebuild), performs path canonicalization and configuration resolution, and delegates work to
+/// the corresponding modules. It returns an error if any subcommand encounters a failure.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Run the installed binary with the "build" subcommand:
+/// use std::process::Command;
+/// let _ = Command::new("shire").arg("build").status().unwrap();
+/// ```
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -179,6 +208,8 @@ async fn main() -> Result<()> {
                 init::run_init(&root, no_hook, yes)
             }
         }
+        Commands::Install { dry_run, force } => install::run_install(dry_run, force),
+        Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
         Commands::Clean { root, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;
 

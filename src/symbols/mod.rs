@@ -1,15 +1,8 @@
-pub mod generic;
-pub mod go;
-pub mod java;
-pub mod kotlin;
-pub mod lang_spec;
-pub mod languages;
+mod hooks;
 pub mod perl;
-pub mod proto;
-pub mod python;
+mod query_extract;
+mod registry;
 pub mod ruby;
-pub mod rust_lang;
-pub mod typescript;
 pub mod walker;
 
 use anyhow::Result;
@@ -93,7 +86,7 @@ pub fn extract_symbols_for_package(
     for file_path in source_files {
         let source = match std::fs::read_to_string(&file_path) {
             Ok(s) => s,
-            Err(_) => continue, // skip binary/unreadable files
+            Err(_) => continue,
         };
 
         let relative_path = file_path
@@ -115,23 +108,9 @@ pub fn extract_symbols_for_package(
 }
 
 /// Extract symbols from a single file by extension.
-/// Uses the generic table-driven extractor for languages with specs,
-/// and falls back to custom extractors for languages with unique AST patterns.
 pub fn extract_file(ext: &str, source: &str, file_path: &str) -> Vec<SymbolInfo> {
-    match ext {
-        // Languages using the generic table-driven extractor
-        "py" => generic::extract(&languages::python(), source, file_path),
-
-        // Languages with custom extractors (unique AST patterns)
-        "ts" | "tsx" => typescript::extract(source, file_path, ext == "tsx"),
-        "js" | "jsx" => typescript::extract_js(source, file_path),
-        "go" => go::extract(source, file_path),
-        "rs" => rust_lang::extract(source, file_path),
-        "proto" => proto::extract(source, file_path),
-        "java" => java::extract(source, file_path),
-        "kt" => kotlin::extract(source, file_path),
-        "pm" | "pl" => perl::extract(source, file_path),
-        "rb" => ruby::extract(source, file_path),
-        _ => Vec::new(),
-    }
+    registry::extract_file(ext, source, file_path)
 }
+
+#[cfg(test)]
+mod tests;

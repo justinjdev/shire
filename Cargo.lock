@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "shire"
-version = "0.1.11-beta"
+version = "0.1.12-beta"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2722,6 +2722,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "sqlite-vec",
+ "streaming-iterator",
  "tempfile",
  "tokio",
  "toml",

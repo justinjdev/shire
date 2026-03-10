@@ -104,6 +104,11 @@ shire rebuild --root /path/to/repo
 # Initialize config
 shire init              # project-level shire.toml
 shire init --global     # global ~/.claude/ config for all projects
+
+# Register with all detected AI tools (Claude Code, Cursor, VS Code, etc.)
+shire install
+shire install --force   # overwrite existing registrations
+shire uninstall         # remove from all tools
 ```
 
 ### CLI reference
@@ -127,6 +132,11 @@ shire init --global     # global ~/.claude/ config for all projects
 | `init` | `--root <DIR>` | Project root (default: `.`) |
 | | `--global` | Set up global config in `~/.claude/` |
 | | `--no-hook` | Use on-demand reindexing instead of PostToolUse hooks |
+| `install` | | Register shire as an MCP server with all detected AI tools |
+| | `--dry-run` | Show what would be done without making changes |
+| | `--force` | Overwrite existing registrations (useful after binary path changes) |
+| `uninstall` | | Remove shire MCP registration from all detected AI tools |
+| | `--dry-run` | Show what would be done without making changes |
 
 The index is written to `.shire/index.db` inside the repo root by default. You can override this with `--db` on the build command or `db_path` in `shire.toml` (see [Configuration](#configuration)). Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build. File indexing is also incremental — a file-tree hash detects structural changes, skipping Phase 9 entirely when no files have been added, removed, or resized. Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput. A per-phase **timing breakdown** is printed to stderr after each build. The server reads from this database in read-only mode.
 

@@ -66,6 +66,48 @@ fn registry() -> Vec<LanguageEntry> {
             query: include_str!("queries/proto.scm"),
             hooks: super::hooks::proto::hooks,
         },
+        LanguageEntry {
+            extensions: &["cs"],
+            ts_language: || tree_sitter_c_sharp::LANGUAGE.into(),
+            query: include_str!("queries/csharp.scm"),
+            hooks: super::hooks::csharp::hooks,
+        },
+        LanguageEntry {
+            extensions: &["swift"],
+            ts_language: || tree_sitter_swift::LANGUAGE.into(),
+            query: include_str!("queries/swift.scm"),
+            hooks: super::hooks::swift::hooks,
+        },
+        LanguageEntry {
+            extensions: &["c", "h"],
+            ts_language: || tree_sitter_c::LANGUAGE.into(),
+            query: include_str!("queries/c.scm"),
+            hooks: super::hooks::c::hooks,
+        },
+        LanguageEntry {
+            extensions: &["cpp", "cc", "cxx", "hpp", "hxx"],
+            ts_language: || tree_sitter_cpp::LANGUAGE.into(),
+            query: include_str!("queries/cpp.scm"),
+            hooks: super::hooks::cpp::hooks,
+        },
+        LanguageEntry {
+            extensions: &["php"],
+            ts_language: || tree_sitter_php::LANGUAGE_PHP.into(),
+            query: include_str!("queries/php.scm"),
+            hooks: super::hooks::php::hooks,
+        },
+        LanguageEntry {
+            extensions: &["scala", "sc"],
+            ts_language: || tree_sitter_scala::LANGUAGE.into(),
+            query: include_str!("queries/scala.scm"),
+            hooks: super::hooks::scala::hooks,
+        },
+        LanguageEntry {
+            extensions: &["zig"],
+            ts_language: || tree_sitter_zig::LANGUAGE.into(),
+            query: include_str!("queries/zig.scm"),
+            hooks: super::hooks::zig::hooks,
+        },
     ]
 }
 
@@ -75,6 +117,7 @@ pub fn extract_file(ext: &str, source: &str, file_path: &str) -> Vec<SymbolInfo>
     match ext {
         "pm" | "pl" => return super::perl::extract(source, file_path),
         "rb" => return super::ruby::extract(source, file_path),
+        "ex" | "exs" => return super::elixir::extract(source, file_path),
         _ => {}
     }
 

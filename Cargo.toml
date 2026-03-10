@@ -43,6 +43,14 @@ zerocopy = { version = "0.8", features = ["derive"], optional = true }
 indicatif = "0.17"
 dialoguer = "0.11"
 which = "7"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-php = "0.23"
+tree-sitter-scala = "0.24"
+tree-sitter-elixir = "0.3"
+tree-sitter-zig = "1.1"
+tree-sitter-swift = "0.6"
 
 [features]
 default = ["rag"]

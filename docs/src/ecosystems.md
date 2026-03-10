@@ -26,4 +26,12 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | Kotlin | tree-sitter |
 | Ruby | tree-sitter |
 | Protobuf | tree-sitter |
+| C | tree-sitter |
+| C++ | tree-sitter |
+| C# | tree-sitter |
+| Swift | tree-sitter |
+| PHP | tree-sitter |
+| Scala | tree-sitter |
+| Zig | tree-sitter |
+| Elixir | regex-based |
 | Perl | regex-based |

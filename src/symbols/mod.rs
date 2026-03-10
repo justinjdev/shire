@@ -5,7 +5,7 @@ mod registry;
 pub mod ruby;
 pub mod walker;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 
@@ -84,10 +84,8 @@ pub fn extract_symbols_for_package(
     let mut symbols = Vec::new();
 
     for file_path in source_files {
-        let source = match std::fs::read_to_string(&file_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let source = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
 
         let relative_path = file_path
             .strip_prefix(repo_root)

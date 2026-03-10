@@ -17,7 +17,7 @@
   (method_declaration
     name: (identifier) @name) @definition.method)
 
-; Fields inside class bodies (constants: public static final)
+; Fields inside class bodies (filtered to public static final constants in post_process hook)
 (class_body
   (field_declaration
     declarator: (variable_declarator

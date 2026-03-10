@@ -265,7 +265,7 @@ fn test_ts_exported_class_with_methods() {
     private _internal(): void {}
 }"#;
     let symbols = extract_file("ts", source, "src/auth.ts");
-    assert!(symbols.len() >= 2);
+    assert_eq!(symbols.len(), 2, "expected class + public method only");
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Class);
     assert_eq!(symbols[1].name, "validate");

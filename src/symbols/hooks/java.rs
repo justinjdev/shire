@@ -31,17 +31,20 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool) 
 
 /// Java visibility: only public or protected symbols are visible.
 /// Private and package-private (no modifier) are skipped.
-/// Also checks ancestor class visibility — methods inside a private class are not visible.
+/// Also checks ancestor class visibility — members inside a private or package-private
+/// class are not externally visible.
 fn is_visible(node: &Node, source: &str) -> bool {
     let (public, protected, private, _, _) = check_modifiers(node, source);
     if private || !(public || protected) {
         return false;
     }
 
-    // Check ancestor class visibility
+    // Check ancestor class visibility — a public method in a package-private or private
+    // class is not externally visible.
     if let Some(parent_class) = find_ancestor(node, "class_declaration") {
-        let (_, _, parent_private, _, _) = check_modifiers(&parent_class, source);
-        if parent_private {
+        let (parent_public, parent_protected, parent_private, _, _) =
+            check_modifiers(&parent_class, source);
+        if parent_private || !(parent_public || parent_protected) {
             return false;
         }
     }
@@ -171,8 +174,10 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             let name = find_identifier(&declarator, source)?;
 
             let type_str = find_type_node(node, source);
+            let vis = &sym.visibility;
             let signature = format!(
-                "public static final {} {}",
+                "{} static final {} {}",
+                vis,
                 type_str.as_deref().unwrap_or("?"),
                 name
             );

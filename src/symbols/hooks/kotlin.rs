@@ -74,35 +74,7 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
             source[start..end.min(source.len())].trim().to_string()
         }
         _ => {
-            if node.kind() == "object_declaration" {
-                return format!("object {}", name);
-            }
-            // class_declaration: determine keyword from children
-            let mut keyword = "class";
-            let mut saw_enum = false;
-            for i in 0..node.child_count() {
-                let child = node.child(i).unwrap();
-                if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                    match text {
-                        "interface" => {
-                            keyword = "interface";
-                            break;
-                        }
-                        "enum" => {
-                            saw_enum = true;
-                            keyword = "enum class";
-                        }
-                        "class" if saw_enum => {
-                            break;
-                        }
-                        "class" => {
-                            keyword = "class";
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            let keyword = detect_class_keyword(node, source);
             format!("{} {}", keyword, name)
         }
     }
@@ -209,37 +181,37 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
     None
 }
 
+/// Detect the class-like keyword from a class_declaration or object_declaration node.
+fn detect_class_keyword(node: &Node, source: &str) -> &'static str {
+    if node.kind() == "object_declaration" {
+        return "object";
+    }
+    let mut saw_enum = false;
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        if let Ok(text) = child.utf8_text(source.as_bytes()) {
+            match text {
+                "interface" => return "interface",
+                "enum" => saw_enum = true,
+                "class" if saw_enum => return "enum class",
+                "class" => return "class",
+                _ => {}
+            }
+        }
+    }
+    "class"
+}
+
 /// Post-process: for class_declaration nodes, determine the actual kind by scanning
 /// keyword children: "interface" -> Interface, "enum" -> Enum, else Class.
 /// For object_declaration, keep as Class (signature already set to "object Name").
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    if node.kind() == "class_declaration"
-        && matches!(sym.kind, SymbolKind::Class)
-    {
-        let mut saw_enum = false;
-        for i in 0..node.child_count() {
-            let child = node.child(i).unwrap();
-            if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                match text {
-                    "interface" => {
-                        sym.kind = SymbolKind::Interface;
-                        break;
-                    }
-                    "enum" => {
-                        saw_enum = true;
-                    }
-                    "class" if saw_enum => {
-                        sym.kind = SymbolKind::Enum;
-                        break;
-                    }
-                    "class" => {
-                        sym.kind = SymbolKind::Class;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
+    if node.kind() == "class_declaration" && matches!(sym.kind, SymbolKind::Class) {
+        sym.kind = match detect_class_keyword(node, source) {
+            "interface" => SymbolKind::Interface,
+            "enum class" => SymbolKind::Enum,
+            _ => SymbolKind::Class,
+        };
     }
     Some(sym)
 }

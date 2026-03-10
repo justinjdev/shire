@@ -94,10 +94,28 @@ fn build_method_signature(node: &Node, source: &str, name: &str) -> String {
         .child_by_field_name("parameters")
         .and_then(|n| node_text(&n, source))
         .unwrap_or("()");
-    let ret = unwrap_return_type(node, source)
+    let ret = node
+        .child_by_field_name("return_type")
+        .and_then(|n| unwrap_type_annotation(&n, source))
         .map(|r| format!(": {}", r))
         .unwrap_or_default();
     format!("{}{}{}", name, params, ret)
+}
+
+/// Unwrap a type from a type_annotation node, skipping the colon.
+fn unwrap_type_annotation(node: &Node, source: &str) -> Option<String> {
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        if child.kind() != ":" {
+            return child
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string());
+        }
+    }
+    node.utf8_text(source.as_bytes())
+        .ok()
+        .map(|s| s.trim_start_matches(": ").to_string())
 }
 
 /// Extract parameters from TypeScript/JavaScript function/method nodes.
@@ -122,17 +140,7 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
 
                 let type_ann = child
                     .child_by_field_name("type")
-                    .and_then(|n| {
-                        // type_annotation node includes the `:` — get the inner type
-                        for j in 0..n.child_count() {
-                            let tc = n.child(j).unwrap();
-                            if tc.kind() != ":" {
-                                return tc.utf8_text(source.as_bytes()).ok();
-                            }
-                        }
-                        n.utf8_text(source.as_bytes()).ok()
-                    })
-                    .map(|s| s.trim_start_matches(": ").to_string());
+                    .and_then(|n| unwrap_type_annotation(&n, source));
 
                 if !name.is_empty() {
                     params.push(Parameter {
@@ -157,26 +165,10 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     params
 }
 
-/// Extract return type, unwrapping the colon from the type_annotation node.
-fn unwrap_return_type(node: &Node, source: &str) -> Option<String> {
-    node.child_by_field_name("return_type")
-        .and_then(|n| {
-            if n.child_count() > 0 {
-                for i in 0..n.child_count() {
-                    let child = n.child(i).unwrap();
-                    if child.kind() != ":" {
-                        return child.utf8_text(source.as_bytes()).ok();
-                    }
-                }
-            }
-            n.utf8_text(source.as_bytes()).ok()
-        })
-        .map(|s| s.trim_start_matches(": ").to_string())
-}
-
 /// Extract return type hook.
 fn extract_return_type(node: &Node, source: &str) -> Option<String> {
-    unwrap_return_type(node, source)
+    node.child_by_field_name("return_type")
+        .and_then(|n| unwrap_type_annotation(&n, source))
 }
 
 /// Post-process symbols.

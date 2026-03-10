@@ -27,9 +27,10 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
                 .or_else(|| node.child_by_field_name("parameters").map(|n| n.end_byte()))
                 .unwrap_or(node.end_byte());
 
-            let body_start = node.child_by_field_name("body").map(|n| n.start_byte());
-            let actual_end = body_start.map_or(end, |bs| bs.min(end + 200));
-            let actual_end = actual_end.max(end);
+            let actual_end = node
+                .child_by_field_name("body")
+                .map(|n| n.start_byte())
+                .unwrap_or(end);
 
             source[start..actual_end.min(source.len())]
                 .trim()

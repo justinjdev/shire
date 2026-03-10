@@ -32,11 +32,40 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     }
 }
 
+/// Extract RPC message types with streaming flags from an RPC node.
+/// Returns a vector of (is_stream, type_name) tuples.
+fn extract_rpc_message_types(node: &Node, source: &str) -> Vec<(bool, String)> {
+    let mut message_types = Vec::new();
+    let mut stream_next = false;
+
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        match child.kind() {
+            "stream" => stream_next = true,
+            "message_or_enum_type" => {
+                let type_text = node_text(&child, source).unwrap_or("").to_string();
+                message_types.push((stream_next, type_text));
+                stream_next = false;
+            }
+            _ => {}
+        }
+    }
+    message_types
+}
+
+/// Format a message type with optional streaming prefix.
+fn format_message_type(is_stream: bool, type_name: &str) -> String {
+    if is_stream {
+        format!("stream {}", type_name)
+    } else {
+        type_name.to_string()
+    }
+}
+
 /// Build signature for proto symbols.
 fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
     match kind {
         SymbolKind::Struct => {
-            // message — check for parent
             if let Some(parent) = resolve_parent(node, source) {
                 format!("message {}.{}", parent, name)
             } else {
@@ -47,44 +76,15 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
             format!("service {}", name)
         }
         SymbolKind::Method => {
-            // RPC — walk children for request/response types and streaming
-            let mut message_types: Vec<(bool, String)> = Vec::new();
-            let mut stream_next = false;
-
-            for i in 0..node.child_count() {
-                let child = node.child(i).unwrap();
-                match child.kind() {
-                    "stream" => {
-                        stream_next = true;
-                    }
-                    "message_or_enum_type" => {
-                        let type_text = node_text(&child, source)
-                            .unwrap_or("")
-                            .to_string();
-                        message_types.push((stream_next, type_text));
-                        stream_next = false;
-                    }
-                    _ => {}
-                }
-            }
-
-            let (req_stream, req_type) =
-                message_types.first().cloned().unwrap_or((false, String::new()));
-            let (resp_stream, resp_type) =
-                message_types.get(1).cloned().unwrap_or((false, String::new()));
-
-            let req_display = if req_stream {
-                format!("stream {}", req_type)
-            } else {
-                req_type
-            };
-            let resp_display = if resp_stream {
-                format!("stream {}", resp_type)
-            } else {
-                resp_type
-            };
-
-            format!("rpc {}({}) returns ({})", name, req_display, resp_display)
+            let types = extract_rpc_message_types(node, source);
+            let (req_stream, req_type) = types.first().cloned().unwrap_or((false, String::new()));
+            let (resp_stream, resp_type) = types.get(1).cloned().unwrap_or((false, String::new()));
+            format!(
+                "rpc {}({}) returns ({})",
+                name,
+                format_message_type(req_stream, &req_type),
+                format_message_type(resp_stream, &resp_type)
+            )
         }
         SymbolKind::Enum => {
             if let Some(parent) = resolve_parent(node, source) {
@@ -94,7 +94,6 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
             }
         }
         SymbolKind::Type => {
-            // oneof — always has a parent message
             if let Some(parent) = resolve_parent(node, source) {
                 format!("oneof {}.{}", parent, name)
             } else {
@@ -112,35 +111,11 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
         return Vec::new();
     }
 
-    let mut message_types: Vec<(bool, String)> = Vec::new();
-    let mut stream_next = false;
-
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        match child.kind() {
-            "stream" => {
-                stream_next = true;
-            }
-            "message_or_enum_type" => {
-                let type_text = node_text(&child, source)
-                    .unwrap_or("")
-                    .to_string();
-                message_types.push((stream_next, type_text));
-                stream_next = false;
-            }
-            _ => {}
-        }
-    }
-
-    if let Some((is_stream, type_name)) = message_types.first() {
-        let param_type = if *is_stream {
-            format!("stream {}", type_name)
-        } else {
-            type_name.clone()
-        };
+    let types = extract_rpc_message_types(node, source);
+    if let Some((is_stream, type_name)) = types.first() {
         vec![Parameter {
             name: "request".to_string(),
-            type_annotation: Some(param_type),
+            type_annotation: Some(format_message_type(*is_stream, type_name)),
         }]
     } else {
         Vec::new()
@@ -153,33 +128,10 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
         return None;
     }
 
-    let mut message_types: Vec<(bool, String)> = Vec::new();
-    let mut stream_next = false;
-
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        match child.kind() {
-            "stream" => {
-                stream_next = true;
-            }
-            "message_or_enum_type" => {
-                let type_text = node_text(&child, source)
-                    .unwrap_or("")
-                    .to_string();
-                message_types.push((stream_next, type_text));
-                stream_next = false;
-            }
-            _ => {}
-        }
-    }
-
-    message_types.get(1).map(|(is_stream, type_name)| {
-        if *is_stream {
-            format!("stream {}", type_name)
-        } else {
-            type_name.clone()
-        }
-    })
+    let types = extract_rpc_message_types(node, source);
+    types
+        .get(1)
+        .map(|(is_stream, type_name)| format_message_type(*is_stream, type_name))
 }
 
 /// Return Protobuf language hooks.

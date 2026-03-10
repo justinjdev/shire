@@ -129,7 +129,9 @@ fn find_parameter_list<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         let kind = child.kind();
-        // The tree-sitter-swift grammar wraps parameters in a node
+        // tree-sitter-swift uses nodes like "lambda_function_type_parameters" or
+        // "function_type_parameters" — match any *_parameter* container except
+        // individual "parameter" nodes
         if kind.contains("parameter") && kind != "parameter" {
             return Some(child);
         }

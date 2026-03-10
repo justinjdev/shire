@@ -1,5 +1,20 @@
 use super::{Parameter, SymbolInfo, SymbolKind};
 use regex::Regex;
+use std::sync::LazyLock;
+
+static MODULE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*defmodule\s+([A-Z][\w.]*)\s+do\b").unwrap());
+static PROTOCOL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*defprotocol\s+([A-Z][\w.]*)\s+do\b").unwrap());
+static DEF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*def\s+(\w+)(\(([^)]*)\))?").unwrap());
+static DEFMACRO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*defmacro\s+(\w+)(\(([^)]*)\))?").unwrap());
+static CALLBACK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*@callback\s+(\w+)\((.*)\)\s*::\s*(.+)").unwrap());
+static TYPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*@type\s+(\w+)(?:\(([^)]*)\))?\s*::\s*(.+)").unwrap());
+static END_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*end\b").unwrap());
 
 /// Extract symbols from Elixir source code using regex-based parsing.
 ///
@@ -10,13 +25,13 @@ use regex::Regex;
 /// protocols (defprotocol), callbacks (@callback), and type definitions (@type).
 /// Skips private functions (defp), private macros (defmacrop), and private types (@typep).
 pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
-    let module_re = Regex::new(r"^\s*defmodule\s+([A-Z][\w.]*)\s+do\b").unwrap();
-    let protocol_re = Regex::new(r"^\s*defprotocol\s+([A-Z][\w.]*)\s+do\b").unwrap();
-    let def_re = Regex::new(r"^\s*def\s+(\w+)(\(([^)]*)\))?").unwrap();
-    let defmacro_re = Regex::new(r"^\s*defmacro\s+(\w+)(\(([^)]*)\))?").unwrap();
-    let callback_re = Regex::new(r"^\s*@callback\s+(\w+)\((.*)\)\s*::\s*(.+)").unwrap();
-    let type_re = Regex::new(r"^\s*@type\s+(\w+)(?:\(([^)]*)\))?\s*::\s*(.+)").unwrap();
-    let end_re = Regex::new(r"^\s*end\b").unwrap();
+    let module_re = &*MODULE_RE;
+    let protocol_re = &*PROTOCOL_RE;
+    let def_re = &*DEF_RE;
+    let defmacro_re = &*DEFMACRO_RE;
+    let callback_re = &*CALLBACK_RE;
+    let type_re = &*TYPE_RE;
+    let end_re = &*END_RE;
 
     let mut symbols = Vec::new();
     // Stack of module names for tracking nesting
@@ -34,7 +49,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
             continue;
         }
 
-        // Check for protocol definition (before module since defprotocol contains "defmodule" prefix-wise)
+        // Check for protocol definition
         if let Some(caps) = protocol_re.captures(line) {
             let name = caps[1].to_string();
             let signature = format!("defprotocol {} do", name);

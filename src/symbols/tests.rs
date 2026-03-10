@@ -815,8 +815,9 @@ fn test_c_function() {
     assert_eq!(sym.name, "process_payment");
     assert_eq!(sym.kind, SymbolKind::Function);
     let params = sym.parameters.as_ref().unwrap();
-    assert!(params.len() >= 1);
+    assert_eq!(params.len(), 2);
     assert_eq!(params[0].name, "amount");
+    assert_eq!(params[1].name, "currency");
 }
 
 #[test]
@@ -1175,7 +1176,7 @@ fn test_scala_trait() {
 }
 "#;
     let symbols = extract_file("scala", source, "Repository.scala");
-    assert!(symbols.iter().any(|s| s.name == "Repository"));
+    assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
 }
 
 #[test]

@@ -13,6 +13,10 @@
 (enum_specifier
   name: (type_identifier) @name) @definition.enum
 
+; Union definitions
+(union_specifier
+  name: (type_identifier) @name) @definition.struct
+
 ; Typedef type aliases — declarator may be type_identifier or primitive_type
 (type_definition
   declarator: (type_identifier) @name) @definition.type

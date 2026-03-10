@@ -20,12 +20,7 @@
 (record_declaration
   name: (identifier) @name) @definition.class
 
-; Methods inside class/struct/record bodies
-(declaration_list
-  (method_declaration
-    name: (identifier) @name) @definition.method)
-
-; Interface methods
+; Methods inside class/struct/record/interface bodies
 (declaration_list
   (method_declaration
     name: (identifier) @name) @definition.method)

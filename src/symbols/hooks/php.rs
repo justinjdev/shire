@@ -201,8 +201,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             Some(sym)
         }
         SymbolKind::Constant => {
-            // Only include public constants (private filtered by is_visible already,
-            // but also skip protected constants from external view)
+            // Only include public constants (is_visible filters private already,
+            // but private constants inside public classes still reach post_process)
             if private {
                 return None;
             }

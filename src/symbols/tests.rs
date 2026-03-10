@@ -798,3 +798,469 @@ fn test_proto_empty_file() {
     let symbols = extract_file("proto", "", "empty.proto");
     assert!(symbols.is_empty());
 }
+
+// ============================================================
+// C tests
+// ============================================================
+
+#[test]
+fn test_c_function() {
+    let source = r#"int process_payment(float amount, const char *currency) {
+    return 0;
+}
+"#;
+    let symbols = extract_file("c", source, "payment.c");
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "process_payment");
+    assert_eq!(sym.kind, SymbolKind::Function);
+    let params = sym.parameters.as_ref().unwrap();
+    assert!(params.len() >= 1);
+    assert_eq!(params[0].name, "amount");
+}
+
+#[test]
+fn test_c_struct() {
+    let source = r#"struct AuthService {
+    int id;
+    char *name;
+};
+"#;
+    let symbols = extract_file("c", source, "auth.c");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "AuthService");
+    assert_eq!(symbols[0].kind, SymbolKind::Struct);
+}
+
+#[test]
+fn test_c_enum() {
+    let source = r#"enum Status {
+    ACTIVE,
+    INACTIVE
+};
+"#;
+    let symbols = extract_file("c", source, "types.c");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Status");
+    assert_eq!(symbols[0].kind, SymbolKind::Enum);
+}
+
+#[test]
+fn test_c_skip_static() {
+    let source = r#"static int internal_helper(void) {
+    return 42;
+}
+"#;
+    let symbols = extract_file("c", source, "internal.c");
+    assert!(symbols.is_empty());
+}
+
+#[test]
+fn test_c_typedef() {
+    let source = r#"typedef unsigned long size_t;
+"#;
+    let symbols = extract_file("c", source, "types.c");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "size_t");
+    assert_eq!(symbols[0].kind, SymbolKind::Type);
+}
+
+// ============================================================
+// C++ tests
+// ============================================================
+
+#[test]
+fn test_cpp_class() {
+    let source = r#"class UserService {
+public:
+    void validate(std::string token) {}
+private:
+    int count;
+};
+"#;
+    let symbols = extract_file("cpp", source, "user_service.cpp");
+    let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+    assert_eq!(classes.len(), 1);
+    assert_eq!(classes[0].name, "UserService");
+}
+
+#[test]
+fn test_cpp_struct() {
+    let source = r#"struct Point {
+    double x;
+    double y;
+};
+"#;
+    let symbols = extract_file("cpp", source, "point.cpp");
+    assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
+}
+
+#[test]
+fn test_cpp_function() {
+    let source = r#"int calculate(double a, double b) {
+    return 0;
+}
+"#;
+    let symbols = extract_file("cpp", source, "math.cpp");
+    assert!(symbols.iter().any(|s| s.name == "calculate" && s.kind == SymbolKind::Function));
+}
+
+#[test]
+fn test_cpp_enum() {
+    let source = r#"enum Color {
+    RED,
+    GREEN,
+    BLUE
+};
+"#;
+    let symbols = extract_file("cpp", source, "colors.cpp");
+    assert!(symbols.iter().any(|s| s.name == "Color" && s.kind == SymbolKind::Enum));
+}
+
+#[test]
+fn test_cpp_namespace() {
+    let source = r#"namespace MyLib {
+    class Widget {};
+}
+"#;
+    let symbols = extract_file("cpp", source, "widget.cpp");
+    assert!(symbols.iter().any(|s| s.name == "MyLib" && s.kind == SymbolKind::Class));
+    assert!(symbols.iter().any(|s| s.name == "Widget" && s.kind == SymbolKind::Class));
+}
+
+// ============================================================
+// C# tests
+// ============================================================
+
+#[test]
+fn test_csharp_class() {
+    let source = r#"
+public class UserService {
+    private int count;
+}
+"#;
+    let symbols = extract_file("cs", source, "UserService.cs");
+    let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+    assert_eq!(classes.len(), 1);
+    assert_eq!(classes[0].name, "UserService");
+}
+
+#[test]
+fn test_csharp_interface() {
+    let source = r#"
+public interface IRepository {
+    void Save(string data);
+}
+"#;
+    let symbols = extract_file("cs", source, "IRepository.cs");
+    let ifaces: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Interface).collect();
+    assert_eq!(ifaces.len(), 1);
+    assert_eq!(ifaces[0].name, "IRepository");
+}
+
+#[test]
+fn test_csharp_struct() {
+    let source = r#"
+public struct Point {
+    public double X;
+    public double Y;
+}
+"#;
+    let symbols = extract_file("cs", source, "Point.cs");
+    assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
+}
+
+#[test]
+fn test_csharp_enum() {
+    let source = r#"
+public enum Status {
+    Active,
+    Inactive,
+    Pending
+}
+"#;
+    let symbols = extract_file("cs", source, "Status.cs");
+    assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+}
+
+#[test]
+fn test_csharp_method() {
+    let source = r#"
+public class OrderService {
+    public Order ProcessOrder(string customerId, int quantity) {
+        return null;
+    }
+}
+"#;
+    let symbols = extract_file("cs", source, "OrderService.cs");
+    let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].name, "ProcessOrder");
+    assert_eq!(methods[0].parent_symbol.as_deref(), Some("OrderService"));
+}
+
+#[test]
+fn test_csharp_skip_private() {
+    let source = r#"
+public class Service {
+    private void SecretMethod() {}
+    public void PublicMethod() {}
+}
+"#;
+    let symbols = extract_file("cs", source, "Service.cs");
+    let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method || s.kind == SymbolKind::Function).collect();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].name, "PublicMethod");
+}
+
+// ============================================================
+// Swift tests
+// ============================================================
+
+#[test]
+fn test_swift_class() {
+    let source = r#"public class AuthService {
+    public func validate(token: String) -> Bool {
+        return true
+    }
+}
+"#;
+    let symbols = extract_file("swift", source, "AuthService.swift");
+    assert!(symbols.iter().any(|s| s.name == "AuthService" && s.kind == SymbolKind::Class));
+}
+
+#[test]
+fn test_swift_struct() {
+    let source = r#"public struct Point {
+    var x: Double
+    var y: Double
+}
+"#;
+    let symbols = extract_file("swift", source, "Point.swift");
+    assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
+}
+
+#[test]
+fn test_swift_protocol() {
+    let source = r#"public protocol Repository {
+    func findById(id: String) -> Entity?
+}
+"#;
+    let symbols = extract_file("swift", source, "Repository.swift");
+    assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+}
+
+#[test]
+fn test_swift_enum() {
+    let source = r#"public enum Status {
+    case active
+    case inactive
+}
+"#;
+    let symbols = extract_file("swift", source, "Status.swift");
+    assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+}
+
+#[test]
+fn test_swift_function() {
+    let source = r#"public func processPayment(amount: Double, currency: String) -> Receipt {
+    return Receipt()
+}
+"#;
+    let symbols = extract_file("swift", source, "Payment.swift");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "processPayment");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+}
+
+#[test]
+fn test_swift_skip_private() {
+    let source = r#"private func internalHelper() -> Void {}
+fileprivate func alsoPrivate() -> Void {}
+"#;
+    let symbols = extract_file("swift", source, "Internal.swift");
+    assert!(symbols.is_empty());
+}
+
+// ============================================================
+// PHP tests
+// ============================================================
+
+#[test]
+fn test_php_class() {
+    let source = r#"<?php
+class UserService {
+    public function validate(string $token): bool {
+        return true;
+    }
+}
+"#;
+    let symbols = extract_file("php", source, "UserService.php");
+    assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
+}
+
+#[test]
+fn test_php_interface() {
+    let source = r#"<?php
+interface Repository {
+    public function findById(int $id): Entity;
+}
+"#;
+    let symbols = extract_file("php", source, "Repository.php");
+    assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+}
+
+#[test]
+fn test_php_function() {
+    let source = r#"<?php
+function process_payment(float $amount, string $currency): Receipt {
+    return new Receipt();
+}
+"#;
+    let symbols = extract_file("php", source, "payment.php");
+    assert!(symbols.iter().any(|s| s.name == "process_payment" && s.kind == SymbolKind::Function));
+}
+
+#[test]
+fn test_php_trait() {
+    let source = r#"<?php
+trait Loggable {
+    public function log(string $message): void {}
+}
+"#;
+    let symbols = extract_file("php", source, "Loggable.php");
+    assert!(symbols.iter().any(|s| s.name == "Loggable" && s.kind == SymbolKind::Trait));
+}
+
+#[test]
+fn test_php_enum() {
+    let source = r#"<?php
+enum Status {
+    case Active;
+    case Inactive;
+}
+"#;
+    let symbols = extract_file("php", source, "Status.php");
+    assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+}
+
+// ============================================================
+// Scala tests
+// ============================================================
+
+#[test]
+fn test_scala_class() {
+    let source = r#"class UserService {
+  def validate(token: String): Boolean = true
+}
+"#;
+    let symbols = extract_file("scala", source, "UserService.scala");
+    assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
+}
+
+#[test]
+fn test_scala_object() {
+    let source = r#"object DatabaseConfig {
+  val url = "jdbc:postgresql://localhost/db"
+}
+"#;
+    let symbols = extract_file("scala", source, "Config.scala");
+    assert!(symbols.iter().any(|s| s.name == "DatabaseConfig" && s.kind == SymbolKind::Class));
+}
+
+#[test]
+fn test_scala_trait() {
+    let source = r#"trait Repository {
+  def findById(id: String): Option[Entity]
+}
+"#;
+    let symbols = extract_file("scala", source, "Repository.scala");
+    assert!(symbols.iter().any(|s| s.name == "Repository"));
+}
+
+#[test]
+fn test_scala_function() {
+    let source = r#"def processPayment(amount: Double, currency: String): Receipt = {
+  Receipt()
+}
+"#;
+    let symbols = extract_file("scala", source, "Payment.scala");
+    assert!(symbols.iter().any(|s| s.name == "processPayment"));
+}
+
+#[test]
+fn test_scala_skip_private() {
+    let source = r#"private def internalHelper(): Unit = {}
+"#;
+    let symbols = extract_file("scala", source, "Internal.scala");
+    assert!(symbols.is_empty());
+}
+
+// ============================================================
+// Zig tests
+// ============================================================
+
+#[test]
+fn test_zig_function() {
+    let source = r#"pub fn processPayment(amount: f64) !Receipt {
+    return error.NotImplemented;
+}
+"#;
+    let symbols = extract_file("zig", source, "payment.zig");
+    assert!(symbols.iter().any(|s| s.name == "processPayment" && s.kind == SymbolKind::Function));
+}
+
+#[test]
+fn test_zig_skip_non_pub() {
+    let source = r#"fn internalHelper() void {
+    return;
+}
+"#;
+    let symbols = extract_file("zig", source, "internal.zig");
+    assert!(symbols.is_empty());
+}
+
+#[test]
+fn test_zig_const() {
+    let source = r#"pub const MAX_SIZE: usize = 1024;
+"#;
+    let symbols = extract_file("zig", source, "config.zig");
+    assert!(symbols.iter().any(|s| s.name == "MAX_SIZE"));
+}
+
+// ============================================================
+// Elixir tests (via regex)
+// ============================================================
+
+#[test]
+fn test_elixir_module() {
+    let source = r#"defmodule MyApp.Users do
+  def get_user(id) do
+    Repo.get(User, id)
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, "lib/users.ex");
+    assert!(symbols.iter().any(|s| s.name == "MyApp.Users" && s.kind == SymbolKind::Class));
+    assert!(symbols.iter().any(|s| s.name == "get_user" && s.kind == SymbolKind::Function));
+}
+
+#[test]
+fn test_elixir_protocol() {
+    let source = r#"defprotocol Stringify do
+  def to_string(value)
+end
+"#;
+    let symbols = extract_file("ex", source, "lib/stringify.ex");
+    assert!(symbols.iter().any(|s| s.name == "Stringify" && s.kind == SymbolKind::Interface));
+}
+
+#[test]
+fn test_elixir_skip_private() {
+    let source = r#"defmodule MyApp do
+  defp internal_helper(x), do: x * 2
+end
+"#;
+    let symbols = extract_file("ex", source, "lib/my_app.ex");
+    assert!(!symbols.iter().any(|s| s.name == "internal_helper"));
+}

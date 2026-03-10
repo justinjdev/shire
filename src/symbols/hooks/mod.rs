@@ -1,10 +1,17 @@
+pub mod c;
+pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod java;
 pub mod kotlin;
+pub mod php;
 pub mod proto;
 pub mod python;
 pub mod rust_lang;
+pub mod scala;
+pub mod swift;
 pub mod typescript;
+pub mod zig;
 
 use super::{Parameter, SymbolInfo, SymbolKind};
 use tree_sitter::Node;

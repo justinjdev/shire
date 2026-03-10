@@ -42,14 +42,22 @@ pub fn extensions_for_kind(kind: &str) -> Vec<&'static str> {
 /// Return ALL registered source file extensions (the union of all languages).
 pub fn all_extensions() -> Vec<&'static str> {
     vec![
-        "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
-        "go",                       // Go
-        "rs",                       // Rust
-        "py",                       // Python
-        "java", "kt",              // Java/Kotlin
-        "proto",                    // Protobuf
-        "pm", "pl",                // Perl
-        "rb",                      // Ruby
+        "ts", "tsx", "js", "jsx",           // TypeScript/JavaScript
+        "go",                                // Go
+        "rs",                                // Rust
+        "py",                                // Python
+        "java", "kt",                       // Java/Kotlin
+        "proto",                             // Protobuf
+        "pm", "pl",                          // Perl
+        "rb",                                // Ruby
+        "swift",                             // Swift
+        "c", "h",                            // C
+        "cpp", "cc", "cxx", "hpp", "hxx",   // C++
+        "cs",                                // C#
+        "php",                               // PHP
+        "scala", "sc",                       // Scala
+        "ex", "exs",                         // Elixir
+        "zig",                               // Zig
     ]
 }
 

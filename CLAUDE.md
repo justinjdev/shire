@@ -25,7 +25,7 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 ### Key modules
 
 - **index/** — Build orchestrator. Walks the repo, discovers manifests, parses them via the `ManifestParser` trait (one impl per ecosystem: npm, go, cargo, python, maven, gradle, perl, ruby), extracts symbols, writes to SQLite. Builds are incremental via SHA-256 content hashing of manifests and source files, with mtime pre-checks to skip unchanged packages entirely.
-- **symbols/** — Source code symbol extraction. Uses tree-sitter for most languages, regex for Perl. Parallelized across packages with rayon. All extractors produce the same `SymbolInfo` struct.
+- **symbols/** — Source code symbol extraction. Uses tree-sitter query patterns + language-specific hooks for most languages (TS/JS, Go, Rust, Python, Java, Kotlin, C, C++, C#, Swift, PHP, Scala, Zig, Protobuf), regex for Perl, Ruby, and Elixir. Parallelized across packages with rayon. All extractors produce the same `SymbolInfo` struct.
 - **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files), triggers to maintain FTS indexes, batched multi-row INSERTs in transactions.
 - **mcp/** — MCP server over stdio using the `rmcp` crate. 10 tools + 1 prompt template for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
 - **watch/** — Unix-only background daemon. Uses Unix domain sockets (`.shire/watch.sock`) for IPC, PID file for process management, configurable debounce. Filters rebuilds by file relevance.
@@ -39,9 +39,20 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 
 ### Adding a new symbol extractor
 
-1. Create `src/symbols/<language>.rs` implementing extraction that returns `Vec<SymbolInfo>`
-2. Register the language's file extensions in `src/symbols/walker.rs`
-3. Wire it into the extraction dispatcher in `src/symbols/mod.rs`
+**Tree-sitter languages (preferred):**
+
+1. Create `src/symbols/queries/<language>.scm` with tree-sitter query patterns using `@name` and `@definition.<kind>` captures
+2. Create `src/symbols/hooks/<language>.rs` implementing `LanguageHooks` (visibility, signatures, params, return types, post-processing)
+3. Add `pub mod <language>;` to `src/symbols/hooks/mod.rs`
+4. Add a `LanguageEntry` to `src/symbols/registry.rs` with the grammar, query, hooks, and file extensions
+5. Add extensions to `all_extensions()` in `src/symbols/walker.rs`
+
+**Regex-based languages (when tree-sitter grammar is impractical):**
+
+1. Create `src/symbols/<language>.rs` with `pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo>`
+2. Add `pub mod <language>;` to `src/symbols/mod.rs`
+3. Add a match arm in `extract_file()` in `src/symbols/registry.rs`
+4. Add extensions to `all_extensions()` in `src/symbols/walker.rs`
 
 ## Platform Notes
 

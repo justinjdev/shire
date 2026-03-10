@@ -27,15 +27,13 @@ src/
 ├── symbols/
 │   ├── mod.rs       # Symbol types, kind-agnostic extraction orchestrator
 │   ├── walker.rs    # Source file discovery (extension filtering, excludes)
-│   ├── typescript.rs # TS/JS extractor (tree-sitter)
-│   ├── go.rs        # Go extractor (tree-sitter)
-│   ├── rust_lang.rs # Rust extractor (tree-sitter)
-│   ├── python.rs    # Python extractor (tree-sitter)
-│   ├── proto.rs     # Protobuf extractor (tree-sitter)
-│   ├── java.rs      # Java extractor (tree-sitter)
-│   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
+│   ├── registry.rs  # Language registry: maps extensions to tree-sitter grammars + hooks
+│   ├── query_extract.rs # Generic tree-sitter query executor with hook callbacks
+│   ├── queries/     # Tree-sitter .scm query files (one per language)
+│   ├── hooks/       # Language-specific hooks (visibility, signatures, params, post-processing)
 │   ├── perl.rs      # Perl extractor (regex-based)
-│   └── ruby.rs      # Ruby extractor (tree-sitter)
+│   ├── ruby.rs      # Ruby extractor (regex-based)
+│   └── elixir.rs    # Elixir extractor (regex-based)
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
 │   ├── embedder.rs  # fastembed wrapper, symbol text formatting, batch embedding

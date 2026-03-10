@@ -125,7 +125,7 @@ The index defaults to `.shire/index.db` inside the repo root. Override with `--d
 
 ### Clean up
 
-Remove the index database and stop the watch daemon:
+Remove the index database, WAL/SHM files, the `.shire` directory, and stop the watch daemon:
 
 ```sh
 shire clean

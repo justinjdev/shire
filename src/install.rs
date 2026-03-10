@@ -129,10 +129,17 @@ pub fn run_uninstall(dry_run: bool) -> Result<()> {
         if dry_run {
             println!("  [dry-run] Would run: claude mcp remove -s user shire");
         } else {
-            let _ = Command::new(&claude_path)
+            let output = Command::new(&claude_path)
                 .args(["mcp", "remove", "-s", "user", "shire"])
                 .output();
-            println!("  Removed MCP registration");
+            match output {
+                Ok(o) if o.status.success() => println!("  Removed MCP registration"),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    println!("  Removal may have failed: {}", err.trim());
+                }
+                Err(e) => println!("  Removal failed: {}", e),
+            }
         }
     }
 
@@ -335,13 +342,6 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         codex_path.unwrap().display()
     );
 
-    let section_header = "[mcp_servers.shire]";
-    let mcp_section = format!(
-        "\n{}\ncommand = \"{}\"\nargs = [\"serve\", \"--root\", \".\"]\n",
-        section_header,
-        binary_path.display()
-    );
-
     if dry_run {
         println!("  [dry-run] Would add MCP server to {}", config_file.display());
         return Registration {
@@ -350,34 +350,8 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         };
     }
 
-    // Read existing or empty
-    let mut content = fs::read_to_string(&config_file).unwrap_or_default();
-
-    if content.contains(section_header) {
-        if !force {
-            println!("  MCP server already configured in {}", config_file.display());
-            return Registration {
-                tool: "Codex CLI",
-                status: RegStatus::AlreadyRegistered(config_file.display().to_string()),
-            };
-        }
-        // Force: remove existing section and re-add below
-        let idx = content.find(section_header).unwrap();
-        let rest = &content[idx + section_header.len()..];
-        let end_idx = rest.find("\n[").map(|i| idx + section_header.len() + i + 1);
-        content = match end_idx {
-            Some(end) => format!("{}{}", content[..idx].trim_end_matches('\n'), &content[end..]),
-            None => content[..idx].trim_end_matches('\n').to_string(),
-        };
-    }
-
-    // Ensure directory exists
-    if let Some(parent) = config_file.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    match fs::write(&config_file, format!("{}{}", content, mcp_section)) {
-        Ok(()) => {
+    match upsert_codex_toml(&config_file, binary_path, force) {
+        Ok(UpsertResult::Created) => {
             let display = config_file.display().to_string();
             println!("  MCP server registered: {}", display);
             Registration {
@@ -385,11 +359,89 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
                 status: RegStatus::Registered(display),
             }
         }
+        Ok(UpsertResult::Updated) => {
+            let display = config_file.display().to_string();
+            println!("  MCP server updated: {}", display);
+            Registration {
+                tool: "Codex CLI",
+                status: RegStatus::Updated(display),
+            }
+        }
+        Ok(UpsertResult::AlreadyExists) => {
+            println!("  MCP server already configured in {}", config_file.display());
+            Registration {
+                tool: "Codex CLI",
+                status: RegStatus::AlreadyRegistered(config_file.display().to_string()),
+            }
+        }
         Err(e) => Registration {
             tool: "Codex CLI",
             status: RegStatus::Failed(e.to_string()),
         },
     }
+}
+
+fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Result<UpsertResult> {
+    let content = fs::read_to_string(config_file).unwrap_or_default();
+    let mut doc: toml::Value = if content.is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", config_file.display()))?
+    };
+
+    let root = doc.as_table_mut().context("TOML root is not a table")?;
+
+    // Ensure mcp_servers table exists
+    if !root.contains_key("mcp_servers") {
+        root.insert("mcp_servers".into(), toml::Value::Table(toml::map::Map::new()));
+    }
+    let mcp_servers = root
+        .get_mut("mcp_servers")
+        .and_then(|v| v.as_table_mut())
+        .context("mcp_servers is not a table")?;
+
+    let is_update = mcp_servers.contains_key("shire");
+    if is_update && !force {
+        return Ok(UpsertResult::AlreadyExists);
+    }
+
+    let mut shire_entry = toml::map::Map::new();
+    shire_entry.insert("command".into(), toml::Value::String(binary_path.to_string_lossy().into()));
+    shire_entry.insert(
+        "args".into(),
+        toml::Value::Array(vec![
+            toml::Value::String("serve".into()),
+            toml::Value::String("--root".into()),
+            toml::Value::String(".".into()),
+        ]),
+    );
+    mcp_servers.insert("shire".into(), toml::Value::Table(shire_entry));
+
+    // Ensure directory exists
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+
+    let output = toml::to_string_pretty(&doc).context("Failed to serialize TOML")?;
+
+    // Atomic write via temp file
+    let tmp_path = config_file.with_extension("toml.tmp");
+    fs::write(&tmp_path, &output)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    if let Err(e) = fs::rename(&tmp_path, config_file) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!("Failed to rename {} to {}", tmp_path.display(), config_file.display())
+        });
+    }
+
+    Ok(if is_update {
+        UpsertResult::Updated
+    } else {
+        UpsertResult::Created
+    })
 }
 
 fn remove_codex_mcp(dry_run: bool) {
@@ -403,28 +455,41 @@ fn remove_codex_mcp(dry_run: bool) {
         Err(_) => return,
     };
 
-    let section_header = "[mcp_servers.shire]";
-    if let Some(idx) = content.find(section_header) {
-        println!("[Codex CLI] config: {}", config_file.display());
-        if dry_run {
-            println!("  [dry-run] Would remove MCP section");
-            return;
-        }
+    let mut doc: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
-        let rest = &content[idx + section_header.len()..];
-        let end_idx = rest.find("\n[").map(|i| idx + section_header.len() + i + 1);
-        let new_content = match end_idx {
-            Some(end) => format!(
-                "{}{}",
-                content[..idx].trim_end_matches('\n'),
-                &content[end..]
-            ),
-            None => content[..idx].trim_end_matches('\n').to_string(),
-        };
+    let has_shire = doc
+        .get("mcp_servers")
+        .and_then(|s| s.get("shire"))
+        .is_some();
 
-        let _ = fs::write(&config_file, new_content);
-        println!("  Removed MCP section");
+    if !has_shire {
+        return;
     }
+
+    println!("[Codex CLI] config: {}", config_file.display());
+    if dry_run {
+        println!("  [dry-run] Would remove MCP section");
+        return;
+    }
+
+    if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
+        mcp_servers.remove("shire");
+        if mcp_servers.is_empty() {
+            if let Some(root) = doc.as_table_mut() {
+                root.remove("mcp_servers");
+            }
+        }
+    }
+
+    let output = toml::to_string_pretty(&doc).unwrap_or_default();
+    let tmp_path = config_file.with_extension("toml.tmp");
+    if fs::write(&tmp_path, &output).is_ok() {
+        let _ = fs::rename(&tmp_path, &config_file);
+    }
+    println!("  Removed MCP section");
 }
 
 // --- Generic JSON-based editor MCP registration ---
@@ -536,7 +601,10 @@ fn remove_editor_mcp(
 
     servers.remove("shire");
     if let Ok(out) = serde_json::to_string_pretty(&Value::Object(root)) {
-        let _ = fs::write(config_path, format!("{}\n", out));
+        let tmp_path = config_path.with_extension("json.tmp");
+        if fs::write(&tmp_path, format!("{}\n", out)).is_ok() {
+            let _ = fs::rename(&tmp_path, config_path);
+        }
         println!("  Removed shire");
     }
 }
@@ -795,6 +863,77 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(!parsed["mcpServers"].as_object().unwrap().contains_key("shire"));
         assert!(parsed["mcpServers"]["other"].is_object());
+    }
+
+    #[test]
+    fn test_upsert_codex_toml_creates_new_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".codex/config.toml");
+
+        let result = upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
+        assert!(matches!(result, UpsertResult::Created));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["shire"]["command"].as_str().unwrap(),
+            "/usr/local/bin/shire"
+        );
+    }
+
+    #[test]
+    fn test_upsert_codex_toml_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
+        let result = upsert_codex_toml(&path, Path::new("/new/shire"), false).unwrap();
+        assert!(matches!(result, UpsertResult::AlreadyExists));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["shire"]["command"].as_str().unwrap(),
+            "/usr/local/bin/shire"
+        );
+    }
+
+    #[test]
+    fn test_upsert_codex_toml_force_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        upsert_codex_toml(&path, Path::new("/old/shire"), false).unwrap();
+        let result = upsert_codex_toml(&path, Path::new("/new/shire"), true).unwrap();
+        assert!(matches!(result, UpsertResult::Updated));
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["shire"]["command"].as_str().unwrap(),
+            "/new/shire"
+        );
+    }
+
+    #[test]
+    fn test_upsert_codex_toml_preserves_other_config() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n").unwrap();
+
+        upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(parsed["model"].as_str().unwrap(), "o3");
+        assert_eq!(
+            parsed["mcp_servers"]["other"]["command"].as_str().unwrap(),
+            "other"
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["shire"]["command"].as_str().unwrap(),
+            "/usr/local/bin/shire"
+        );
     }
 
     #[test]

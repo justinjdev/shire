@@ -58,6 +58,19 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 
 Tags containing `beta`, `alpha`, or `rc` are automatically marked as prereleases.
 
+## Documentation
+
+The docs site lives in `docs/src/` (mdBook). When changing user-facing behavior, update the relevant docs:
+
+- New/changed subcommands → `CLAUDE.md` (Architecture section), `docs/src/architecture.md`, `docs/src/setup.md` (CLI reference)
+- New/changed MCP tools or prompts → `docs/src/mcp-tools.md`, `CLAUDE.md` (mcp/ description)
+- New/changed config options → `docs/src/configuration.md`, `CLAUDE.md` (Configuration section)
+- New manifest parser → `docs/src/ecosystems.md`
+- New symbol extractor → `docs/src/ecosystems.md` (Symbol extraction table)
+- Changes to `shire init` behavior → `docs/src/setup.md`
+- Changes to watch daemon → `docs/src/watch-daemon.md`
+- Changes to worktree handling → `docs/src/worktrees.md`
+
 ## Configuration
 
 `shire.toml` at repo root, with fallback to `~/.claude/shire.toml` if no local config exists. Key settings: `db_path`, `discovery.manifests`, `discovery.exclude`, `discovery.custom` rules, `symbols.exclude_extensions`, `watch.debounce_ms`, `[[packages]]` overrides. Relative `db_path` values are resolved against the repo root.

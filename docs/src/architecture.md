@@ -2,7 +2,7 @@
 
 ```
 src/
-├── main.rs          # CLI (clap): build, serve, watch, rebuild, init subcommands
+├── main.rs          # CLI (clap): build, serve, watch, rebuild, init, clean subcommands
 ├── config.rs        # shire.toml parsing
 ├── git.rs           # Git worktree detection and repo root resolution
 ├── init.rs          # `shire init` setup (config, MCP server, hooks, rules)

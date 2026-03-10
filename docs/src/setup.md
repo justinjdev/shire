@@ -38,7 +38,7 @@ To create a `shire.toml` in the current repo instead of globally:
 shire init
 ```
 
-This generates a local config file with commented-out defaults you can customize, and writes the MCP server config to `.mcp.json`.
+This generates a local config file with commented-out defaults you can customize, and writes the MCP server config to `.mcp.json`. If the `db_path` points to a local directory (e.g., `.shire/index.db`), it offers to add that directory to `.gitignore`.
 
 ### Manual setup
 
@@ -122,6 +122,14 @@ shire build --root /path/to/repo --db /tmp/my-index.db
 ```
 
 The index defaults to `.shire/index.db` inside the repo root. Override with `--db` or `db_path` in `shire.toml` (see [Configuration](./configuration.md)).
+
+### Clean up
+
+Remove the index database, WAL/SHM files, the `.shire` directory, and stop the watch daemon:
+
+```sh
+shire clean
+```
 
 ## Incremental builds
 

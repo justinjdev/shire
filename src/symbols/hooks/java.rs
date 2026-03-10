@@ -39,14 +39,17 @@ fn is_visible(node: &Node, source: &str) -> bool {
         return false;
     }
 
-    // Check ancestor class visibility — a public method in a package-private or private
-    // class is not externally visible.
-    if let Some(parent_class) = find_ancestor(node, "class_declaration") {
-        let (parent_public, parent_protected, parent_private, _, _) =
-            check_modifiers(&parent_class, source);
-        if parent_private || !(parent_public || parent_protected) {
-            return false;
+    // Check all ancestor classes for visibility — a public method in a package-private
+    // or private class (at any nesting level) is not externally visible.
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "class_declaration" {
+            let (p_public, p_protected, p_private, _, _) = check_modifiers(&n, source);
+            if p_private || !(p_public || p_protected) {
+                return false;
+            }
         }
+        current = n.parent();
     }
 
     true

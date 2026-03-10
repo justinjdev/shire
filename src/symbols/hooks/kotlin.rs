@@ -9,13 +9,15 @@ fn is_visible(node: &Node, source: &str) -> bool {
         return false;
     }
 
-    // Check ancestor class/object visibility
-    if let Some(parent_class) = find_ancestor(node, "class_declaration")
-        .or_else(|| find_ancestor(node, "object_declaration"))
-    {
-        if has_private_or_internal_modifier(&parent_class, source) {
+    // Check all ancestor classes/objects for visibility
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if (n.kind() == "class_declaration" || n.kind() == "object_declaration")
+            && has_private_or_internal_modifier(&n, source)
+        {
             return false;
         }
+        current = n.parent();
     }
 
     true

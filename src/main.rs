@@ -7,6 +7,7 @@ mod db;
 mod git;
 mod index;
 mod init;
+mod install;
 mod mcp;
 mod rag;
 mod symbols;
@@ -92,6 +93,18 @@ enum Commands {
         /// Skip interactive prompts and use defaults
         #[arg(long, short)]
         yes: bool,
+    },
+    /// Register shire as an MCP server with all detected AI tools
+    Install {
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove shire MCP registration from all detected AI tools
+    Uninstall {
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove the index database and all shire artifacts for a project
     Clean {
@@ -179,6 +192,8 @@ async fn main() -> Result<()> {
                 init::run_init(&root, no_hook, yes)
             }
         }
+        Commands::Install { dry_run } => install::run_install(dry_run),
+        Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
         Commands::Clean { root, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;
 

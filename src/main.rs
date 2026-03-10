@@ -123,6 +123,19 @@ enum Commands {
     },
 }
 
+/// Program entry point that parses command-line arguments and dispatches the selected subcommand.
+///
+/// This function drives the CLI behavior (build, serve, watch, init, install, uninstall, clean,
+/// rebuild), performs path canonicalization and configuration resolution, and delegates work to
+/// the corresponding modules. It returns an error if any subcommand encounters a failure.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Run the installed binary with the "build" subcommand:
+/// use std::process::Command;
+/// let _ = Command::new("shire").arg("build").status().unwrap();
+/// ```
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

@@ -18,6 +18,26 @@ enum RegStatus {
     Failed(String),
 }
 
+/// Installs shire MCP entries for supported CLIs and editors.
+///
+/// Attempts to register the current binary with supported tools (Claude Code, Codex CLI,
+/// Cursor, Windsurf, Gemini CLI, VS Code, and Zed), printing progress and a concise summary.
+///
+/// Parameters:
+/// - `dry_run`: when true, print planned actions without modifying files or invoking CLIs.
+/// - `force`: when true, overwrite existing registrations when possible.
+///
+/// # Returns
+///
+/// `Ok(())` on success; an error indicates a failure to detect the current binary or to perform
+/// filesystem/CLI operations required for installation.
+///
+/// # Examples
+///
+/// ```
+/// // Run in dry-run mode to preview actions without making changes.
+/// run_install(true, false).unwrap();
+/// ```
 pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
     let binary_path = detect_binary_path()?;
 
@@ -119,6 +139,31 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Uninstalls MCP registrations previously added by shire.
+///
+/// When `dry_run` is true, this reports the removals that would be performed without modifying any files
+/// or invoking external CLIs. Otherwise it attempts to remove registrations for supported tools:
+/// Claude Code (via the `claude` CLI if found), Codex CLI, and JSON-based editor configs (Cursor,
+/// Windsurf, Gemini CLI, VS Code, Zed).
+///
+/// # Parameters
+///
+/// - `dry_run`: If `true`, show planned removal actions without performing them.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an `Err` containing the underlying failure.
+///
+/// # Examples
+///
+/// ```
+/// # use anyhow::Result;
+/// # fn example() -> Result<()> {
+/// // Show what would be removed without making changes
+/// run_uninstall(true)?;
+/// # Ok(())
+/// # }
+/// ```
 pub fn run_uninstall(dry_run: bool) -> Result<()> {
     println!("shire uninstall");
     println!();
@@ -159,6 +204,22 @@ pub fn run_uninstall(dry_run: bool) -> Result<()> {
 
 // --- Binary detection ---
 
+/// Determine the filesystem path of the currently running executable.
+///
+/// Attempts to canonicalize the path returned by `std::env::current_exe()`. If canonicalization fails,
+/// the original (non-canonical) executable path is returned.
+///
+/// # Errors
+///
+/// Returns an error if the current executable path cannot be determined.
+///
+/// # Examples
+///
+/// ```
+/// // This example shows basic usage; in tests call from the same crate/module scope.
+/// let path = crate::detect_binary_path().unwrap();
+/// assert!(path.is_absolute() || path.exists());
+/// ```
 fn detect_binary_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("Cannot detect binary path")?;
     fs::canonicalize(&exe).or(Ok(exe))
@@ -166,6 +227,25 @@ fn detect_binary_path() -> Result<PathBuf> {
 
 // --- CLI detection ---
 
+/// Locates an executable by name by checking the system PATH and common user/local install locations.
+///
+/// First attempts to find `name` using the system PATH. If that fails, checks these candidate locations:
+/// `/usr/local/bin`, `/opt/homebrew/bin`, and the user's `~/.npm/bin`, `~/.local/bin`, and `~/.cargo/bin`.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// // Attempt to find an executable; handle presence or absence.
+/// match find_cli("example-cli") {
+///     Some(path) => println!("Found at {}", path.display()),
+///     None => println!("Not found"),
+/// }
+/// ```
+///
+/// # Returns
+///
+/// `Some(PathBuf)` with the resolved path to the executable if found, `None` otherwise.
 fn find_cli(name: &str) -> Option<PathBuf> {
     if let Ok(p) = which::which(name) {
         return Some(p);
@@ -183,6 +263,20 @@ fn find_cli(name: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|c| c.exists())
 }
 
+/// Returns the current user's home directory as a PathBuf by reading the `HOME` environment variable.
+///
+/// # Errors
+///
+/// Returns an error with context "HOME environment variable not set" if the `HOME` environment variable is missing.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// std::env::set_var("HOME", "/tmp/example_home");
+/// let home = crate::home_dir().unwrap();
+/// assert_eq!(home, PathBuf::from("/tmp/example_home"));
+/// ```
 fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -191,6 +285,22 @@ fn home_dir() -> Result<PathBuf> {
 
 // --- Claude Code ---
 
+/// Registers the current binary as an MCP server for Claude Code.
+///
+/// Attempts to use the `claude` CLI to add a user-scoped MCP entry pointing to `binary_path`.
+/// If the `claude` CLI is not found, falls back to updating the user's `~/.claude.json` via
+/// `register_claude_code_file`. In dry-run mode, prints the planned command without executing it.
+///
+/// # Returns
+///
+/// A `Registration` describing the outcome of the registration attempt for Claude Code.
+///
+/// # Examples
+///
+/// ```
+/// let reg = register_claude_code(std::path::Path::new("/usr/local/bin/shire"), true, false);
+/// assert_eq!(reg.tool, "Claude Code");
+/// ```
 fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let claude_path = match find_cli("claude") {
         Some(p) => p,
@@ -259,6 +369,23 @@ fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Regis
     }
 }
 
+/// Inserts or updates a "shire" MCP entry in the user's ~/.claude.json to point at the provided binary.
+///
+/// If the user's home directory cannot be determined this returns a `Registration` with `RegStatus::NotFound`.
+/// In dry-run mode the function reports the planned change and returns a `Registration` indicating the target path without writing.
+/// The `force` flag controls whether an existing "shire" entry will be overwritten.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// // Dry-run example: does not modify the filesystem
+/// let _ = crate::register_claude_code_file(Path::new("/usr/bin/shire"), true, false);
+/// ```
+///
+/// # Returns
+///
+/// A `Registration` describing the result: created, updated, already registered, not found, or failed.
 fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let home = match home_dir() {
         Ok(h) => h,
@@ -317,6 +444,22 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
 
 // --- Codex CLI ---
 
+/// Register or update a "shire" MCP entry in the user's Codex CLI config.
+///
+/// Attempts to locate the `codex` CLI and then ensure the file `~/.codex/config.toml` contains an
+/// [mcp_servers.shire] entry that invokes this binary with `serve --root .`. If the Codex CLI
+/// executable is not found, returns `RegStatus::NotFound`. When `dry_run` is true the function
+/// reports the intended config path without making changes. The `force` flag controls whether an
+/// existing `shire` entry is overwritten.
+///
+/// # Examples
+///
+/// ```
+/// // Example usage (may return NotFound if `codex` is not installed on the system):
+/// use std::path::Path;
+/// // call with dry_run=true to see planned changes without modifying files:
+/// let _ = register_codex(Path::new("/path/to/binary"), true, false);
+/// ```
 fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let codex_path = find_cli("codex");
     if codex_path.is_none() {
@@ -381,6 +524,29 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
     }
 }
 
+/// Inserts or updates a `mcp_servers.shire` entry in a Codex TOML config file.
+///
+/// Creates the `mcp_servers` table if it does not exist, writes the `shire` table with
+/// a `command` pointing to `binary_path` and `args = ["serve", "--root", "."]`,
+/// and performs an atomic on-disk write (writes to a temporary file then renames).
+/// If a `shire` entry already exists and `force` is false, the function returns `UpsertResult::AlreadyExists`.
+/// Parent directories for `config_file` are created as needed.
+///
+/// # Returns
+///
+/// `UpsertResult::Created` if the `shire` entry was newly created, `UpsertResult::Updated` if an existing entry
+/// was replaced, or `UpsertResult::AlreadyExists` if an entry existed and `force` was false.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// // Assume `upsert_codex_toml` and `UpsertResult` are available in scope.
+/// let config = Path::new("/tmp/example_codex_config.toml");
+/// let bin = Path::new("/usr/local/bin/shire-binary");
+/// let res = upsert_codex_toml(config, bin, false).unwrap();
+/// assert!(matches!(res, UpsertResult::Created | UpsertResult::Updated | UpsertResult::AlreadyExists));
+/// ```
 fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Result<UpsertResult> {
     let content = fs::read_to_string(config_file).unwrap_or_default();
     let mut doc: toml::Value = if content.is_empty() {
@@ -444,6 +610,19 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
     })
 }
 
+/// Remove the "shire" MCP entry from the Codex CLI configuration (~/.codex/config.toml) if it exists.
+///
+/// If the home directory cannot be determined, the config file cannot be read, or the file is not valid TOML,
+/// the function returns without making changes. When `dry_run` is true, the function prints the planned removal
+/// but does not modify any files. When removal occurs, the config is written atomically via a temporary file
+/// and renamed into place; if the containing `mcp_servers` table becomes empty it is removed as well.
+///
+/// # Examples
+///
+/// ```
+/// // Print what would be done without changing files.
+/// remove_codex_mcp(true);
+/// ```
 fn remove_codex_mcp(dry_run: bool) {
     let home = match home_dir() {
         Ok(h) => h,
@@ -494,6 +673,30 @@ fn remove_codex_mcp(dry_run: bool) {
 
 // --- Generic JSON-based editor MCP registration ---
 
+/// Upserts an MCP "shire" entry into an editor's JSON configuration and returns a Registration describing the outcome.
+///
+/// If `config_path` is None, returns a `Registration` with `RegStatus::NotFound`. If `dry_run` is true, reports the planned upsert and returns `RegStatus::Registered` with the config path string. Uses `custom_entry` when provided; otherwise uses a default entry that runs the given `binary_path` with `serve --root .`. Calls `upsert_json_mcp` and maps its result to `RegStatus::Registered`/`Updated`/`AlreadyRegistered`, or `RegStatus::Failed` on error.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// // assumes Registration and RegStatus are in scope
+/// let cfg = Some(PathBuf::from("/tmp/mcp.json"));
+/// let reg = register_editor_mcp(
+///     Path::new("/usr/local/bin/shire"),
+///     "Cursor",
+///     &cfg,
+///     "mcpServers",
+///     None,
+///     true,  // dry_run
+///     false, // force
+/// );
+/// match reg.status {
+///     RegStatus::Registered(p) => assert!(p.contains("/tmp/mcp.json")),
+///     _ => panic!("expected Registered on dry-run"),
+/// }
+/// ```
 fn register_editor_mcp(
     binary_path: &Path,
     tool_name: &'static str,
@@ -562,6 +765,26 @@ fn register_editor_mcp(
     }
 }
 
+/// Remove the "shire" MCP entry from an editor JSON configuration if present.
+///
+/// If `config_path` is `None` or the file cannot be read/parsed, the function returns
+/// silently. If the specified `servers_key` does not contain an object or does not
+/// have a `"shire"` entry, the function does nothing. When `dry_run` is true, the
+/// function only prints what it would remove without writing changes.
+///
+/// # Parameters
+///
+/// - `tool_name`: human-readable tool identifier used in printed messages.
+/// - `config_path`: path to the editor's JSON config file; if `None`, the function is a no-op.
+/// - `servers_key`: top-level object key that holds server entries (e.g., "mcpServers").
+/// - `dry_run`: when true, print the intended removal but do not modify the file.
+///
+/// # Examples
+///
+/// ```
+/// // Best-effort example: calling with `None` is a safe no-op.
+/// remove_editor_mcp("example", &None, "servers", true);
+/// ```
 fn remove_editor_mcp(
     tool_name: &str,
     config_path: &Option<PathBuf>,
@@ -611,21 +834,71 @@ fn remove_editor_mcp(
 
 // --- Config paths ---
 
+/// Returns the expected path to Cursor's MCP configuration file inside the current user's home directory.
+///
+/// If the HOME environment variable cannot be determined, returns `None`.
+///
+/// # Examples
+///
+/// ```
+/// if let Some(path) = cursor_config_path() {
+///     assert!(path.ends_with(".cursor/mcp.json"));
+/// }
+/// ```
 fn cursor_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     Some(home.join(".cursor/mcp.json"))
 }
 
+/// Locate the Windsurf MCP JSON config file under the current user's home directory.
+///
+/// Returns `Some(PathBuf)` pointing to `HOME/.codeium/windsurf/mcp_config.json` when the `HOME`
+/// environment variable is available, or `None` if the home directory cannot be determined.
+///
+/// # Examples
+///
+/// ```
+/// let p = windsurf_config_path();
+/// // If HOME is unset this will be `None`; otherwise the path ends with the expected suffix.
+/// assert!(p.map_or(true, |pb| pb.ends_with(".codeium/windsurf/mcp_config.json")));
+/// ```
 fn windsurf_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     Some(home.join(".codeium/windsurf/mcp_config.json"))
 }
 
+/// Get the path to the Gemini settings JSON in the user's home directory if available.
+///
+/// Returns `Some(PathBuf)` with the path to `.gemini/settings.json` inside the user's HOME
+/// when the HOME environment variable is set and can be resolved, or `None` if HOME is unset.
+///
+/// # Examples
+///
+/// ```
+/// if let Some(path) = gemini_config_path() {
+///     assert!(path.ends_with(".gemini/settings.json"));
+/// } else {
+///     // HOME not set in this environment
+/// }
+/// ```
 fn gemini_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     Some(home.join(".gemini/settings.json"))
 }
 
+/// Returns the platform-specific path to VS Code's MCP configuration file.
+///
+/// On macOS this is `HOME/Library/Application Support/Code/User/mcp.json`.
+/// On Linux this is `HOME/.config/Code/User/mcp.json`.
+/// On other platforms returns `None`.
+///
+/// # Examples
+///
+/// ```
+/// if let Some(path) = vscode_config_path() {
+///     assert!(path.ends_with("mcp.json"));
+/// }
+/// ```
 fn vscode_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     #[cfg(target_os = "macos")]
@@ -642,6 +915,17 @@ fn vscode_config_path() -> Option<PathBuf> {
     }
 }
 
+/// Locate the Zed editor MCP configuration file inside the current user's home directory.
+///
+/// Returns `None` if the `HOME` environment variable is not set.
+///
+/// # Examples
+///
+/// ```
+/// if let Some(path) = zed_config_path() {
+///     assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("settings.json"));
+/// }
+/// ```
 fn zed_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     Some(home.join(".config/zed/settings.json"))
@@ -655,6 +939,38 @@ enum UpsertResult {
     AlreadyExists,
 }
 
+/// Inserts or updates a named entry under a JSON object key and writes the file atomically.
+///
+/// If the file does not exist, a new JSON object is created. Ensures `servers_key` exists
+/// as an object and inserts `entry_value` under `entry_name`. If an entry already exists
+/// and `force` is false, the function returns `UpsertResult::AlreadyExists`. Writes are
+/// performed atomically by writing to a temporary file and renaming it into place.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use std::path::Path;
+/// // create a temp path for demonstration (in real code prefer tempfile crate)
+/// let path = Path::new("/tmp/shire_example_mcp.json");
+/// // ensure file is removed after example run (ignore errors)
+/// let _ = std::fs::remove_file(path);
+///
+/// let entry = json!({
+///     "command": path.to_string_lossy(),
+///     "args": ["serve", "--root", "."]
+/// });
+///
+/// // first call should create the file
+/// let res = crate::install::upsert_json_mcp(path, "mcpServers", "shire", entry.clone(), false)
+///     .expect("upsert failed");
+/// assert!(matches!(res, crate::install::UpsertResult::Created));
+///
+/// // calling again without force returns AlreadyExists
+/// let res2 = crate::install::upsert_json_mcp(path, "mcpServers", "shire", entry, false)
+///     .expect("upsert failed");
+/// assert!(matches!(res2, crate::install::UpsertResult::AlreadyExists));
+/// ```
 fn upsert_json_mcp(
     path: &Path,
     servers_key: &str,

@@ -187,6 +187,15 @@ pub fn run_uninstall(dry_run: bool) -> Result<()> {
             }
         }
     }
+    // Also clean up ~/.claude.json fallback (install may have used file patching)
+    if let Ok(home) = home_dir() {
+        remove_editor_mcp(
+            "Claude Code",
+            &Some(home.join(".claude.json")),
+            "mcpServers",
+            dry_run,
+        );
+    }
 
     // Codex CLI
     remove_codex_mcp(dry_run);
@@ -323,10 +332,26 @@ fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Regis
         };
     }
 
-    // Remove first (may not exist, that's OK)
-    let _ = Command::new(&claude_path)
-        .args(["mcp", "remove", "-s", "user", "shire"])
-        .output();
+    // Check if already registered
+    if !force {
+        let check = Command::new(&claude_path)
+            .args(["mcp", "get", "-s", "user", "shire"])
+            .output();
+        if let Ok(o) = check {
+            if o.status.success() {
+                println!("  MCP server already registered (scope: user)");
+                return Registration {
+                    tool: "Claude Code",
+                    status: RegStatus::AlreadyRegistered("via claude mcp".into()),
+                };
+            }
+        }
+    } else {
+        // Force: remove existing entry first
+        let _ = Command::new(&claude_path)
+            .args(["mcp", "remove", "-s", "user", "shire"])
+            .output();
+    }
 
     let output = Command::new(&claude_path)
         .args([
@@ -666,9 +691,15 @@ fn remove_codex_mcp(dry_run: bool) {
     let output = toml::to_string_pretty(&doc).unwrap_or_default();
     let tmp_path = config_file.with_extension("toml.tmp");
     if fs::write(&tmp_path, &output).is_ok() {
-        let _ = fs::rename(&tmp_path, &config_file);
+        if fs::rename(&tmp_path, &config_file).is_ok() {
+            println!("  Removed MCP section");
+        } else {
+            let _ = fs::remove_file(&tmp_path);
+            println!("  Removal failed: could not update config file");
+        }
+    } else {
+        println!("  Removal failed: could not write temporary file");
     }
-    println!("  Removed MCP section");
 }
 
 // --- Generic JSON-based editor MCP registration ---
@@ -715,6 +746,16 @@ fn register_editor_mcp(
             }
         }
     };
+
+    // Only register if the config file or its parent directory already exists
+    // (i.e., the editor is actually installed). Don't create config trees for
+    // editors that aren't present.
+    if !config_path.exists() && !config_path.parent().is_some_and(|p| p.exists()) {
+        return Registration {
+            tool: tool_name,
+            status: RegStatus::NotFound,
+        };
+    }
 
     println!("[{}] config: {}", tool_name, config_path.display());
 
@@ -826,9 +867,15 @@ fn remove_editor_mcp(
     if let Ok(out) = serde_json::to_string_pretty(&Value::Object(root)) {
         let tmp_path = config_path.with_extension("json.tmp");
         if fs::write(&tmp_path, format!("{}\n", out)).is_ok() {
-            let _ = fs::rename(&tmp_path, config_path);
+            if fs::rename(&tmp_path, config_path).is_ok() {
+                println!("  Removed shire");
+            } else {
+                let _ = fs::remove_file(&tmp_path);
+                println!("  Removal failed: could not update config file");
+            }
+        } else {
+            println!("  Removal failed: could not write temporary file");
         }
-        println!("  Removed shire");
     }
 }
 

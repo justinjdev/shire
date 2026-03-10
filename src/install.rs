@@ -95,7 +95,7 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
         "VS Code",
         &vscode_config_path(),
         "servers",
-        Some(json!({"type": "stdio", "command": binary_path.to_string_lossy()})),
+        Some(json!({"type": "stdio", "command": binary_path.to_string_lossy(), "args": ["serve", "--root", "."]})),
         dry_run,
         force,
     ));
@@ -106,7 +106,7 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
         "Zed",
         &zed_config_path(),
         "context_servers",
-        Some(json!({"source": "custom", "command": binary_path.to_string_lossy()})),
+        Some(json!({"source": "custom", "command": binary_path.to_string_lossy(), "args": ["serve", "--root", "."]})),
         dry_run,
         force,
     ));
@@ -134,6 +134,17 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
         println!("\nRestart your editor/CLI to activate.");
     } else {
         println!("\nNo supported tools detected. Install one of: Claude Code, Cursor, Windsurf, VS Code, Zed, Gemini CLI, Codex CLI");
+    }
+
+    let failures: Vec<_> = results
+        .iter()
+        .filter_map(|r| match &r.status {
+            RegStatus::Failed(err) => Some(format!("{}: {}", r.tool, err.trim())),
+            _ => None,
+        })
+        .collect();
+    if !dry_run && !failures.is_empty() {
+        anyhow::bail!("installation failed for {}", failures.join(", "));
     }
 
     Ok(())
@@ -260,14 +271,17 @@ fn find_cli(name: &str) -> Option<PathBuf> {
         return Some(p);
     }
 
-    let home = home_dir().ok()?;
-    let candidates = [
+    let mut candidates = vec![
         PathBuf::from("/usr/local/bin").join(name),
         PathBuf::from("/opt/homebrew/bin").join(name),
-        home.join(".npm/bin").join(name),
-        home.join(".local/bin").join(name),
-        home.join(".cargo/bin").join(name),
     ];
+    if let Ok(home) = home_dir() {
+        candidates.extend([
+            home.join(".npm/bin").join(name),
+            home.join(".local/bin").join(name),
+            home.join(".cargo/bin").join(name),
+        ]);
+    }
 
     candidates.into_iter().find(|c| c.exists())
 }

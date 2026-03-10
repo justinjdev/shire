@@ -43,7 +43,7 @@ fn is_visible(node: &Node, source: &str) -> bool {
     // or private class (at any nesting level) is not externally visible.
     let mut current = node.parent();
     while let Some(n) = current {
-        if n.kind() == "class_declaration" {
+        if matches!(n.kind(), "class_declaration" | "interface_declaration" | "enum_declaration") {
             let (p_public, p_protected, p_private, _, _) = check_modifiers(&n, source);
             if p_private || !(p_public || p_protected) {
                 return false;
@@ -59,7 +59,9 @@ fn is_visible(node: &Node, source: &str) -> bool {
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
         "method_declaration" | "field_declaration" => {
-            let class_node = find_ancestor(node, "class_declaration")?;
+            let class_node = find_ancestor(node, "class_declaration")
+                .or_else(|| find_ancestor(node, "interface_declaration"))
+                .or_else(|| find_ancestor(node, "enum_declaration"))?;
             let name_node = class_node.child_by_field_name("name")?;
             node_text(&name_node, source).map(|s| s.to_string())
         }

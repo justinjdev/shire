@@ -2728,6 +2728,7 @@ dependencies = [
  "sha2",
  "shellexpand",
  "sqlite-vec",
+ "streaming-iterator",
  "tempfile",
  "tokio",
  "toml",

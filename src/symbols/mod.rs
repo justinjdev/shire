@@ -1,15 +1,11 @@
-pub mod go;
-pub mod java;
-pub mod kotlin;
+mod hooks;
 pub mod perl;
-pub mod proto;
-pub mod python;
+mod query_extract;
+mod registry;
 pub mod ruby;
-pub mod rust_lang;
-pub mod typescript;
 pub mod walker;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 
@@ -88,10 +84,8 @@ pub fn extract_symbols_for_package(
     let mut symbols = Vec::new();
 
     for file_path in source_files {
-        let source = match std::fs::read_to_string(&file_path) {
-            Ok(s) => s,
-            Err(_) => continue, // skip binary/unreadable files
-        };
+        let source = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
 
         let relative_path = file_path
             .strip_prefix(repo_root)
@@ -104,22 +98,17 @@ pub fn extract_symbols_for_package(
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        let mut file_symbols = match ext {
-            "ts" | "tsx" => typescript::extract(&source, &relative_path, ext == "tsx"),
-            "js" | "jsx" => typescript::extract_js(&source, &relative_path),
-            "go" => go::extract(&source, &relative_path),
-            "rs" => rust_lang::extract(&source, &relative_path),
-            "py" => python::extract(&source, &relative_path),
-            "proto" => proto::extract(&source, &relative_path),
-            "java" => java::extract(&source, &relative_path),
-            "kt" => kotlin::extract(&source, &relative_path),
-            "pm" | "pl" => perl::extract(&source, &relative_path),
-            "rb" => ruby::extract(&source, &relative_path),
-            _ => Vec::new(),
-        };
-
+        let mut file_symbols = extract_file(ext, &source, &relative_path);
         symbols.append(&mut file_symbols);
     }
 
     Ok(symbols)
 }
+
+/// Extract symbols from a single file by extension.
+pub fn extract_file(ext: &str, source: &str, file_path: &str) -> Vec<SymbolInfo> {
+    registry::extract_file(ext, source, file_path)
+}
+
+#[cfg(test)]
+mod tests;

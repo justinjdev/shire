@@ -12,25 +12,29 @@ struct Registration {
 
 enum RegStatus {
     Registered(String),
+    Updated(String),
     AlreadyRegistered(String),
     NotFound,
     Failed(String),
 }
 
-pub fn run_install(dry_run: bool) -> Result<()> {
+pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
     let binary_path = detect_binary_path()?;
 
-    println!("shire install");
+    println!("shire {} — install", env!("CARGO_PKG_VERSION"));
     println!("Binary: {}", binary_path.display());
+    if force {
+        println!("Mode: force (overwrite existing registrations)");
+    }
     println!();
 
     let mut results = Vec::new();
 
     // Claude Code — use `claude mcp add` CLI if available
-    results.push(register_claude_code(&binary_path, dry_run));
+    results.push(register_claude_code(&binary_path, dry_run, force));
 
     // Codex CLI — ~/.codex/config.toml
-    results.push(register_codex(&binary_path, dry_run));
+    results.push(register_codex(&binary_path, dry_run, force));
 
     // Cursor — ~/.cursor/mcp.json
     results.push(register_editor_mcp(
@@ -40,6 +44,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
         "mcpServers",
         None,
         dry_run,
+        force,
     ));
 
     // Windsurf — ~/.codeium/windsurf/mcp_config.json
@@ -50,6 +55,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
         "mcpServers",
         None,
         dry_run,
+        force,
     ));
 
     // Gemini CLI — ~/.gemini/settings.json
@@ -60,6 +66,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
         "mcpServers",
         None,
         dry_run,
+        force,
     ));
 
     // VS Code — ~/Library/Application Support/Code/User/mcp.json
@@ -70,6 +77,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
         "servers",
         Some(json!({"type": "stdio", "command": binary_path.to_string_lossy()})),
         dry_run,
+        force,
     ));
 
     // Zed — ~/.config/zed/settings.json
@@ -80,6 +88,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
         "context_servers",
         Some(json!({"source": "custom", "command": binary_path.to_string_lossy()})),
         dry_run,
+        force,
     ));
 
     // Summary
@@ -88,6 +97,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
     for r in &results {
         match &r.status {
             RegStatus::Registered(path) => println!("  + {} — registered ({})", r.tool, path),
+            RegStatus::Updated(path) => println!("  ~ {} — updated ({})", r.tool, path),
             RegStatus::AlreadyRegistered(path) => {
                 println!("  = {} — already registered ({})", r.tool, path)
             }
@@ -98,7 +108,7 @@ pub fn run_install(dry_run: bool) -> Result<()> {
 
     let registered = results
         .iter()
-        .filter(|r| matches!(r.status, RegStatus::Registered(_) | RegStatus::AlreadyRegistered(_)))
+        .filter(|r| matches!(r.status, RegStatus::Registered(_) | RegStatus::Updated(_) | RegStatus::AlreadyRegistered(_)))
         .count();
     if registered > 0 {
         println!("\nRestart your editor/CLI to activate.");
@@ -174,12 +184,12 @@ fn home_dir() -> Result<PathBuf> {
 
 // --- Claude Code ---
 
-fn register_claude_code(binary_path: &Path, dry_run: bool) -> Registration {
+fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let claude_path = match find_cli("claude") {
         Some(p) => p,
         None => {
             // Fall back to ~/.claude.json file patching
-            return register_claude_code_file(binary_path, dry_run);
+            return register_claude_code_file(binary_path, dry_run, force);
         }
     };
 
@@ -242,7 +252,7 @@ fn register_claude_code(binary_path: &Path, dry_run: bool) -> Registration {
     }
 }
 
-fn register_claude_code_file(binary_path: &Path, dry_run: bool) -> Registration {
+fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let home = match home_dir() {
         Ok(h) => h,
         Err(_) => {
@@ -264,20 +274,24 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool) -> Registration 
         };
     }
 
-    match upsert_json_mcp(
-        &claude_json,
-        "mcpServers",
-        "shire",
-        json!({
-            "command": binary_path.to_string_lossy(),
-            "args": ["serve", "--root", "."],
-        }),
-    ) {
+    let entry = json!({
+        "command": binary_path.to_string_lossy(),
+        "args": ["serve", "--root", "."],
+    });
+
+    match upsert_json_mcp(&claude_json, "mcpServers", "shire", entry, force) {
         Ok(UpsertResult::Created) => {
             println!("  Added mcpServers.shire to ~/.claude.json");
             Registration {
                 tool: "Claude Code",
                 status: RegStatus::Registered("~/.claude.json".into()),
+            }
+        }
+        Ok(UpsertResult::Updated) => {
+            println!("  Updated mcpServers.shire in ~/.claude.json");
+            Registration {
+                tool: "Claude Code",
+                status: RegStatus::Updated("~/.claude.json".into()),
             }
         }
         Ok(UpsertResult::AlreadyExists) => {
@@ -296,7 +310,7 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool) -> Registration 
 
 // --- Codex CLI ---
 
-fn register_codex(binary_path: &Path, dry_run: bool) -> Registration {
+fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registration {
     let codex_path = find_cli("codex");
     if codex_path.is_none() {
         return Registration {
@@ -337,13 +351,23 @@ fn register_codex(binary_path: &Path, dry_run: bool) -> Registration {
     }
 
     // Read existing or empty
-    let content = fs::read_to_string(&config_file).unwrap_or_default();
+    let mut content = fs::read_to_string(&config_file).unwrap_or_default();
 
     if content.contains(section_header) {
-        println!("  MCP server already configured in {}", config_file.display());
-        return Registration {
-            tool: "Codex CLI",
-            status: RegStatus::AlreadyRegistered(config_file.display().to_string()),
+        if !force {
+            println!("  MCP server already configured in {}", config_file.display());
+            return Registration {
+                tool: "Codex CLI",
+                status: RegStatus::AlreadyRegistered(config_file.display().to_string()),
+            };
+        }
+        // Force: remove existing section and re-add below
+        let idx = content.find(section_header).unwrap();
+        let rest = &content[idx + section_header.len()..];
+        let end_idx = rest.find("\n[").map(|i| idx + section_header.len() + i + 1);
+        content = match end_idx {
+            Some(end) => format!("{}{}", content[..idx].trim_end_matches('\n'), &content[end..]),
+            None => content[..idx].trim_end_matches('\n').to_string(),
         };
     }
 
@@ -354,10 +378,11 @@ fn register_codex(binary_path: &Path, dry_run: bool) -> Registration {
 
     match fs::write(&config_file, format!("{}{}", content, mcp_section)) {
         Ok(()) => {
-            println!("  MCP server registered: {}", config_file.display());
+            let display = config_file.display().to_string();
+            println!("  MCP server registered: {}", display);
             Registration {
                 tool: "Codex CLI",
-                status: RegStatus::Registered(config_file.display().to_string()),
+                status: RegStatus::Registered(display),
             }
         }
         Err(e) => Registration {
@@ -411,6 +436,7 @@ fn register_editor_mcp(
     servers_key: &str,
     custom_entry: Option<Value>,
     dry_run: bool,
+    force: bool,
 ) -> Registration {
     let config_path = match config_path {
         Some(p) => p,
@@ -439,12 +465,19 @@ fn register_editor_mcp(
         };
     }
 
-    match upsert_json_mcp(config_path, servers_key, "shire", entry) {
+    match upsert_json_mcp(config_path, servers_key, "shire", entry, force) {
         Ok(UpsertResult::Created) => {
             println!("  MCP server registered");
             Registration {
                 tool: tool_name,
                 status: RegStatus::Registered(config_path.display().to_string()),
+            }
+        }
+        Ok(UpsertResult::Updated) => {
+            println!("  MCP server updated");
+            Registration {
+                tool: tool_name,
+                status: RegStatus::Updated(config_path.display().to_string()),
             }
         }
         Ok(UpsertResult::AlreadyExists) => {
@@ -550,6 +583,7 @@ fn zed_config_path() -> Option<PathBuf> {
 
 enum UpsertResult {
     Created,
+    Updated,
     AlreadyExists,
 }
 
@@ -558,6 +592,7 @@ fn upsert_json_mcp(
     servers_key: &str,
     entry_name: &str,
     entry_value: Value,
+    force: bool,
 ) -> Result<UpsertResult> {
     let mut root: Map<String, Value> = if path.exists() {
         let content = fs::read_to_string(path)
@@ -576,7 +611,8 @@ fn upsert_json_mcp(
         .as_object_mut()
         .context(format!("{} is not an object in {}", servers_key, path.display()))?;
 
-    if servers_obj.contains_key(entry_name) {
+    let is_update = servers_obj.contains_key(entry_name);
+    if is_update && !force {
         return Ok(UpsertResult::AlreadyExists);
     }
 
@@ -606,7 +642,11 @@ fn upsert_json_mcp(
         });
     }
 
-    Ok(UpsertResult::Created)
+    Ok(if is_update {
+        UpsertResult::Updated
+    } else {
+        UpsertResult::Created
+    })
 }
 
 #[cfg(test)]
@@ -624,6 +664,7 @@ mod tests {
             "mcpServers",
             "shire",
             json!({"command": "shire", "args": ["serve"]}),
+            false,
         )
         .unwrap();
         assert!(matches!(result, UpsertResult::Created));
@@ -645,6 +686,7 @@ mod tests {
             "mcpServers",
             "shire",
             json!({"command": "shire"}),
+            false,
         )
         .unwrap();
 
@@ -659,10 +701,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"})).unwrap();
+        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false).unwrap();
 
         let result =
-            upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire2"})).unwrap();
+            upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire2"}), false).unwrap();
         assert!(matches!(result, UpsertResult::AlreadyExists));
 
         // Original value preserved
@@ -681,6 +723,7 @@ mod tests {
             "context_servers",
             "shire",
             json!({"source": "custom", "command": "shire"}),
+            false,
         )
         .unwrap();
 
@@ -694,7 +737,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nested/dir/mcp.json");
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"})).unwrap();
+        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false).unwrap();
         assert!(path.exists());
     }
 
@@ -704,8 +747,39 @@ mod tests {
         let path = dir.path().join("mcp.json");
         fs::write(&path, json!({"mcpServers": "broken"}).to_string()).unwrap();
 
-        let result = upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}));
+        let result = upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_upsert_force_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/old/shire"}), false).unwrap();
+
+        let result =
+            upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/new/shire"}), true).unwrap();
+        assert!(matches!(result, UpsertResult::Updated));
+
+        let parsed: Map<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["shire"]["command"], "/new/shire");
+    }
+
+    #[test]
+    fn test_upsert_force_preserves_other_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        let existing = json!({"mcpServers": {"shire": {"command": "/old"}, "other": {"command": "other"}}});
+        fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/new"}), true).unwrap();
+
+        let parsed: Map<String, Value> =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["shire"]["command"], "/new");
+        assert_eq!(parsed["mcpServers"]["other"]["command"], "other");
     }
 
     #[test]

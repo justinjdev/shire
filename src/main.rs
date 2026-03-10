@@ -99,6 +99,9 @@ enum Commands {
         /// Show what would be done without making changes
         #[arg(long)]
         dry_run: bool,
+        /// Overwrite existing registrations (useful after binary path changes)
+        #[arg(long)]
+        force: bool,
     },
     /// Remove shire MCP registration from all detected AI tools
     Uninstall {
@@ -192,7 +195,7 @@ async fn main() -> Result<()> {
                 init::run_init(&root, no_hook, yes)
             }
         }
-        Commands::Install { dry_run } => install::run_install(dry_run),
+        Commands::Install { dry_run, force } => install::run_install(dry_run, force),
         Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
         Commands::Clean { root, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;

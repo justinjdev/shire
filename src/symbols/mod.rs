@@ -1,6 +1,9 @@
+pub mod generic;
 pub mod go;
 pub mod java;
 pub mod kotlin;
+pub mod lang_spec;
+pub mod languages;
 pub mod perl;
 pub mod proto;
 pub mod python;
@@ -104,22 +107,31 @@ pub fn extract_symbols_for_package(
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        let mut file_symbols = match ext {
-            "ts" | "tsx" => typescript::extract(&source, &relative_path, ext == "tsx"),
-            "js" | "jsx" => typescript::extract_js(&source, &relative_path),
-            "go" => go::extract(&source, &relative_path),
-            "rs" => rust_lang::extract(&source, &relative_path),
-            "py" => python::extract(&source, &relative_path),
-            "proto" => proto::extract(&source, &relative_path),
-            "java" => java::extract(&source, &relative_path),
-            "kt" => kotlin::extract(&source, &relative_path),
-            "pm" | "pl" => perl::extract(&source, &relative_path),
-            "rb" => ruby::extract(&source, &relative_path),
-            _ => Vec::new(),
-        };
-
+        let mut file_symbols = extract_file(ext, &source, &relative_path);
         symbols.append(&mut file_symbols);
     }
 
     Ok(symbols)
+}
+
+/// Extract symbols from a single file by extension.
+/// Uses the generic table-driven extractor for languages with specs,
+/// and falls back to custom extractors for languages with unique AST patterns.
+pub fn extract_file(ext: &str, source: &str, file_path: &str) -> Vec<SymbolInfo> {
+    match ext {
+        // Languages using the generic table-driven extractor
+        "py" => generic::extract(&languages::python(), source, file_path),
+
+        // Languages with custom extractors (unique AST patterns)
+        "ts" | "tsx" => typescript::extract(source, file_path, ext == "tsx"),
+        "js" | "jsx" => typescript::extract_js(source, file_path),
+        "go" => go::extract(source, file_path),
+        "rs" => rust_lang::extract(source, file_path),
+        "proto" => proto::extract(source, file_path),
+        "java" => java::extract(source, file_path),
+        "kt" => kotlin::extract(source, file_path),
+        "pm" | "pl" => perl::extract(source, file_path),
+        "rb" => ruby::extract(source, file_path),
+        _ => Vec::new(),
+    }
 }

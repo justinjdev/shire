@@ -336,6 +336,11 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
 }
 
 /// Clear and re-insert symbols for a package using batched multi-row INSERTs.
+/// Drops FTS5 triggers during the bulk operation and manually syncs FTS afterward.
+///
+/// Must be called within a transaction — if an error occurs after dropping
+/// triggers, the transaction rollback restores DB state but triggers won't
+/// be restored until the next schema creation.
 /// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
 fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
     // 1. Drop triggers to avoid per-row FTS overhead

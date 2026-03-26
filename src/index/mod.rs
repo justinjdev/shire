@@ -267,9 +267,10 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
     )?;
 
     if orphaned_syms > 0 || orphaned_deps > 0 {
-        eprintln!(
-            "Warning: cleaning up {} orphaned symbol(s) and {} orphaned dependency(ies)",
-            orphaned_syms, orphaned_deps
+        tracing::warn!(
+            orphaned_symbols = orphaned_syms,
+            orphaned_dependencies = orphaned_deps,
+            "cleaning up orphaned symbol(s) and dependency(ies)"
         );
         conn.execute(
             "DELETE FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
@@ -343,6 +344,8 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
 /// be restored until the next schema creation.
 /// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
 fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    tracing::debug!(package = %package, symbols = syms.len(), "upserting symbols for package");
+
     // 1. Drop triggers to avoid per-row FTS overhead
     db::drop_symbols_fts_triggers(conn)?;
 
@@ -519,7 +522,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
         });
 
         if files.len() >= MAX_FILES {
-            eprintln!("Warning: file tree walk capped at {} files", MAX_FILES);
+            tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
             break;
         }
     }
@@ -1003,6 +1006,8 @@ fn single_pass_extract(
         return Ok((Vec::new(), empty_hash, Vec::new()));
     }
 
+    tracing::debug!(package = %pkg_path, files = source_files.len(), "extracting symbols");
+
     // Process files in parallel: read once, hash, extract symbols
     let file_results: Vec<FileExtractResult> = source_files
         .par_iter()
@@ -1063,6 +1068,8 @@ fn phase_extract_symbols(
     exclude_extensions: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<()> {
+    tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
+
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
@@ -1078,7 +1085,7 @@ fn phase_extract_symbols(
                     file_hashes,
                 },
                 Err(e) => {
-                    eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
+                    tracing::warn!(package = %pkg_name, error = %e, "symbol extraction failed");
                     PackageExtractResult {
                         pkg_name: pkg_name.clone(),
                         symbols: Vec::new(),
@@ -1353,6 +1360,15 @@ fn phase_source_incremental(
     // Batch-upsert all source hashes collected in this phase
     batch_upsert_source_hashes(conn, &hash_entries)?;
 
+    let num_checked = unchanged_pkgs.len();
+    let num_skipped_mtime = num_checked - results.len();
+    tracing::debug!(
+        checked = num_checked,
+        skipped_mtime = num_skipped_mtime,
+        re_extracted = num_reextracted,
+        "phase_source_incremental: incremental source check complete"
+    );
+
     Ok(num_reextracted)
 }
 
@@ -1382,6 +1398,7 @@ fn phase_index_files(
         .ok();
 
     if stored_hash.as_deref() == Some(current_hash.as_str()) {
+        tracing::debug!("phase_index_files: file tree hash matched, skipping rebuild");
         // File tree unchanged — skip rebuild, read count from existing table
         let num_files: usize = conn.query_row(
             "SELECT COUNT(*) FROM files",
@@ -1390,6 +1407,8 @@ fn phase_index_files(
         )? as usize;
         return Ok(num_files);
     }
+
+    tracing::debug!(files = walked_files.len(), "phase_index_files: file tree hash changed, rebuilding file index");
 
     // File tree changed (or first build) — incremental update
     let all_packages: Vec<(String, String)> = conn
@@ -1434,9 +1453,9 @@ fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
                 (desc, &override_pkg.name),
             )?;
             if rows == 0 {
-                eprintln!(
-                    "Warning: config override for '{}' matched no packages",
-                    override_pkg.name
+                tracing::warn!(
+                    package = %override_pkg.name,
+                    "config override matched no packages"
                 );
             }
         }
@@ -1513,12 +1532,12 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
                     .ok()
                     .map(|s| s.trim().to_string())
             } else {
-                eprintln!("Note: git rev-parse failed (not a git repo?)");
+                tracing::info!("git rev-parse failed (not a git repo?)");
                 None
             }
         }
         Err(e) => {
-            eprintln!("Warning: could not run git: {}", e);
+            tracing::warn!(error = %e, "could not run git");
             None
         }
     };
@@ -1554,6 +1573,7 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
         eprintln!("{} manifest(s) failed to parse:", summary.failures.len());
         for (path, err) in &summary.failures {
             eprintln!("  {}: {}", path, err);
+            tracing::warn!(path = %path, error = %err, "manifest parse failure");
         }
     }
 
@@ -1582,11 +1602,11 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
 
 /// Print timing breakdown to stderr.
 fn print_timings(timings: &[(&str, Duration)], total: Duration) {
-    eprintln!("Build timing:");
+    tracing::debug!("Build timing:");
     for (label, dur) in timings {
-        eprintln!("  {:<20} {}ms", label, dur.as_millis());
+        tracing::debug!(phase = %label, duration_ms = dur.as_millis(), "phase timing");
     }
-    eprintln!("  {:<20} {}ms", "total", total.as_millis());
+    tracing::debug!(duration_ms = total.as_millis(), "total build time");
 }
 
 /// Create a spinner-style progress bar attached to the MultiProgress.
@@ -1644,6 +1664,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         if let Some(seed_path) = crate::config::seed_db_path(config, repo_root, &wt_info)? {
             if seed_path.exists() {
                 crate::db::seed_db(&seed_path, &db_path)?;
+                tracing::info!(seed = %seed_path.display(), "seeded DB from main worktree");
                 eprintln!("Seeded DB from {}", seed_path.display());
             }
         }
@@ -1680,6 +1701,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     ];
 
     // Phase 1: Walk manifests
+    tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
     let walked = walk_manifests(repo_root, config, &parsers)?;
@@ -1687,6 +1709,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
     // Phase 1.5: Workspace context
+    tracing::debug!("phase 1.5: workspace context");
     let sp = make_spinner(&mp, "Building workspace context…");
     let t = Instant::now();
     let ws_ctx = WorkspaceContext {
@@ -1699,6 +1722,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     sp.finish_with_message("Workspace context ready");
 
     // Phase 2: Diff against stored hashes
+    tracing::debug!("phase 2: diff manifests");
     let sp = make_spinner(&mp, "Diffing manifests…");
     let t = Instant::now();
     let stored_hashes = load_stored_hashes(&conn)?;
@@ -1723,6 +1747,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     ));
 
     // Phase 3: Parse new + changed manifests (transaction-wrapped)
+    tracing::debug!(to_parse = to_parse.len(), "phase 3: parse manifests");
     let t = Instant::now();
     let pb_parse = if !to_parse.is_empty() {
         let pb = make_progress(&mp, to_parse.len() as u64, "Parsing manifests");
@@ -1739,6 +1764,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     timings.push(("parse", t.elapsed()));
 
     // Phase 3.5: Custom package discovery
+    tracing::debug!("phase 3.5: custom discovery");
     let sp = make_spinner(&mp, "Custom discovery…");
     let t = Instant::now();
     if !config.discovery.custom.is_empty() {
@@ -1778,6 +1804,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     sp.finish_with_message("Custom discovery done");
 
     // Phase 4: Remove deleted packages (transaction-wrapped)
+    tracing::debug!(removed = diff.removed.len(), "phase 4: remove deleted packages");
     let t = Instant::now();
     if !diff.removed.is_empty() {
         let pb = make_progress(&mp, diff.removed.len() as u64, "Removing deleted");
@@ -1793,6 +1820,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     timings.push(("remove-deleted", t.elapsed()));
 
     // Phase 5: Recompute is_internal (transaction-wrapped)
+    tracing::debug!("phase 5: recompute internals");
     let sp = make_spinner(&mp, "Recomputing internals…");
     let t = Instant::now();
     with_transaction(&conn, || {
@@ -1805,6 +1833,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     sp.finish_with_message("Internals recomputed");
 
     // Phase 6: Store manifest hashes (transaction-wrapped)
+    tracing::debug!("phase 6: store manifest hashes");
     let t = Instant::now();
     if !to_parse.is_empty() {
         let pb = make_progress(&mp, to_parse.len() as u64, "Storing hashes");
@@ -1820,6 +1849,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     timings.push(("update-hashes", t.elapsed()));
 
     // Phase 7+8: Extract symbols + source-level re-extraction (transaction-wrapped)
+    tracing::debug!(
+        new_changed = parsed_packages.len(),
+        unchanged = diff.unchanged.len(),
+        "phase 7+8: extract symbols"
+    );
     let t = Instant::now();
     let pb_sym = if !parsed_packages.is_empty() || !diff.unchanged.is_empty() {
         let total = parsed_packages.len() + diff.unchanged.len();
@@ -1906,7 +1940,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                                 }
                                 Err(e) => {
                                     pb.finish_and_clear();
-                                    eprintln!("Warning: Failed to embed symbols: {}", e);
+                                    tracing::warn!(error = %e, "failed to embed symbols");
                                 }
                             }
                         }
@@ -1914,13 +1948,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                     timings.push(("rag-embed", t.elapsed()));
                 }
                 Err(e) => {
-                    eprintln!("Warning: RAG embedding skipped (model init failed): {}", e);
+                    tracing::warn!(error = %e, "RAG embedding skipped (model init failed)");
                 }
             }
         }
     }
 
     // Phase 9: Index files (transaction-wrapped)
+    tracing::debug!("phase 9: index files");
     let sp = make_spinner(&mp, "Indexing files…");
     let t = Instant::now();
     let num_files = with_transaction(&conn, || {
@@ -1976,12 +2011,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     // FTS5 maintenance: full optimize on fresh/forced builds, incremental merge otherwise.
     if is_full_build || force {
+        tracing::debug!("FTS maintenance: full optimize");
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
              INSERT INTO files_fts(files_fts) VALUES('optimize');
              INSERT INTO symbols_fts(symbols_fts) VALUES('optimize');",
         )?;
     } else {
+        tracing::debug!("FTS maintenance: incremental merge");
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
              INSERT INTO files_fts(files_fts, rank) VALUES('merge', 500);

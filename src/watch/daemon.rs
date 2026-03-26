@@ -10,10 +10,6 @@ pub fn sock_path(root: &Path) -> PathBuf {
     root.join(".shire/watch.sock")
 }
 
-fn log_path(root: &Path) -> PathBuf {
-    root.join(".shire/watch.log")
-}
-
 /// Check if the daemon is running by reading the PID file and sending signal 0.
 pub fn is_running(root: &Path) -> bool {
     let pid_file = pid_path(root);
@@ -45,9 +41,6 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
     let _ = std::fs::remove_file(sock_path(root));
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let log_file = std::fs::File::create(log_path(root))
-        .context("failed to create watch.log")?;
-
     let mut cmd = Command::new(exe);
     cmd.arg("watch")
         .arg("--root")
@@ -62,9 +55,20 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
         cmd.arg("--config").arg(cfg_path);
     }
 
+    let shire_dir = root.join(".shire");
+    let _ = std::fs::create_dir_all(&shire_dir);
+    let stderr_log = shire_dir.join("watch-stderr.log");
+    let stderr_target = match std::fs::File::create(&stderr_log) {
+        Ok(file) => std::process::Stdio::from(file),
+        Err(e) => {
+            eprintln!("Warning: failed to open {}: {e}; daemon stderr will be discarded", stderr_log.display());
+            std::process::Stdio::null()
+        }
+    };
+
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(log_file);
+        .stderr(stderr_target);
 
     let child = cmd.spawn().context("failed to spawn watch daemon")?;
 

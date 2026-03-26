@@ -84,7 +84,7 @@ The docs site lives in `docs/src/` (mdBook). When changing user-facing behavior,
 
 ## Configuration
 
-`shire.toml` at repo root, with fallback to `~/.claude/shire.toml` if no local config exists. Key settings: `db_path`, `discovery.manifests`, `discovery.exclude`, `discovery.custom` rules, `symbols.exclude_extensions`, `watch.debounce_ms`, `[[packages]]` overrides. Relative `db_path` values are resolved against the repo root.
+`shire.toml` at repo root, with fallback to `~/.claude/shire.toml` if no local config exists. Key settings: `db_path`, `discovery.manifests`, `discovery.exclude`, `discovery.custom` rules, `symbols.exclude_extensions`, `watch.debounce_ms`, `log.level`, `log.dir`, `log.max_days`, `[[packages]]` overrides. Relative `db_path` values are resolved against the repo root. `SHIRE_LOG` env var overrides `log.level`.
 
 ## License
 

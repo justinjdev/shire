@@ -90,7 +90,7 @@ pub async fn run_daemon(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<RebuildMessage>();
 
-    eprintln!("[watch] daemon started, listening on {}", sock.display());
+    tracing::info!(socket = %sock.display(), "daemon started");
 
     // Spawn connection acceptor task
     let tx_clone = tx.clone();
@@ -108,14 +108,14 @@ pub async fn run_daemon(
                                     let _ = tx.send(msg);
                                 }
                                 Err(e) => {
-                                    eprintln!("[watch] invalid message: {e}");
+                                    tracing::warn!(%e, "invalid message received");
                                 }
                             }
                         }
                     });
                 }
                 Err(e) => {
-                    eprintln!("[watch] accept error: {e}");
+                    tracing::error!(%e, "socket accept error");
                 }
             }
         }
@@ -145,6 +145,7 @@ pub async fn run_daemon(
                 let mut file_set: HashSet<PathBuf> = first_msg.files.into_iter().collect();
 
                 // Got a rebuild signal, start debounce window
+                tracing::debug!(debounce_ms = config.watch.debounce_ms, "debounce window started");
                 let deadline = tokio::time::Instant::now() + debounce;
 
                 // Drain any additional signals during debounce window
@@ -172,7 +173,7 @@ pub async fn run_daemon(
                             .iter()
                             .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
                             .collect();
-                        eprintln!("[watch] skipping rebuild — no relevant files: {}", names.join(", "));
+                        tracing::debug!(files = %names.join(", "), "skipping rebuild — no relevant files");
                         continue;
                     }
                 }
@@ -182,7 +183,7 @@ pub async fn run_daemon(
                 let build_config = config.clone();
                 let build_db = db_override.clone();
 
-                eprintln!("[watch] triggering rebuild...");
+                tracing::info!("triggering rebuild");
                 let result = tokio::task::spawn_blocking(move || {
                     index::build_index_quiet(
                         &build_root,
@@ -194,17 +195,17 @@ pub async fn run_daemon(
                 .await;
 
                 match result {
-                    Ok(Ok(())) => eprintln!("[watch] rebuild completed"),
-                    Ok(Err(e)) => eprintln!("[watch] rebuild failed: {e}"),
-                    Err(e) => eprintln!("[watch] rebuild task panicked: {e}"),
+                    Ok(Ok(())) => tracing::info!("rebuild completed"),
+                    Ok(Err(e)) => tracing::error!(%e, "rebuild failed"),
+                    Err(e) => tracing::error!(%e, "rebuild task panicked"),
                 }
             }
             _ = sigterm.recv() => {
-                eprintln!("[watch] received SIGTERM, shutting down");
+                tracing::info!("received SIGTERM, shutting down");
                 break;
             }
             _ = sigint.recv() => {
-                eprintln!("[watch] received SIGINT, shutting down");
+                tracing::info!("received SIGINT, shutting down");
                 break;
             }
         }
@@ -214,6 +215,6 @@ pub async fn run_daemon(
     accept_handle.abort();
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(daemon::pid_path(&root));
-    eprintln!("[watch] daemon stopped");
+    tracing::info!("daemon stopped");
     Ok(())
 }

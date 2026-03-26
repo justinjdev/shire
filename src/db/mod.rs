@@ -242,6 +242,12 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    tracing::debug!(
+        from = ?current.as_deref(),
+        to = FTS_SCHEMA_VERSION,
+        "migrating FTS schema"
+    );
+
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS packages_ai;
          DROP TRIGGER IF EXISTS packages_ad;

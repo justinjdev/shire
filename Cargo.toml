@@ -40,6 +40,9 @@ shellexpand = "3"
 fastembed = { version = "4", optional = true }
 sqlite-vec = { version = "0.1", optional = true }
 zerocopy = { version = "0.8", features = ["derive"], optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 indicatif = "0.17"
 dialoguer = "0.11"
 which = "7"

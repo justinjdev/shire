@@ -43,9 +43,9 @@ impl ShireService {
                         .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0")
                         .is_ok();
                     if !table_exists {
-                        eprintln!(
-                            "Warning: RAG enabled but symbol_embeddings table not found. \
-                             Run `shire build` with [rag] enabled to generate embeddings."
+                        tracing::warn!(
+                            "RAG enabled but symbol_embeddings table not found — \
+                             run `shire build` with [rag] enabled to generate embeddings"
                         );
                         None
                     } else {
@@ -53,7 +53,7 @@ impl ShireService {
                     }
                 }
                 Err(err) => {
-                    eprintln!("Warning: RAG embedder init failed: {err}");
+                    tracing::warn!(%err, "RAG embedder init failed");
                     None
                 }
             }
@@ -127,7 +127,7 @@ impl ShireService {
             None => return,
         };
 
-        eprintln!("[shire] Rebuilding index…");
+        tracing::info!("rebuilding index (stale)");
 
         match crate::index::build_index_quiet(&ctx.repo_root, &ctx.config, false, Some(&ctx.db_path)) {
             Ok(()) => {
@@ -142,9 +142,9 @@ impl ShireService {
                                 if let Ok(mut li) = self.last_indexed.lock() {
                                     *li = now;
                                 }
-                                eprintln!("[shire] Index rebuilt");
+                                tracing::info!("index rebuilt");
                             }
-                            Err(e) => eprintln!("[shire] Warning: index rebuilt but failed to swap connection: {e}"),
+                            Err(e) => tracing::warn!(%e, "index rebuilt but failed to swap connection"),
                         }
                     }
                     Err(e) => {
@@ -152,11 +152,11 @@ impl ShireService {
                         if let Ok(mut li) = self.last_indexed.lock() {
                             *li = Some(SystemTime::now());
                         }
-                        eprintln!("[shire] Warning: failed to reopen index after rebuild: {e}");
+                        tracing::warn!(%e, "failed to reopen index after rebuild");
                     }
                 }
             }
-            Err(e) => eprintln!("[shire] Warning: rebuild failed: {e}"),
+            Err(e) => tracing::warn!(%e, "rebuild failed"),
         }
     }
 
@@ -313,6 +313,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "search_packages", query = %params.query, limit = ?params.limit);
         self.maybe_rebuild();
         if params.query.trim().is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -333,6 +334,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<DepsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "package_dependencies", name = %params.name, depth = ?params.depth, internal_only = params.internal_only);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         match params.depth {
@@ -359,6 +361,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<DependentsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "package_dependents", name = %params.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::package_dependents(&conn, &params.name)
@@ -373,6 +376,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<ListParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "list_packages", kind = ?params.kind);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::list_packages(&conn, params.kind.as_deref())
@@ -387,6 +391,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<SearchSymbolsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "search_symbols", query = ?params.query, package = ?params.package, kind = ?params.kind, limit = ?params.limit);
         self.maybe_rebuild();
         let limit = params.limit.unwrap_or(20);
         let query = params.query.as_deref().unwrap_or("").trim();
@@ -421,7 +426,7 @@ impl ShireService {
             match Self::hybrid_search(&conn, embedder, &params, &fts_results) {
                 Ok(merged) => merged,
                 Err(e) => {
-                    eprintln!("Warning: hybrid search failed, falling back to FTS-only: {}", e.message);
+                    tracing::warn!(error = %e.message, "hybrid search failed, falling back to FTS-only");
                     fts_results
                 }
             }
@@ -442,6 +447,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<GetFileSymbolsParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "get_file_symbols", file_path = %params.file_path, kind = ?params.kind);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::get_file_symbols(
@@ -460,6 +466,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<ListPackageFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "list_package_files", package = %params.package, extension = ?params.extension);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::list_package_files(
@@ -475,6 +482,7 @@ impl ShireService {
 
     #[tool(description = "Index build metadata: timestamp, git commit, counts")]
     fn index_status(&self) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "index_status");
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let status = queries::index_status(&conn)
@@ -489,6 +497,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<SearchFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "search_files", query = %params.query, package = ?params.package, extension = ?params.extension);
         self.maybe_rebuild();
         if params.query.trim().is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -513,6 +522,7 @@ impl ShireService {
         &self,
         Parameters(params): Parameters<ExploreParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "explore", query = %params.query);
         self.maybe_rebuild();
         if params.query.trim().is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(

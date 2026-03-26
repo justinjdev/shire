@@ -16,6 +16,8 @@ pub struct Config {
     pub watch: WatchConfig,
     #[serde(default)]
     pub rag: RagConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -43,6 +45,43 @@ impl Default for RagConfig {
             cache_dir: None,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LogConfig {
+    /// Log level: "error", "warn", "info", "debug", "trace". Default: "warn".
+    /// Can be overridden by SHIRE_LOG env var.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Directory for log files. Default: ".shire/logs".
+    /// Set to "" to disable file logging.
+    #[serde(default = "default_log_dir")]
+    pub dir: String,
+    /// Number of days to retain log files. Default: 30.
+    #[serde(default = "default_log_max_days")]
+    pub max_days: u32,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            dir: default_log_dir(),
+            max_days: default_log_max_days(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "warn".into()
+}
+
+fn default_log_dir() -> String {
+    ".shire/logs".into()
+}
+
+fn default_log_max_days() -> u32 {
+    30
 }
 
 fn default_debounce_ms() -> u64 {
@@ -254,7 +293,7 @@ pub fn load_config_from(config_path: Option<&Path>, repo_root: &Path) -> Result<
             }
         }
         Err(e) => {
-            eprintln!("Warning: could not read HOME environment variable ({e}), skipping global config fallback");
+            tracing::warn!(%e, "could not read HOME environment variable, skipping global config fallback");
         }
     }
 

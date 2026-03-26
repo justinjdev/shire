@@ -47,12 +47,22 @@ pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> String {
                 return sid;
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: could not create log directory {}: {e}",
-                    log_dir.display()
-                );
+                if command == "serve" {
+                    // serve cannot fall back to stderr (would corrupt MCP stdio)
+                    eprintln!(
+                        "Error: could not create log directory {}: {e}. Logging disabled for serve.",
+                        log_dir.display()
+                    );
+                } else {
+                    eprintln!(
+                        "Warning: could not create log directory {}: {e}",
+                        log_dir.display()
+                    );
+                }
             }
         }
+    } else if command == "serve" {
+        eprintln!("Warning: log.dir is empty — logging disabled for serve");
     }
 
     // Fallback: stderr-only logging (skip for serve — stderr may interfere with MCP stdio)

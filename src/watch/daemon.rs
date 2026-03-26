@@ -57,12 +57,13 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
 
     let shire_dir = root.join(".shire");
     let _ = std::fs::create_dir_all(&shire_dir);
-    let stderr_file = std::fs::File::create(shire_dir.join("watch-stderr.log"))
-        .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap());
+    let stderr_target = std::fs::File::create(shire_dir.join("watch-stderr.log"))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(stderr_file);
+        .stderr(stderr_target);
 
     let child = cmd.spawn().context("failed to spawn watch daemon")?;
 

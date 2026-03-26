@@ -27,6 +27,17 @@ description = "Deprecated auth service — do not add new dependencies"
 debounce_ms = 2000  # milliseconds to wait after last change before rebuilding
 ```
 
+## Logging
+
+```toml
+[log]
+level = "warn"          # error, warn, info, debug, trace
+dir = ".shire/logs"     # log directory (relative to repo root). Set to "" to disable file logging
+max_days = 30           # automatically delete log files older than this
+```
+
+The `SHIRE_LOG` environment variable overrides the config `level` (e.g., `SHIRE_LOG=debug shire build`). Log files are daily-rotated with filenames like `shire.log.2026-03-26`. Each session includes a unique session ID for correlation across concurrent processes.
+
 All fields are optional. Defaults are shown above. The `--db` CLI flag takes precedence over `db_path` in config.
 
 ## Custom package discovery

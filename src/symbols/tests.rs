@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 // ============================================================
 // Python tests (ported from python.rs)
@@ -9,7 +10,7 @@ fn test_python_function_with_type_hints() {
     let source = r#"def process_payment(amount: float, currency: str) -> Receipt:
     pass
 "#;
-    let symbols = extract_file("py", source, "pay.py");
+    let symbols = extract_file("py", source, Arc::from("pay.py"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "process_payment");
@@ -35,7 +36,7 @@ fn test_python_class_with_methods() {
     def _internal(self):
         pass
 "#;
-    let symbols = extract_file("py", source, "auth.py");
+    let symbols = extract_file("py", source, Arc::from("auth.py"));
     // class + __init__ + validate (skip _internal)
     assert_eq!(symbols.len(), 3);
     assert_eq!(symbols[0].name, "AuthService");
@@ -60,7 +61,7 @@ fn test_python_function_no_hints() {
     let source = r#"def greet(name):
     return f"Hello {name}"
 "#;
-    let symbols = extract_file("py", source, "greet.py");
+    let symbols = extract_file("py", source, Arc::from("greet.py"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "greet");
     assert!(symbols[0].return_type.is_none());
@@ -78,7 +79,7 @@ func ProcessPayment(amount float64, currency string) (*Receipt, error) {
     return nil, nil
 }
 "#;
-    let symbols = extract_file("go", source, "handler.go");
+    let symbols = extract_file("go", source, Arc::from("handler.go"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "ProcessPayment");
@@ -99,7 +100,7 @@ type AuthService struct {
     db *sql.DB
 }
 "#;
-    let symbols = extract_file("go", source, "auth.go");
+    let symbols = extract_file("go", source, Arc::from("auth.go"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Struct);
@@ -113,7 +114,7 @@ type Handler interface {
     ServeHTTP(w ResponseWriter, r *Request)
 }
 "#;
-    let symbols = extract_file("go", source, "handler.go");
+    let symbols = extract_file("go", source, Arc::from("handler.go"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Handler");
     assert_eq!(symbols[0].kind, SymbolKind::Interface);
@@ -127,7 +128,7 @@ func (s *AuthService) Validate(token string) error {
     return nil
 }
 "#;
-    let symbols = extract_file("go", source, "auth.go");
+    let symbols = extract_file("go", source, Arc::from("auth.go"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Validate");
     assert_eq!(symbols[0].kind, SymbolKind::Method);
@@ -141,7 +142,7 @@ fn test_go_skip_unexported() {
 func internalHelper() {}
 type internalType struct {}
 "#;
-    let symbols = extract_file("go", source, "internal.go");
+    let symbols = extract_file("go", source, Arc::from("internal.go"));
     assert!(symbols.is_empty());
 }
 
@@ -154,7 +155,7 @@ fn test_rust_pub_function() {
     let source = r#"pub fn process_payment(amount: f64, currency: &str) -> Result<Receipt> {
     todo!()
 }"#;
-    let symbols = extract_file("rs", source, "src/pay.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/pay.rs"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "process_payment");
@@ -174,7 +175,7 @@ fn test_rust_pub_struct() {
     let source = r#"pub struct AuthService {
     db: Connection,
 }"#;
-    let symbols = extract_file("rs", source, "src/auth.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/auth.rs"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Struct);
@@ -186,7 +187,7 @@ fn test_rust_pub_enum() {
     Active,
     Inactive,
 }"#;
-    let symbols = extract_file("rs", source, "src/types.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/types.rs"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Status");
     assert_eq!(symbols[0].kind, SymbolKind::Enum);
@@ -197,7 +198,7 @@ fn test_rust_pub_trait() {
     let source = r#"pub trait Handler {
     fn handle(&self) -> Result<()>;
 }"#;
-    let symbols = extract_file("rs", source, "src/handler.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/handler.rs"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Handler");
     assert_eq!(symbols[0].kind, SymbolKind::Trait);
@@ -212,7 +213,7 @@ fn test_rust_impl_method() {
 
     fn internal_helper(&self) {}
 }"#;
-    let symbols = extract_file("rs", source, "src/auth.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/auth.rs"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "validate");
     assert_eq!(symbols[0].kind, SymbolKind::Method);
@@ -228,7 +229,7 @@ fn test_rust_skip_non_pub() {
 struct InternalStruct {}
 enum InternalEnum {}
 "#;
-    let symbols = extract_file("rs", source, "src/internal.rs");
+    let symbols = extract_file("rs", source, Arc::from("src/internal.rs"));
     assert!(symbols.is_empty());
 }
 
@@ -241,7 +242,7 @@ fn test_ts_exported_function() {
     let source = r#"export function processPayment(amount: number, currency: string): Promise<Receipt> {
     return fetch('/pay');
 }"#;
-    let symbols = extract_file("ts", source, "src/pay.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/pay.ts"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "processPayment");
@@ -264,7 +265,7 @@ fn test_ts_exported_class_with_methods() {
     }
     private _internal(): void {}
 }"#;
-    let symbols = extract_file("ts", source, "src/auth.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/auth.ts"));
     assert_eq!(symbols.len(), 2, "expected class + public method only");
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Class);
@@ -280,7 +281,7 @@ fn test_ts_exported_interface() {
     name: string;
     theme: string;
 }"#;
-    let symbols = extract_file("ts", source, "src/types.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/types.ts"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "UserConfig");
     assert_eq!(symbols[0].kind, SymbolKind::Interface);
@@ -289,7 +290,7 @@ fn test_ts_exported_interface() {
 #[test]
 fn test_ts_exported_type_alias() {
     let source = "export type Result<T> = Success<T> | Failure;";
-    let symbols = extract_file("ts", source, "src/types.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/types.ts"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Result");
     assert_eq!(symbols[0].kind, SymbolKind::Type);
@@ -301,7 +302,7 @@ fn test_ts_exported_enum() {
     Active,
     Inactive
 }"#;
-    let symbols = extract_file("ts", source, "src/types.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/types.ts"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Status");
     assert_eq!(symbols[0].kind, SymbolKind::Enum);
@@ -310,7 +311,7 @@ fn test_ts_exported_enum() {
 #[test]
 fn test_ts_exported_const() {
     let source = "export const MAX_RETRIES = 3;";
-    let symbols = extract_file("ts", source, "src/config.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/config.ts"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "MAX_RETRIES");
     assert_eq!(symbols[0].kind, SymbolKind::Constant);
@@ -323,7 +324,7 @@ function internalHelper() {}
 class InternalClass {}
 const secret = 42;
 "#;
-    let symbols = extract_file("ts", source, "src/internal.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/internal.ts"));
     assert!(symbols.is_empty());
 }
 
@@ -332,7 +333,7 @@ fn test_ts_default_export_function() {
     let source = r#"export default function handler(req: Request): Response {
     return new Response();
 }"#;
-    let symbols = extract_file("ts", source, "src/handler.ts");
+    let symbols = extract_file("ts", source, Arc::from("src/handler.ts"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "handler");
     assert_eq!(symbols[0].kind, SymbolKind::Function);
@@ -343,7 +344,7 @@ fn test_js_function() {
     let source = r#"export function greet(name) {
     return 'Hello ' + name;
 }"#;
-    let symbols = extract_file("js", source, "src/greet.js");
+    let symbols = extract_file("js", source, Arc::from("src/greet.js"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "greet");
 }
@@ -359,7 +360,7 @@ public class UserService {
     private int count;
 }
 "#;
-    let symbols = extract_file("java", source, "UserService.java");
+    let symbols = extract_file("java", source, Arc::from("UserService.java"));
     let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
     assert_eq!(classes.len(), 1);
     assert_eq!(classes[0].name, "UserService");
@@ -374,7 +375,7 @@ public interface Repository<T> {
     T findById(long id);
 }
 "#;
-    let symbols = extract_file("java", source, "Repository.java");
+    let symbols = extract_file("java", source, Arc::from("Repository.java"));
     let ifaces: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Interface).collect();
     assert_eq!(ifaces.len(), 1);
     assert_eq!(ifaces[0].name, "Repository");
@@ -390,7 +391,7 @@ public enum Status {
     PENDING
 }
 "#;
-    let symbols = extract_file("java", source, "Status.java");
+    let symbols = extract_file("java", source, Arc::from("Status.java"));
     let enums: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Enum).collect();
     assert_eq!(enums.len(), 1);
     assert_eq!(enums[0].name, "Status");
@@ -406,7 +407,7 @@ public class OrderService {
     }
 }
 "#;
-    let symbols = extract_file("java", source, "OrderService.java");
+    let symbols = extract_file("java", source, Arc::from("OrderService.java"));
     let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method).collect();
     assert_eq!(methods.len(), 1);
     let m = &methods[0];
@@ -431,7 +432,7 @@ public class MathUtils {
     }
 }
 "#;
-    let symbols = extract_file("java", source, "MathUtils.java");
+    let symbols = extract_file("java", source, Arc::from("MathUtils.java"));
     let funcs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
     assert_eq!(funcs.len(), 1);
     assert_eq!(funcs[0].name, "calculateArea");
@@ -449,7 +450,7 @@ public class AppConfig {
     private static final String SECRET = "hidden";
 }
 "#;
-    let symbols = extract_file("java", source, "AppConfig.java");
+    let symbols = extract_file("java", source, Arc::from("AppConfig.java"));
     let constants: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Constant).collect();
     assert_eq!(constants.len(), 2);
     assert_eq!(constants[0].name, "API_VERSION");
@@ -464,7 +465,7 @@ private class InternalHelper {
     public void doSomething() {}
 }
 "#;
-    let symbols = extract_file("java", source, "InternalHelper.java");
+    let symbols = extract_file("java", source, Arc::from("InternalHelper.java"));
     assert!(symbols.is_empty());
 }
 
@@ -482,7 +483,7 @@ public class Service {
     }
 }
 "#;
-    let symbols = extract_file("java", source, "Service.java");
+    let symbols = extract_file("java", source, Arc::from("Service.java"));
     let methods: Vec<_> = symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
@@ -502,7 +503,7 @@ fn test_kotlin_class() {
         return true
     }
 }"#;
-    let symbols = extract_file("kt", source, "UserService.kt");
+    let symbols = extract_file("kt", source, Arc::from("UserService.kt"));
     let class_sym = symbols.iter().find(|s| s.name == "UserService").unwrap();
     assert_eq!(class_sym.kind, SymbolKind::Class);
     assert_eq!(class_sym.line, 1);
@@ -514,7 +515,7 @@ fn test_kotlin_interface() {
     let source = r#"interface Repository {
     fun findById(id: String): Entity?
 }"#;
-    let symbols = extract_file("kt", source, "Repository.kt");
+    let symbols = extract_file("kt", source, Arc::from("Repository.kt"));
     let iface = symbols.iter().find(|s| s.name == "Repository").expect("should find Repository");
     assert_eq!(iface.kind, SymbolKind::Interface);
     assert!(iface.signature.as_ref().unwrap().contains("interface Repository"));
@@ -525,7 +526,7 @@ fn test_kotlin_object() {
     let source = r#"object DatabaseConfig {
     val url = "jdbc:postgresql://localhost/db"
 }"#;
-    let symbols = extract_file("kt", source, "Config.kt");
+    let symbols = extract_file("kt", source, Arc::from("Config.kt"));
     let obj = symbols.iter().find(|s| s.name == "DatabaseConfig").expect("should find DatabaseConfig");
     assert_eq!(obj.kind, SymbolKind::Class);
     assert!(obj.signature.as_ref().unwrap().contains("object DatabaseConfig"));
@@ -538,7 +539,7 @@ fn test_kotlin_enum_class() {
     INACTIVE,
     SUSPENDED
 }"#;
-    let symbols = extract_file("kt", source, "Status.kt");
+    let symbols = extract_file("kt", source, Arc::from("Status.kt"));
     let enum_sym = symbols.iter().find(|s| s.name == "Status").expect("should find Status");
     assert_eq!(enum_sym.kind, SymbolKind::Enum);
     assert!(enum_sym.signature.as_ref().unwrap().contains("enum class Status"));
@@ -549,7 +550,7 @@ fn test_kotlin_top_level_function() {
     let source = r#"fun processPayment(amount: Double, currency: String): Receipt {
     return Receipt()
 }"#;
-    let symbols = extract_file("kt", source, "Payment.kt");
+    let symbols = extract_file("kt", source, Arc::from("Payment.kt"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "processPayment");
@@ -571,7 +572,7 @@ fn test_kotlin_class_method() {
         return true
     }
 }"#;
-    let symbols = extract_file("kt", source, "AuthService.kt");
+    let symbols = extract_file("kt", source, Arc::from("AuthService.kt"));
     let method = symbols.iter().find(|s| s.name == "validate").expect("should find validate method");
     assert_eq!(method.kind, SymbolKind::Method);
     assert_eq!(method.parent_symbol.as_deref(), Some("AuthService"));
@@ -587,7 +588,7 @@ fn test_kotlin_skip_private_class() {
     let source = r#"private class InternalHelper {
     fun doSomething() {}
 }"#;
-    let symbols = extract_file("kt", source, "Internal.kt");
+    let symbols = extract_file("kt", source, Arc::from("Internal.kt"));
     assert!(symbols.is_empty(), "private class and its methods should be skipped");
 }
 
@@ -596,7 +597,7 @@ fn test_kotlin_skip_internal_function() {
     let source = r#"internal fun helperFunction(x: Int): Int {
     return x * 2
 }"#;
-    let symbols = extract_file("kt", source, "Helper.kt");
+    let symbols = extract_file("kt", source, Arc::from("Helper.kt"));
     assert!(symbols.is_empty(), "internal function should be skipped");
 }
 
@@ -611,7 +612,7 @@ fn test_kotlin_skip_private_method() {
         return ""
     }
 }"#;
-    let symbols = extract_file("kt", source, "Service.kt");
+    let symbols = extract_file("kt", source, Arc::from("Service.kt"));
     assert!(symbols.iter().any(|s| s.name == "PublicService"));
     assert!(symbols.iter().any(|s| s.name == "publicMethod"));
     assert!(!symbols.iter().any(|s| s.name == "secretMethod"), "private method should be skipped");
@@ -622,7 +623,7 @@ fn test_kotlin_function_no_return_type() {
     let source = r#"fun doWork(task: String) {
     println(task)
 }"#;
-    let symbols = extract_file("kt", source, "Work.kt");
+    let symbols = extract_file("kt", source, Arc::from("Work.kt"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "doWork");
     assert!(symbols[0].return_type.is_none());
@@ -641,7 +642,7 @@ message SearchRequest {
   int32 page_number = 2;
 }
 "#;
-    let symbols = extract_file("proto", source, "search.proto");
+    let symbols = extract_file("proto", source, Arc::from("search.proto"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "SearchRequest");
@@ -658,7 +659,7 @@ service SearchService {
   rpc Search (SearchRequest) returns (SearchResponse);
 }
 "#;
-    let symbols = extract_file("proto", source, "search.proto");
+    let symbols = extract_file("proto", source, Arc::from("search.proto"));
     assert_eq!(symbols.len(), 2);
 
     let svc = &symbols[0];
@@ -691,7 +692,7 @@ service StreamService {
   rpc BiDiStream (stream ChatMessage) returns (stream ChatMessage);
 }
 "#;
-    let symbols = extract_file("proto", source, "stream.proto");
+    let symbols = extract_file("proto", source, Arc::from("stream.proto"));
     assert_eq!(symbols.len(), 4);
 
     let client_rpc = &symbols[1];
@@ -723,7 +724,7 @@ enum Status {
   INACTIVE = 2;
 }
 "#;
-    let symbols = extract_file("proto", source, "status.proto");
+    let symbols = extract_file("proto", source, Arc::from("status.proto"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "Status");
@@ -748,7 +749,7 @@ message Outer {
   }
 }
 "#;
-    let symbols = extract_file("proto", source, "nested.proto");
+    let symbols = extract_file("proto", source, Arc::from("nested.proto"));
     assert_eq!(symbols.len(), 3);
 
     let outer = &symbols[0];
@@ -780,7 +781,7 @@ message SampleMessage {
   }
 }
 "#;
-    let symbols = extract_file("proto", source, "oneof.proto");
+    let symbols = extract_file("proto", source, Arc::from("oneof.proto"));
     assert_eq!(symbols.len(), 2);
 
     let msg = &symbols[0];
@@ -795,7 +796,7 @@ message SampleMessage {
 
 #[test]
 fn test_proto_empty_file() {
-    let symbols = extract_file("proto", "", "empty.proto");
+    let symbols = extract_file("proto", "", Arc::from("empty.proto"));
     assert!(symbols.is_empty());
 }
 
@@ -809,7 +810,7 @@ fn test_c_function() {
     return 0;
 }
 "#;
-    let symbols = extract_file("c", source, "payment.c");
+    let symbols = extract_file("c", source, Arc::from("payment.c"));
     assert_eq!(symbols.len(), 1);
     let sym = &symbols[0];
     assert_eq!(sym.name, "process_payment");
@@ -827,7 +828,7 @@ fn test_c_struct() {
     char *name;
 };
 "#;
-    let symbols = extract_file("c", source, "auth.c");
+    let symbols = extract_file("c", source, Arc::from("auth.c"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Struct);
@@ -840,7 +841,7 @@ fn test_c_enum() {
     INACTIVE
 };
 "#;
-    let symbols = extract_file("c", source, "types.c");
+    let symbols = extract_file("c", source, Arc::from("types.c"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "Status");
     assert_eq!(symbols[0].kind, SymbolKind::Enum);
@@ -852,7 +853,7 @@ fn test_c_skip_static() {
     return 42;
 }
 "#;
-    let symbols = extract_file("c", source, "internal.c");
+    let symbols = extract_file("c", source, Arc::from("internal.c"));
     assert!(symbols.is_empty());
 }
 
@@ -860,7 +861,7 @@ fn test_c_skip_static() {
 fn test_c_typedef() {
     let source = r#"typedef unsigned long size_t;
 "#;
-    let symbols = extract_file("c", source, "types.c");
+    let symbols = extract_file("c", source, Arc::from("types.c"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "size_t");
     assert_eq!(symbols[0].kind, SymbolKind::Type);
@@ -879,7 +880,7 @@ private:
     int count;
 };
 "#;
-    let symbols = extract_file("cpp", source, "user_service.cpp");
+    let symbols = extract_file("cpp", source, Arc::from("user_service.cpp"));
     let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
     assert_eq!(classes.len(), 1);
     assert_eq!(classes[0].name, "UserService");
@@ -892,7 +893,7 @@ fn test_cpp_struct() {
     double y;
 };
 "#;
-    let symbols = extract_file("cpp", source, "point.cpp");
+    let symbols = extract_file("cpp", source, Arc::from("point.cpp"));
     assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
 }
 
@@ -902,7 +903,7 @@ fn test_cpp_function() {
     return 0;
 }
 "#;
-    let symbols = extract_file("cpp", source, "math.cpp");
+    let symbols = extract_file("cpp", source, Arc::from("math.cpp"));
     assert!(symbols.iter().any(|s| s.name == "calculate" && s.kind == SymbolKind::Function));
 }
 
@@ -914,7 +915,7 @@ fn test_cpp_enum() {
     BLUE
 };
 "#;
-    let symbols = extract_file("cpp", source, "colors.cpp");
+    let symbols = extract_file("cpp", source, Arc::from("colors.cpp"));
     assert!(symbols.iter().any(|s| s.name == "Color" && s.kind == SymbolKind::Enum));
 }
 
@@ -924,7 +925,7 @@ fn test_cpp_namespace() {
     class Widget {};
 }
 "#;
-    let symbols = extract_file("cpp", source, "widget.cpp");
+    let symbols = extract_file("cpp", source, Arc::from("widget.cpp"));
     assert!(symbols.iter().any(|s| s.name == "MyLib" && s.kind == SymbolKind::Class));
     assert!(symbols.iter().any(|s| s.name == "Widget" && s.kind == SymbolKind::Class));
 }
@@ -940,7 +941,7 @@ public class UserService {
     private int count;
 }
 "#;
-    let symbols = extract_file("cs", source, "UserService.cs");
+    let symbols = extract_file("cs", source, Arc::from("UserService.cs"));
     let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
     assert_eq!(classes.len(), 1);
     assert_eq!(classes[0].name, "UserService");
@@ -953,7 +954,7 @@ public interface IRepository {
     void Save(string data);
 }
 "#;
-    let symbols = extract_file("cs", source, "IRepository.cs");
+    let symbols = extract_file("cs", source, Arc::from("IRepository.cs"));
     let ifaces: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Interface).collect();
     assert_eq!(ifaces.len(), 1);
     assert_eq!(ifaces[0].name, "IRepository");
@@ -967,7 +968,7 @@ public struct Point {
     public double Y;
 }
 "#;
-    let symbols = extract_file("cs", source, "Point.cs");
+    let symbols = extract_file("cs", source, Arc::from("Point.cs"));
     assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
 }
 
@@ -980,7 +981,7 @@ public enum Status {
     Pending
 }
 "#;
-    let symbols = extract_file("cs", source, "Status.cs");
+    let symbols = extract_file("cs", source, Arc::from("Status.cs"));
     assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
 }
 
@@ -993,7 +994,7 @@ public class OrderService {
     }
 }
 "#;
-    let symbols = extract_file("cs", source, "OrderService.cs");
+    let symbols = extract_file("cs", source, Arc::from("OrderService.cs"));
     let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method).collect();
     assert_eq!(methods.len(), 1);
     assert_eq!(methods[0].name, "ProcessOrder");
@@ -1008,7 +1009,7 @@ public class Service {
     public void PublicMethod() {}
 }
 "#;
-    let symbols = extract_file("cs", source, "Service.cs");
+    let symbols = extract_file("cs", source, Arc::from("Service.cs"));
     let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method || s.kind == SymbolKind::Function).collect();
     assert_eq!(methods.len(), 1);
     assert_eq!(methods[0].name, "PublicMethod");
@@ -1026,7 +1027,7 @@ fn test_swift_class() {
     }
 }
 "#;
-    let symbols = extract_file("swift", source, "AuthService.swift");
+    let symbols = extract_file("swift", source, Arc::from("AuthService.swift"));
     assert!(symbols.iter().any(|s| s.name == "AuthService" && s.kind == SymbolKind::Class));
 }
 
@@ -1037,7 +1038,7 @@ fn test_swift_struct() {
     var y: Double
 }
 "#;
-    let symbols = extract_file("swift", source, "Point.swift");
+    let symbols = extract_file("swift", source, Arc::from("Point.swift"));
     assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
 }
 
@@ -1047,7 +1048,7 @@ fn test_swift_protocol() {
     func findById(id: String) -> Entity?
 }
 "#;
-    let symbols = extract_file("swift", source, "Repository.swift");
+    let symbols = extract_file("swift", source, Arc::from("Repository.swift"));
     assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
 }
 
@@ -1058,7 +1059,7 @@ fn test_swift_enum() {
     case inactive
 }
 "#;
-    let symbols = extract_file("swift", source, "Status.swift");
+    let symbols = extract_file("swift", source, Arc::from("Status.swift"));
     assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
 }
 
@@ -1068,7 +1069,7 @@ fn test_swift_function() {
     return Receipt()
 }
 "#;
-    let symbols = extract_file("swift", source, "Payment.swift");
+    let symbols = extract_file("swift", source, Arc::from("Payment.swift"));
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "processPayment");
     assert_eq!(symbols[0].kind, SymbolKind::Function);
@@ -1079,7 +1080,7 @@ fn test_swift_skip_private() {
     let source = r#"private func internalHelper() -> Void {}
 fileprivate func alsoPrivate() -> Void {}
 "#;
-    let symbols = extract_file("swift", source, "Internal.swift");
+    let symbols = extract_file("swift", source, Arc::from("Internal.swift"));
     assert!(symbols.is_empty());
 }
 
@@ -1096,7 +1097,7 @@ class UserService {
     }
 }
 "#;
-    let symbols = extract_file("php", source, "UserService.php");
+    let symbols = extract_file("php", source, Arc::from("UserService.php"));
     assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
 }
 
@@ -1107,7 +1108,7 @@ interface Repository {
     public function findById(int $id): Entity;
 }
 "#;
-    let symbols = extract_file("php", source, "Repository.php");
+    let symbols = extract_file("php", source, Arc::from("Repository.php"));
     assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
 }
 
@@ -1118,7 +1119,7 @@ function process_payment(float $amount, string $currency): Receipt {
     return new Receipt();
 }
 "#;
-    let symbols = extract_file("php", source, "payment.php");
+    let symbols = extract_file("php", source, Arc::from("payment.php"));
     assert!(symbols.iter().any(|s| s.name == "process_payment" && s.kind == SymbolKind::Function));
 }
 
@@ -1129,7 +1130,7 @@ trait Loggable {
     public function log(string $message): void {}
 }
 "#;
-    let symbols = extract_file("php", source, "Loggable.php");
+    let symbols = extract_file("php", source, Arc::from("Loggable.php"));
     assert!(symbols.iter().any(|s| s.name == "Loggable" && s.kind == SymbolKind::Trait));
 }
 
@@ -1141,7 +1142,7 @@ enum Status {
     case Inactive;
 }
 "#;
-    let symbols = extract_file("php", source, "Status.php");
+    let symbols = extract_file("php", source, Arc::from("Status.php"));
     assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
 }
 
@@ -1155,7 +1156,7 @@ fn test_scala_class() {
   def validate(token: String): Boolean = true
 }
 "#;
-    let symbols = extract_file("scala", source, "UserService.scala");
+    let symbols = extract_file("scala", source, Arc::from("UserService.scala"));
     assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
 }
 
@@ -1165,7 +1166,7 @@ fn test_scala_object() {
   val url = "jdbc:postgresql://localhost/db"
 }
 "#;
-    let symbols = extract_file("scala", source, "Config.scala");
+    let symbols = extract_file("scala", source, Arc::from("Config.scala"));
     assert!(symbols.iter().any(|s| s.name == "DatabaseConfig" && s.kind == SymbolKind::Class));
 }
 
@@ -1175,7 +1176,7 @@ fn test_scala_trait() {
   def findById(id: String): Option[Entity]
 }
 "#;
-    let symbols = extract_file("scala", source, "Repository.scala");
+    let symbols = extract_file("scala", source, Arc::from("Repository.scala"));
     assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
 }
 
@@ -1185,7 +1186,7 @@ fn test_scala_function() {
   Receipt()
 }
 "#;
-    let symbols = extract_file("scala", source, "Payment.scala");
+    let symbols = extract_file("scala", source, Arc::from("Payment.scala"));
     assert!(symbols.iter().any(|s| s.name == "processPayment"));
 }
 
@@ -1193,7 +1194,7 @@ fn test_scala_function() {
 fn test_scala_skip_private() {
     let source = r#"private def internalHelper(): Unit = {}
 "#;
-    let symbols = extract_file("scala", source, "Internal.scala");
+    let symbols = extract_file("scala", source, Arc::from("Internal.scala"));
     assert!(symbols.is_empty());
 }
 
@@ -1207,7 +1208,7 @@ fn test_zig_function() {
     return error.NotImplemented;
 }
 "#;
-    let symbols = extract_file("zig", source, "payment.zig");
+    let symbols = extract_file("zig", source, Arc::from("payment.zig"));
     assert!(symbols.iter().any(|s| s.name == "processPayment" && s.kind == SymbolKind::Function));
 }
 
@@ -1217,7 +1218,7 @@ fn test_zig_skip_non_pub() {
     return;
 }
 "#;
-    let symbols = extract_file("zig", source, "internal.zig");
+    let symbols = extract_file("zig", source, Arc::from("internal.zig"));
     assert!(symbols.is_empty());
 }
 
@@ -1225,7 +1226,7 @@ fn test_zig_skip_non_pub() {
 fn test_zig_const() {
     let source = r#"pub const MAX_SIZE: usize = 1024;
 "#;
-    let symbols = extract_file("zig", source, "config.zig");
+    let symbols = extract_file("zig", source, Arc::from("config.zig"));
     assert!(symbols.iter().any(|s| s.name == "MAX_SIZE"));
 }
 
@@ -1241,7 +1242,7 @@ fn test_elixir_module() {
   end
 end
 "#;
-    let symbols = extract_file("ex", source, "lib/users.ex");
+    let symbols = extract_file("ex", source, Arc::from("lib/users.ex"));
     assert!(symbols.iter().any(|s| s.name == "MyApp.Users" && s.kind == SymbolKind::Class));
     assert!(symbols.iter().any(|s| s.name == "get_user" && s.kind == SymbolKind::Function));
 }
@@ -1252,7 +1253,7 @@ fn test_elixir_protocol() {
   def to_string(value)
 end
 "#;
-    let symbols = extract_file("ex", source, "lib/stringify.ex");
+    let symbols = extract_file("ex", source, Arc::from("lib/stringify.ex"));
     assert!(symbols.iter().any(|s| s.name == "Stringify" && s.kind == SymbolKind::Interface));
 }
 
@@ -1262,6 +1263,6 @@ fn test_elixir_skip_private() {
   defp internal_helper(x), do: x * 2
 end
 "#;
-    let symbols = extract_file("ex", source, "lib/my_app.ex");
+    let symbols = extract_file("ex", source, Arc::from("lib/my_app.ex"));
     assert!(!symbols.iter().any(|s| s.name == "internal_helper"));
 }

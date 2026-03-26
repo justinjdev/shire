@@ -1,5 +1,6 @@
+use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Parser, Query, QueryCursor};
 
 use super::hooks::LanguageHooks;
 use super::{SymbolInfo, SymbolKind};
@@ -21,30 +22,20 @@ fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
     }
 }
 
-/// Extract symbols from source using a tree-sitter query and optional hooks.
+/// Extract symbols from source using a pre-compiled tree-sitter query and a reusable parser.
+///
+/// The caller is responsible for compiling the `Query` (once per language) and creating
+/// a `Parser` with the correct language set. This avoids per-file compilation overhead.
 pub fn extract(
-    language: &Language,
-    query_source: &str,
+    parser: &mut Parser,
+    query: &Query,
     source: &str,
-    file_path: &str,
+    file_path: Arc<str>,
     hooks: &LanguageHooks,
 ) -> Vec<SymbolInfo> {
-    let mut parser = Parser::new();
-    if parser.set_language(language).is_err() {
-        return Vec::new();
-    }
-
     let tree = match parser.parse(source, None) {
         Some(t) => t,
         None => return Vec::new(),
-    };
-
-    let query = match Query::new(language, query_source) {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("Query parse error: {}", e);
-            return Vec::new();
-        }
     };
 
     let capture_names = query.capture_names();
@@ -131,7 +122,7 @@ pub fn extract(
             name,
             kind,
             signature: Some(signature),
-            file_path: file_path.to_string(),
+            file_path: file_path.clone(),
             line,
             visibility: "public".to_string(),
             parent_symbol: parent,

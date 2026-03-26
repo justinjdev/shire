@@ -30,14 +30,12 @@ pub fn compute_source_hash(repo_root: &Path, package_path: &str, package_kind: &
         return Ok(format!("{:x}", digest));
     }
 
-    // Hash each file, concatenate hex hashes, then hash the concatenation
-    let mut combined = String::new();
+    let mut hasher = Sha256::new();
     for file_path in &source_files {
-        let file_hash = hash_file(file_path)?;
-        combined.push_str(&file_hash);
+        let content = std::fs::read(file_path)?;
+        hasher.update(Sha256::digest(&content));
     }
-
-    let digest = Sha256::digest(combined.as_bytes());
+    let digest = hasher.finalize();
     Ok(format!("{:x}", digest))
 }
 
@@ -57,6 +55,19 @@ pub fn compute_file_tree_hash(files: &[(String, u64)]) -> String {
     format!("{:x}", digest)
 }
 
+/// Compute SHA-256 of a file's contents, returning raw digest bytes.
+pub fn hash_file_raw(path: &Path) -> Result<[u8; 32]> {
+    let content = std::fs::read(path)?;
+    let digest = Sha256::digest(&content);
+    Ok(digest.into())
+}
+
+/// Compute hex-encoded SHA-256 of a byte slice.
+pub fn hash_bytes_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    format!("{:x}", digest)
+}
+
 /// Check if any source file in a package directory has been modified since the given timestamp.
 /// Uses the same walker and extension filters as `compute_source_hash`.
 /// Returns `true` if any file has a newer mtime (meaning hash computation is needed).
@@ -65,7 +76,6 @@ pub fn compute_file_tree_hash(files: &[(String, u64)]) -> String {
 pub fn has_newer_source_files(
     repo_root: &Path,
     package_path: &str,
-    package_kind: &str,
     since: SystemTime,
 ) -> bool {
     let package_dir = repo_root.join(package_path);
@@ -73,16 +83,20 @@ pub fn has_newer_source_files(
         return false;
     }
 
-    let extensions = walker::extensions_for_kind(package_kind);
+    let extensions = walker::all_extensions();
     let source_files = match walker::walk_source_files(&package_dir, &extensions) {
         Ok(files) => files,
         Err(_) => return true, // conservative: assume changed on error
     };
 
+    // Use 1-second margin to handle low-resolution filesystem timestamps (e.g. HFS+)
+    let margin = std::time::Duration::from_secs(1);
+    let since_with_margin = since.checked_sub(margin).unwrap_or(since);
+
     for file_path in &source_files {
         match std::fs::metadata(file_path).and_then(|m| m.modified()) {
             Ok(mtime) => {
-                if mtime > since {
+                if mtime > since_with_margin {
                     return true;
                 }
             }
@@ -223,7 +237,7 @@ mod tests {
 
         // Use a timestamp in the future — no files should be newer
         let future = SystemTime::now() + std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(dir.path(), "", "cargo", future));
+        assert!(!has_newer_source_files(dir.path(), "", future));
     }
 
     #[test]
@@ -234,7 +248,7 @@ mod tests {
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
         std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
 
-        assert!(has_newer_source_files(dir.path(), "", "cargo", past));
+        assert!(has_newer_source_files(dir.path(), "", past));
     }
 
     #[test]
@@ -242,13 +256,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
         // No source files — nothing is newer
-        assert!(!has_newer_source_files(dir.path(), "", "cargo", past));
+        assert!(!has_newer_source_files(dir.path(), "", past));
     }
 
     #[test]
     fn test_has_newer_source_files_nonexistent_dir() {
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(Path::new("/nonexistent/dir"), "", "cargo", past));
+        assert!(!has_newer_source_files(Path::new("/nonexistent/dir"), "", past));
     }
 
     #[test]
@@ -258,6 +272,6 @@ mod tests {
         std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
 
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(dir.path(), "", "cargo", past));
+        assert!(!has_newer_source_files(dir.path(), "", past));
     }
 }

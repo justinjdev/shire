@@ -293,7 +293,7 @@ pub fn load_config_from(config_path: Option<&Path>, repo_root: &Path) -> Result<
             }
         }
         Err(e) => {
-            tracing::warn!(%e, "could not read HOME environment variable, skipping global config fallback");
+            eprintln!("Warning: could not read HOME environment variable ({e}), skipping global config fallback");
         }
     }
 

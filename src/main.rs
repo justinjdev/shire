@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "rag")]
     if let Err(e) = rag::storage::load_extension() {
-        tracing::warn!(%e, "failed to load RAG extension");
+        eprintln!("Warning: {e}");
     }
 
     match cli.command {

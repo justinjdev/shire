@@ -37,14 +37,14 @@ pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> Result<S
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .with_ansi(false)
-            .init();
+            .try_init().ok();
         return Ok(sid);
     }
 
     let log_dir = resolve_log_dir(&log_config.dir, repo_root);
     std::fs::create_dir_all(&log_dir)?;
 
-    evict_old_logs(&log_dir, log_config.max_days);
+    evict_old_logs(&log_dir, log_config.max_days.max(1));
 
     let file_appender = rolling::daily(&log_dir, "shire.log");
 
@@ -52,7 +52,7 @@ pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> Result<S
         .with_env_filter(filter)
         .with_writer(file_appender)
         .with_ansi(false)
-        .init();
+        .try_init().ok();
 
     tracing::info!(session = %sid, command, "shire session started");
 

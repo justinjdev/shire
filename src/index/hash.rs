@@ -11,34 +11,6 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest))
 }
 
-/// Compute an aggregate SHA-256 hash of all source files in a package directory.
-/// Walks source files using the same walker as symbol extraction, hashes each file,
-/// then hashes the concatenation of all individual hashes (in sorted-path order).
-/// Returns SHA-256 of empty string if no source files are found.
-pub fn compute_source_hash(repo_root: &Path, package_path: &str, package_kind: &str) -> Result<String> {
-    let package_dir = repo_root.join(package_path);
-    if !package_dir.is_dir() {
-        let digest = Sha256::digest(b"");
-        return Ok(format!("{:x}", digest));
-    }
-
-    let extensions = walker::extensions_for_kind(package_kind);
-    let source_files = walker::walk_source_files(&package_dir, &extensions)?;
-
-    if source_files.is_empty() {
-        let digest = Sha256::digest(b"");
-        return Ok(format!("{:x}", digest));
-    }
-
-    let mut hasher = Sha256::new();
-    for file_path in &source_files {
-        let content = std::fs::read(file_path)?;
-        hasher.update(Sha256::digest(&content));
-    }
-    let digest = hasher.finalize();
-    Ok(format!("{:x}", digest))
-}
-
 /// Compute an aggregate SHA-256 hash of the file tree from walked files.
 /// Collects (relative_path, size_bytes) tuples, sorts lexicographically by path,
 /// and hashes the concatenation.
@@ -55,13 +27,6 @@ pub fn compute_file_tree_hash(files: &[(String, u64)]) -> String {
     format!("{:x}", digest)
 }
 
-/// Compute SHA-256 of a file's contents, returning raw digest bytes.
-pub fn hash_file_raw(path: &Path) -> Result<[u8; 32]> {
-    let content = std::fs::read(path)?;
-    let digest = Sha256::digest(&content);
-    Ok(digest.into())
-}
-
 /// Compute hex-encoded SHA-256 of a byte slice.
 pub fn hash_bytes_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
@@ -69,7 +34,6 @@ pub fn hash_bytes_hex(data: &[u8]) -> String {
 }
 
 /// Check if any source file in a package directory has been modified since the given timestamp.
-/// Uses the same walker and extension filters as `compute_source_hash`.
 /// Returns `true` if any file has a newer mtime (meaning hash computation is needed).
 /// Returns `true` on any error (conservative fallback).
 /// Short-circuits on the first newer file found.
@@ -131,44 +95,6 @@ mod tests {
     fn test_hash_missing_file() {
         let result = hash_file(Path::new("/nonexistent/file.txt"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_compute_source_hash_deterministic() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("lib.rs"), "pub fn hello() {}").unwrap();
-        std::fs::write(src.join("main.rs"), "fn main() {}").unwrap();
-
-        let hash1 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-        let hash2 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-        assert_eq!(hash1, hash2);
-        assert!(!hash1.is_empty());
-    }
-
-    #[test]
-    fn test_compute_source_hash_changes_on_add() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
-
-        let hash1 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-
-        std::fs::write(dir.path().join("util.rs"), "pub fn util() {}").unwrap();
-
-        let hash2 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_compute_source_hash_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let hash1 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-        let hash2 = compute_source_hash(dir.path(), "", "cargo").unwrap();
-        assert_eq!(hash1, hash2);
-        // SHA-256 of empty string
-        assert_eq!(hash1, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
 
     #[test]

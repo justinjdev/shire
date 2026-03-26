@@ -25,20 +25,6 @@ const SKIP_SUFFIXES: &[&str] = &[
 
 const SKIP_FILES: &[&str] = &["build.rs"];
 
-/// Return the source file extensions to scan for a given package kind.
-pub fn extensions_for_kind(kind: &str) -> Vec<&'static str> {
-    match kind {
-        "npm" => vec!["ts", "tsx", "js", "jsx"],
-        "go" => vec!["go"],
-        "cargo" => vec!["rs"],
-        "python" => vec!["py"],
-        "maven" | "gradle" => vec!["java", "kt"],
-        "perl" => vec!["pm", "pl"],
-        "ruby" => vec!["rb"],
-        _ => vec![],
-    }
-}
-
 /// Return ALL registered source file extensions (the union of all languages).
 pub fn all_extensions() -> Vec<&'static str> {
     vec![
@@ -133,17 +119,6 @@ mod tests {
         assert!(exts.contains(&"py"));
         assert!(exts.contains(&"java"));
         assert!(exts.contains(&"proto"));
-    }
-
-    #[test]
-    fn test_extensions_for_kind() {
-        assert_eq!(extensions_for_kind("npm"), vec!["ts", "tsx", "js", "jsx"]);
-        assert_eq!(extensions_for_kind("go"), vec!["go"]);
-        assert_eq!(extensions_for_kind("cargo"), vec!["rs"]);
-        assert_eq!(extensions_for_kind("python"), vec!["py"]);
-        assert_eq!(extensions_for_kind("maven"), vec!["java", "kt"]);
-        assert_eq!(extensions_for_kind("gradle"), vec!["java", "kt"]);
-        assert!(extensions_for_kind("unknown").is_empty());
     }
 
     #[test]

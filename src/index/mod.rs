@@ -21,6 +21,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -286,10 +287,9 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
-fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
-
+/// Batch-insert symbols into the symbols table (no DELETE, no trigger management).
+/// Callers are responsible for deleting old rows and managing FTS triggers.
+fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
     const BATCH_SIZE: usize = 100;
     const COLS: usize = 10;
 
@@ -321,12 +321,102 @@ fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]
             params.push(Box::new(sym.name.clone()));
             params.push(Box::new(sym.kind.as_str().to_string()));
             params.push(Box::new(sym.signature.clone()));
-            params.push(Box::new(sym.file_path.clone()));
+            params.push(Box::new(sym.file_path.to_string()));
             params.push(Box::new(sym.line as i64));
             params.push(Box::new(sym.visibility.clone()));
             params.push(Box::new(sym.parent_symbol.clone()));
             params.push(Box::new(sym.return_type.clone()));
             params.push(Box::new(params_json));
+        }
+
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
+    Ok(())
+}
+
+/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
+/// Drops FTS5 triggers during the bulk operation and manually syncs FTS afterward.
+///
+/// Must be called within a transaction — if an error occurs after dropping
+/// triggers, the transaction rollback restores DB state but triggers won't
+/// be restored until the next schema creation.
+/// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
+fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    // 1. Drop triggers to avoid per-row FTS overhead
+    db::drop_symbols_fts_triggers(conn)?;
+
+    // 2. Manually delete old FTS entries for this package
+    conn.execute(
+        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
+        [package],
+    )?;
+
+    // 3. Delete old symbols
+    conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
+
+    // 4. Batch insert new symbols (no triggers fire)
+    batch_insert_symbols(conn, package, syms)?;
+
+    // 5. Manually insert FTS entries for new rows
+    conn.execute(
+        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
+        [package],
+    )?;
+
+    // 6. Recreate triggers
+    db::recreate_symbols_fts_triggers(conn)?;
+
+    Ok(())
+}
+
+/// Upsert symbols for a single file within a package. Uses triggers (small operation).
+fn upsert_symbols_for_file(conn: &Connection, package: &str, file_path: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    // Delete old symbols for this specific file (triggers handle FTS)
+    conn.execute(
+        "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
+        rusqlite::params![package, file_path],
+    )?;
+    // Insert new symbols (triggers handle FTS)
+    batch_insert_symbols(conn, package, syms)?;
+    Ok(())
+}
+
+/// Batch upsert file hashes for a package.
+fn batch_upsert_file_hashes(conn: &Connection, package: &str, file_hashes: &[(&str, &str)]) -> Result<()> {
+    if file_hashes.is_empty() {
+        return Ok(());
+    }
+
+    // Delete old entries for this package
+    conn.execute("DELETE FROM file_hashes WHERE package = ?1", [package])?;
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    const BATCH_SIZE: usize = 500;
+    const COLS: usize = 4;
+
+    for chunk in file_hashes.chunks(BATCH_SIZE) {
+        let placeholders: Vec<String> = (0..chunk.len())
+            .map(|i| {
+                let base = i * COLS + 1;
+                format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3)
+            })
+            .collect();
+
+        let sql = format!(
+            "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES {}",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        for (fp, hash) in chunk {
+            params.push(Box::new(fp.to_string()));
+            params.push(Box::new(package.to_string()));
+            params.push(Box::new(hash.to_string()));
+            params.push(Box::new(now.clone()));
         }
 
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
@@ -381,6 +471,8 @@ struct WalkedFile {
     size_bytes: u64,
 }
 
+const MAX_FILES: usize = 500_000;
+
 /// Walk the repo and collect all files with metadata.
 fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
@@ -425,6 +517,11 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
             extension,
             size_bytes,
         });
+
+        if files.len() >= MAX_FILES {
+            eprintln!("Warning: file tree walk capped at {} files", MAX_FILES);
+            break;
+        }
     }
 
     Ok(files)
@@ -469,17 +566,60 @@ fn associate_files_with_packages(
         .collect()
 }
 
-/// Clear and re-insert all files using batched multi-row INSERTs.
-fn upsert_files(
+/// Incrementally update the files table: insert new files, delete removed files,
+/// update files whose package/extension/size changed. Avoids a full table wipe.
+fn incremental_upsert_files(
     conn: &Connection,
     files: &[(String, Option<String>, String, u64)],
 ) -> Result<()> {
-    conn.execute("DELETE FROM files", [])?;
+    // Load existing file paths from DB
+    let existing: HashMap<String, (Option<String>, String, i64)> = {
+        let mut stmt = conn.prepare("SELECT path, package, extension, size_bytes FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?),
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, rest) = row?;
+            map.insert(path, rest);
+        }
+        map
+    };
+
+    // Build new file set for quick lookup
+    let new_set: HashMap<&str, (&Option<String>, &str, u64)> = files
+        .iter()
+        .map(|(path, pkg, ext, size)| (path.as_str(), (pkg, ext.as_str(), *size)))
+        .collect();
+
+    // Delete files no longer present
+    let to_delete: Vec<&str> = existing
+        .keys()
+        .filter(|p| !new_set.contains_key(p.as_str()))
+        .map(|p| p.as_str())
+        .collect();
+    for chunk in to_delete.chunks(500) {
+        let placeholders: String = chunk.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM files WHERE path IN ({})", placeholders);
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk.iter().map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
+    // Insert new files (not in existing)
+    let to_insert: Vec<&(String, Option<String>, String, u64)> = files
+        .iter()
+        .filter(|(path, _, _, _)| !existing.contains_key(path))
+        .collect();
 
     const BATCH_SIZE: usize = 500;
     const COLS: usize = 4;
-
-    for chunk in files.chunks(BATCH_SIZE) {
+    for chunk in to_insert.chunks(BATCH_SIZE) {
         let placeholders: Vec<String> = (0..chunk.len())
             .map(|i| {
                 let base = i * COLS + 1;
@@ -493,7 +633,7 @@ fn upsert_files(
         );
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for (path, package, ext, size) in chunk {
+        for (path, package, ext, size) in chunk.iter() {
             params.push(Box::new(path.clone()));
             params.push(Box::new(package.clone()));
             params.push(Box::new(ext.clone()));
@@ -501,6 +641,18 @@ fn upsert_files(
         }
 
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
+    // Update existing files whose metadata changed
+    let mut update_stmt = conn.prepare(
+        "UPDATE files SET package = ?1, extension = ?2, size_bytes = ?3 WHERE path = ?4",
+    )?;
+    for (path, pkg, ext, size) in files {
+        if let Some((old_pkg, old_ext, old_size)) = existing.get(path) {
+            if old_pkg != pkg || old_ext != ext || *old_size != *size as i64 {
+                update_stmt.execute(rusqlite::params![pkg, ext, *size as i64, path])?;
+            }
+        }
     }
 
     Ok(())
@@ -757,6 +909,10 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             [relative_dir],
         )?;
         conn.execute(
+            "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+            [relative_dir],
+        )?;
+        conn.execute(
             "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
             [relative_dir],
         )?;
@@ -803,7 +959,103 @@ fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result
     Ok(())
 }
 
+/// Result of single-pass hash + extraction for a package.
+struct PackageExtractResult {
+    pkg_name: String,
+    symbols: Vec<symbols::SymbolInfo>,
+    aggregate_hash: String,
+    file_hashes: Vec<(String, String)>, // (relative_path, content_hash)
+}
+
+/// Intermediate per-file result carrying raw hash bytes for aggregation.
+struct FileExtractResult {
+    relative_path: String,
+    content_hash_hex: String,
+    raw_digest: [u8; 32],
+    symbols: Vec<symbols::SymbolInfo>,
+}
+
+/// Single-pass: walk source files, read once, hash + extract symbols.
+fn single_pass_extract(
+    repo_root: &Path,
+    pkg_path: &str,
+    _pkg_kind: &str,
+    exclude_extensions: &[String],
+) -> Result<(Vec<symbols::SymbolInfo>, String, Vec<(String, String)>)> {
+    let package_dir = repo_root.join(pkg_path);
+    if !package_dir.is_dir() {
+        let empty_hash = hash::hash_bytes_hex(b"");
+        return Ok((Vec::new(), empty_hash, Vec::new()));
+    }
+
+    let all_exts = symbols::walker::all_extensions();
+    let extensions: Vec<&str> = all_exts
+        .into_iter()
+        .filter(|ext| {
+            let with_dot = format!(".{}", ext);
+            !exclude_extensions.contains(&with_dot)
+        })
+        .collect();
+    let source_files = symbols::walker::walk_source_files(&package_dir, &extensions)?;
+
+    if source_files.is_empty() {
+        let empty_hash = hash::hash_bytes_hex(b"");
+        return Ok((Vec::new(), empty_hash, Vec::new()));
+    }
+
+    // Process files in parallel: read once, hash, extract symbols
+    let file_results: Vec<FileExtractResult> = source_files
+        .par_iter()
+        .filter_map(|file_path| {
+            let content = std::fs::read(file_path).ok()?;
+            let digest = Sha256::digest(&content);
+            let raw_digest: [u8; 32] = digest.into();
+            let content_hash_hex = format!("{:x}", digest);
+            let relative_path = file_path
+                .strip_prefix(repo_root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+            let ext = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let syms = String::from_utf8(content).ok()
+                .map(|source| {
+                    let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
+                    symbols::extract_file(ext, &source, file_path_arc)
+                })
+                .unwrap_or_default();
+            Some(FileExtractResult {
+                relative_path,
+                content_hash_hex,
+                raw_digest,
+                symbols: syms,
+            })
+        })
+        .collect();
+
+    // Aggregate: collect symbols, build aggregate hash, collect per-file hashes
+    let mut all_symbols = Vec::new();
+    let mut file_hashes = Vec::new();
+    // Sort by path for deterministic aggregate hash
+    let mut sorted_results = file_results;
+    sorted_results.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+    let mut hasher = Sha256::new();
+    for r in sorted_results {
+        all_symbols.extend(r.symbols);
+        // Feed raw digest bytes into aggregate hasher
+        hasher.update(r.raw_digest);
+        file_hashes.push((r.relative_path, r.content_hash_hex));
+    }
+    let aggregate_hash = format!("{:x}", hasher.finalize());
+
+    Ok((all_symbols, aggregate_hash, file_hashes))
+}
+
 /// Phase 7: Extract symbols for new/changed packages (parallel).
+/// Uses single-pass read+hash+extract to avoid double file reads.
 fn phase_extract_symbols(
     conn: &Connection,
     repo_root: &Path,
@@ -814,27 +1066,42 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
-            let src_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
-            (pkg_name, syms, src_hash)
+            match result {
+                Ok((symbols, aggregate_hash, file_hashes)) => PackageExtractResult {
+                    pkg_name: pkg_name.clone(),
+                    symbols,
+                    aggregate_hash,
+                    file_hashes,
+                },
+                Err(e) => {
+                    eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
+                    PackageExtractResult {
+                        pkg_name: pkg_name.clone(),
+                        symbols: Vec::new(),
+                        aggregate_hash: String::new(),
+                        file_hashes: Vec::new(),
+                    }
+                }
+            }
         })
         .collect();
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
-    for (pkg_name, syms, src_hash) in &results {
-        match syms {
-            Ok(syms) => {
-                upsert_symbols(conn, pkg_name, syms)?;
-            }
-            Err(e) => {
-                eprintln!("Warning: symbol extraction failed for {}: {}", pkg_name, e);
-            }
+    for r in &results {
+        if !r.symbols.is_empty() || !r.file_hashes.is_empty() {
+            upsert_symbols(conn, &r.pkg_name, &r.symbols)?;
         }
-        if let Ok(h) = src_hash {
-            hash_entries.push((pkg_name.as_str(), h.clone()));
+        if !r.aggregate_hash.is_empty() {
+            hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
+        }
+        // Store per-file hashes
+        if !r.file_hashes.is_empty() {
+            let fh_refs: Vec<(&str, &str)> = r.file_hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
+            batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
 
@@ -850,16 +1117,44 @@ fn parse_hashed_at(s: &str) -> Option<std::time::SystemTime> {
     Some(std::time::SystemTime::from(dt))
 }
 
+/// Per-file result from incremental check.
+struct FileResult {
+    file_path: String,        // relative path
+    content_hash: String,
+    raw_digest: [u8; 32],
+    symbols: Option<Vec<symbols::SymbolInfo>>, // None if unchanged
+}
+
 /// Result of parallel phase 8 work for a single package.
-enum SourceCheckResult<'a> {
-    /// Hash was computed and differs from stored — needs re-extraction.
-    Changed(&'a str, Result<Vec<symbols::SymbolInfo>>, String),
-    /// Hash was computed but matches stored — just update hashed_at.
-    Unchanged(&'a str, String),
+enum SourceCheckResult {
+    /// Package needs per-file updates.
+    NeedsUpdate {
+        pkg_name: String,
+        file_results: Vec<FileResult>,
+        deleted_files: Vec<String>, // file paths no longer on disk
+        aggregate_hash: String,
+    },
+    /// Package unchanged — just update hashed_at.
+    Unchanged(String, String),
+    // Skipped is implicit (filter_map returns None)
+}
+
+/// Load stored file hashes for a package from the DB.
+fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT file_path, content_hash FROM file_hashes WHERE package = ?1")?;
+    let rows = stmt.query_map([package], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (path, hash) = row?;
+        map.insert(path, hash);
+    }
+    Ok(map)
 }
 
 /// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
-/// Uses mtime pre-check to skip hash computation when no files have been modified.
+/// Uses per-file hashing for granular incremental updates.
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
@@ -867,8 +1162,8 @@ fn phase_source_incremental(
     exclude_extensions: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<usize> {
-    // Pre-fetch package info, stored hashes, and hashed_at from DB
-    let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>)> = unchanged
+    // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
+    let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
         .iter()
         .filter_map(|manifest| {
             let relative_dir = &manifest.relative_dir;
@@ -886,32 +1181,118 @@ fn phase_source_incremental(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap_or((None, None));
-            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash, hashed_at))
+            let stored_file_hashes = load_stored_file_hashes(conn, &pkg_name).unwrap_or_default();
+            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash, hashed_at, stored_file_hashes))
         })
         .collect();
 
-    // Parallel: mtime pre-check, then conditionally compute hashes and extract symbols
+    // Parallel: mtime pre-check, then per-file hash comparison and selective extraction
     let results: Vec<SourceCheckResult> = unchanged_pkgs
         .par_iter()
-        .filter_map(|(pkg_name, pkg_path, pkg_kind, stored_hash, hashed_at)| {
-            let result = (|| {
+        .filter_map(|(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
+            let result = (|| -> Option<SourceCheckResult> {
                 // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
                 if let Some(ts_str) = hashed_at {
                     if let Some(since) = parse_hashed_at(ts_str) {
-                        if !hash::has_newer_source_files(repo_root, pkg_path, pkg_kind, since) {
-                            return None; // No files changed — skip hash computation
+                        if !hash::has_newer_source_files(repo_root, pkg_path, since) {
+                            return None; // No files changed — skip entirely
                         }
                     }
                 }
 
-                // Mtime says check needed (or no hashed_at) — compute full hash
-                let current_hash = hash::compute_source_hash(repo_root, pkg_path, pkg_kind).ok()?;
-                if stored_hash.as_deref() == Some(current_hash.as_str()) {
-                    // Content unchanged — update hashed_at only
-                    return Some(SourceCheckResult::Unchanged(pkg_name.as_str(), current_hash));
+                // Mtime says check needed — walk files and do per-file comparison
+                let package_dir = repo_root.join(pkg_path);
+                if !package_dir.is_dir() {
+                    return None;
                 }
-                let syms = symbols::extract_symbols_for_package(repo_root, pkg_path, pkg_kind, exclude_extensions);
-                Some(SourceCheckResult::Changed(pkg_name.as_str(), syms, current_hash))
+
+                let all_exts = symbols::walker::all_extensions();
+                let extensions: Vec<&str> = all_exts
+                    .into_iter()
+                    .filter(|ext| {
+                        let with_dot = format!(".{}", ext);
+                        !exclude_extensions.contains(&with_dot)
+                    })
+                    .collect();
+                let source_files = symbols::walker::walk_source_files(&package_dir, &extensions).ok()?;
+
+                // Process each file: read, hash, compare, extract if changed
+                let file_results: Vec<FileResult> = source_files
+                    .par_iter()
+                    .filter_map(|file_path| {
+                        let content = std::fs::read(file_path).ok()?;
+                        let digest = Sha256::digest(&content);
+                        let raw_digest: [u8; 32] = digest.into();
+                        let content_hash = format!("{:x}", digest);
+                        let relative_path = file_path
+                            .strip_prefix(repo_root)
+                            .unwrap_or(file_path)
+                            .to_string_lossy()
+                            .to_string();
+
+                        let stored = stored_file_hashes.get(&relative_path);
+                        if stored == Some(&content_hash) {
+                            // File unchanged — include in results for aggregate hash but no symbols
+                            Some(FileResult {
+                                file_path: relative_path,
+                                content_hash,
+                                raw_digest,
+                                symbols: None,
+                            })
+                        } else {
+                            // File changed or new — extract symbols if valid UTF-8
+                            let ext = file_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("");
+                            let syms = String::from_utf8(content).ok()
+                                .map(|source| {
+                                    let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
+                                    symbols::extract_file(ext, &source, file_path_arc)
+                                });
+                            Some(FileResult {
+                                file_path: relative_path,
+                                content_hash,
+                                raw_digest,
+                                symbols: syms,
+                            })
+                        }
+                    })
+                    .collect();
+
+                // Detect deleted files (in stored hashes but not on disk)
+                let current_paths: HashSet<&str> = file_results.iter().map(|r| r.file_path.as_str()).collect();
+                let deleted_files: Vec<String> = stored_file_hashes
+                    .keys()
+                    .filter(|p| !current_paths.contains(p.as_str()))
+                    .cloned()
+                    .collect();
+
+                // Compute aggregate hash from per-file hashes (sorted by path)
+                let mut sorted_for_hash: Vec<(&str, &[u8; 32])> = file_results
+                    .iter()
+                    .map(|r| (r.file_path.as_str(), &r.raw_digest))
+                    .collect();
+                sorted_for_hash.sort_by(|a, b| a.0.cmp(&b.0));
+
+                let mut hasher = Sha256::new();
+                for (_, raw_digest) in &sorted_for_hash {
+                    hasher.update(*raw_digest);
+                }
+                let aggregate_hash = format!("{:x}", hasher.finalize());
+
+                // Check if any files actually changed
+                let has_changes = file_results.iter().any(|r| r.symbols.is_some()) || !deleted_files.is_empty();
+                if !has_changes {
+                    return Some(SourceCheckResult::Unchanged(pkg_name.clone(), aggregate_hash));
+                }
+
+                Some(SourceCheckResult::NeedsUpdate {
+                    pkg_name: pkg_name.clone(),
+                    file_results,
+                    deleted_files,
+                    aggregate_hash,
+                })
             })();
             if let Some(pb) = progress {
                 pb.inc(1);
@@ -925,21 +1306,46 @@ fn phase_source_incremental(
     let mut hash_entries: Vec<(&str, &str)> = Vec::new();
     for result in &results {
         match result {
-            SourceCheckResult::Changed(pkg_name, syms, current_hash) => {
-                match syms {
-                    Ok(syms) => {
-                        upsert_symbols(conn, pkg_name, syms)?;
-                        num_reextracted += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: symbol re-extraction failed for {}: {}", pkg_name, e);
+            SourceCheckResult::NeedsUpdate { pkg_name, file_results: all_files, deleted_files, aggregate_hash } => {
+                // Delete symbols for deleted files
+                for del_path in deleted_files {
+                    conn.execute(
+                        "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
+                        rusqlite::params![pkg_name, del_path],
+                    )?;
+                }
+                // Delete file_hashes for deleted files
+                for del_path in deleted_files {
+                    conn.execute(
+                        "DELETE FROM file_hashes WHERE package = ?1 AND file_path = ?2",
+                        rusqlite::params![pkg_name, del_path],
+                    )?;
+                }
+
+                // Collect per-file hashes for batch upsert
+                let mut fh_entries: Vec<(&str, &str)> = Vec::new();
+                let mut had_changes = false;
+
+                for fr in all_files {
+                    fh_entries.push((fr.file_path.as_str(), fr.content_hash.as_str()));
+                    if let Some(syms) = &fr.symbols {
+                        // File changed — upsert symbols for this file
+                        upsert_symbols_for_file(conn, pkg_name, &fr.file_path, syms)?;
+                        had_changes = true;
                     }
                 }
-                hash_entries.push((pkg_name, current_hash.as_str()));
+
+                // Update per-file hashes
+                batch_upsert_file_hashes(conn, pkg_name, &fh_entries)?;
+
+                if had_changes || !deleted_files.is_empty() {
+                    num_reextracted += 1;
+                }
+                hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
             }
-            SourceCheckResult::Unchanged(pkg_name, current_hash) => {
+            SourceCheckResult::Unchanged(pkg_name, aggregate_hash) => {
                 // Update hashed_at to reflect the new computation time
-                hash_entries.push((pkg_name, current_hash.as_str()));
+                hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
             }
         }
     }
@@ -985,7 +1391,7 @@ fn phase_index_files(
         return Ok(num_files);
     }
 
-    // File tree changed (or first build) — full rebuild
+    // File tree changed (or first build) — incremental update
     let all_packages: Vec<(String, String)> = conn
         .prepare("SELECT name, path FROM packages")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -1008,7 +1414,7 @@ fn phase_index_files(
         .collect();
 
     let num_files = validated_files.len();
-    upsert_files(conn, &validated_files)?;
+    incremental_upsert_files(conn, &validated_files)?;
 
     // Store the new file-tree hash
     conn.execute(
@@ -1035,6 +1441,62 @@ fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Remove stale entries from manifest_hashes and source_hashes that no longer
+/// correspond to existing packages. This prevents unbounded growth when packages
+/// are renamed, moved, or removed across builds.
+fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
+    // source_hashes: key is package name — delete if package no longer exists
+    conn.execute(
+        "DELETE FROM source_hashes WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+    )?;
+
+    // file_hashes: key is (file_path, package) — delete if package no longer exists
+    conn.execute(
+        "DELETE FROM file_hashes WHERE package NOT IN (SELECT name FROM packages)",
+        [],
+    )?;
+
+    // manifest_hashes: key is manifest path (e.g. "services/auth/package.json").
+    // Load known package paths, then delete any manifest hash whose parent dir
+    // doesn't match a known package path (or root "").
+    let known_paths: HashSet<String> = conn
+        .prepare("SELECT path FROM packages")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    let all_manifest_keys: Vec<String> = conn
+        .prepare("SELECT path FROM manifest_hashes")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let stale_keys: Vec<&str> = all_manifest_keys
+        .iter()
+        .filter(|key| {
+            let parent_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            !known_paths.contains(parent_dir)
+        })
+        .map(|k| k.as_str())
+        .collect();
+
+    for chunk in stale_keys.chunks(500) {
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM manifest_hashes WHERE path IN ({})", placeholders);
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk
+            .iter()
+            .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
     Ok(())
 }
 
@@ -1194,6 +1656,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM manifest_hashes", [])?;
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM source_hashes", [])?;
+            conn.execute("DELETE FROM file_hashes", [])?;
             conn.execute("DELETE FROM shire_meta WHERE key = 'file_tree_hash'", [])?;
             Ok(())
         })?;
@@ -1503,6 +1966,28 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     with_transaction(&conn, || {
         validate_referential_integrity(&conn)
     })?;
+
+    // Clean up stale hash entries that no longer correspond to any existing package.
+    // source_hashes keys on package name, so orphans are easy to detect.
+    // manifest_hashes keys on manifest path — orphans occur when packages are
+    // renamed/moved; we detect them by checking if the manifest's parent directory
+    // still matches a known package path.
+    cleanup_stale_hashes(&conn)?;
+
+    // FTS5 maintenance: full optimize on fresh/forced builds, incremental merge otherwise.
+    if is_full_build || force {
+        conn.execute_batch(
+            "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
+             INSERT INTO files_fts(files_fts) VALUES('optimize');
+             INSERT INTO symbols_fts(symbols_fts) VALUES('optimize');",
+        )?;
+    } else {
+        conn.execute_batch(
+            "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
+             INSERT INTO files_fts(files_fts, rank) VALUES('merge', 500);
+             INSERT INTO symbols_fts(symbols_fts, rank) VALUES('merge', 500);",
+        )?;
+    }
 
     // Clear progress bars before printing summary
     mp.clear()?;

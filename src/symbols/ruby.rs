@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::{Parameter, SymbolInfo, SymbolKind};
 use regex::Regex;
 
@@ -6,7 +8,7 @@ use regex::Regex;
 /// Extracts classes (with inheritance), modules, instance methods, class methods,
 /// and top-level functions. Uses recursive-style line scanning to track
 /// parent class/module context.
-pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
+pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     let class_re = Regex::new(r"^\s*class\s+(\w+)(?:\s*<\s*(\w+))?").unwrap();
     let module_re = Regex::new(r"^\s*module\s+(\w+)").unwrap();
     let method_re = Regex::new(r"^\s*def\s+(self\.)?(\w+[!?=]?)(?:\s*\(([^)]*)\))?").unwrap();
@@ -42,7 +44,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: name.clone(),
                 kind: SymbolKind::Class,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: context_stack.last().map(|(n, _)| n.clone()),
@@ -64,7 +66,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: name.clone(),
                 kind: SymbolKind::Class,
                 signature: Some(format!("module {}", name)),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: context_stack.last().map(|(n, _)| n.clone()),
@@ -117,7 +119,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: method_name,
                 kind,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol,
@@ -193,6 +195,7 @@ fn parse_parameters(params_str: &str) -> Vec<Parameter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_extract_class() {
@@ -203,7 +206,7 @@ class UserService
   end
 end
 "#;
-        let symbols = extract(source, "app/services/user_service.rb");
+        let symbols = extract(source, Arc::from("app/services/user_service.rb"));
 
         let class_sym = symbols.iter().find(|s| s.name == "UserService").unwrap();
         assert_eq!(class_sym.kind, SymbolKind::Class);
@@ -220,7 +223,7 @@ module Authentication
   end
 end
 "#;
-        let symbols = extract(source, "app/concerns/authentication.rb");
+        let symbols = extract(source, Arc::from("app/concerns/authentication.rb"));
 
         let mod_sym = symbols.iter().find(|s| s.name == "Authentication").unwrap();
         assert_eq!(mod_sym.kind, SymbolKind::Class);
@@ -236,7 +239,7 @@ class OrderProcessor
   end
 end
 "#;
-        let symbols = extract(source, "app/services/order_processor.rb");
+        let symbols = extract(source, Arc::from("app/services/order_processor.rb"));
 
         let method_sym = symbols.iter().find(|s| s.name == "process").unwrap();
         assert_eq!(method_sym.kind, SymbolKind::Method);
@@ -261,7 +264,7 @@ class Config
   end
 end
 "#;
-        let symbols = extract(source, "lib/config.rb");
+        let symbols = extract(source, Arc::from("lib/config.rb"));
 
         let method_sym = symbols.iter().find(|s| s.name == "load").unwrap();
         assert_eq!(method_sym.kind, SymbolKind::Function);
@@ -276,7 +279,7 @@ def main
   puts "hello"
 end
 "#;
-        let symbols = extract(source, "script.rb");
+        let symbols = extract(source, Arc::from("script.rb"));
 
         assert_eq!(symbols.len(), 1);
         let sym = &symbols[0];
@@ -295,7 +298,7 @@ class AdminController < ApplicationController
   end
 end
 "#;
-        let symbols = extract(source, "app/controllers/admin_controller.rb");
+        let symbols = extract(source, Arc::from("app/controllers/admin_controller.rb"));
 
         let class_sym = symbols
             .iter()
@@ -323,7 +326,7 @@ module Payments
   end
 end
 "#;
-        let symbols = extract(source, "lib/payments/processor.rb");
+        let symbols = extract(source, Arc::from("lib/payments/processor.rb"));
 
         let mod_sym = symbols.iter().find(|s| s.name == "Payments").unwrap();
         assert_eq!(mod_sym.kind, SymbolKind::Class);
@@ -344,7 +347,7 @@ def create(name, *args, **opts, &block)
   # ...
 end
 "#;
-        let symbols = extract(source, "factory.rb");
+        let symbols = extract(source, Arc::from("factory.rb"));
 
         assert_eq!(symbols.len(), 1);
         let params = symbols[0].parameters.as_ref().unwrap();

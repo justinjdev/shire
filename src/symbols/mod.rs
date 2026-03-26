@@ -6,16 +6,15 @@ mod registry;
 pub mod ruby;
 pub mod walker;
 
-use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolInfo {
     pub name: String,
     pub kind: SymbolKind,
     pub signature: Option<String>,
-    pub file_path: String,
+    pub file_path: Arc<str>,
     pub line: usize,
     pub visibility: String,
     pub parent_symbol: Option<String>,
@@ -60,54 +59,8 @@ pub struct Parameter {
     pub type_annotation: Option<String>,
 }
 
-/// Extract symbols from all source files in a package directory.
-pub fn extract_symbols_for_package(
-    repo_root: &Path,
-    package_path: &str,
-    _package_kind: &str,
-    exclude_extensions: &[String],
-) -> Result<Vec<SymbolInfo>> {
-    let package_dir = repo_root.join(package_path);
-    if !package_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let all_exts = walker::all_extensions();
-    let extensions: Vec<&str> = all_exts
-        .into_iter()
-        .filter(|ext| {
-            let with_dot = format!(".{}", ext);
-            !exclude_extensions.contains(&with_dot)
-        })
-        .collect();
-    let source_files = walker::walk_source_files(&package_dir, &extensions)?;
-
-    let mut symbols = Vec::new();
-
-    for file_path in source_files {
-        let source = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("failed to read {}", file_path.display()))?;
-
-        let relative_path = file_path
-            .strip_prefix(repo_root)
-            .unwrap_or(&file_path)
-            .to_string_lossy()
-            .to_string();
-
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-
-        let mut file_symbols = extract_file(ext, &source, &relative_path);
-        symbols.append(&mut file_symbols);
-    }
-
-    Ok(symbols)
-}
-
 /// Extract symbols from a single file by extension.
-pub fn extract_file(ext: &str, source: &str, file_path: &str) -> Vec<SymbolInfo> {
+pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     registry::extract_file(ext, source, file_path)
 }
 

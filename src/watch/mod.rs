@@ -141,8 +141,8 @@ pub async fn run_daemon(
         // Wait for first signal or shutdown
         tokio::select! {
             Some(first_msg) = rx.recv() => {
-                // Accumulate files across the debounce window
-                let mut all_files: Vec<PathBuf> = first_msg.files;
+                // Accumulate unique files across the debounce window
+                let mut file_set: HashSet<PathBuf> = first_msg.files.into_iter().collect();
 
                 // Got a rebuild signal, start debounce window
                 let deadline = tokio::time::Instant::now() + debounce;
@@ -151,13 +151,15 @@ pub async fn run_daemon(
                 loop {
                     tokio::select! {
                         Some(msg) = rx.recv() => {
-                            all_files.extend(msg.files);
+                            file_set.extend(msg.files);
                         }
                         _ = tokio::time::sleep_until(deadline) => {
                             break;
                         }
                     }
                 }
+
+                let all_files: Vec<PathBuf> = file_set.into_iter().collect();
 
                 // If files were specified, check relevance before rebuilding.
                 // Empty file list = unconditional rebuild (manual `shire rebuild`).

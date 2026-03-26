@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::{SymbolInfo, SymbolKind};
 use regex::Regex;
 
@@ -6,7 +8,7 @@ use regex::Regex;
 /// Extracts package declarations as Class symbols and sub definitions as
 /// Function (top-level) or Method (inside a package block) symbols.
 /// Subs starting with `_` are skipped (Perl private convention).
-pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
+pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     let package_re = Regex::new(r"^\s*package\s+([\w:]+)").unwrap();
     let sub_re = Regex::new(r"^\s*sub\s+(\w+)").unwrap();
 
@@ -24,7 +26,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: name.clone(),
                 kind: SymbolKind::Class,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: None,
@@ -61,7 +63,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name,
                 kind,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol,
@@ -77,11 +79,12 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_extract_package_declaration() {
         let source = "package Foo::Bar;\n\nuse strict;\n";
-        let symbols = extract(source, "lib/Foo/Bar.pm");
+        let symbols = extract(source, Arc::from("lib/Foo/Bar.pm"));
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "Foo::Bar");
@@ -99,7 +102,7 @@ sub greet {
     print "Hello, $name\n";
 }
 "#;
-        let symbols = extract(source, "script.pl");
+        let symbols = extract(source, Arc::from("script.pl"));
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "greet");
@@ -122,7 +125,7 @@ sub validate {
     return 1;
 }
 "#;
-        let symbols = extract(source, "lib/MyApp/Auth.pm");
+        let symbols = extract(source, Arc::from("lib/MyApp/Auth.pm"));
 
         assert_eq!(symbols.len(), 3);
 
@@ -161,7 +164,7 @@ sub _another_private {
     return 3;
 }
 "#;
-        let symbols = extract(source, "lib/Foo.pm");
+        let symbols = extract(source, Arc::from("lib/Foo.pm"));
 
         assert_eq!(symbols.len(), 2); // package + public_method only
         assert_eq!(symbols[0].name, "Foo");
@@ -182,7 +185,7 @@ sub beta {
     return 2;
 }
 "#;
-        let symbols = extract(source, "lib/Multi.pm");
+        let symbols = extract(source, Arc::from("lib/Multi.pm"));
 
         assert_eq!(symbols.len(), 4);
 
@@ -206,7 +209,7 @@ sub beta {
 
     #[test]
     fn test_empty_source() {
-        let symbols = extract("", "empty.pl");
+        let symbols = extract("", Arc::from("empty.pl"));
         assert!(symbols.is_empty());
     }
 
@@ -228,7 +231,7 @@ sub helper {
 
 1;
 "#;
-        let symbols = extract(source, "lib/Utils.pm");
+        let symbols = extract(source, Arc::from("lib/Utils.pm"));
 
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0].name, "Utils");
@@ -249,7 +252,7 @@ sub baz {
     return 2;
 }
 "#;
-        let symbols = extract(source, "lib/Foo.pm");
+        let symbols = extract(source, Arc::from("lib/Foo.pm"));
 
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0].line, 1); // package Foo

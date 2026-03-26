@@ -1,6 +1,7 @@
+use std::sync::{Arc, LazyLock};
+
 use super::{Parameter, SymbolInfo, SymbolKind};
 use regex::Regex;
-use std::sync::LazyLock;
 
 static MODULE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*defmodule\s+([A-Z][\w.]*)\s+do\b").unwrap());
@@ -24,7 +25,7 @@ static END_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*end\b").unwra
 /// Extracts: modules (defmodule), public functions (def), public macros (defmacro),
 /// protocols (defprotocol), callbacks (@callback), and type definitions (@type).
 /// Skips private functions (defp), private macros (defmacrop), and private types (@typep).
-pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
+pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     let module_re = &*MODULE_RE;
     let protocol_re = &*PROTOCOL_RE;
     let def_re = &*DEF_RE;
@@ -58,7 +59,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: name.clone(),
                 kind: SymbolKind::Interface,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -81,7 +82,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name: name.clone(),
                 kind: SymbolKind::Class,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -108,7 +109,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name,
                 kind: SymbolKind::Method,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -133,7 +134,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name,
                 kind: SymbolKind::Type,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -158,7 +159,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name,
                 kind: SymbolKind::Function,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -188,7 +189,7 @@ pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo> {
                 name,
                 kind: SymbolKind::Function,
                 signature: Some(signature),
-                file_path: file_path.to_string(),
+                file_path: file_path.clone(),
                 line: line_number,
                 visibility: "public".to_string(),
                 parent_symbol: module_stack.last().cloned(),
@@ -329,6 +330,7 @@ fn parse_type_params(params_str: &str) -> Vec<Parameter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_extract_module() {
@@ -339,7 +341,7 @@ defmodule MyApp.Users do
   end
 end
 "#;
-        let symbols = extract(source, "lib/my_app/users.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/users.ex"));
 
         let mod_sym = symbols.iter().find(|s| s.name == "MyApp.Users").unwrap();
         assert_eq!(mod_sym.kind, SymbolKind::Class);
@@ -360,7 +362,7 @@ defmodule Calculator do
   end
 end
 "#;
-        let symbols = extract(source, "lib/calculator.ex");
+        let symbols = extract(source, Arc::from("lib/calculator.ex"));
 
         let func = symbols.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
@@ -387,7 +389,7 @@ defmodule MyModule do
   end
 end
 "#;
-        let symbols = extract(source, "lib/my_module.ex");
+        let symbols = extract(source, Arc::from("lib/my_module.ex"));
 
         assert!(symbols.iter().any(|s| s.name == "public_fn"));
         assert!(!symbols.iter().any(|s| s.name == "private_fn"));
@@ -401,7 +403,7 @@ defprotocol MyApp.Serializable do
   def serialize(value)
 end
 "#;
-        let symbols = extract(source, "lib/my_app/serializable.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/serializable.ex"));
 
         let proto = symbols
             .iter()
@@ -429,7 +431,7 @@ defmodule MyApp.Router do
   end
 end
 "#;
-        let symbols = extract(source, "lib/my_app/router.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/router.ex"));
 
         let mac = symbols.iter().find(|s| s.name == "route").unwrap();
         assert_eq!(mac.kind, SymbolKind::Function);
@@ -452,7 +454,7 @@ defmodule MyApp.Behaviour do
   @callback init(opts :: keyword()) :: {:ok, state :: term()} | {:error, reason :: term()}
 end
 "#;
-        let symbols = extract(source, "lib/my_app/behaviour.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/behaviour.ex"));
 
         let cb = symbols.iter().find(|s| s.name == "init").unwrap();
         assert_eq!(cb.kind, SymbolKind::Method);
@@ -473,7 +475,7 @@ defmodule MyApp.Types do
   @type pair(a, b) :: {a, b}
 end
 "#;
-        let symbols = extract(source, "lib/my_app/types.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/types.ex"));
 
         let name_type = symbols.iter().find(|s| s.name == "name").unwrap();
         assert_eq!(name_type.kind, SymbolKind::Type);
@@ -498,7 +500,7 @@ defmodule MyApp.Outer do
   end
 end
 "#;
-        let symbols = extract(source, "lib/my_app/outer.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/outer.ex"));
 
         let outer = symbols.iter().find(|s| s.name == "MyApp.Outer").unwrap();
         assert!(outer.parent_symbol.is_none());
@@ -519,7 +521,7 @@ defmodule Config do
   end
 end
 "#;
-        let symbols = extract(source, "lib/config.ex");
+        let symbols = extract(source, Arc::from("lib/config.ex"));
 
         let func = symbols.iter().find(|s| s.name == "load").unwrap();
         let params = func.parameters.as_ref().unwrap();
@@ -537,7 +539,7 @@ defmodule Math do
   end
 end
 "#;
-        let symbols = extract(source, "lib/math.ex");
+        let symbols = extract(source, Arc::from("lib/math.ex"));
 
         let func = symbols.iter().find(|s| s.name == "abs").unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
@@ -551,7 +553,7 @@ defmodule MyModule do
   def greet(name), do: "Hello, #{name}"
 end
 "#;
-        let symbols = extract(source, "lib/my_module.ex");
+        let symbols = extract(source, Arc::from("lib/my_module.ex"));
 
         let func = symbols.iter().find(|s| s.name == "greet").unwrap();
         assert_eq!(func.kind, SymbolKind::Function);
@@ -560,7 +562,7 @@ end
 
     #[test]
     fn test_empty_source() {
-        let symbols = extract("", "empty.ex");
+        let symbols = extract("", Arc::from("empty.ex"));
         assert!(symbols.is_empty());
     }
 
@@ -576,7 +578,7 @@ end
   end
 end
 "#;
-        let symbols = extract(source, "lib/foo.ex");
+        let symbols = extract(source, Arc::from("lib/foo.ex"));
 
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0].line, 1); // defmodule Foo
@@ -597,7 +599,7 @@ defmodule Foo do
   end
 end
 "#;
-        let symbols = extract(source, "lib/foo.ex");
+        let symbols = extract(source, Arc::from("lib/foo.ex"));
 
         assert_eq!(symbols.len(), 2); // module + real_function
         assert!(!symbols.iter().any(|s| s.name == "not_a_function"));
@@ -606,7 +608,7 @@ end
     #[test]
     fn test_dotted_module_name() {
         let source = "defmodule MyApp.Web.Controllers.UserController do\nend\n";
-        let symbols = extract(source, "lib/my_app/web/controllers/user_controller.ex");
+        let symbols = extract(source, Arc::from("lib/my_app/web/controllers/user_controller.ex"));
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "MyApp.Web.Controllers.UserController");

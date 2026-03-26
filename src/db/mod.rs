@@ -8,8 +8,16 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA cache_size=-64000;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA mmap_size=268435456;",
+    )?;
     create_schema(&conn)?;
+    migrate_fts_if_needed(&conn)?;
 
     #[cfg(feature = "rag")]
     if rag_enabled {
@@ -25,6 +33,13 @@ pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA query_only=ON;
+         PRAGMA cache_size=-64000;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA mmap_size=268435456;",
     )?;
     Ok(conn)
 }
@@ -53,7 +68,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS packages_fts USING fts5(
             name, description, path,
             content='packages',
-            content_rowid='rowid'
+            content_rowid='rowid',
+            tokenize=\"unicode61 tokenchars '_-'\",
+            prefix='2,3'
         );
 
         CREATE TRIGGER IF NOT EXISTS packages_ai AFTER INSERT ON packages BEGIN
@@ -89,6 +106,16 @@ fn create_schema(conn: &Connection) -> Result<()> {
             hashed_at    TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS file_hashes (
+            file_path    TEXT NOT NULL,
+            package      TEXT NOT NULL REFERENCES packages(name),
+            content_hash TEXT NOT NULL,
+            hashed_at    TEXT,
+            PRIMARY KEY (file_path, package)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_file_hashes_package ON file_hashes(package);
+
         CREATE TABLE IF NOT EXISTS files (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             path       TEXT NOT NULL UNIQUE,
@@ -103,7 +130,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
             path,
             content='files',
-            content_rowid='rowid'
+            content_rowid='rowid',
+            tokenize=\"unicode61 tokenchars '_-'\"
         );
 
         CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
@@ -144,7 +172,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
             name, kind, signature, file_path,
             content='symbols',
-            content_rowid='rowid'
+            content_rowid='rowid',
+            tokenize=\"unicode61 tokenchars '_'\",
+            prefix='2,3'
         );
 
         CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
@@ -165,6 +195,81 @@ fn create_schema(conn: &Connection) -> Result<()> {
         END;
         ",
     )?;
+    Ok(())
+}
+
+pub fn drop_symbols_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS symbols_ai;
+         DROP TRIGGER IF EXISTS symbols_ad;
+         DROP TRIGGER IF EXISTS symbols_au;",
+    )?;
+    Ok(())
+}
+
+pub fn recreate_symbols_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
+            INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+            VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path);
+            INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+            VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path);
+        END;",
+    )?;
+    Ok(())
+}
+
+const FTS_SCHEMA_VERSION: &str = "2";
+
+fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'fts_schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if current.as_deref() == Some(FTS_SCHEMA_VERSION) {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS packages_ai;
+         DROP TRIGGER IF EXISTS packages_ad;
+         DROP TRIGGER IF EXISTS packages_au;
+         DROP TRIGGER IF EXISTS files_ai;
+         DROP TRIGGER IF EXISTS files_ad;
+         DROP TRIGGER IF EXISTS files_au;
+         DROP TRIGGER IF EXISTS symbols_ai;
+         DROP TRIGGER IF EXISTS symbols_ad;
+         DROP TRIGGER IF EXISTS symbols_au;
+         DROP TABLE IF EXISTS packages_fts;
+         DROP TABLE IF EXISTS files_fts;
+         DROP TABLE IF EXISTS symbols_fts;",
+    )?;
+
+    create_schema(conn)?;
+
+    conn.execute_batch(
+        "INSERT INTO packages_fts(packages_fts) VALUES('rebuild');
+         INSERT INTO files_fts(files_fts) VALUES('rebuild');
+         INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');",
+    )?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('fts_schema_version', ?1)",
+        [FTS_SCHEMA_VERSION],
+    )?;
+
     Ok(())
 }
 
@@ -254,6 +359,7 @@ mod tests {
         assert!(tables.contains(&"source_hashes".to_string()));
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"symbols".to_string()));
+        assert!(tables.contains(&"file_hashes".to_string()));
     }
 
     #[test]

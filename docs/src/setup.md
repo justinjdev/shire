@@ -133,8 +133,8 @@ shire clean
 
 ## Incremental builds
 
-Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build.
+Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are tracked at **per-file granularity**: if individual source files change without a manifest change, only those files have their symbols re-extracted. An **mtime pre-check** skips hash computation entirely for packages whose source files haven't been touched since the last build.
 
 File indexing is also incremental — a file-tree hash detects structural changes, skipping the file indexing phase entirely when no files have been added, removed, or resized.
 
-Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput.
+Symbol extraction and source hashing are **parallelized** across packages and within packages using rayon for multi-core throughput. Files are read once per build (single-pass hash + extraction). All database writes use **batched multi-row INSERTs** within explicit transactions, with FTS5 triggers temporarily disabled during bulk operations for maximum SQLite throughput.

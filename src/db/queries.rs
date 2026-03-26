@@ -67,46 +67,50 @@ pub fn search_symbols(
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
     let limit = limit.min(200) as i64;
 
-    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
         (Some(pkg), Some(kind)) => (
-            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
-             LIMIT {limit}"),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string())],
+             ORDER BY rank
+             LIMIT ?4",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string()), Box::new(limit)],
         ),
         (Some(pkg), None) => (
-            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             LIMIT {limit}"),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
+             ORDER BY rank
+             LIMIT ?3",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
         ),
         (None, Some(kind)) => (
-            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.kind = ?2
-             LIMIT {limit}"),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string())],
+             ORDER BY rank
+             LIMIT ?3",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string()), Box::new(limit)],
         ),
         (None, None) => (
-            format!("SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             LIMIT {limit}"),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
+             ORDER BY rank
+             LIMIT ?2",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
         ),
     };
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(SymbolRow {
             name: row.get(0)?,
@@ -152,7 +156,7 @@ pub fn get_package_symbols(
             vec![Box::new(package.to_string())],
         ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(SymbolRow {
             name: row.get(0)?,
@@ -198,7 +202,7 @@ pub fn get_file_symbols(
             vec![Box::new(file_path.to_string())],
         ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(SymbolRow {
             name: row.get(0)?,
@@ -323,42 +327,48 @@ pub fn search_files(
     }
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
 
-    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, extension_filter) {
+    let limit = 20i64;
+
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, extension_filter) {
         (Some(pkg), Some(ext)) => (
             "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2 AND f.extension = ?3
-             LIMIT 20".to_string(),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string())],
+             ORDER BY rank
+             LIMIT ?4",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string()), Box::new(limit)],
         ),
         (Some(pkg), None) => (
             "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2
-             LIMIT 20".to_string(),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string())],
+             ORDER BY rank
+             LIMIT ?3",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
         ),
         (None, Some(ext)) => (
             "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.extension = ?2
-             LIMIT 20".to_string(),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string())],
+             ORDER BY rank
+             LIMIT ?3",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string()), Box::new(limit)],
         ),
         (None, None) => (
             "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1
-             LIMIT 20".to_string(),
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>],
+             ORDER BY rank
+             LIMIT ?2",
+            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
         ),
     };
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(FileRow {
             path: row.get(0)?,
@@ -396,7 +406,7 @@ pub fn list_package_files(
             vec![Box::new(package.to_string())],
         ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(FileRow {
             path: row.get(0)?,
@@ -420,14 +430,15 @@ pub fn search_packages(conn: &Connection, query: &str, limit: u32) -> Result<Vec
     // Sanitize for FTS5: wrap in double quotes, escape internal quotes
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
     let limit = limit.min(200) as i64;
-    let mut stmt = conn.prepare(
-        &format!("SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
+    let mut stmt = conn.prepare_cached(
+        "SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
          FROM packages_fts f
-         JOIN packages p ON p.name = f.name
+         JOIN packages p ON p.rowid = f.rowid
          WHERE packages_fts MATCH ?1
-         LIMIT {limit}"),
+         ORDER BY rank
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map([&sanitized], |row| {
+    let rows = stmt.query_map(rusqlite::params![&sanitized, &limit], |row| {
         Ok(PackageRow {
             name: row.get(0)?,
             path: row.get(1)?,
@@ -447,7 +458,7 @@ pub fn search_packages(conn: &Connection, query: &str, limit: u32) -> Result<Vec
 /// Exact name lookup for a single package.
 #[allow(dead_code)]
 pub fn get_package(conn: &Connection, name: &str) -> Result<Option<PackageRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT name, path, kind, version, description, metadata
          FROM packages
          WHERE name = ?1",
@@ -484,7 +495,7 @@ pub fn package_dependencies(
          FROM dependencies
          WHERE package = ?1"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map([name], |row| {
         Ok(DependencyRow {
             package: row.get(0)?,
@@ -503,7 +514,7 @@ pub fn package_dependencies(
 
 /// Reverse dependency lookup: find all packages that depend on `name`.
 pub fn package_dependents(conn: &Connection, name: &str) -> Result<Vec<DependencyRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
          WHERE dependency = ?1",
@@ -526,12 +537,15 @@ pub fn package_dependents(conn: &Connection, name: &str) -> Result<Vec<Dependenc
 
 /// BFS traversal of the dependency graph starting from `root`, up to `max_depth` levels.
 /// When `internal_only` is true, only follows internal dependency edges.
+/// Returns at most `MAX_EDGES` edges to prevent unbounded memory growth in large monorepos.
 pub fn dependency_graph(
     conn: &Connection,
     root: &str,
     max_depth: u32,
     internal_only: bool,
 ) -> Result<Vec<GraphEdge>> {
+    const MAX_EDGES: usize = 10_000;
+
     let sql = if internal_only {
         "SELECT dependency, dep_kind FROM dependencies WHERE package = ?1 AND is_internal = 1"
     } else {
@@ -545,10 +559,10 @@ pub fn dependency_graph(
     visited.insert(root.to_string());
     queue.push_back((root.to_string(), 0));
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
 
     while let Some((current, depth)) = queue.pop_front() {
-        if depth >= max_depth {
+        if depth >= max_depth || edges.len() >= MAX_EDGES {
             continue;
         }
         let rows = stmt.query_map([&current], |row| {
@@ -561,6 +575,9 @@ pub fn dependency_graph(
                 to: dep.clone(),
                 dep_kind: kind,
             });
+            if edges.len() >= MAX_EDGES {
+                break;
+            }
             if visited.insert(dep.clone()) {
                 queue.push_back((dep, depth + 1));
             }
@@ -587,7 +604,7 @@ pub fn list_packages(conn: &Connection, kind: Option<&str>) -> Result<Vec<Packag
             vec![],
         ),
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok(PackageRow {
             name: row.get(0)?,
@@ -608,7 +625,7 @@ pub fn list_packages(conn: &Connection, kind: Option<&str>) -> Result<Vec<Packag
 /// Read indexing status from the shire_meta table.
 pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
     let get_meta = |key: &str| -> Result<Option<String>> {
-        let mut stmt = conn.prepare("SELECT value FROM shire_meta WHERE key = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT value FROM shire_meta WHERE key = ?1")?;
         let mut rows = stmt.query_map([key], |row| row.get::<_, String>(0))?;
         match rows.next() {
             Some(val) => Ok(Some(val?)),
@@ -628,12 +645,15 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
 
 /// BFS traversal of the reverse dependency graph starting from `root`, up to `max_depth` levels.
 /// Finds all packages that transitively depend on `root`.
+/// Returns at most `MAX_EDGES` edges to prevent unbounded memory growth.
 #[allow(dead_code)]
 pub fn reverse_dependency_graph(
     conn: &Connection,
     root: &str,
     max_depth: u32,
 ) -> Result<Vec<GraphEdge>> {
+    const MAX_EDGES: usize = 10_000;
+
     let sql = "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1";
 
     let mut edges = Vec::new();
@@ -643,10 +663,10 @@ pub fn reverse_dependency_graph(
     visited.insert(root.to_string());
     queue.push_back((root.to_string(), 0));
 
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
 
     while let Some((current, depth)) = queue.pop_front() {
-        if depth >= max_depth {
+        if depth >= max_depth || edges.len() >= MAX_EDGES {
             continue;
         }
         let rows = stmt.query_map([&current], |row| {
@@ -659,6 +679,9 @@ pub fn reverse_dependency_graph(
                 to: current.clone(),
                 dep_kind: kind,
             });
+            if edges.len() >= MAX_EDGES {
+                break;
+            }
             if visited.insert(dependent.clone()) {
                 queue.push_back((dependent, depth + 1));
             }

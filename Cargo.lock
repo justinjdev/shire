@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "shire"
-version = "0.1.13-beta"
+version = "0.2.0-beta"
 dependencies = [
  "anyhow",
  "chrono",

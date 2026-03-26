@@ -57,9 +57,14 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
 
     let shire_dir = root.join(".shire");
     let _ = std::fs::create_dir_all(&shire_dir);
-    let stderr_target = std::fs::File::create(shire_dir.join("watch-stderr.log"))
-        .map(std::process::Stdio::from)
-        .unwrap_or_else(|_| std::process::Stdio::null());
+    let stderr_log = shire_dir.join("watch-stderr.log");
+    let stderr_target = match std::fs::File::create(&stderr_log) {
+        Ok(file) => std::process::Stdio::from(file),
+        Err(e) => {
+            eprintln!("Warning: failed to open {}: {e}; daemon stderr will be discarded", stderr_log.display());
+            std::process::Stdio::null()
+        }
+    };
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

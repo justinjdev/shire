@@ -1,5 +1,4 @@
 use crate::config::LogConfig;
-use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
@@ -22,41 +21,49 @@ fn session_id() -> String {
 /// Initialize the tracing subscriber with daily-rotating file logging.
 ///
 /// Log level priority: SHIRE_LOG env var > config file > default ("warn").
-/// If the log dir is empty, file logging is disabled.
+/// If the log dir is empty or cannot be created, falls back to stderr logging.
 /// Old log files beyond `max_days` are cleaned up on init.
 ///
 /// Returns the session ID for correlation.
-pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> Result<String> {
+pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> String {
     let sid = session_id();
     let level = std::env::var("SHIRE_LOG").unwrap_or_else(|_| log_config.level.clone());
     let filter = EnvFilter::try_new(&format!("shire={level}"))
         .unwrap_or_else(|_| EnvFilter::new("shire=warn"));
 
-    if log_config.dir.is_empty() {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .try_init().ok();
-        return Ok(sid);
+    if !log_config.dir.is_empty() {
+        let log_dir = resolve_log_dir(&log_config.dir, repo_root);
+        match std::fs::create_dir_all(&log_dir) {
+            Ok(()) => {
+                evict_old_logs(&log_dir, log_config.max_days.max(1));
+                let file_appender = rolling::daily(&log_dir, "shire.log");
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(file_appender)
+                    .with_ansi(false)
+                    .try_init()
+                    .ok();
+                tracing::info!(session = %sid, command, "shire session started");
+                return sid;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not create log directory {}: {e}",
+                    log_dir.display()
+                );
+            }
+        }
     }
 
-    let log_dir = resolve_log_dir(&log_config.dir, repo_root);
-    std::fs::create_dir_all(&log_dir)?;
-
-    evict_old_logs(&log_dir, log_config.max_days.max(1));
-
-    let file_appender = rolling::daily(&log_dir, "shire.log");
-
+    // Fallback: stderr-only logging
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(file_appender)
+        .with_writer(std::io::stderr)
         .with_ansi(false)
-        .try_init().ok();
+        .try_init()
+        .ok();
 
-    tracing::info!(session = %sid, command, "shire session started");
-
-    Ok(sid)
+    sid
 }
 
 fn resolve_log_dir(dir: &str, repo_root: &Path) -> PathBuf {

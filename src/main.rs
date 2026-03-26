@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
         Commands::Build { root, force, db, config: cfg_path } => {
             let root = std::fs::canonicalize(&root)?;
             let config = config::load_config_from(cfg_path.as_deref(), &root)?;
-            let _ = logging::init(&config.log, &root, "build");
+            let _sid = logging::init(&config.log, &root, "build");
             index::build_index(&root, &config, force, db.as_deref())
         }
         Commands::Serve { root, db, config: cfg_path } => {
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
             let repo_root = root.as_ref().map(|r| std::fs::canonicalize(r)).transpose()?;
             let effective_root = repo_root.as_deref().unwrap_or(&cwd);
             let cfg = config::load_config_from(cfg_path.as_deref(), effective_root)?;
-            let _ = logging::init(&cfg.log, effective_root, "serve");
+            let _sid = logging::init(&cfg.log, effective_root, "serve");
             let db_path = if let Some(p) = db {
                 p
             } else {
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
                 watch::daemon::stop_daemon(&root)
             } else if foreground {
                 let config = config::load_config_from(cfg_path.as_deref(), &root)?;
-                let _ = logging::init(&config.log, &root, "watch");
+                let _sid = logging::init(&config.log, &root, "watch");
                 watch::run_daemon(root, config, db).await
             } else {
                 watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())

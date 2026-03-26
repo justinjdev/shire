@@ -55,13 +55,15 @@ pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> String {
         }
     }
 
-    // Fallback: stderr-only logging
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init()
-        .ok();
+    // Fallback: stderr-only logging (skip for serve — stderr may interfere with MCP stdio)
+    if command != "serve" {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init()
+            .ok();
+    }
 
     sid
 }

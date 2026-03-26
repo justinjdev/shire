@@ -1570,8 +1570,9 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
 /// Print build summary to stdout/stderr.
 fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, force: bool) {
     if !summary.failures.is_empty() {
-        tracing::warn!(count = summary.failures.len(), "manifest(s) failed to parse");
+        eprintln!("{} manifest(s) failed to parse:", summary.failures.len());
         for (path, err) in &summary.failures {
+            eprintln!("  {}: {}", path, err);
             tracing::warn!(path = %path, error = %err, "manifest parse failure");
         }
     }

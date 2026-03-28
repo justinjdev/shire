@@ -995,6 +995,31 @@ mod tests {
     }
 
     #[test]
+    fn test_search_symbols_filter_by_package_and_kind() {
+        let conn = test_db_with_symbols();
+        // Combined filter: package + kind
+        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("method"), 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "validate");
+
+        // Wrong package
+        let results = search_symbols(&conn, "validate", Some("nonexistent"), Some("method"), 20).unwrap();
+        assert!(results.is_empty());
+
+        // Wrong kind
+        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("class"), 20).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_kind_with_special_chars() {
+        let conn = test_db_with_symbols();
+        // Kind filter with quotes should not cause SQL errors
+        let result = search_symbols(&conn, "AuthService", None, Some("class\"test"), 20);
+        assert!(result.is_ok()); // shouldn't error regardless of match
+    }
+
+    #[test]
     fn test_search_symbols_empty_query() {
         let conn = test_db_with_symbols();
         let results = search_symbols(&conn, "", None, None, 20).unwrap();

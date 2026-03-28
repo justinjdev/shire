@@ -209,4 +209,32 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("lib.rs"));
     }
+
+    #[test]
+    fn test_walk_with_custom_exclude_patterns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("handler.go"), "package main").unwrap();
+        fs::write(dir.path().join("handler_mock.go"), "package main").unwrap();
+        fs::write(dir.path().join("CustomGenerated.java"), "class Foo {}").unwrap();
+        fs::write(dir.path().join("Real.java"), "class Bar {}").unwrap();
+
+        let patterns = vec!["_mock.go".to_string(), "CustomGenerated".to_string()];
+        let files = walk_source_files_with_patterns(dir.path(), &["go", "java"], &patterns).unwrap();
+        assert_eq!(files.len(), 2);
+        let names: Vec<&str> = files.iter().map(|f| f.file_name().unwrap().to_str().unwrap()).collect();
+        assert!(names.contains(&"handler.go"));
+        assert!(names.contains(&"Real.java"));
+    }
+
+    #[test]
+    fn test_walk_empty_exclude_pattern_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("main.go"), "package main").unwrap();
+        fs::write(dir.path().join("lib.go"), "package lib").unwrap();
+
+        // An empty pattern should NOT match everything
+        let patterns = vec!["".to_string()];
+        let files = walk_source_files_with_patterns(dir.path(), &["go"], &patterns).unwrap();
+        assert_eq!(files.len(), 2, "empty pattern should not filter out files");
+    }
 }

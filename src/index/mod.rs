@@ -336,45 +336,6 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
     Ok(())
 }
 
-/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
-/// Drops FTS5 triggers during the bulk operation and manually syncs FTS afterward.
-///
-/// Must be called within a transaction — if an error occurs after dropping
-/// triggers, the transaction rollback restores DB state but triggers won't
-/// be restored until the next schema creation.
-/// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
-fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    tracing::debug!(package = %package, symbols = syms.len(), "upserting symbols for package");
-
-    // 1. Drop triggers to avoid per-row FTS overhead
-    db::drop_symbols_fts_triggers(conn)?;
-
-    // 2. Manually delete old FTS entries for this package
-    conn.execute(
-        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
-         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 3. Delete old symbols
-    conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
-
-    // 4. Batch insert new symbols (no triggers fire)
-    batch_insert_symbols(conn, package, syms)?;
-
-    // 5. Manually insert FTS entries for new rows
-    conn.execute(
-        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
-         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 6. Recreate triggers
-    db::recreate_symbols_fts_triggers(conn)?;
-
-    Ok(())
-}
-
 /// Upsert symbols for a package without managing FTS triggers or FTS sync.
 /// Caller is responsible for dropping triggers before, rebuilding FTS after.
 fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {

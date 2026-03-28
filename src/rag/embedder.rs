@@ -80,6 +80,47 @@ pub fn embed_symbols(
     Ok(result)
 }
 
+pub struct FileForEmbedding {
+    pub id: i64,
+    pub file_path: String,
+    pub package: String,
+    pub symbols: Vec<(String, String)>, // (name, kind)
+}
+
+pub fn file_to_text(file: &FileForEmbedding) -> String {
+    if file.symbols.is_empty() {
+        return format!("file {} in {}", file.file_path, file.package);
+    }
+    let symbol_list: String = file
+        .symbols
+        .iter()
+        .take(50) // cap to avoid exceeding token limits
+        .map(|(name, kind)| format!("{kind} {name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{} in {} — {}", file.file_path, file.package, symbol_list)
+}
+
+pub fn embed_files(
+    embedder: &Embedder,
+    files: &[FileForEmbedding],
+) -> Result<Vec<(i64, Vec<f32>)>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let texts: Vec<String> = files.iter().map(file_to_text).collect();
+    let embeddings = embedder.embed(texts)?;
+
+    let result: Vec<(i64, Vec<f32>)> = files
+        .iter()
+        .zip(embeddings)
+        .map(|(file, emb)| (file.id, emb))
+        .collect();
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1128,10 +1128,9 @@ fn phase_extract_symbols(
     }
 
     // Rebuild FTS index in bulk (much faster than per-package FTS sync)
-    conn.execute("DELETE FROM symbols_fts", [])?;
+    conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('delete-all')", [])?;
     conn.execute(
-        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
-         SELECT rowid, name, kind, signature, file_path FROM symbols",
+        "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
         [],
     )?;
 

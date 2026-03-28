@@ -375,28 +375,14 @@ fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]
     Ok(())
 }
 
-/// Upsert symbols for a package without managing FTS triggers.
-/// Caller is responsible for dropping triggers before and recreating after.
+/// Upsert symbols for a package without managing FTS triggers or FTS sync.
+/// Caller is responsible for dropping triggers before, rebuilding FTS after.
 fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    // Delete old FTS entries for this package
-    conn.execute(
-        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
-         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // Delete old symbols
+    // Delete old symbols (FTS entries will be rebuilt in bulk later)
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
 
     // Batch insert new symbols (no triggers fire)
     batch_insert_symbols(conn, package, syms)?;
-
-    // Insert FTS entries for new rows
-    conn.execute(
-        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
-         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
 
     Ok(())
 }
@@ -1140,6 +1126,14 @@ fn phase_extract_symbols(
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
+
+    // Rebuild FTS index in bulk (much faster than per-package FTS sync)
+    conn.execute("DELETE FROM symbols_fts", [])?;
+    conn.execute(
+        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+         SELECT rowid, name, kind, signature, file_path FROM symbols",
+        [],
+    )?;
 
     // Recreate FTS triggers after all packages processed
     db::recreate_symbols_fts_triggers(conn)?;

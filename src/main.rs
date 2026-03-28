@@ -2,17 +2,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod config;
-mod db;
-mod git;
-mod index;
-mod init;
-mod install;
-mod logging;
-mod mcp;
-mod rag;
-mod symbols;
-mod watch;
+use shire::config;
+use shire::index;
+use shire::init;
+use shire::install;
+use shire::logging;
+use shire::mcp;
+use shire::rag;
+use shire::watch;
 
 #[derive(Parser)]
 #[command(name = "shire", about = "Monorepo package index and MCP server")]

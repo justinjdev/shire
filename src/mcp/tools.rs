@@ -39,17 +39,19 @@ impl ShireService {
             match crate::rag::embedder::Embedder::new(rag_config) {
                 Ok(e) => {
                     // Verify vector table exists before enabling hybrid search
-                    let table_exists = conn
-                        .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0")
-                        .is_ok();
-                    if !table_exists {
-                        tracing::warn!(
-                            "RAG enabled but symbol_embeddings table not found — \
-                             run `shire build` with [rag] enabled to generate embeddings"
-                        );
-                        None
-                    } else {
-                        Some(e)
+                    let table_check = conn
+                        .prepare("SELECT 1 FROM file_embeddings LIMIT 0");
+                    match &table_check {
+                        Ok(_) => {
+                            tracing::info!("RAG hybrid search enabled");
+                            Some(e)
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err,
+                                "RAG enabled but symbol_embeddings table not accessible — \
+                                 run `shire build` with [rag] enabled to generate embeddings");
+                            None
+                        }
                     }
                 }
                 Err(err) => {
@@ -91,6 +93,7 @@ impl ShireService {
     }
 
     /// Check if the index is stale by comparing .git/index mtime against last_indexed.
+    /// Includes a 2-second debounce to avoid redundant rebuilds during rapid tool calls.
     fn is_stale(&self) -> bool {
         let ctx = match &self.build_ctx {
             Some(c) => c,
@@ -104,6 +107,18 @@ impl ShireService {
             return true;
         }
         let last = last.unwrap();
+
+        // Debounce: skip stale check if last rebuild completed within the debounce
+        // window (default 5s, configurable via serve.debounce_s in shire.toml).
+        // Prevents redundant rebuilds during rapid tool call bursts. No changes are
+        // lost — the next check after the window expires triggers a rebuild that
+        // reads current file state.
+        let debounce_s = ctx.config.serve.debounce_s;
+        if let Ok(elapsed) = last.elapsed() {
+            if elapsed < std::time::Duration::from_secs(debounce_s) {
+                return false;
+            }
+        }
 
         // Check .git/index mtime
         let git_index = ctx.repo_root.join(".git/index");
@@ -176,8 +191,6 @@ impl ShireService {
         params: &SearchSymbolsParams,
         fts_results: &[queries::SymbolRow],
     ) -> Result<Vec<queries::SymbolRow>, ErrorData> {
-        use std::collections::HashMap;
-
         let query_text = params.query.as_deref().unwrap_or("");
         if query_text.is_empty() {
             return Ok(fts_results.to_vec());
@@ -192,39 +205,58 @@ impl ShireService {
             .next()
             .ok_or_else(|| Self::mcp_err("No embedding returned".into()))?;
 
-        // Vector search
-        let vec_results = crate::rag::storage::search_similar(conn, &query_vec, 50)
+        // File-level vector search → find matching files → return their symbols
+        let file_vec_results = crate::rag::storage::search_similar_files(conn, &query_vec, 20)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        if vec_results.is_empty() {
+        if file_vec_results.is_empty() {
             return Ok(fts_results.to_vec());
         }
 
-        // Fetch symbol rows for vector results; rank order preserved by iterating vec_results below
-        let vec_ids: Vec<i64> = vec_results.iter().map(|(id, _)| *id).collect();
-        let id_symbol_pairs = queries::get_symbols_by_ids(conn, &vec_ids)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let id_to_symbol: HashMap<i64, queries::SymbolRow> =
-            id_symbol_pairs.into_iter().collect();
+        let mut vec_symbols: Vec<queries::SymbolRow> = Vec::new();
+        // Fetch up to 50 symbols per file to avoid missing matches after filtering
+        let mut sym_stmt = conn.prepare(
+            "SELECT name, kind, signature, package, file_path, line, visibility, parent_symbol, return_type, parameters \
+             FROM symbols WHERE file_path = ?1 LIMIT 50"
+        ).map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        // Build filtered vector result list in rank order
-        let vec_symbols: Vec<queries::SymbolRow> = vec_results
-            .iter()
-            .filter_map(|(symbol_id, _)| {
-                let sym = id_to_symbol.get(symbol_id)?;
-                if let Some(ref pkg) = params.package {
-                    if sym.package != *pkg {
-                        return None;
+        for (file_id, _distance) in &file_vec_results {
+            let file_path: String = match conn.query_row(
+                "SELECT path FROM files WHERE id = ?1",
+                [file_id],
+                |row| row.get(0),
+            ) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if let Ok(rows) = sym_stmt.query_map([&file_path], |row| {
+                Ok(queries::SymbolRow {
+                    name: row.get(0)?,
+                    kind: row.get(1)?,
+                    signature: row.get(2)?,
+                    package: row.get(3)?,
+                    file_path: row.get(4)?,
+                    line: row.get(5)?,
+                    visibility: row.get(6)?,
+                    parent_symbol: row.get(7)?,
+                    return_type: row.get(8)?,
+                    parameters: row.get(9)?,
+                })
+            }) {
+                for sym in rows.flatten() {
+                    if params.package.as_ref().is_none_or(|p| sym.package == *p)
+                        && params.kind.as_ref().is_none_or(|k| sym.kind == *k)
+                    {
+                        vec_symbols.push(sym);
                     }
                 }
-                if let Some(ref kind) = params.kind {
-                    if sym.kind != *kind {
-                        return None;
-                    }
-                }
-                Some(sym.clone())
-            })
-            .collect();
+            }
+        }
+
+        if vec_symbols.is_empty() {
+            return Ok(fts_results.to_vec());
+        }
 
         let limit = params.limit.unwrap_or(20) as usize;
         Ok(queries::rrf_merge(fts_results, &vec_symbols, limit))

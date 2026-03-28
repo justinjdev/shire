@@ -67,17 +67,21 @@ pub fn search_symbols(
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
     let limit = limit.min(200) as i64;
 
+    // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
+    // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
-        (Some(pkg), Some(kind)) => (
+        (Some(pkg), Some(kind)) => {
+            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+            (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
-             WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
+             WHERE symbols_fts MATCH ?1 AND s.package = ?2
              ORDER BY rank
-             LIMIT ?4",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string()), Box::new(limit)],
-        ),
+             LIMIT ?3",
+            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
+        )},
         (Some(pkg), None) => (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -88,16 +92,18 @@ pub fn search_symbols(
              LIMIT ?3",
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
         ),
-        (None, Some(kind)) => (
+        (None, Some(kind)) => {
+            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+            (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
-             WHERE symbols_fts MATCH ?1 AND s.kind = ?2
+             WHERE symbols_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?3",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string()), Box::new(limit)],
-        ),
+             LIMIT ?2",
+            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
+        )},
         (None, None) => (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -986,6 +992,31 @@ mod tests {
 
         let results = search_symbols(&conn, "AuthService", None, Some("function"), 20).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_filter_by_package_and_kind() {
+        let conn = test_db_with_symbols();
+        // Combined filter: package + kind
+        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("method"), 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "validate");
+
+        // Wrong package
+        let results = search_symbols(&conn, "validate", Some("nonexistent"), Some("method"), 20).unwrap();
+        assert!(results.is_empty());
+
+        // Wrong kind
+        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("class"), 20).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_kind_with_special_chars() {
+        let conn = test_db_with_symbols();
+        // Kind filter with quotes should not cause SQL errors
+        let result = search_symbols(&conn, "AuthService", None, Some("class\"test"), 20);
+        assert!(result.is_ok()); // shouldn't error regardless of match
     }
 
     #[test]

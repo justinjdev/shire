@@ -23,12 +23,16 @@ pub fn load_extension() -> Result<()> {
     Ok(())
 }
 
-/// Create the vec0 virtual table for symbol embeddings (384-dim, cosine distance)
-/// if it doesn't exist.
+/// Create the vec0 virtual tables for embeddings (384-dim, cosine distance)
+/// if they don't exist.
 pub fn init_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS symbol_embeddings USING vec0(
             symbol_id INTEGER PRIMARY KEY,
+            embedding float[{EMBEDDING_DIM}] distance_metric=cosine
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS file_embeddings USING vec0(
+            file_id INTEGER PRIMARY KEY,
             embedding float[{EMBEDDING_DIM}] distance_metric=cosine
         );"
     ))?;
@@ -69,6 +73,51 @@ pub fn delete_embeddings_for_symbols(conn: &Connection, symbol_ids: &[i64]) -> R
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Insert file embeddings within a transaction.
+/// Each entry is a (file_id, embedding_vector) pair.
+pub fn insert_file_embeddings(conn: &Connection, embeddings: &[(i64, Vec<f32>)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO file_embeddings (file_id, embedding) VALUES (?1, ?2)",
+        )?;
+        for (file_id, embedding) in embeddings {
+            if embedding.len() != EMBEDDING_DIM {
+                anyhow::bail!(
+                    "Embedding dimension mismatch for file {file_id}: expected {EMBEDDING_DIM}, got {}",
+                    embedding.len()
+                );
+            }
+            let bytes: &[u8] = embedding.as_slice().as_bytes();
+            stmt.execute(rusqlite::params![file_id, bytes])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Search for the most similar file embeddings using KNN cosine distance.
+/// Returns a list of (file_id, distance) pairs ordered by distance ascending.
+pub fn search_similar_files(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let bytes: &[u8] = query_embedding.as_bytes();
+    let mut stmt = conn.prepare(
+        "SELECT file_id, distance FROM file_embeddings
+         WHERE embedding MATCH ?1
+         ORDER BY distance
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![bytes, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Search for the most similar embeddings using KNN cosine distance.

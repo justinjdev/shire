@@ -8,6 +8,11 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // Set auto_vacuum before schema creation (must be set on empty DB)
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
+    if page_count <= 1 {
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+    }
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA foreign_keys=ON;

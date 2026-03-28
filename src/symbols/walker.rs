@@ -16,14 +16,29 @@ const EXCLUDED_DIRS: &[&str] = &[
 ];
 
 const SKIP_SUFFIXES: &[&str] = &[
+    // Go
+    ".generated.go",
+    "_generated.go",
+    ".pb.go",
+    ".gen.go",
+    "_test.go",
+    // TypeScript/JavaScript
     ".generated.ts",
     ".generated.js",
-    ".pb.go",
-    "_test.go",
     ".d.ts",
+    // Python (protobuf)
+    "_pb2.py",
+    "_pb2_grpc.py",
+    // C/C++ (protobuf)
+    ".pb.h",
+    ".pb.cc",
+    // Java
+    "Generated.java",
 ];
 
-const SKIP_FILES: &[&str] = &["build.rs"];
+const SKIP_PREFIXES: &[&str] = &["zz_generated."];
+
+const SKIP_FILES: &[&str] = &["build.rs", "deepcopy_generated.go"];
 
 /// Return ALL registered source file extensions (the union of all languages).
 pub fn all_extensions() -> Vec<&'static str> {
@@ -49,7 +64,13 @@ pub fn all_extensions() -> Vec<&'static str> {
 
 /// Walk a directory and collect source files matching the given extensions,
 /// skipping excluded directories and generated/test files.
+/// `extra_skip_patterns` are user-configured patterns from shire.toml
+/// (matched as suffix or prefix against the filename).
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    walk_source_files_with_patterns(dir, extensions, &[])
+}
+
+pub fn walk_source_files_with_patterns(dir: &Path, extensions: &[&str], extra_skip_patterns: &[String]) -> Result<Vec<PathBuf>> {
     let ext_set: HashSet<&str> = extensions.iter().copied().collect();
     let exclude_set: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
 
@@ -95,6 +116,17 @@ pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>
         }
 
         if SKIP_SUFFIXES.iter().any(|suffix| filename.ends_with(suffix)) {
+            continue;
+        }
+
+        if SKIP_PREFIXES.iter().any(|prefix| filename.starts_with(prefix)) {
+            continue;
+        }
+
+        // User-configured skip patterns (suffix or prefix match, ignore blanks)
+        if extra_skip_patterns.iter().any(|pat| {
+            !pat.is_empty() && (filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str()))
+        }) {
             continue;
         }
 
@@ -176,5 +208,33 @@ mod tests {
         let files = walk_source_files(dir.path(), &["rs"]).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("lib.rs"));
+    }
+
+    #[test]
+    fn test_walk_with_custom_exclude_patterns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("handler.go"), "package main").unwrap();
+        fs::write(dir.path().join("handler_mock.go"), "package main").unwrap();
+        fs::write(dir.path().join("CustomGenerated.java"), "class Foo {}").unwrap();
+        fs::write(dir.path().join("Real.java"), "class Bar {}").unwrap();
+
+        let patterns = vec!["_mock.go".to_string(), "CustomGenerated".to_string()];
+        let files = walk_source_files_with_patterns(dir.path(), &["go", "java"], &patterns).unwrap();
+        assert_eq!(files.len(), 2);
+        let names: Vec<&str> = files.iter().map(|f| f.file_name().unwrap().to_str().unwrap()).collect();
+        assert!(names.contains(&"handler.go"));
+        assert!(names.contains(&"Real.java"));
+    }
+
+    #[test]
+    fn test_walk_empty_exclude_pattern_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("main.go"), "package main").unwrap();
+        fs::write(dir.path().join("lib.go"), "package lib").unwrap();
+
+        // An empty pattern should NOT match everything
+        let patterns = vec!["".to_string()];
+        let files = walk_source_files_with_patterns(dir.path(), &["go"], &patterns).unwrap();
+        assert_eq!(files.len(), 2, "empty pattern should not filter out files");
     }
 }

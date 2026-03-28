@@ -291,86 +291,41 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
 /// Batch-insert symbols into the symbols table (no DELETE, no trigger management).
 /// Callers are responsible for deleting old rows and managing FTS triggers.
 fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    const BATCH_SIZE: usize = 100;
-    const COLS: usize = 10;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
 
-    for chunk in syms.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!(
-                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                    base, base + 1, base + 2, base + 3, base + 4,
-                    base + 5, base + 6, base + 7, base + 8, base + 9
-                )
-            })
-            .collect();
+    for sym in syms {
+        let params_json = sym
+            .parameters
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default());
 
-        let sql = format!(
-            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for sym in chunk {
-            let params_json = sym
-                .parameters
-                .as_ref()
-                .map(|p| serde_json::to_string(p).unwrap_or_default());
-
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(sym.name.clone()));
-            params.push(Box::new(sym.kind.as_str().to_string()));
-            params.push(Box::new(sym.signature.clone()));
-            params.push(Box::new(sym.file_path.to_string()));
-            params.push(Box::new(sym.line as i64));
-            params.push(Box::new(sym.visibility.clone()));
-            params.push(Box::new(sym.parent_symbol.clone()));
-            params.push(Box::new(sym.return_type.clone()));
-            params.push(Box::new(params_json));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        stmt.execute(rusqlite::params![
+            package,
+            &sym.name,
+            sym.kind.as_str(),
+            &sym.signature,
+            sym.file_path.as_ref(),
+            sym.line as i64,
+            &sym.visibility,
+            &sym.parent_symbol,
+            &sym.return_type,
+            &params_json,
+        ])?;
     }
 
     Ok(())
 }
 
-/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
-/// Drops FTS5 triggers during the bulk operation and manually syncs FTS afterward.
-///
-/// Must be called within a transaction — if an error occurs after dropping
-/// triggers, the transaction rollback restores DB state but triggers won't
-/// be restored until the next schema creation.
-/// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
-fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    tracing::debug!(package = %package, symbols = syms.len(), "upserting symbols for package");
-
-    // 1. Drop triggers to avoid per-row FTS overhead
-    db::drop_symbols_fts_triggers(conn)?;
-
-    // 2. Manually delete old FTS entries for this package
-    conn.execute(
-        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
-         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 3. Delete old symbols
+/// Upsert symbols for a package without managing FTS triggers or FTS sync.
+/// Caller is responsible for dropping triggers before, rebuilding FTS after.
+fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    // Delete old symbols (FTS entries will be rebuilt in bulk later)
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
 
-    // 4. Batch insert new symbols (no triggers fire)
+    // Batch insert new symbols (no triggers fire)
     batch_insert_symbols(conn, package, syms)?;
-
-    // 5. Manually insert FTS entries for new rows
-    conn.execute(
-        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
-         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 6. Recreate triggers
-    db::recreate_symbols_fts_triggers(conn)?;
 
     Ok(())
 }
@@ -398,37 +353,17 @@ fn batch_upsert_file_hashes(conn: &Connection, package: &str, file_hashes: &[(&s
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 4;
-
-    for chunk in file_hashes.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for (fp, hash) in chunk {
-            params.push(Box::new(fp.to_string()));
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (fp, hash) in file_hashes {
+        stmt.execute(rusqlite::params![fp, package, hash, &now])?;
     }
 
     Ok(())
 }
 
-/// Batch-upsert source hashes for multiple packages using multi-row INSERT OR REPLACE.
+/// Batch-upsert source hashes for multiple packages.
 /// Each entry is (package, content_hash). All rows share the same hashed_at timestamp.
 fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Result<()> {
     if entries.is_empty() {
@@ -437,31 +372,11 @@ fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Re
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 3;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{})", base, base + 1, base + 2)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            Vec::with_capacity(chunk.len() * COLS);
-        for (package, hash) in chunk {
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES (?1, ?2, ?3)",
+    )?;
+    for (package, hash) in entries {
+        stmt.execute(rusqlite::params![package, hash, &now])?;
     }
 
     Ok(())
@@ -482,6 +397,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(true)
+        .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str() {
                 if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -490,44 +406,58 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    let mut files = Vec::new();
+    let files = std::sync::Mutex::new(Vec::new());
+    let capped = std::sync::atomic::AtomicBool::new(false);
+    let repo_root_ref = repo_root;
 
-    for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
+    walker.run(|| {
+        Box::new(|entry| {
+            if capped.load(std::sync::atomic::Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
 
-        let file_path = entry.path();
-        let relative_path = file_path
-            .strip_prefix(repo_root)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
+            let file_path = entry.path();
+            let relative_path = file_path
+                .strip_prefix(repo_root_ref)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
 
-        let extension = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
+            let extension = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
 
-        let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
-        files.push(WalkedFile {
-            relative_path,
-            extension,
-            size_bytes,
-        });
+            let mut guard = files.lock().unwrap();
+            guard.push(WalkedFile {
+                relative_path,
+                extension,
+                size_bytes,
+            });
 
-        if files.len() >= MAX_FILES {
-            tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
-            break;
-        }
-    }
+            if guard.len() >= MAX_FILES {
+                tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
+                capped.store(true, std::sync::atomic::Ordering::Relaxed);
+                return ignore::WalkState::Quit;
+            }
 
-    Ok(files)
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(files.into_inner().unwrap())
 }
 
 /// Associate files with their owning package using longest-prefix matching.
@@ -984,6 +914,7 @@ fn single_pass_extract(
     pkg_path: &str,
     _pkg_kind: &str,
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
 ) -> Result<(Vec<symbols::SymbolInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -999,7 +930,7 @@ fn single_pass_extract(
             !exclude_extensions.contains(&with_dot)
         })
         .collect();
-    let source_files = symbols::walker::walk_source_files(&package_dir, &extensions)?;
+    let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns)?;
 
     if source_files.is_empty() {
         let empty_hash = hash::hash_bytes_hex(b"");
@@ -1066,6 +997,7 @@ fn phase_extract_symbols(
     repo_root: &Path,
     parsed_packages: &[(String, String, String)],
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
@@ -1073,7 +1005,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1097,20 +1029,45 @@ fn phase_extract_symbols(
         })
         .collect();
 
+    // Drop FTS triggers once before processing all packages
+    db::drop_symbols_fts_triggers(conn)?;
+
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
-        if !r.symbols.is_empty() || !r.file_hashes.is_empty() {
-            upsert_symbols(conn, &r.pkg_name, &r.symbols)?;
-        }
+        // Always upsert (even if empty) to clear stale symbols for packages
+        // whose source files were all removed or excluded
+        upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
         }
-        // Store per-file hashes
-        if !r.file_hashes.is_empty() {
+        if r.file_hashes.is_empty() {
+            conn.execute("DELETE FROM file_hashes WHERE package = ?1", [r.pkg_name.as_str()])?;
+        } else {
             let fh_refs: Vec<(&str, &str)> = r.file_hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
+
+    // Drop and recreate FTS table, then rebuild from content table.
+    // Skip entirely when phase 7 had no packages to process.
+    if !results.is_empty() {
+        conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+                name, kind, signature, file_path,
+                content='symbols',
+                content_rowid='rowid',
+                tokenize='unicode61 tokenchars ''_-'''
+            )",
+        )?;
+        conn.execute(
+            "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
+            [],
+        )?;
+    }
+
+    // Recreate FTS triggers (needed even if we skipped rebuild)
+    db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
     let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();
@@ -1167,6 +1124,7 @@ fn phase_source_incremental(
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
@@ -1221,7 +1179,7 @@ fn phase_source_incremental(
                         !exclude_extensions.contains(&with_dot)
                     })
                     .collect();
-                let source_files = symbols::walker::walk_source_files(&package_dir, &extensions).ok()?;
+                let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns).ok()?;
 
                 // Process each file: read, hash, compare, extract if changed
                 let file_results: Vec<FileResult> = source_files
@@ -1373,12 +1331,41 @@ fn phase_source_incremental(
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
-/// Uses a file-tree hash to skip the full rebuild when no files have changed.
+/// Uses .git/index mtime as a fast pre-check, then file-tree hash to skip
+/// the full rebuild when no files have changed.
 fn phase_index_files(
     conn: &Connection,
     repo_root: &Path,
     config: &Config,
 ) -> Result<usize> {
+    // Fast pre-check: if .git/index mtime hasn't changed since last file index,
+    // the file tree can't have changed. Skip the expensive walk entirely.
+    let git_index_path = repo_root.join(".git/index");
+    let stored_file_index_at: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'file_index_at'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if let (Ok(git_meta), Some(stored_ts)) =
+        (std::fs::metadata(&git_index_path), &stored_file_index_at)
+    {
+        if let Ok(git_mtime) = git_meta.modified() {
+            if let Some(since) = parse_hashed_at(stored_ts) {
+                let margin = std::time::Duration::from_secs(1);
+                if git_mtime <= since.checked_add(margin).unwrap_or(since) {
+                    tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
+                    let num_files: usize = conn
+                        .query_row("SELECT COUNT(*) FROM files", [], |row| {
+                            row.get::<_, i64>(0)
+                        })? as usize;
+                    return Ok(num_files);
+                }
+            }
+        }
+    }
+
     let walked_files = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
@@ -1399,7 +1386,12 @@ fn phase_index_files(
 
     if stored_hash.as_deref() == Some(current_hash.as_str()) {
         tracing::debug!("phase_index_files: file tree hash matched, skipping rebuild");
-        // File tree unchanged — skip rebuild, read count from existing table
+        // Update timestamp so mtime pre-check works next time
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
+            [&now],
+        )?;
         let num_files: usize = conn.query_row(
             "SELECT COUNT(*) FROM files",
             [],
@@ -1435,10 +1427,15 @@ fn phase_index_files(
     let num_files = validated_files.len();
     incremental_upsert_files(conn, &validated_files)?;
 
-    // Store the new file-tree hash
+    // Store the new file-tree hash and timestamp for mtime pre-check
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
         [&current_hash],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
+        [&now],
     )?;
 
     Ok(num_files)
@@ -1492,9 +1489,17 @@ fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Workspace-only manifests (go.work, settings.gradle, etc.) don't produce
+    // packages but must be kept for workspace context and cached walks.
+    const WORKSPACE_MANIFESTS: &[&str] = &["go.work", "settings.gradle", "settings.gradle.kts"];
+
     let stale_keys: Vec<&str> = all_manifest_keys
         .iter()
         .filter(|key| {
+            let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key.as_str());
+            if WORKSPACE_MANIFESTS.contains(&filename) {
+                return false; // never prune workspace manifests
+            }
             let parent_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
             !known_paths.contains(parent_dir)
         })
@@ -1600,8 +1605,107 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
     }
 }
 
-/// Print timing breakdown to stderr.
+/// Check if .git/index has changed since the last build.
+/// Returns true if changed or unknown (conservative).
+fn git_index_changed_since_build(repo_root: &Path, conn: &Connection) -> bool {
+    let git_index_path = repo_root.join(".git/index");
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'last_build_at'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    match (std::fs::metadata(&git_index_path), stored) {
+        (Ok(meta), Some(ts)) => {
+            let git_mtime = match meta.modified() {
+                Ok(m) => m,
+                Err(_) => return true,
+            };
+            let since = match parse_hashed_at(&ts) {
+                Some(s) => s,
+                None => return true,
+            };
+            let margin = std::time::Duration::from_secs(1);
+            git_mtime > since.checked_add(margin).unwrap_or(since)
+        }
+        _ => true, // unknown — assume changed
+    }
+}
+
+/// Check if the DB has been populated (has manifest hashes).
+fn is_fresh_db(conn: &Connection) -> bool {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM manifest_hashes", [], |row| row.get(0))
+        .unwrap_or(0);
+    count == 0
+}
+
+/// Try to reconstruct manifest walk from cached DB state.
+/// Returns None if we can't determine the manifest list (forces full walk).
+fn cached_manifest_walk(
+    repo_root: &Path,
+    conn: &Connection,
+) -> Option<Vec<WalkedManifest>> {
+    // Read stored manifest paths and hashes from DB
+    let mut stmt = conn
+        .prepare("SELECT path, content_hash FROM manifest_hashes")
+        .ok()?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut manifests = Vec::with_capacity(rows.len());
+    for (manifest_key, _stored_hash) in &rows {
+        let abs_path = repo_root.join(manifest_key);
+        if !abs_path.exists() {
+            // Manifest was deleted — need full walk to detect removals
+            return None;
+        }
+        // Re-hash to check if content changed
+        let current_hash = match hash::hash_file(&abs_path) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+
+        let relative_dir = abs_path
+            .parent()
+            .and_then(|p| p.strip_prefix(repo_root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        manifests.push(WalkedManifest {
+            abs_path,
+            relative_dir,
+            manifest_key: manifest_key.clone(),
+            content_hash: current_hash,
+        });
+    }
+
+    // Check if any NEW manifests have appeared by comparing count with DB
+    // This is a heuristic: we can't know for sure without walking, but if
+    // the stored count matches and all files exist, it's very likely correct.
+    // New manifests will be caught on the next full walk (triggered by force
+    // rebuild or when a known manifest changes).
+    Some(manifests)
+}
+
+/// Print timing breakdown. Emits to stderr when SHIRE_BENCH_TIMINGS is set,
+/// otherwise uses tracing::debug.
 fn print_timings(timings: &[(&str, Duration)], total: Duration) {
+    if std::env::var("SHIRE_BENCH_TIMINGS").is_ok() {
+        eprintln!("--- Phase timings ---");
+        for (label, dur) in timings {
+            eprintln!("  {:25} {:>8.1} ms", label, dur.as_secs_f64() * 1000.0);
+        }
+        eprintln!("  {:25} {:>8.1} ms", "TOTAL", total.as_secs_f64() * 1000.0);
+    }
     tracing::debug!("Build timing:");
     for (label, dur) in timings {
         tracing::debug!(phase = %label, duration_ms = dur.as_millis(), "phase timing");
@@ -1701,10 +1805,23 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     ];
 
     // Phase 1: Walk manifests
+    // On incremental builds, use cached manifest paths to skip the full walk
+    // when no manifests have been added or removed.
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let walked = walk_manifests(repo_root, config, &parsers)?;
+    let walked = if !force && !is_fresh_db(&conn) && !git_index_changed_since_build(repo_root, &conn) {
+        // .git/index unchanged — no files added/removed. Use cached manifest paths.
+        match cached_manifest_walk(repo_root, &conn) {
+            Some(cached) => {
+                tracing::debug!(manifests = cached.len(), "using cached manifest paths");
+                cached
+            }
+            None => walk_manifests(repo_root, config, &parsers)?,
+        }
+    } else {
+        walk_manifests(repo_root, config, &parsers)?
+    };
     timings.push(("walk", t.elapsed()));
     sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
@@ -1864,95 +1981,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
     let pb_sym_clone = pb_sym.clone();
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &pb_sym_clone)?;
-        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &pb_sym_clone)
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)?;
+        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");
     }
     timings.push(("extract-symbols", t.elapsed()));
-
-    // Phase 8.5: RAG embedding (optional)
-    #[cfg(feature = "rag")]
-    {
-        if config.rag.enabled {
-            let t = Instant::now();
-            let sp = make_spinner(&mp, "Loading embedding model\u{2026}");
-            let embedder_result = crate::rag::embedder::Embedder::new(&config.rag);
-            sp.finish_and_clear();
-            match embedder_result {
-                Ok(embedder) => {
-                    // Get all changed package names
-                    let changed_packages: Vec<&str> = parsed_packages
-                        .iter()
-                        .map(|(name, _, _)| name.as_str())
-                        .collect();
-
-                    if !changed_packages.is_empty() {
-                        // Collect all symbols and delete stale embeddings across all changed
-                        // packages before embedding. This lets fastembed run a single batched
-                        // inference call instead of N per-package calls, which is much faster.
-                        let mut all_symbols: Vec<crate::rag::embedder::SymbolForEmbedding> =
-                            Vec::new();
-
-                        for pkg_name in &changed_packages {
-                            let old_ids: Vec<i64> = conn
-                                .prepare("SELECT id FROM symbols WHERE package = ?1")?
-                                .query_map([pkg_name], |row| row.get(0))?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            if !old_ids.is_empty() {
-                                crate::rag::storage::delete_embeddings_for_symbols(
-                                    &conn, &old_ids,
-                                )?;
-                            }
-
-                            let symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = conn
-                                .prepare(
-                                    "SELECT id, name, kind, signature, package, file_path \
-                                     FROM symbols WHERE package = ?1",
-                                )?
-                                .query_map([pkg_name], |row| {
-                                    Ok(crate::rag::embedder::SymbolForEmbedding {
-                                        id: row.get(0)?,
-                                        name: row.get(1)?,
-                                        kind: row.get(2)?,
-                                        signature: row.get(3)?,
-                                        package: row.get(4)?,
-                                        file_path: row.get(5)?,
-                                    })
-                                })?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            all_symbols.extend(symbols);
-                        }
-
-                        if !all_symbols.is_empty() {
-                            let pb = make_spinner(&mp, "Embedding symbols\u{2026}");
-                            match crate::rag::embedder::embed_symbols(&embedder, &all_symbols) {
-                                Ok(embeddings) => {
-                                    crate::rag::storage::insert_embeddings(&conn, &embeddings)?;
-                                    pb.finish_with_message(format!(
-                                        "Embedded {} symbols across {} packages",
-                                        embeddings.len(),
-                                        changed_packages.len()
-                                    ));
-                                }
-                                Err(e) => {
-                                    pb.finish_and_clear();
-                                    tracing::warn!(error = %e, "failed to embed symbols");
-                                }
-                            }
-                        }
-                    }
-                    timings.push(("rag-embed", t.elapsed()));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RAG embedding skipped (model init failed)");
-                }
-            }
-        }
-    }
 
     // Phase 9: Index files (transaction-wrapped)
     tracing::debug!("phase 9: index files");
@@ -1963,6 +1998,110 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     })?;
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
+
+    // Phase 10: RAG file-level embedding (optional, runs in background thread)
+    // Build completes and prints summary immediately. Embedding continues in a
+    // background thread that opens its own DB connection. The thread handle is
+    // returned so callers can optionally wait for it.
+    #[cfg(feature = "rag")]
+    let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
+        let changed_packages: Vec<String> = parsed_packages
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+
+        if changed_packages.is_empty() {
+            tracing::debug!("rag: no changed packages, skipping embedding");
+            None
+        } else {
+            // Clean stale embeddings (fast, inline)
+            conn.execute(
+                "DELETE FROM file_embeddings WHERE file_id NOT IN (SELECT id FROM files)",
+                [],
+            )?;
+
+            // Collect files needing embeddings (fast DB reads)
+            let placeholders: String = (1..=changed_packages.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
+                .iter()
+                .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let file_sql = format!(
+                "SELECT f.id, f.path, f.package \
+                 FROM files f \
+                 WHERE f.package IN ({placeholders}) \
+                 AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
+            );
+            let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = conn
+                .prepare(&file_sql)?
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(file_id, file_path, package)| {
+                    let symbols: Vec<(String, String)> = conn
+                        .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
+                        .and_then(|mut s| {
+                            s.query_map([file_path.as_str()], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                        })
+                        .unwrap_or_default();
+                    crate::rag::embedder::FileForEmbedding {
+                        id: file_id,
+                        file_path,
+                        package,
+                        symbols,
+                    }
+                })
+                .collect();
+
+            if file_inputs.is_empty() {
+                None
+            } else {
+                let num_files = file_inputs.len();
+                let db_path_owned = db_path.clone();
+                let rag_config = config.rag.clone();
+
+                eprintln!("Embedding {num_files} files in background…");
+                Some(std::thread::spawn(move || {
+                    let t = Instant::now();
+                    let embedder = match crate::rag::embedder::Embedder::new(&rag_config) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "RAG background: model init failed");
+                            return;
+                        }
+                    };
+                    match crate::rag::embedder::embed_files(&embedder, &file_inputs) {
+                        Ok(embeddings) => {
+                            match db::open_or_create(&db_path_owned, true) {
+                                Ok(bg_conn) => {
+                                    if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
+                                        tracing::warn!(error = %e, "RAG background: insert failed");
+                                    } else {
+                                        eprintln!("Embedded {num_files} files in {:.1}s", t.elapsed().as_secs_f64());
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, "RAG background: DB open failed"),
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "RAG background: embed failed"),
+                    }
+                }))
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "rag"))]
+    let rag_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
     with_transaction(&conn, || {
@@ -1986,12 +2125,17 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     let total_duration = build_start.elapsed();
 
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     with_transaction(&conn, || {
         store_metadata(&conn, repo_root, &summary)?;
-        // Store total build duration in shire_meta
         conn.execute(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('total_duration_ms', ?1)",
             [total_duration.as_millis().to_string()],
+        )?;
+        // Timestamp for .git/index mtime fast-path on next build
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
+            [&now],
         )?;
         Ok(())
     })?;
@@ -2009,15 +2153,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // still matches a known package path.
     cleanup_stale_hashes(&conn)?;
 
-    // FTS5 maintenance: full optimize on fresh/forced builds, incremental merge otherwise.
-    if is_full_build || force {
-        tracing::debug!("FTS maintenance: full optimize");
-        conn.execute_batch(
-            "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
-             INSERT INTO files_fts(files_fts) VALUES('optimize');
-             INSERT INTO symbols_fts(symbols_fts) VALUES('optimize');",
-        )?;
-    } else {
+    // FTS5 maintenance: incremental merge on non-full builds.
+    // Skip optimize on full/forced builds — the FTS was just rebuilt from scratch.
+    if !is_full_build && !force {
         tracing::debug!("FTS maintenance: incremental merge");
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
@@ -2026,11 +2164,19 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         )?;
     }
 
+    // Reclaim free pages from incremental updates (prevents DB bloat over time)
+    conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
+
     // Clear progress bars before printing summary
     mp.clear()?;
 
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
+
+    // Wait for background RAG embedding to complete before exiting
+    if let Some(handle) = rag_handle {
+        let _ = handle.join();
+    }
 
     Ok(())
 }

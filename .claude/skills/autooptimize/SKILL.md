@@ -25,15 +25,17 @@ You are an autonomous performance optimization agent. Your job is to make shire 
    cargo build --release --bin autoresearch 2>&1 | tail -5
    ```
 
-4. Establish baseline — run the build benchmark 3 times, take the median as baseline:
+4. Establish baseline — run build benchmarks across all repo sizes:
    ```bash
    cargo run --release --bin autoresearch -- --phase build
    ```
-   Record the output JSON. This is your baseline. Save it mentally — you will compare every experiment against it.
+   This runs against all repos in `~/.cache/shire-bench/` (small/medium/large).
+   You can filter with `--size small|medium|large` or point at a specific repo with `--repo <path>`.
+   Record the output JSON per repo. These are your baselines.
 
 5. Initialize `results.tsv` with the header:
    ```bash
-   printf 'timestamp\texperiment\tmodule\tphase\tmedian_ms\tp95_ms\tbaseline_ms\tdelta_pct\tkept\tnotes\n' > results.tsv
+   printf 'timestamp\texperiment\tmodule\trepo\tphase\tmedian_ms\tp95_ms\tbaseline_ms\tdelta_pct\tkept\tnotes\n' > results.tsv
    ```
 
 ## The Loop
@@ -54,13 +56,13 @@ REPEAT:
   6. cargo test  ->  must pass
      - If fails: one fix attempt, then revert if still failing
   7. cargo build --release --bin autoresearch
-  8. cargo run --release --bin autoresearch -- --phase build  ->  parse JSON
-  9. Compare new median_ms to baseline:
-     - KEEP if: new_median < baseline_median - (2 * baseline_stddev)
-     - REVERT if: new_median >= baseline_median - (2 * baseline_stddev)
-  10. If KEEP: update baseline to new values
+  8. cargo run --release --bin autoresearch -- --phase build  ->  parse JSON (reports per-repo)
+  9. Compare new median_ms to baseline FOR EACH REPO:
+     - KEEP if: improvement in at least 2 of 3 repos, no regression > 2% in any
+     - REVERT if: regression in any repo or improvement in only 1
+  10. If KEEP: update baselines to new values
       If REVERT: git reset --hard $BEFORE_SHA
-  11. Append result to results.tsv (tab-separated)
+  11. Append one row per repo to results.tsv (tab-separated)
   12. If 3 consecutive experiments show no improvement -> switch to Phase 2
 ```
 

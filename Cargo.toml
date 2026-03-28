@@ -7,6 +7,18 @@ license = "Apache-2.0"
 keywords = ["monorepo", "mcp", "index", "search"]
 categories = ["command-line-utilities", "development-tools"]
 
+[lib]
+name = "shire"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shire"
+path = "src/main.rs"
+
+[[bin]]
+name = "autoresearch"
+path = "src/bin/autoresearch.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.36", features = ["bundled", "backup"] }

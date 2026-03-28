@@ -291,86 +291,41 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
 /// Batch-insert symbols into the symbols table (no DELETE, no trigger management).
 /// Callers are responsible for deleting old rows and managing FTS triggers.
 fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    const BATCH_SIZE: usize = 100;
-    const COLS: usize = 10;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
 
-    for chunk in syms.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!(
-                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                    base, base + 1, base + 2, base + 3, base + 4,
-                    base + 5, base + 6, base + 7, base + 8, base + 9
-                )
-            })
-            .collect();
+    for sym in syms {
+        let params_json = sym
+            .parameters
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default());
 
-        let sql = format!(
-            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for sym in chunk {
-            let params_json = sym
-                .parameters
-                .as_ref()
-                .map(|p| serde_json::to_string(p).unwrap_or_default());
-
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(sym.name.clone()));
-            params.push(Box::new(sym.kind.as_str().to_string()));
-            params.push(Box::new(sym.signature.clone()));
-            params.push(Box::new(sym.file_path.to_string()));
-            params.push(Box::new(sym.line as i64));
-            params.push(Box::new(sym.visibility.clone()));
-            params.push(Box::new(sym.parent_symbol.clone()));
-            params.push(Box::new(sym.return_type.clone()));
-            params.push(Box::new(params_json));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        stmt.execute(rusqlite::params![
+            package,
+            &sym.name,
+            sym.kind.as_str(),
+            &sym.signature,
+            sym.file_path.as_ref(),
+            sym.line as i64,
+            &sym.visibility,
+            &sym.parent_symbol,
+            &sym.return_type,
+            &params_json,
+        ])?;
     }
 
     Ok(())
 }
 
-/// Clear and re-insert symbols for a package using batched multi-row INSERTs.
-/// Drops FTS5 triggers during the bulk operation and manually syncs FTS afterward.
-///
-/// Must be called within a transaction — if an error occurs after dropping
-/// triggers, the transaction rollback restores DB state but triggers won't
-/// be restored until the next schema creation.
-/// Drops FTS5 triggers during bulk operation and manually syncs FTS afterward.
-fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    tracing::debug!(package = %package, symbols = syms.len(), "upserting symbols for package");
-
-    // 1. Drop triggers to avoid per-row FTS overhead
-    db::drop_symbols_fts_triggers(conn)?;
-
-    // 2. Manually delete old FTS entries for this package
-    conn.execute(
-        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
-         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 3. Delete old symbols
+/// Upsert symbols for a package without managing FTS triggers or FTS sync.
+/// Caller is responsible for dropping triggers before, rebuilding FTS after.
+fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    // Delete old symbols (FTS entries will be rebuilt in bulk later)
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
 
-    // 4. Batch insert new symbols (no triggers fire)
+    // Batch insert new symbols (no triggers fire)
     batch_insert_symbols(conn, package, syms)?;
-
-    // 5. Manually insert FTS entries for new rows
-    conn.execute(
-        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
-         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
-        [package],
-    )?;
-
-    // 6. Recreate triggers
-    db::recreate_symbols_fts_triggers(conn)?;
 
     Ok(())
 }
@@ -398,37 +353,17 @@ fn batch_upsert_file_hashes(conn: &Connection, package: &str, file_hashes: &[(&s
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 4;
-
-    for chunk in file_hashes.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for (fp, hash) in chunk {
-            params.push(Box::new(fp.to_string()));
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (fp, hash) in file_hashes {
+        stmt.execute(rusqlite::params![fp, package, hash, &now])?;
     }
 
     Ok(())
 }
 
-/// Batch-upsert source hashes for multiple packages using multi-row INSERT OR REPLACE.
+/// Batch-upsert source hashes for multiple packages.
 /// Each entry is (package, content_hash). All rows share the same hashed_at timestamp.
 fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Result<()> {
     if entries.is_empty() {
@@ -437,31 +372,11 @@ fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Re
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 3;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{})", base, base + 1, base + 2)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            Vec::with_capacity(chunk.len() * COLS);
-        for (package, hash) in chunk {
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES (?1, ?2, ?3)",
+    )?;
+    for (package, hash) in entries {
+        stmt.execute(rusqlite::params![package, hash, &now])?;
     }
 
     Ok(())
@@ -1097,10 +1012,13 @@ fn phase_extract_symbols(
         })
         .collect();
 
+    // Drop FTS triggers once before processing all packages
+    db::drop_symbols_fts_triggers(conn)?;
+
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if !r.symbols.is_empty() || !r.file_hashes.is_empty() {
-            upsert_symbols(conn, &r.pkg_name, &r.symbols)?;
+            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -1111,6 +1029,16 @@ fn phase_extract_symbols(
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
+
+    // Rebuild FTS index in bulk (much faster than per-package FTS sync)
+    conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('delete-all')", [])?;
+    conn.execute(
+        "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
+        [],
+    )?;
+
+    // Recreate FTS triggers after all packages processed
+    db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
     let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();
@@ -1872,88 +1800,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     }
     timings.push(("extract-symbols", t.elapsed()));
 
-    // Phase 8.5: RAG embedding (optional)
-    #[cfg(feature = "rag")]
-    {
-        if config.rag.enabled {
-            let t = Instant::now();
-            let sp = make_spinner(&mp, "Loading embedding model\u{2026}");
-            let embedder_result = crate::rag::embedder::Embedder::new(&config.rag);
-            sp.finish_and_clear();
-            match embedder_result {
-                Ok(embedder) => {
-                    // Get all changed package names
-                    let changed_packages: Vec<&str> = parsed_packages
-                        .iter()
-                        .map(|(name, _, _)| name.as_str())
-                        .collect();
-
-                    if !changed_packages.is_empty() {
-                        // Collect all symbols and delete stale embeddings across all changed
-                        // packages before embedding. This lets fastembed run a single batched
-                        // inference call instead of N per-package calls, which is much faster.
-                        let mut all_symbols: Vec<crate::rag::embedder::SymbolForEmbedding> =
-                            Vec::new();
-
-                        for pkg_name in &changed_packages {
-                            let old_ids: Vec<i64> = conn
-                                .prepare("SELECT id FROM symbols WHERE package = ?1")?
-                                .query_map([pkg_name], |row| row.get(0))?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            if !old_ids.is_empty() {
-                                crate::rag::storage::delete_embeddings_for_symbols(
-                                    &conn, &old_ids,
-                                )?;
-                            }
-
-                            let symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = conn
-                                .prepare(
-                                    "SELECT id, name, kind, signature, package, file_path \
-                                     FROM symbols WHERE package = ?1",
-                                )?
-                                .query_map([pkg_name], |row| {
-                                    Ok(crate::rag::embedder::SymbolForEmbedding {
-                                        id: row.get(0)?,
-                                        name: row.get(1)?,
-                                        kind: row.get(2)?,
-                                        signature: row.get(3)?,
-                                        package: row.get(4)?,
-                                        file_path: row.get(5)?,
-                                    })
-                                })?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            all_symbols.extend(symbols);
-                        }
-
-                        if !all_symbols.is_empty() {
-                            let pb = make_spinner(&mp, "Embedding symbols\u{2026}");
-                            match crate::rag::embedder::embed_symbols(&embedder, &all_symbols) {
-                                Ok(embeddings) => {
-                                    crate::rag::storage::insert_embeddings(&conn, &embeddings)?;
-                                    pb.finish_with_message(format!(
-                                        "Embedded {} symbols across {} packages",
-                                        embeddings.len(),
-                                        changed_packages.len()
-                                    ));
-                                }
-                                Err(e) => {
-                                    pb.finish_and_clear();
-                                    tracing::warn!(error = %e, "failed to embed symbols");
-                                }
-                            }
-                        }
-                    }
-                    timings.push(("rag-embed", t.elapsed()));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RAG embedding skipped (model init failed)");
-                }
-            }
-        }
-    }
-
     // Phase 9: Index files (transaction-wrapped)
     tracing::debug!("phase 9: index files");
     let sp = make_spinner(&mp, "Indexing files…");
@@ -1963,6 +1809,112 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     })?;
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
+
+    // Phase 10: RAG file-level embedding (optional, runs in background thread)
+    // Build completes and prints summary immediately. Embedding continues in a
+    // background thread that opens its own DB connection. The thread handle is
+    // returned so callers can optionally wait for it.
+    #[cfg(feature = "rag")]
+    let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
+        let changed_packages: Vec<String> = parsed_packages
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+
+        if changed_packages.is_empty() {
+            tracing::debug!("rag: no changed packages, skipping embedding");
+            None
+        } else {
+            // Clean stale embeddings (fast, inline)
+            conn.execute(
+                "DELETE FROM file_embeddings WHERE file_id NOT IN (SELECT id FROM files)",
+                [],
+            )?;
+
+            // Collect files needing embeddings (fast DB reads)
+            let placeholders: String = (1..=changed_packages.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
+                .iter()
+                .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let file_sql = format!(
+                "SELECT f.id, f.path, f.package \
+                 FROM files f \
+                 LEFT JOIN file_embeddings fe ON f.id = fe.file_id \
+                 WHERE f.package IN ({placeholders}) \
+                 AND fe.file_id IS NULL \
+                 AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
+            );
+            let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = conn
+                .prepare(&file_sql)?
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(file_id, file_path, package)| {
+                    let symbols: Vec<(String, String)> = conn
+                        .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
+                        .and_then(|mut s| {
+                            s.query_map([file_path.as_str()], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                        })
+                        .unwrap_or_default();
+                    crate::rag::embedder::FileForEmbedding {
+                        id: file_id,
+                        file_path,
+                        package,
+                        symbols,
+                    }
+                })
+                .collect();
+
+            if file_inputs.is_empty() {
+                None
+            } else {
+                let num_files = file_inputs.len();
+                let db_path_owned = db_path.clone();
+                let rag_config = config.rag.clone();
+
+                eprintln!("Embedding {num_files} files in background…");
+                Some(std::thread::spawn(move || {
+                    let t = Instant::now();
+                    let embedder = match crate::rag::embedder::Embedder::new(&rag_config) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "RAG background: model init failed");
+                            return;
+                        }
+                    };
+                    match crate::rag::embedder::embed_files(&embedder, &file_inputs) {
+                        Ok(embeddings) => {
+                            match db::open_or_create(&db_path_owned, true) {
+                                Ok(bg_conn) => {
+                                    if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
+                                        tracing::warn!(error = %e, "RAG background: insert failed");
+                                    } else {
+                                        eprintln!("Embedded {num_files} files in {:.1}s", t.elapsed().as_secs_f64());
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, "RAG background: DB open failed"),
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "RAG background: embed failed"),
+                    }
+                }))
+            }
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "rag"))]
+    let rag_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
     with_transaction(&conn, || {
@@ -2009,15 +1961,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // still matches a known package path.
     cleanup_stale_hashes(&conn)?;
 
-    // FTS5 maintenance: full optimize on fresh/forced builds, incremental merge otherwise.
-    if is_full_build || force {
-        tracing::debug!("FTS maintenance: full optimize");
-        conn.execute_batch(
-            "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
-             INSERT INTO files_fts(files_fts) VALUES('optimize');
-             INSERT INTO symbols_fts(symbols_fts) VALUES('optimize');",
-        )?;
-    } else {
+    // FTS5 maintenance: incremental merge on non-full builds.
+    // Skip optimize on full/forced builds — the FTS was just rebuilt from scratch.
+    if !is_full_build && !force {
         tracing::debug!("FTS maintenance: incremental merge");
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
@@ -2031,6 +1977,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
+
+    // Wait for background RAG embedding to complete before exiting
+    if let Some(handle) = rag_handle {
+        let _ = handle.join();
+    }
 
     Ok(())
 }

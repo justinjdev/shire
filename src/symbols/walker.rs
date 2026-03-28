@@ -16,14 +16,29 @@ const EXCLUDED_DIRS: &[&str] = &[
 ];
 
 const SKIP_SUFFIXES: &[&str] = &[
+    // Go
+    ".generated.go",
+    "_generated.go",
+    ".pb.go",
+    ".gen.go",
+    "_test.go",
+    // TypeScript/JavaScript
     ".generated.ts",
     ".generated.js",
-    ".pb.go",
-    "_test.go",
     ".d.ts",
+    // Python (protobuf)
+    "_pb2.py",
+    "_pb2_grpc.py",
+    // C/C++ (protobuf)
+    ".pb.h",
+    ".pb.cc",
+    // Java
+    "Generated.java",
 ];
 
-const SKIP_FILES: &[&str] = &["build.rs"];
+const SKIP_PREFIXES: &[&str] = &["zz_generated."];
+
+const SKIP_FILES: &[&str] = &["build.rs", "deepcopy_generated.go"];
 
 /// Return ALL registered source file extensions (the union of all languages).
 pub fn all_extensions() -> Vec<&'static str> {
@@ -95,6 +110,10 @@ pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>
         }
 
         if SKIP_SUFFIXES.iter().any(|suffix| filename.ends_with(suffix)) {
+            continue;
+        }
+
+        if SKIP_PREFIXES.iter().any(|prefix| filename.starts_with(prefix)) {
             continue;
         }
 

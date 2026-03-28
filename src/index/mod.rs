@@ -397,6 +397,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(true)
+        .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str() {
                 if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -405,44 +406,58 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    let mut files = Vec::new();
+    let files = std::sync::Mutex::new(Vec::new());
+    let capped = std::sync::atomic::AtomicBool::new(false);
+    let repo_root_ref = repo_root;
 
-    for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
+    walker.run(|| {
+        Box::new(|entry| {
+            if capped.load(std::sync::atomic::Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
 
-        let file_path = entry.path();
-        let relative_path = file_path
-            .strip_prefix(repo_root)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
+            let file_path = entry.path();
+            let relative_path = file_path
+                .strip_prefix(repo_root_ref)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
 
-        let extension = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
+            let extension = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
 
-        let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
-        files.push(WalkedFile {
-            relative_path,
-            extension,
-            size_bytes,
-        });
+            let mut guard = files.lock().unwrap();
+            guard.push(WalkedFile {
+                relative_path,
+                extension,
+                size_bytes,
+            });
 
-        if files.len() >= MAX_FILES {
-            tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
-            break;
-        }
-    }
+            if guard.len() >= MAX_FILES {
+                tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
+                capped.store(true, std::sync::atomic::Ordering::Relaxed);
+                return ignore::WalkState::Quit;
+            }
 
-    Ok(files)
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(files.into_inner().unwrap())
 }
 
 /// Associate files with their owning package using longest-prefix matching.
@@ -1030,14 +1045,24 @@ fn phase_extract_symbols(
         }
     }
 
-    // Rebuild FTS index in bulk (much faster than per-package FTS sync)
-    conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('delete-all')", [])?;
+    // Drop and recreate FTS table, then rebuild from content table.
+    // Faster than delete-all + rebuild because DROP discards the index
+    // structure entirely rather than updating it row by row.
+    conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+            name, kind, signature, file_path,
+            content='symbols',
+            content_rowid='rowid',
+            tokenize='unicode61 tokenchars ''_-'''
+        )",
+    )?;
     conn.execute(
         "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
         [],
     )?;
 
-    // Recreate FTS triggers after all packages processed
+    // Recreate FTS triggers after rebuild
     db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase

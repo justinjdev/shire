@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "autoresearch"
-path = "benches/autoresearch.rs"
+path = "src/bin/autoresearch.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

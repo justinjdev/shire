@@ -108,7 +108,7 @@ Work through these categories systematically, highest impact first:
 ## Off-Limits
 
 Do NOT modify:
-- `benches/autoresearch.rs` — the measuring stick
+- `src/bin/autoresearch.rs` — the measuring stick
 - `tests/` — the safety net
 - `src/config.rs` — cold path
 

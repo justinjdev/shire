@@ -353,37 +353,17 @@ fn batch_upsert_file_hashes(conn: &Connection, package: &str, file_hashes: &[(&s
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 4;
-
-    for chunk in file_hashes.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for (fp, hash) in chunk {
-            params.push(Box::new(fp.to_string()));
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (fp, hash) in file_hashes {
+        stmt.execute(rusqlite::params![fp, package, hash, &now])?;
     }
 
     Ok(())
 }
 
-/// Batch-upsert source hashes for multiple packages using multi-row INSERT OR REPLACE.
+/// Batch-upsert source hashes for multiple packages.
 /// Each entry is (package, content_hash). All rows share the same hashed_at timestamp.
 fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Result<()> {
     if entries.is_empty() {
@@ -392,31 +372,11 @@ fn batch_upsert_source_hashes(conn: &Connection, entries: &[(&str, &str)]) -> Re
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-    const BATCH_SIZE: usize = 500;
-    const COLS: usize = 3;
-
-    for chunk in entries.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!("(?{}, ?{}, ?{})", base, base + 1, base + 2)
-            })
-            .collect();
-
-        let sql = format!(
-            "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            Vec::with_capacity(chunk.len() * COLS);
-        for (package, hash) in chunk {
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(hash.to_string()));
-            params.push(Box::new(now.clone()));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO source_hashes (package, content_hash, hashed_at) VALUES (?1, ?2, ?3)",
+    )?;
+    for (package, hash) in entries {
+        stmt.execute(rusqlite::params![package, hash, &now])?;
     }
 
     Ok(())

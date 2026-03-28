@@ -67,17 +67,21 @@ pub fn search_symbols(
     let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
     let limit = limit.min(200) as i64;
 
+    // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
+    // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
-        (Some(pkg), Some(kind)) => (
+        (Some(pkg), Some(kind)) => {
+            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+            (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
-             WHERE symbols_fts MATCH ?1 AND s.package = ?2 AND s.kind = ?3
+             WHERE symbols_fts MATCH ?1 AND s.package = ?2
              ORDER BY rank
-             LIMIT ?4",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(kind.to_string()), Box::new(limit)],
-        ),
+             LIMIT ?3",
+            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
+        )},
         (Some(pkg), None) => (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -88,16 +92,18 @@ pub fn search_symbols(
              LIMIT ?3",
             vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
         ),
-        (None, Some(kind)) => (
+        (None, Some(kind)) => {
+            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+            (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
-             WHERE symbols_fts MATCH ?1 AND s.kind = ?2
+             WHERE symbols_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?3",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(kind.to_string()), Box::new(limit)],
-        ),
+             LIMIT ?2",
+            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
+        )},
         (None, None) => (
             "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters

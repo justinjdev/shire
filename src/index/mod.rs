@@ -1846,7 +1846,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                          FROM files f \
                          LEFT JOIN file_embeddings fe ON f.id = fe.file_id \
                          WHERE f.package IN ({placeholders}) \
-                         AND fe.file_id IS NULL"
+                         AND fe.file_id IS NULL \
+                         AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
                     );
                     let files_to_embed: Vec<(i64, String, String)> = conn
                         .prepare(&file_sql)?

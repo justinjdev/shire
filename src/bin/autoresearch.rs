@@ -24,8 +24,9 @@ fn main() {
     match phase.as_str() {
         "build" => run_build_benchmark(&repos),
         "query" => run_query_benchmark(&repos),
+        "lifecycle" => run_lifecycle_benchmark(&repos),
         other => {
-            eprintln!("error: unknown phase '{}', expected 'build' or 'query'", other);
+            eprintln!("error: unknown phase '{}', expected 'build' or 'query' or 'lifecycle'", other);
             std::process::exit(1);
         }
     }
@@ -277,6 +278,239 @@ fn run_query_benchmark(repos: &[PathBuf]) {
 
     let output = serde_json::json!({
         "phase": "query",
+        "repos": all_results,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+/// Simulate real MCP server lifecycle: initial build, then repeated
+/// file modifications → incremental rebuild → query cycles.
+/// Reports per-cycle timings to detect degradation over time.
+fn run_lifecycle_benchmark(repos: &[PathBuf]) {
+    use std::fs;
+
+    const CYCLES: usize = 50;
+
+    let mut all_results = Vec::new();
+
+    for repo_dir in repos {
+        let repo_name = repo_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let size = repo_size(repo_name);
+        let db_path = repo_dir.join(".shire").join("bench.db");
+        let config = shire::config::load_config(repo_dir).unwrap_or_default();
+
+        eprintln!("\n=== {} ({}) — lifecycle ===", repo_name, size);
+
+        // Collect source files we can modify
+        let source_files: Vec<PathBuf> = walkdir::WalkDir::new(repo_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().is_file()
+                    && e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .is_some_and(|x| matches!(x, "go" | "ts" | "js" | "rs" | "py"))
+            })
+            .map(|e| e.into_path())
+            .take(200) // cap to 200 candidates
+            .collect();
+
+        if source_files.is_empty() {
+            eprintln!("[lifecycle] no source files found, skipping");
+            continue;
+        }
+
+        // Phase 1: Fresh full build
+        let _ = fs::remove_file(&db_path);
+        eprintln!("[lifecycle] initial full build...");
+        let start = Instant::now();
+        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+            eprintln!("error: initial build failed: {}", e);
+            std::process::exit(1);
+        }
+        let initial_build_ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[lifecycle] initial build: {:.1} ms", initial_build_ms);
+
+        // Get initial DB size
+        let initial_db_size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        // Phase 2: Incremental rebuild + query cycles
+        let mut rebuild_times = Vec::with_capacity(CYCLES);
+        let mut query_times = Vec::with_capacity(CYCLES);
+        let mut db_sizes = Vec::with_capacity(CYCLES);
+        let mut modifications: Vec<(String, String)> = Vec::new(); // (path, action)
+
+        for cycle in 0..CYCLES {
+            // Pick a source file to modify (round-robin)
+            let target = &source_files[cycle % source_files.len()];
+
+            // Simulate different real-world scenarios in a pattern:
+            //   0-2: modify existing files (most common)
+            //   3:   no-op (MCP call with no file changes)
+            //   4:   create new file
+            //   5-7: modify existing files
+            //   8:   delete a previously created file
+            //   9:   no-op
+            let action = match cycle % 10 {
+                3 | 9 => {
+                    // No-op: don't touch any files, just rebuild
+                    "no-op"
+                }
+                4 => {
+                    // Create a new file
+                    let new_file = repo_dir.join(format!(".shire-bench-tmp-{}.go", cycle));
+                    let _ = fs::write(
+                        &new_file,
+                        format!("package bench\n\nfunc BenchFunc{}() {{}}\n", cycle),
+                    );
+                    modifications.push((new_file.to_string_lossy().to_string(), "create".into()));
+                    "create"
+                }
+                8 => {
+                    // Delete a previously created file (if any exist)
+                    let deleted = modifications
+                        .iter()
+                        .rev()
+                        .find(|(_, a)| a == "create")
+                        .map(|(p, _)| p.clone());
+                    if let Some(path) = deleted {
+                        let _ = fs::remove_file(&path);
+                        "delete"
+                    } else {
+                        // No file to delete, modify instead
+                        let mut content = fs::read_to_string(target).unwrap_or_default();
+                        content.push_str(&format!("\n// bench cycle {}\n", cycle));
+                        let _ = fs::write(target, &content);
+                        modifications.push((target.to_string_lossy().to_string(), "modify".into()));
+                        "modify"
+                    }
+                }
+                _ => {
+                    // Normal cycle: modify existing file
+                    let mut content = fs::read_to_string(target).unwrap_or_default();
+                    content.push_str(&format!("\n// bench cycle {}\n", cycle));
+                    let _ = fs::write(target, &content);
+                    modifications.push((target.to_string_lossy().to_string(), "modify".into()));
+                    "modify"
+                }
+            };
+
+            // Incremental rebuild (simulates maybe_rebuild)
+            let start = Instant::now();
+            if let Err(e) =
+                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path))
+            {
+                eprintln!("error: rebuild failed on cycle {}: {}", cycle + 1, e);
+                std::process::exit(1);
+            }
+            let rebuild_ms = start.elapsed().as_secs_f64() * 1000.0;
+            rebuild_times.push(rebuild_ms);
+
+            // Run a query (simulates MCP tool call after rebuild)
+            let conn =
+                shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
+            let start = Instant::now();
+            let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
+            let _ = shire::db::queries::search_files(&conn, "test", None, None);
+            let _ = shire::db::queries::search_packages(&conn, "api", 20);
+            let query_ms = start.elapsed().as_secs_f64() * 1000.0;
+            query_times.push(query_ms);
+            drop(conn);
+
+            let db_size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            db_sizes.push(db_size);
+
+            if (cycle + 1) % 10 == 0 || cycle == 0 {
+                eprintln!(
+                    "[lifecycle] cycle {:>2}: {} {:<6} rebuild={:.1}ms query={:.3}ms db={:.1}MB",
+                    cycle + 1,
+                    action,
+                    "",
+                    rebuild_ms,
+                    query_ms,
+                    db_size as f64 / 1_048_576.0,
+                );
+            }
+        }
+
+        // Clean up temporary files
+        for (path, action) in &modifications {
+            if action == "create" {
+                let _ = fs::remove_file(path);
+            }
+        }
+
+        // Restore modified files via git checkout
+        let _ = std::process::Command::new("git")
+            .args(["checkout", "."])
+            .current_dir(repo_dir)
+            .output();
+
+        // Analyze degradation: compare first 10 cycles vs last 10 cycles
+        let first_10_rebuild: Vec<f64> = rebuild_times[..10].to_vec();
+        let last_10_rebuild: Vec<f64> = rebuild_times[CYCLES - 10..].to_vec();
+        let first_10_query: Vec<f64> = query_times[..10].to_vec();
+        let last_10_query: Vec<f64> = query_times[CYCLES - 10..].to_vec();
+
+        let rebuild_first = compute_stats(&first_10_rebuild);
+        let rebuild_last = compute_stats(&last_10_rebuild);
+        let query_first = compute_stats(&first_10_query);
+        let query_last = compute_stats(&last_10_query);
+
+        let rebuild_degradation =
+            (rebuild_last.median - rebuild_first.median) / rebuild_first.median * 100.0;
+        let query_degradation =
+            (query_last.median - query_first.median) / query_first.median * 100.0;
+
+        eprintln!(
+            "\n[lifecycle] {} summary:",
+            repo_name
+        );
+        eprintln!(
+            "  rebuild: first10={:.1}ms last10={:.1}ms degradation={:+.1}%",
+            rebuild_first.median, rebuild_last.median, rebuild_degradation
+        );
+        eprintln!(
+            "  query:   first10={:.3}ms last10={:.3}ms degradation={:+.1}%",
+            query_first.median, query_last.median, query_degradation
+        );
+        eprintln!(
+            "  db_size: initial={:.1}MB final={:.1}MB growth={:+.1}%",
+            initial_db_size as f64 / 1_048_576.0,
+            *db_sizes.last().unwrap_or(&0) as f64 / 1_048_576.0,
+            (*db_sizes.last().unwrap_or(&0) as f64 - initial_db_size as f64)
+                / initial_db_size as f64
+                * 100.0,
+        );
+
+        all_results.push(serde_json::json!({
+            "repo": repo_name,
+            "size": size,
+            "cycles": CYCLES,
+            "initial_build_ms": round1(initial_build_ms),
+            "initial_db_size_bytes": initial_db_size,
+            "final_db_size_bytes": db_sizes.last().copied().unwrap_or(0),
+            "rebuild": {
+                "first_10_median_ms": round1(rebuild_first.median),
+                "last_10_median_ms": round1(rebuild_last.median),
+                "degradation_pct": round1(rebuild_degradation),
+                "all_medians_ms": rebuild_times.iter().map(|v| round1(*v)).collect::<Vec<f64>>(),
+            },
+            "query": {
+                "first_10_median_ms": round3(query_first.median),
+                "last_10_median_ms": round3(query_last.median),
+                "degradation_pct": round1(query_degradation),
+            },
+        }));
+    }
+
+    let output = serde_json::json!({
+        "phase": "lifecycle",
         "repos": all_results,
     });
 

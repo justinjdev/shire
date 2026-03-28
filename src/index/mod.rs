@@ -1326,12 +1326,41 @@ fn phase_source_incremental(
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
-/// Uses a file-tree hash to skip the full rebuild when no files have changed.
+/// Uses .git/index mtime as a fast pre-check, then file-tree hash to skip
+/// the full rebuild when no files have changed.
 fn phase_index_files(
     conn: &Connection,
     repo_root: &Path,
     config: &Config,
 ) -> Result<usize> {
+    // Fast pre-check: if .git/index mtime hasn't changed since last file index,
+    // the file tree can't have changed. Skip the expensive walk entirely.
+    let git_index_path = repo_root.join(".git/index");
+    let stored_file_index_at: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'file_index_at'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if let (Ok(git_meta), Some(stored_ts)) =
+        (std::fs::metadata(&git_index_path), &stored_file_index_at)
+    {
+        if let Ok(git_mtime) = git_meta.modified() {
+            if let Some(since) = parse_hashed_at(stored_ts) {
+                let margin = std::time::Duration::from_secs(1);
+                if git_mtime <= since.checked_add(margin).unwrap_or(since) {
+                    tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
+                    let num_files: usize = conn
+                        .query_row("SELECT COUNT(*) FROM files", [], |row| {
+                            row.get::<_, i64>(0)
+                        })? as usize;
+                    return Ok(num_files);
+                }
+            }
+        }
+    }
+
     let walked_files = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
@@ -1352,7 +1381,12 @@ fn phase_index_files(
 
     if stored_hash.as_deref() == Some(current_hash.as_str()) {
         tracing::debug!("phase_index_files: file tree hash matched, skipping rebuild");
-        // File tree unchanged — skip rebuild, read count from existing table
+        // Update timestamp so mtime pre-check works next time
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
+            [&now],
+        )?;
         let num_files: usize = conn.query_row(
             "SELECT COUNT(*) FROM files",
             [],
@@ -1388,10 +1422,15 @@ fn phase_index_files(
     let num_files = validated_files.len();
     incremental_upsert_files(conn, &validated_files)?;
 
-    // Store the new file-tree hash
+    // Store the new file-tree hash and timestamp for mtime pre-check
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
         [&current_hash],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
+        [&now],
     )?;
 
     Ok(num_files)
@@ -1553,8 +1592,16 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
     }
 }
 
-/// Print timing breakdown to stderr.
+/// Print timing breakdown. Emits to stderr when SHIRE_BENCH_TIMINGS is set,
+/// otherwise uses tracing::debug.
 fn print_timings(timings: &[(&str, Duration)], total: Duration) {
+    if std::env::var("SHIRE_BENCH_TIMINGS").is_ok() {
+        eprintln!("--- Phase timings ---");
+        for (label, dur) in timings {
+            eprintln!("  {:25} {:>8.1} ms", label, dur.as_secs_f64() * 1000.0);
+        }
+        eprintln!("  {:25} {:>8.1} ms", "TOTAL", total.as_secs_f64() * 1000.0);
+    }
     tracing::debug!("Build timing:");
     for (label, dur) in timings {
         tracing::debug!(phase = %label, duration_ms = dur.as_millis(), "phase timing");
@@ -1996,6 +2043,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
              INSERT INTO symbols_fts(symbols_fts, rank) VALUES('merge', 500);",
         )?;
     }
+
+    // Reclaim free pages from incremental updates (prevents DB bloat over time)
+    conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
     // Clear progress bars before printing summary
     mp.clear()?;

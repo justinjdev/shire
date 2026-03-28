@@ -64,7 +64,13 @@ pub fn all_extensions() -> Vec<&'static str> {
 
 /// Walk a directory and collect source files matching the given extensions,
 /// skipping excluded directories and generated/test files.
+/// `extra_skip_patterns` are user-configured patterns from shire.toml
+/// (matched as suffix or prefix against the filename).
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+    walk_source_files_with_patterns(dir, extensions, &[])
+}
+
+pub fn walk_source_files_with_patterns(dir: &Path, extensions: &[&str], extra_skip_patterns: &[String]) -> Result<Vec<PathBuf>> {
     let ext_set: HashSet<&str> = extensions.iter().copied().collect();
     let exclude_set: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
 
@@ -114,6 +120,13 @@ pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>
         }
 
         if SKIP_PREFIXES.iter().any(|prefix| filename.starts_with(prefix)) {
+            continue;
+        }
+
+        // User-configured skip patterns (suffix or prefix match)
+        if extra_skip_patterns.iter().any(|pat| {
+            filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str())
+        }) {
             continue;
         }
 

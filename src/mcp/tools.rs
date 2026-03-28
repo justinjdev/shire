@@ -93,6 +93,7 @@ impl ShireService {
     }
 
     /// Check if the index is stale by comparing .git/index mtime against last_indexed.
+    /// Includes a 2-second debounce to avoid redundant rebuilds during rapid tool calls.
     fn is_stale(&self) -> bool {
         let ctx = match &self.build_ctx {
             Some(c) => c,
@@ -106,6 +107,18 @@ impl ShireService {
             return true;
         }
         let last = last.unwrap();
+
+        // Debounce: skip stale check if last rebuild completed within the debounce
+        // window (default 5s, configurable via serve.debounce_s in shire.toml).
+        // Prevents redundant rebuilds during rapid tool call bursts. No changes are
+        // lost — the next check after the window expires triggers a rebuild that
+        // reads current file state.
+        let debounce_s = ctx.config.serve.debounce_s;
+        if let Ok(elapsed) = last.elapsed() {
+            if elapsed < std::time::Duration::from_secs(debounce_s) {
+                return false;
+            }
+        }
 
         // Check .git/index mtime
         let git_index = ctx.repo_root.join(".git/index");

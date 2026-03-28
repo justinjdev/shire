@@ -15,6 +15,8 @@ pub struct Config {
     #[serde(default)]
     pub watch: WatchConfig,
     #[serde(default)]
+    pub serve: ServeConfig,
+    #[serde(default)]
     pub rag: RagConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -24,6 +26,11 @@ pub struct Config {
 pub struct SymbolsConfig {
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
+    /// File name patterns to skip during symbol extraction.
+    /// Supports suffix matches (e.g. "_generated.go") and prefix matches
+    /// (e.g. "zz_generated." — note the trailing dot).
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,6 +93,26 @@ fn default_log_max_days() -> u32 {
 
 fn default_debounce_ms() -> u64 {
     2000
+}
+
+fn default_serve_debounce_s() -> u64 {
+    5
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServeConfig {
+    /// Minimum seconds between rebuild checks during MCP tool calls.
+    /// Prevents redundant rebuilds during rapid tool call bursts.
+    #[serde(default = "default_serve_debounce_s")]
+    pub debounce_s: u64,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            debounce_s: default_serve_debounce_s(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

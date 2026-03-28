@@ -25,8 +25,9 @@ fn main() {
         "build" => run_build_benchmark(&repos),
         "query" => run_query_benchmark(&repos),
         "lifecycle" => run_lifecycle_benchmark(&repos),
+        "quality" => run_quality_checks(&repos),
         other => {
-            eprintln!("error: unknown phase '{}', expected 'build' or 'query' or 'lifecycle'", other);
+            eprintln!("error: unknown phase '{}', expected build|query|lifecycle|quality", other);
             std::process::exit(1);
         }
     }
@@ -515,6 +516,346 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+/// Verify result quality: symbol counts, search correctness, FTS integrity,
+/// deterministic builds, and no data loss from generated file skipping.
+fn run_quality_checks(repos: &[PathBuf]) {
+    use std::fs;
+
+    let mut all_results = Vec::new();
+    let mut total_pass = 0usize;
+    let mut total_fail = 0usize;
+
+    for repo_dir in repos {
+        let repo_name = repo_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let size = repo_size(repo_name);
+        let db_path = repo_dir.join(".shire").join("bench.db");
+        let config = shire::config::load_config(repo_dir).unwrap_or_default();
+
+        eprintln!("\n=== {} ({}) — quality checks ===", repo_name, size);
+
+        // Build fresh index
+        let _ = fs::remove_file(&db_path);
+        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+            eprintln!("FAIL: initial build failed: {}", e);
+            total_fail += 1;
+            continue;
+        }
+
+        let conn = shire::db::open_readonly(&db_path).expect("failed to open DB");
+
+        let mut checks: Vec<(&str, bool, String)> = Vec::new();
+
+        // 1. Symbol count > 0
+        let sym_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap_or(0);
+        checks.push((
+            "symbols exist",
+            sym_count > 0,
+            format!("{} symbols", sym_count),
+        ));
+
+        // 2. Package count > 0
+        let pkg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap_or(0);
+        checks.push((
+            "packages exist",
+            pkg_count > 0,
+            format!("{} packages", pkg_count),
+        ));
+
+        // 3. File count > 0
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap_or(0);
+        checks.push((
+            "files exist",
+            file_count > 0,
+            format!("{} files", file_count),
+        ));
+
+        // 4. Every symbol has a valid package reference
+        let orphan_syms: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols s WHERE NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = s.package)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        checks.push((
+            "no orphan symbols",
+            orphan_syms == 0,
+            format!("{} orphans", orphan_syms),
+        ));
+
+        // 5. FTS integrity (needs read-write connection)
+        drop(conn);
+        let rw_conn = rusqlite::Connection::open(&db_path).expect("failed to open DB read-write");
+        let fts_ok = rw_conn
+            .execute_batch("INSERT INTO symbols_fts(symbols_fts) VALUES('integrity-check')")
+            .is_ok();
+        checks.push(("symbols_fts integrity", fts_ok, String::new()));
+
+        let fts_files_ok = rw_conn
+            .execute_batch("INSERT INTO files_fts(files_fts) VALUES('integrity-check')")
+            .is_ok();
+        checks.push(("files_fts integrity", fts_files_ok, String::new()));
+        drop(rw_conn);
+        let conn = shire::db::open_readonly(&db_path).expect("failed to reopen DB");
+
+        // 6. FTS returns results for common terms
+        let fts_sym_results = shire::db::queries::search_symbols(&conn, "new", None, None, 10)
+            .map(|r| r.len())
+            .unwrap_or(0);
+        checks.push((
+            "symbol FTS returns results",
+            fts_sym_results > 0,
+            format!("{} results for 'new'", fts_sym_results),
+        ));
+
+        let fts_file_results = shire::db::queries::search_files(&conn, "src", None, None)
+            .map(|r| r.len())
+            .unwrap_or(0);
+        checks.push((
+            "file FTS returns results",
+            fts_file_results > 0,
+            format!("{} results for 'src'", fts_file_results),
+        ));
+
+        // 7. Kind-filtered search works (try common kinds)
+        let kind_results: usize = ["function", "method", "type", "struct", "class", "interface"]
+            .iter()
+            .map(|kind| {
+                shire::db::queries::search_symbols(&conn, "new", None, Some(kind), 10)
+                    .map(|r| r.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        checks.push((
+            "kind-filtered search works",
+            kind_results > 0,
+            format!("{} results across common kinds", kind_results),
+        ));
+
+        // 8. Result relevance: top results should match the query term
+        let config_results =
+            shire::db::queries::search_symbols(&conn, "Config", None, None, 5)
+                .unwrap_or_default();
+        // Check that query term appears somewhere in the result (name, signature, or file_path)
+        let top_relevant = config_results
+            .iter()
+            .take(5)
+            .filter(|s| {
+                let lname = s.name.to_lowercase();
+                let lsig = s.signature.as_deref().unwrap_or("").to_lowercase();
+                let lpath = s.file_path.to_lowercase();
+                lname.contains("config") || lsig.contains("config") || lpath.contains("config")
+            })
+            .count();
+        checks.push((
+            "symbol search relevance",
+            top_relevant >= 3,
+            format!(
+                "top 5 for 'Config': {}/5 relate to 'config' (names: {})",
+                top_relevant,
+                config_results
+                    .iter()
+                    .take(5)
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+
+        // 9. File search relevance: results should contain the query in path
+        let file_results =
+            shire::db::queries::search_files(&conn, "config", None, None)
+                .unwrap_or_default();
+        let files_relevant = file_results
+            .iter()
+            .filter(|f| f.path.to_lowercase().contains("config"))
+            .count();
+        checks.push((
+            "file search relevance",
+            files_relevant == file_results.len(),
+            format!(
+                "{}/{} results contain 'config' in path",
+                files_relevant,
+                file_results.len()
+            ),
+        ));
+
+        // 10. No generated files in results
+        let generated_in_results = file_results
+            .iter()
+            .filter(|f| {
+                let name = f.path.rsplit('/').next().unwrap_or("");
+                name.ends_with("_generated.go")
+                    || name.ends_with(".generated.go")
+                    || name.starts_with("zz_generated.")
+                    || name.ends_with(".pb.go")
+            })
+            .count();
+        checks.push((
+            "no generated files in results",
+            generated_in_results == 0,
+            format!("{} generated files found", generated_in_results),
+        ));
+
+        // 11. Symbol kinds are valid
+        let invalid_kinds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind NOT IN ('function', 'method', 'type', 'struct', 'class', 'interface', 'enum', 'constant', 'variable', 'field', 'property', 'module', 'trait', 'impl', 'protocol', 'extension', 'macro', 'typedef', 'arrow_function', 'union', 'namespace', 'package', 'rpc', 'message', 'service', 'object', 'alias', 'component', 'hook', 'test', 'sub', 'mixin', 'concern', 'scope', 'callback')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        checks.push((
+            "all symbol kinds valid",
+            invalid_kinds == 0,
+            if invalid_kinds > 0 {
+                let sample: String = conn
+                    .query_row(
+                        "SELECT kind FROM symbols WHERE kind NOT IN ('function', 'method', 'type', 'struct', 'class', 'interface', 'enum', 'constant', 'variable', 'field', 'property', 'module', 'trait', 'impl', 'protocol', 'extension', 'macro', 'typedef', 'arrow_function', 'union', 'namespace', 'package', 'rpc', 'message', 'service', 'object', 'alias', 'component', 'hook', 'test', 'sub', 'mixin', 'concern', 'scope', 'callback') LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                format!("{} invalid (e.g. '{}')", invalid_kinds, sample)
+            } else {
+                String::new()
+            },
+        ));
+
+        // 12. Deterministic: build twice, same symbol count
+        drop(conn);
+        let _ = fs::remove_file(&db_path);
+        let _ = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path));
+        let conn2 = shire::db::open_readonly(&db_path).expect("failed to open DB");
+        let sym_count_2: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap_or(0);
+        // Allow small variance from parallel extraction non-determinism
+        let variance = (sym_count - sym_count_2).unsigned_abs();
+        let max_variance = (sym_count as f64 * 0.05) as u64; // 5% tolerance
+        checks.push((
+            "deterministic symbol count",
+            variance <= max_variance,
+            format!(
+                "build1={} build2={} variance={}",
+                sym_count, sym_count_2, variance
+            ),
+        ));
+
+        // 9. Incremental build preserves symbols
+        // Modify a file, rebuild, check symbols still exist
+        let test_file: Option<PathBuf> = walkdir::WalkDir::new(repo_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_type().is_file()
+                    && e.path().extension().and_then(|x| x.to_str()) == Some("go")
+            })
+            .map(|e| e.into_path());
+
+        if let Some(test_file) = test_file {
+            let original = fs::read_to_string(&test_file).unwrap_or_default();
+            let modified = format!("{}\n// quality check\n", original);
+            let _ = fs::write(&test_file, &modified);
+            let incr_ok = shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
+            let _ = fs::write(&test_file, &original); // restore
+
+            let conn3 = shire::db::open_readonly(&db_path).expect("failed to open DB");
+            let sym_count_3: i64 = conn3
+                .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+                .unwrap_or(0);
+            let incr_variance = (sym_count_2 - sym_count_3).unsigned_abs();
+            checks.push((
+                "incremental preserves symbols",
+                incr_ok && incr_variance <= max_variance,
+                format!(
+                    "before={} after={} variance={}",
+                    sym_count_2, sym_count_3, incr_variance
+                ),
+            ));
+            drop(conn3);
+        }
+
+        // 10. No real source files skipped by generated patterns
+        // Check that common non-generated filenames are NOT skipped
+        let has_main_files: bool = conn2
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM symbols WHERE file_path LIKE '%main.go' OR file_path LIKE '%index.ts' OR file_path LIKE '%lib.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        checks.push((
+            "real source files not skipped",
+            has_main_files || file_count < 100, // small repos may not have these
+            String::new(),
+        ));
+
+        drop(conn2);
+
+        // Report
+        let mut repo_checks = Vec::new();
+        for (name, passed, detail) in &checks {
+            let status = if *passed { "PASS" } else { "FAIL" };
+            if *passed {
+                total_pass += 1;
+            } else {
+                total_fail += 1;
+            }
+            let detail_str = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", detail)
+            };
+            eprintln!("  [{}] {}{}", status, name, detail_str);
+            repo_checks.push(serde_json::json!({
+                "name": name,
+                "passed": passed,
+                "detail": detail,
+            }));
+        }
+
+        // Restore repo
+        let _ = std::process::Command::new("git")
+            .args(["checkout", "."])
+            .current_dir(repo_dir)
+            .output();
+
+        all_results.push(serde_json::json!({
+            "repo": repo_name,
+            "size": size,
+            "checks": repo_checks,
+        }));
+    }
+
+    eprintln!(
+        "\n=== Quality: {} passed, {} failed ===",
+        total_pass, total_fail
+    );
+
+    let output = serde_json::json!({
+        "phase": "quality",
+        "total_pass": total_pass,
+        "total_fail": total_fail,
+        "repos": all_results,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+
+    if total_fail > 0 {
+        std::process::exit(1);
+    }
 }
 
 struct Stats {

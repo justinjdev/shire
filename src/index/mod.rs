@@ -914,6 +914,7 @@ fn single_pass_extract(
     pkg_path: &str,
     _pkg_kind: &str,
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
 ) -> Result<(Vec<symbols::SymbolInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -929,7 +930,7 @@ fn single_pass_extract(
             !exclude_extensions.contains(&with_dot)
         })
         .collect();
-    let source_files = symbols::walker::walk_source_files(&package_dir, &extensions)?;
+    let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns)?;
 
     if source_files.is_empty() {
         let empty_hash = hash::hash_bytes_hex(b"");
@@ -996,6 +997,7 @@ fn phase_extract_symbols(
     repo_root: &Path,
     parsed_packages: &[(String, String, String)],
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
@@ -1003,7 +1005,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1120,6 +1122,7 @@ fn phase_source_incremental(
     repo_root: &Path,
     unchanged: &[&WalkedManifest],
     exclude_extensions: &[String],
+    exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
@@ -1174,7 +1177,7 @@ fn phase_source_incremental(
                         !exclude_extensions.contains(&with_dot)
                     })
                     .collect();
-                let source_files = symbols::walker::walk_source_files(&package_dir, &extensions).ok()?;
+                let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns).ok()?;
 
                 // Process each file: read, hash, compare, extract if changed
                 let file_results: Vec<FileResult> = source_files
@@ -1968,8 +1971,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
     let pb_sym_clone = pb_sym.clone();
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &pb_sym_clone)?;
-        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &pb_sym_clone)
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)?;
+        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");

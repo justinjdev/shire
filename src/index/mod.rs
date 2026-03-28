@@ -1030,14 +1030,24 @@ fn phase_extract_symbols(
         }
     }
 
-    // Rebuild FTS index in bulk (much faster than per-package FTS sync)
-    conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('delete-all')", [])?;
+    // Drop and recreate FTS table, then rebuild from content table.
+    // Faster than delete-all + rebuild because DROP discards the index
+    // structure entirely rather than updating it row by row.
+    conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+            name, kind, signature, file_path,
+            content='symbols',
+            content_rowid='rowid',
+            tokenize='unicode61 tokenchars ''_-'''
+        )",
+    )?;
     conn.execute(
         "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
         [],
     )?;
 
-    // Recreate FTS triggers after all packages processed
+    // Recreate FTS triggers after rebuild
     db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase

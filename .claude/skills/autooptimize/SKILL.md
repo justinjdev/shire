@@ -109,8 +109,9 @@ Work through these categories systematically, highest impact first:
 
 Do NOT modify:
 - `src/bin/autoresearch.rs` — the measuring stick
-- `tests/` — the safety net
 - `src/config.rs` — cold path
+
+**Tests (`tests/`):** You MAY update tests when your optimization legitimately changes behavior that tests assert on (e.g., switching hash algorithms, changing schema, reordering output). You MUST NOT weaken, remove, or skip tests to make a broken optimization pass. If a test fails, understand WHY — if it's asserting on an implementation detail your optimization changed, update the test. If it's asserting on correctness, your optimization is wrong.
 
 ## Dependencies
 

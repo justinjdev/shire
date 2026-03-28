@@ -291,46 +291,28 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
 /// Batch-insert symbols into the symbols table (no DELETE, no trigger management).
 /// Callers are responsible for deleting old rows and managing FTS triggers.
 fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    const BATCH_SIZE: usize = 100;
-    const COLS: usize = 10;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
 
-    for chunk in syms.chunks(BATCH_SIZE) {
-        let placeholders: Vec<String> = (0..chunk.len())
-            .map(|i| {
-                let base = i * COLS + 1;
-                format!(
-                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                    base, base + 1, base + 2, base + 3, base + 4,
-                    base + 5, base + 6, base + 7, base + 8, base + 9
-                )
-            })
-            .collect();
+    for sym in syms {
+        let params_json = sym
+            .parameters
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default());
 
-        let sql = format!(
-            "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
-        for sym in chunk {
-            let params_json = sym
-                .parameters
-                .as_ref()
-                .map(|p| serde_json::to_string(p).unwrap_or_default());
-
-            params.push(Box::new(package.to_string()));
-            params.push(Box::new(sym.name.clone()));
-            params.push(Box::new(sym.kind.as_str().to_string()));
-            params.push(Box::new(sym.signature.clone()));
-            params.push(Box::new(sym.file_path.to_string()));
-            params.push(Box::new(sym.line as i64));
-            params.push(Box::new(sym.visibility.clone()));
-            params.push(Box::new(sym.parent_symbol.clone()));
-            params.push(Box::new(sym.return_type.clone()));
-            params.push(Box::new(params_json));
-        }
-
-        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+        stmt.execute(rusqlite::params![
+            package,
+            &sym.name,
+            sym.kind.as_str(),
+            &sym.signature,
+            sym.file_path.as_ref(),
+            sym.line as i64,
+            &sym.visibility,
+            &sym.parent_symbol,
+            &sym.return_type,
+            &params_json,
+        ])?;
     }
 
     Ok(())

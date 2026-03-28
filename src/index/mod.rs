@@ -1489,9 +1489,17 @@ fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Workspace-only manifests (go.work, settings.gradle, etc.) don't produce
+    // packages but must be kept for workspace context and cached walks.
+    const WORKSPACE_MANIFESTS: &[&str] = &["go.work", "settings.gradle", "settings.gradle.kts"];
+
     let stale_keys: Vec<&str> = all_manifest_keys
         .iter()
         .filter(|key| {
+            let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key.as_str());
+            if WORKSPACE_MANIFESTS.contains(&filename) {
+                return false; // never prune workspace manifests
+            }
             let parent_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
             !known_paths.contains(parent_dir)
         })

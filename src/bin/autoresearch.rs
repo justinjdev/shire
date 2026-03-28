@@ -5,7 +5,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let phase = parse_arg(&args, "--phase").unwrap_or_else(|| {
-        eprintln!("Usage: autoresearch --phase build|query [--repo <path>] [--size small|medium|large|all]");
+        eprintln!("Usage: autoresearch --phase build|query|lifecycle|quality [--repo <path>] [--size small|medium|large|all]");
         std::process::exit(1);
     });
 
@@ -305,6 +305,19 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
 
         eprintln!("\n=== {} ({}) — lifecycle ===", repo_name, size);
+
+        // Refuse to mutate a dirty worktree to avoid discarding user work
+        let git_status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo_dir)
+            .output();
+        if let Ok(out) = &git_status {
+            let dirty = String::from_utf8_lossy(&out.stdout);
+            if !dirty.trim().is_empty() {
+                eprintln!("[lifecycle] skipping {} — worktree has uncommitted changes", repo_name);
+                continue;
+            }
+        }
 
         // Collect source files we can modify, using the same walker the
         // indexer uses so we don't pick vendored/generated files

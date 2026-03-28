@@ -738,14 +738,14 @@ manifests = ["package.json"]
 
     #[test]
     fn test_load_config_no_config_returns_defaults() {
+        // Use an explicit empty config file to avoid HOME-dependent fallback
         let dir = tempfile::TempDir::new().unwrap();
-        // Use isolated HOME to avoid picking up ~/.claude/shire.toml
-        let fake_home = dir.path().join("home");
-        std::fs::create_dir_all(&fake_home).unwrap();
-        // SAFETY: test runs single-threaded, no other threads reading HOME
-        unsafe { std::env::set_var("HOME", &fake_home); }
-        let config = load_config_from(None, dir.path()).unwrap();
+        let empty_config = dir.path().join("empty.toml");
+        std::fs::write(&empty_config, "").unwrap();
+        let config = load_config_from(Some(empty_config.as_path()), dir.path()).unwrap();
         assert!(config.db_path.is_none());
+        assert_eq!(config.serve.debounce_s, 5);
+        assert!(config.symbols.exclude_patterns.is_empty());
     }
 
     #[test]

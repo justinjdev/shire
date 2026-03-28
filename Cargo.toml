@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "shire"
 path = "src/main.rs"
 
+[[bin]]
+name = "autoresearch"
+path = "benches/autoresearch.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.36", features = ["bundled", "backup"] }

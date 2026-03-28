@@ -1652,7 +1652,7 @@ fn cached_manifest_walk(
     }
 
     let mut manifests = Vec::with_capacity(rows.len());
-    for (manifest_key, stored_hash) in &rows {
+    for (manifest_key, _stored_hash) in &rows {
         let abs_path = repo_root.join(manifest_key);
         if !abs_path.exists() {
             // Manifest was deleted — need full walk to detect removals

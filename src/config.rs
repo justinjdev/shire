@@ -739,6 +739,11 @@ manifests = ["package.json"]
     #[test]
     fn test_load_config_no_config_returns_defaults() {
         let dir = tempfile::TempDir::new().unwrap();
+        // Use isolated HOME to avoid picking up ~/.claude/shire.toml
+        let fake_home = dir.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // SAFETY: test runs single-threaded, no other threads reading HOME
+        unsafe { std::env::set_var("HOME", &fake_home); }
         let config = load_config_from(None, dir.path()).unwrap();
         assert!(config.db_path.is_none());
     }

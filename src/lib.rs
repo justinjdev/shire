@@ -3,6 +3,7 @@ pub mod db;
 pub mod git;
 pub mod index;
 pub mod init;
+#[cfg(not(doctest))]
 pub mod install;
 pub mod logging;
 pub mod mcp;

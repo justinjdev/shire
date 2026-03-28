@@ -222,7 +222,7 @@ fn build_managed_deps(
 
 /// Collect parent POM context from all walked pom.xml files.
 /// Returns a map of `groupId:artifactId` → MavenParentContext for parent/aggregator POMs.
-pub fn collect_maven_parent_context(
+pub(crate) fn collect_maven_parent_context(
     walked: &[super::WalkedManifest],
 ) -> HashMap<String, MavenParentContext> {
     let mut context = HashMap::new();

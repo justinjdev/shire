@@ -191,8 +191,6 @@ impl ShireService {
         params: &SearchSymbolsParams,
         fts_results: &[queries::SymbolRow],
     ) -> Result<Vec<queries::SymbolRow>, ErrorData> {
-        use std::collections::HashMap;
-
         let query_text = params.query.as_deref().unwrap_or("");
         if query_text.is_empty() {
             return Ok(fts_results.to_vec());

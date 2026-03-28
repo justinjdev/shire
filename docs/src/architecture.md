@@ -3,6 +3,7 @@
 ```
 src/
 ├── main.rs          # CLI (clap): build, serve, watch, rebuild, init, clean subcommands
+├── lib.rs           # Library re-exports for embedding shire as a crate
 ├── config.rs        # shire.toml parsing
 ├── git.rs           # Git worktree detection and repo root resolution
 ├── init.rs          # `shire init` setup (config, MCP server, hooks, rules)
@@ -36,7 +37,7 @@ src/
 │   └── elixir.rs    # Elixir extractor (regex-based)
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
-│   ├── embedder.rs  # fastembed wrapper, symbol text formatting, batch embedding
+│   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)

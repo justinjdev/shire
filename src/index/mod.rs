@@ -1810,99 +1810,111 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
 
-    // Phase 10: RAG file-level embedding (optional, after files are indexed)
+    // Phase 10: RAG file-level embedding (optional, runs in background thread)
+    // Build completes and prints summary immediately. Embedding continues in a
+    // background thread that opens its own DB connection. The thread handle is
+    // returned so callers can optionally wait for it.
     #[cfg(feature = "rag")]
-    {
-        if config.rag.enabled {
-            let t = Instant::now();
-            let changed_packages: Vec<&str> = parsed_packages
+    let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
+        let changed_packages: Vec<String> = parsed_packages
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+
+        if changed_packages.is_empty() {
+            tracing::debug!("rag: no changed packages, skipping embedding");
+            None
+        } else {
+            // Clean stale embeddings (fast, inline)
+            conn.execute(
+                "DELETE FROM file_embeddings WHERE file_id NOT IN (SELECT id FROM files)",
+                [],
+            )?;
+
+            // Collect files needing embeddings (fast DB reads)
+            let placeholders: String = (1..=changed_packages.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
                 .iter()
-                .map(|(name, _, _)| name.as_str())
+                .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let file_sql = format!(
+                "SELECT f.id, f.path, f.package \
+                 FROM files f \
+                 LEFT JOIN file_embeddings fe ON f.id = fe.file_id \
+                 WHERE f.package IN ({placeholders}) \
+                 AND fe.file_id IS NULL \
+                 AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
+            );
+            let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = conn
+                .prepare(&file_sql)?
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|(file_id, file_path, package)| {
+                    let symbols: Vec<(String, String)> = conn
+                        .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
+                        .and_then(|mut s| {
+                            s.query_map([file_path.as_str()], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                        })
+                        .unwrap_or_default();
+                    crate::rag::embedder::FileForEmbedding {
+                        id: file_id,
+                        file_path,
+                        package,
+                        symbols,
+                    }
+                })
                 .collect();
 
-            if changed_packages.is_empty() {
-                tracing::debug!("rag: no changed packages, skipping embedding");
+            if file_inputs.is_empty() {
+                None
             } else {
-                let sp = make_spinner(&mp, "Loading embedding model\u{2026}");
-                let embedder_result = crate::rag::embedder::Embedder::new(&config.rag);
-                sp.finish_and_clear();
+                let num_files = file_inputs.len();
+                let db_path_owned = db_path.clone();
+                let rag_config = config.rag.clone();
 
-                if let Ok(embedder) = embedder_result {
-                    conn.execute(
-                        "DELETE FROM file_embeddings WHERE file_id NOT IN (SELECT id FROM files)",
-                        [],
-                    )?;
-
-                    let placeholders: String = (1..=changed_packages.len())
-                        .map(|i| format!("?{i}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
-                        .iter()
-                        .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
-                        .collect();
-                    let file_sql = format!(
-                        "SELECT f.id, f.path, f.package \
-                         FROM files f \
-                         LEFT JOIN file_embeddings fe ON f.id = fe.file_id \
-                         WHERE f.package IN ({placeholders}) \
-                         AND fe.file_id IS NULL \
-                         AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
-                    );
-                    let files_to_embed: Vec<(i64, String, String)> = conn
-                        .prepare(&file_sql)?
-                        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    if !files_to_embed.is_empty() {
-                        let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = files_to_embed
-                            .iter()
-                            .map(|(file_id, file_path, package)| {
-                                let symbols: Vec<(String, String)> = conn
-                                    .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
-                                    .and_then(|mut s| {
-                                        s.query_map([file_path.as_str()], |row| {
-                                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                                        })
-                                        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                                    })
-                                    .unwrap_or_default();
-                                crate::rag::embedder::FileForEmbedding {
-                                    id: *file_id,
-                                    file_path: file_path.clone(),
-                                    package: package.clone(),
-                                    symbols,
+                eprintln!("Embedding {num_files} files in background…");
+                Some(std::thread::spawn(move || {
+                    let t = Instant::now();
+                    let embedder = match crate::rag::embedder::Embedder::new(&rag_config) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "RAG background: model init failed");
+                            return;
+                        }
+                    };
+                    match crate::rag::embedder::embed_files(&embedder, &file_inputs) {
+                        Ok(embeddings) => {
+                            match db::open_or_create(&db_path_owned, true) {
+                                Ok(bg_conn) => {
+                                    if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
+                                        tracing::warn!(error = %e, "RAG background: insert failed");
+                                    } else {
+                                        eprintln!("Embedded {num_files} files in {:.1}s", t.elapsed().as_secs_f64());
+                                    }
                                 }
-                            })
-                            .collect();
-
-                        let pb = make_spinner(&mp, "Embedding files\u{2026}");
-                        let t_embed = Instant::now();
-                        match crate::rag::embedder::embed_files(&embedder, &file_inputs) {
-                            Ok(embeddings) => {
-                                tracing::debug!(
-                                    duration_ms = t_embed.elapsed().as_millis() as u64,
-                                    files = file_inputs.len(),
-                                    "rag: file embedding inference"
-                                );
-                                crate::rag::storage::insert_file_embeddings(&conn, &embeddings)?;
-                                pb.finish_with_message(format!("Embedded {} files", embeddings.len()));
-                            }
-                            Err(e) => {
-                                pb.finish_and_clear();
-                                tracing::warn!(error = %e, "failed to embed files");
+                                Err(e) => tracing::warn!(error = %e, "RAG background: DB open failed"),
                             }
                         }
+                        Err(e) => tracing::warn!(error = %e, "RAG background: embed failed"),
                     }
-                } else if let Err(e) = embedder_result {
-                    tracing::warn!(error = %e, "RAG embedding skipped (model init failed)");
-                }
+                }))
             }
-            timings.push(("rag-embed", t.elapsed()));
         }
-    }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "rag"))]
+    let rag_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
     with_transaction(&conn, || {
@@ -1965,6 +1977,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
+
+    // Wait for background RAG embedding to complete before exiting
+    if let Some(handle) = rag_handle {
+        let _ = handle.join();
+    }
 
     Ok(())
 }

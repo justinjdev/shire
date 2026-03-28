@@ -375,6 +375,32 @@ fn upsert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]
     Ok(())
 }
 
+/// Upsert symbols for a package without managing FTS triggers.
+/// Caller is responsible for dropping triggers before and recreating after.
+fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+    // Delete old FTS entries for this package
+    conn.execute(
+        "INSERT INTO symbols_fts(symbols_fts, rowid, name, kind, signature, file_path)
+         SELECT 'delete', rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
+        [package],
+    )?;
+
+    // Delete old symbols
+    conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
+
+    // Batch insert new symbols (no triggers fire)
+    batch_insert_symbols(conn, package, syms)?;
+
+    // Insert FTS entries for new rows
+    conn.execute(
+        "INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
+         SELECT rowid, name, kind, signature, file_path FROM symbols WHERE package = ?1",
+        [package],
+    )?;
+
+    Ok(())
+}
+
 /// Upsert symbols for a single file within a package. Uses triggers (small operation).
 fn upsert_symbols_for_file(conn: &Connection, package: &str, file_path: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
     // Delete old symbols for this specific file (triggers handle FTS)
@@ -1097,10 +1123,13 @@ fn phase_extract_symbols(
         })
         .collect();
 
+    // Drop FTS triggers once before processing all packages
+    db::drop_symbols_fts_triggers(conn)?;
+
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if !r.symbols.is_empty() || !r.file_hashes.is_empty() {
-            upsert_symbols(conn, &r.pkg_name, &r.symbols)?;
+            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -1111,6 +1140,9 @@ fn phase_extract_symbols(
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
+
+    // Recreate FTS triggers after all packages processed
+    db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
     let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();

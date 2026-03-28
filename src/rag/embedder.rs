@@ -91,8 +91,9 @@ pub fn file_to_text(file: &FileForEmbedding) -> String {
     if file.symbols.is_empty() {
         return format!("file {} in {}", file.file_path, file.package);
     }
-    let symbol_list: String = file
-        .symbols
+    let mut sorted_symbols: Vec<&(String, String)> = file.symbols.iter().collect();
+    sorted_symbols.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let symbol_list: String = sorted_symbols
         .iter()
         .take(50) // cap to avoid exceeding token limits
         .map(|(name, kind)| format!("{kind} {name}"))

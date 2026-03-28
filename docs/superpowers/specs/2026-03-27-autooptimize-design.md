@@ -26,7 +26,7 @@ The agent runs phase 1 until three consecutive experiments show no improvement (
 
 ## Benchmark Harness
 
-A standalone Rust binary (`[[bin]]` target in Cargo.toml, not a criterion bench) at `benches/autoresearch.rs` that programmatically exercises shire's internals. Invoked as `cargo run --release --bin autoresearch -- --phase build`.
+A standalone Rust binary (`[[bin]]` target in Cargo.toml, not a criterion bench) at `src/bin/autoresearch.rs` that programmatically exercises shire's internals. Invoked as `cargo run --release --bin autoresearch -- --phase build`.
 
 ### Build Benchmark
 
@@ -100,7 +100,7 @@ Each experiment targets exactly one module:
 
 ### Off-Limits (never modified)
 
-- `benches/autoresearch.rs` — the measuring stick
+- `src/bin/autoresearch.rs` — the measuring stick
 - `tests/` — correctness tests are the safety net
 - `src/config.rs` — config parsing isn't a hot path
 - `Cargo.toml` — only modified when adding a new crate that yields >5% improvement
@@ -190,7 +190,7 @@ The `/autooptimize` skill instructs the agent to:
 
 ## Deliverables
 
-1. `benches/autoresearch.rs` — Rust benchmark binary
+1. `src/bin/autoresearch.rs` — Rust benchmark binary
 2. Synthetic/real test repo setup script or instructions
 3. `/autooptimize` Claude Code skill (SKILL.md)
 4. `.gitignore` entry for `results.tsv`

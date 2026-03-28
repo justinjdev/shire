@@ -15,9 +15,9 @@ You are an autonomous performance optimization agent. Your job is to make shire 
    ```
    If not, run `scripts/setup-bench-repo.sh` from the shire repo root.
 
-2. Create the optimization branch:
+2. Create or resume the optimization branch:
    ```bash
-   git checkout -b opt/autooptimize-$(date +%Y%m%d)
+   git checkout -b opt/autooptimize-$(date +%Y%m%d) 2>/dev/null || git checkout opt/autooptimize-$(date +%Y%m%d)
    ```
 
 3. Build the benchmark binary:
@@ -33,9 +33,9 @@ You are an autonomous performance optimization agent. Your job is to make shire 
    You can filter with `--size small|medium|large` or point at a specific repo with `--repo <path>`.
    Record the output JSON per repo. These are your baselines.
 
-5. Initialize `results.tsv` with the header:
+5. Initialize `results.tsv` if it doesn't exist (preserve history on restarts):
    ```bash
-   printf 'timestamp\texperiment\tmodule\trepo\tphase\tmedian_ms\tp95_ms\tbaseline_ms\tdelta_pct\tkept\tnotes\n' > results.tsv
+   [ -f results.tsv ] || printf 'timestamp\texperiment\tmodule\trepo\tphase\tmedian_ms\tp95_ms\tbaseline_ms\tdelta_pct\tkept\tnotes\n' > results.tsv
    ```
 
 ## The Loop
@@ -58,8 +58,8 @@ REPEAT:
   7. cargo build --release --bin autoresearch
   8. cargo run --release --bin autoresearch -- --phase build  ->  parse JSON (reports per-repo)
   9. Compare new median_ms to baseline FOR EACH REPO:
-     - KEEP if: improvement in at least 2 of 3 repos, no regression > 2% in any
-     - REVERT if: regression in any repo or improvement in only 1
+     - KEEP if: improvement in at least 2 of 3 repos AND no repo regresses > 2%
+     - REVERT otherwise (improvement in only 1 repo, or any repo regresses > 2%)
   10. If KEEP: update baselines to new values
       If REVERT: git reset --hard $BEFORE_SHA
   11. Append one row per repo to results.tsv (tab-separated)

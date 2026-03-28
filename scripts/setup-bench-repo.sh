@@ -23,15 +23,16 @@ setup_repo() {
         echo "[${name}] Already exists at ${repo_dir}"
         cd "${repo_dir}"
         CURRENT=$(git describe --tags --exact-match 2>/dev/null || git rev-parse HEAD)
-        if [ "${CURRENT}" = "${commit}" ]; then
-            echo "[${name}] Already at ${commit}"
-            return 0
-        else
+        if [ "${CURRENT}" != "${commit}" ]; then
             echo "[${name}] Checking out ${commit}"
             git fetch origin --tags
             git checkout "${commit}" 2>/dev/null || git checkout "tags/${commit}" 2>/dev/null
-            return 0
+        else
+            echo "[${name}] Already at ${commit}"
         fi
+        # Always ensure RAG is disabled for benchmarks
+        echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
+        return 0
     fi
 
     echo "[${name}] Cloning ${url}..."

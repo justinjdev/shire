@@ -123,9 +123,9 @@ pub fn walk_source_files_with_patterns(dir: &Path, extensions: &[&str], extra_sk
             continue;
         }
 
-        // User-configured skip patterns (suffix or prefix match)
+        // User-configured skip patterns (suffix or prefix match, ignore blanks)
         if extra_skip_patterns.iter().any(|pat| {
-            filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str())
+            !pat.is_empty() && (filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str()))
         }) {
             continue;
         }

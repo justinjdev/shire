@@ -747,4 +747,26 @@ manifests = ["package.json"]
         let config = load_config_from(None, dir.path()).unwrap();
         assert!(config.db_path.is_none());
     }
+
+    #[test]
+    fn test_serve_config_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.serve.debounce_s, 5);
+    }
+
+    #[test]
+    fn test_serve_config_custom() {
+        let config: Config = toml::from_str("[serve]\ndebounce_s = 10\n").unwrap();
+        assert_eq!(config.serve.debounce_s, 10);
+    }
+
+    #[test]
+    fn test_exclude_patterns_config() {
+        let config: Config = toml::from_str(
+            "[symbols]\nexclude_patterns = [\"_mock.go\", \"Generated.kt\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config.symbols.exclude_patterns.len(), 2);
+        assert!(config.symbols.exclude_patterns.contains(&"_mock.go".to_string()));
+    }
 }

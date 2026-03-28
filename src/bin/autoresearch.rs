@@ -306,19 +306,13 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
 
         eprintln!("\n=== {} ({}) — lifecycle ===", repo_name, size);
 
-        // Collect source files we can modify
-        let source_files: Vec<PathBuf> = walkdir::WalkDir::new(repo_dir)
+        // Collect source files we can modify, using the same walker the
+        // indexer uses so we don't pick vendored/generated files
+        let exts = shire::symbols::walker::all_extensions();
+        let source_files: Vec<PathBuf> = shire::symbols::walker::walk_source_files(repo_dir, &exts)
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file()
-                    && e.path()
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .is_some_and(|x| matches!(x, "go" | "ts" | "js" | "rs" | "py"))
-            })
-            .map(|e| e.into_path())
-            .take(200) // cap to 200 candidates
+            .take(200)
             .collect();
 
         if source_files.is_empty() {

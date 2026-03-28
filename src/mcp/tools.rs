@@ -214,9 +214,10 @@ impl ShireService {
         }
 
         let mut vec_symbols: Vec<queries::SymbolRow> = Vec::new();
+        // Fetch up to 50 symbols per file to avoid missing matches after filtering
         let mut sym_stmt = conn.prepare(
             "SELECT name, kind, signature, package, file_path, line, visibility, parent_symbol, return_type, parameters \
-             FROM symbols WHERE file_path = ?1 LIMIT 10"
+             FROM symbols WHERE file_path = ?1 LIMIT 50"
         ).map_err(|e| Self::mcp_err(e.to_string()))?;
 
         for (file_id, _distance) in &file_vec_results {

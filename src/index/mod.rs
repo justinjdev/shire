@@ -1034,37 +1034,39 @@ fn phase_extract_symbols(
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
-        if !r.symbols.is_empty() || !r.file_hashes.is_empty() {
-            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
-        }
+        // Always upsert (even if empty) to clear stale symbols for packages
+        // whose source files were all removed or excluded
+        upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
         }
-        // Store per-file hashes
-        if !r.file_hashes.is_empty() {
+        if r.file_hashes.is_empty() {
+            conn.execute("DELETE FROM file_hashes WHERE package = ?1", [r.pkg_name.as_str()])?;
+        } else {
             let fh_refs: Vec<(&str, &str)> = r.file_hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
 
     // Drop and recreate FTS table, then rebuild from content table.
-    // Faster than delete-all + rebuild because DROP discards the index
-    // structure entirely rather than updating it row by row.
-    conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-            name, kind, signature, file_path,
-            content='symbols',
-            content_rowid='rowid',
-            tokenize='unicode61 tokenchars ''_-'''
-        )",
-    )?;
-    conn.execute(
-        "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
-        [],
-    )?;
+    // Skip entirely when phase 7 had no packages to process.
+    if !results.is_empty() {
+        conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+                name, kind, signature, file_path,
+                content='symbols',
+                content_rowid='rowid',
+                tokenize='unicode61 tokenchars ''_-'''
+            )",
+        )?;
+        conn.execute(
+            "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
+            [],
+        )?;
+    }
 
-    // Recreate FTS triggers after rebuild
+    // Recreate FTS triggers (needed even if we skipped rebuild)
     db::recreate_symbols_fts_triggers(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
@@ -2022,9 +2024,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             let file_sql = format!(
                 "SELECT f.id, f.path, f.package \
                  FROM files f \
-                 LEFT JOIN file_embeddings fe ON f.id = fe.file_id \
                  WHERE f.package IN ({placeholders}) \
-                 AND fe.file_id IS NULL \
                  AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
             );
             let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = conn

@@ -4,7 +4,7 @@
 
 **Goal:** Build an autonomous performance optimization loop for shire that proposes code changes, benchmarks them against a real large repo, keeps statistically significant improvements, and reverts failures.
 
-**Architecture:** A Rust benchmark binary (`benches/autoresearch.rs`) calls shire's indexing and query functions directly. A Claude Code skill (`/autooptimize`) drives the autonomous loop: propose change, test, benchmark, keep/revert, log, repeat. The crate must be restructured as a library + binary to allow the benchmark to import shire's modules.
+**Architecture:** A Rust benchmark binary (`src/bin/autoresearch.rs`) calls shire's indexing and query functions directly. A Claude Code skill (`/autooptimize`) drives the autonomous loop: propose change, test, benchmark, keep/revert, log, repeat. The crate must be restructured as a library + binary to allow the benchmark to import shire's modules.
 
 **Tech Stack:** Rust (edition 2024), SQLite, tree-sitter, serde_json for benchmark output, clap for benchmark CLI args
 
@@ -19,7 +19,7 @@
 | Create | `src/lib.rs` | Re-export modules for library consumers (benchmark binary) |
 | Modify | `src/main.rs` | Import from library crate instead of declaring modules |
 | Modify | `Cargo.toml` | Add `[[bin]]` target for benchmark, add `[lib]` section |
-| Create | `benches/autoresearch.rs` | Benchmark harness binary (build + query phases) |
+| Create | `src/bin/autoresearch.rs` | Benchmark harness binary (build + query phases) |
 | Create | `scripts/setup-bench-repo.sh` | Clone and pin the benchmark test repo |
 | Create | `~/.claude/skills/autooptimize/SKILL.md` | Claude Code skill for the autonomous loop |
 | Modify | `.gitignore` | Add `results.tsv` |
@@ -211,7 +211,7 @@ git commit -m "feat: add benchmark test repo setup script"
 The core benchmark binary that measures indexing performance.
 
 **Files:**
-- Create: `benches/autoresearch.rs`
+- Create: `src/bin/autoresearch.rs`
 - Modify: `Cargo.toml` (add `[[bin]]` target)
 
 - [ ] **Step 1: Add benchmark binary target to `Cargo.toml`**
@@ -221,12 +221,12 @@ The `[[bin]]` for `shire` was added in Task 1. Now add the autoresearch target:
 ```toml
 [[bin]]
 name = "autoresearch"
-path = "benches/autoresearch.rs"
+path = "src/bin/autoresearch.rs"
 ```
 
 - [ ] **Step 2: Write the benchmark harness — argument parsing and main structure**
 
-Create `benches/autoresearch.rs`:
+Create `src/bin/autoresearch.rs`:
 
 ```rust
 use anyhow::{Context, Result};
@@ -489,7 +489,7 @@ This will take several minutes. Verify JSON output is valid and contains reasona
 - [ ] **Step 5: Commit**
 
 ```bash
-git add benches/autoresearch.rs Cargo.toml
+git add src/bin/autoresearch.rs Cargo.toml
 git commit -m "feat: add autoresearch benchmark harness (build + query phases)"
 ```
 
@@ -637,7 +637,7 @@ Work through these categories systematically, highest impact first:
 ## Off-Limits
 
 Do NOT modify:
-- `benches/autoresearch.rs` — the measuring stick
+- `src/bin/autoresearch.rs` — the measuring stick
 - `tests/` — the safety net
 - `src/config.rs` — cold path
 

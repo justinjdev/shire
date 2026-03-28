@@ -39,17 +39,19 @@ impl ShireService {
             match crate::rag::embedder::Embedder::new(rag_config) {
                 Ok(e) => {
                     // Verify vector table exists before enabling hybrid search
-                    let table_exists = conn
-                        .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0")
-                        .is_ok();
-                    if !table_exists {
-                        tracing::warn!(
-                            "RAG enabled but symbol_embeddings table not found — \
-                             run `shire build` with [rag] enabled to generate embeddings"
-                        );
-                        None
-                    } else {
-                        Some(e)
+                    let table_check = conn
+                        .prepare("SELECT 1 FROM symbol_embeddings LIMIT 0");
+                    match &table_check {
+                        Ok(_) => {
+                            tracing::info!("RAG hybrid search enabled");
+                            Some(e)
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err,
+                                "RAG enabled but symbol_embeddings table not accessible — \
+                                 run `shire build` with [rag] enabled to generate embeddings");
+                            None
+                        }
                     }
                 }
                 Err(err) => {

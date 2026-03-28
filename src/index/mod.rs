@@ -1805,61 +1805,72 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     {
         if config.rag.enabled {
             let t = Instant::now();
+            // Get all changed package names
+            let changed_packages: Vec<&str> = parsed_packages
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+
+            // Skip model load entirely if no packages changed
+            if changed_packages.is_empty() {
+                tracing::debug!("rag: no changed packages, skipping embedding");
+                timings.push(("rag-embed", t.elapsed()));
+            } else {
             let sp = make_spinner(&mp, "Loading embedding model\u{2026}");
+            let t_model = Instant::now();
             let embedder_result = crate::rag::embedder::Embedder::new(&config.rag);
+            tracing::debug!(duration_ms = t_model.elapsed().as_millis() as u64, "rag: model load");
             sp.finish_and_clear();
             match embedder_result {
                 Ok(embedder) => {
-                    // Get all changed package names
-                    let changed_packages: Vec<&str> = parsed_packages
-                        .iter()
-                        .map(|(name, _, _)| name.as_str())
-                        .collect();
 
                     if !changed_packages.is_empty() {
-                        // Collect all symbols and delete stale embeddings across all changed
-                        // packages before embedding. This lets fastembed run a single batched
-                        // inference call instead of N per-package calls, which is much faster.
-                        let mut all_symbols: Vec<crate::rag::embedder::SymbolForEmbedding> =
-                            Vec::new();
+                        // Delete stale embeddings for symbols that no longer exist
+                        conn.execute(
+                            "DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols)",
+                            [],
+                        )?;
 
-                        for pkg_name in &changed_packages {
-                            let old_ids: Vec<i64> = conn
-                                .prepare("SELECT id FROM symbols WHERE package = ?1")?
-                                .query_map([pkg_name], |row| row.get(0))?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            if !old_ids.is_empty() {
-                                crate::rag::storage::delete_embeddings_for_symbols(
-                                    &conn, &old_ids,
-                                )?;
-                            }
-
-                            let symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = conn
-                                .prepare(
-                                    "SELECT id, name, kind, signature, package, file_path \
-                                     FROM symbols WHERE package = ?1",
-                                )?
-                                .query_map([pkg_name], |row| {
-                                    Ok(crate::rag::embedder::SymbolForEmbedding {
-                                        id: row.get(0)?,
-                                        name: row.get(1)?,
-                                        kind: row.get(2)?,
-                                        signature: row.get(3)?,
-                                        package: row.get(4)?,
-                                        file_path: row.get(5)?,
-                                    })
-                                })?
-                                .collect::<Result<Vec<_>, _>>()?;
-
-                            all_symbols.extend(symbols);
-                        }
+                        // Find all symbols in changed packages that need embedding.
+                        // Use LEFT JOIN to find symbols missing from symbol_embeddings.
+                        let placeholders: String = (1..=changed_packages.len())
+                            .map(|i| format!("?{i}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT s.id, s.name, s.kind, s.signature, s.package, s.file_path \
+                             FROM symbols s \
+                             LEFT JOIN symbol_embeddings se ON s.id = se.symbol_id \
+                             WHERE s.package IN ({placeholders}) \
+                             AND se.symbol_id IS NULL"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
+                            .iter()
+                            .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
+                            .collect();
+                        let all_symbols: Vec<crate::rag::embedder::SymbolForEmbedding> = stmt
+                            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                                Ok(crate::rag::embedder::SymbolForEmbedding {
+                                    id: row.get(0)?,
+                                    name: row.get(1)?,
+                                    kind: row.get(2)?,
+                                    signature: row.get(3)?,
+                                    package: row.get(4)?,
+                                    file_path: row.get(5)?,
+                                })
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
 
                         if !all_symbols.is_empty() {
                             let pb = make_spinner(&mp, "Embedding symbols\u{2026}");
+                            let t_embed = Instant::now();
                             match crate::rag::embedder::embed_symbols(&embedder, &all_symbols) {
                                 Ok(embeddings) => {
+                                    tracing::debug!(duration_ms = t_embed.elapsed().as_millis() as u64, symbols = all_symbols.len(), "rag: embedding inference");
+                                    let t_insert = Instant::now();
                                     crate::rag::storage::insert_embeddings(&conn, &embeddings)?;
+                                    tracing::debug!(duration_ms = t_insert.elapsed().as_millis() as u64, count = embeddings.len(), "rag: insert embeddings");
                                     pb.finish_with_message(format!(
                                         "Embedded {} symbols across {} packages",
                                         embeddings.len(),
@@ -1879,6 +1890,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                     tracing::warn!(error = %e, "RAG embedding skipped (model init failed)");
                 }
             }
+            } // end else (changed_packages not empty)
         }
     }
 

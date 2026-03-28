@@ -1995,15 +1995,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // still matches a known package path.
     cleanup_stale_hashes(&conn)?;
 
-    // FTS5 maintenance: full optimize on fresh/forced builds, incremental merge otherwise.
-    if is_full_build || force {
-        tracing::debug!("FTS maintenance: full optimize");
-        conn.execute_batch(
-            "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
-             INSERT INTO files_fts(files_fts) VALUES('optimize');
-             INSERT INTO symbols_fts(symbols_fts) VALUES('optimize');",
-        )?;
-    } else {
+    // FTS5 maintenance: incremental merge on non-full builds.
+    // Skip optimize on full/forced builds — the FTS was just rebuilt from scratch.
+    if !is_full_build && !force {
         tracing::debug!("FTS maintenance: incremental merge");
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);

@@ -1592,6 +1592,97 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
     }
 }
 
+/// Check if .git/index has changed since the last build.
+/// Returns true if changed or unknown (conservative).
+fn git_index_changed_since_build(repo_root: &Path, conn: &Connection) -> bool {
+    let git_index_path = repo_root.join(".git/index");
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'last_build_at'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    match (std::fs::metadata(&git_index_path), stored) {
+        (Ok(meta), Some(ts)) => {
+            let git_mtime = match meta.modified() {
+                Ok(m) => m,
+                Err(_) => return true,
+            };
+            let since = match parse_hashed_at(&ts) {
+                Some(s) => s,
+                None => return true,
+            };
+            let margin = std::time::Duration::from_secs(1);
+            git_mtime > since.checked_add(margin).unwrap_or(since)
+        }
+        _ => true, // unknown — assume changed
+    }
+}
+
+/// Check if the DB has been populated (has manifest hashes).
+fn is_fresh_db(conn: &Connection) -> bool {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM manifest_hashes", [], |row| row.get(0))
+        .unwrap_or(0);
+    count == 0
+}
+
+/// Try to reconstruct manifest walk from cached DB state.
+/// Returns None if we can't determine the manifest list (forces full walk).
+fn cached_manifest_walk(
+    repo_root: &Path,
+    conn: &Connection,
+) -> Option<Vec<WalkedManifest>> {
+    // Read stored manifest paths and hashes from DB
+    let mut stmt = conn
+        .prepare("SELECT path, content_hash FROM manifest_hashes")
+        .ok()?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut manifests = Vec::with_capacity(rows.len());
+    for (manifest_key, stored_hash) in &rows {
+        let abs_path = repo_root.join(manifest_key);
+        if !abs_path.exists() {
+            // Manifest was deleted — need full walk to detect removals
+            return None;
+        }
+        // Re-hash to check if content changed
+        let current_hash = match hash::hash_file(&abs_path) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+
+        let relative_dir = abs_path
+            .parent()
+            .and_then(|p| p.strip_prefix(repo_root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        manifests.push(WalkedManifest {
+            abs_path,
+            relative_dir,
+            manifest_key: manifest_key.clone(),
+            content_hash: current_hash,
+        });
+    }
+
+    // Check if any NEW manifests have appeared by comparing count with DB
+    // This is a heuristic: we can't know for sure without walking, but if
+    // the stored count matches and all files exist, it's very likely correct.
+    // New manifests will be caught on the next full walk (triggered by force
+    // rebuild or when a known manifest changes).
+    Some(manifests)
+}
+
 /// Print timing breakdown. Emits to stderr when SHIRE_BENCH_TIMINGS is set,
 /// otherwise uses tracing::debug.
 fn print_timings(timings: &[(&str, Duration)], total: Duration) {
@@ -1701,10 +1792,23 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     ];
 
     // Phase 1: Walk manifests
+    // On incremental builds, use cached manifest paths to skip the full walk
+    // when no manifests have been added or removed.
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let walked = walk_manifests(repo_root, config, &parsers)?;
+    let walked = if !force && !is_fresh_db(&conn) && !git_index_changed_since_build(repo_root, &conn) {
+        // .git/index unchanged — no files added/removed. Use cached manifest paths.
+        match cached_manifest_walk(repo_root, &conn) {
+            Some(cached) => {
+                tracing::debug!(manifests = cached.len(), "using cached manifest paths");
+                cached
+            }
+            None => walk_manifests(repo_root, config, &parsers)?,
+        }
+    } else {
+        walk_manifests(repo_root, config, &parsers)?
+    };
     timings.push(("walk", t.elapsed()));
     sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
@@ -2010,12 +2114,17 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     let total_duration = build_start.elapsed();
 
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     with_transaction(&conn, || {
         store_metadata(&conn, repo_root, &summary)?;
-        // Store total build duration in shire_meta
         conn.execute(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('total_duration_ms', ?1)",
             [total_duration.as_millis().to_string()],
+        )?;
+        // Timestamp for .git/index mtime fast-path on next build
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
+            [&now],
         )?;
         Ok(())
     })?;

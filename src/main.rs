@@ -12,7 +12,7 @@ use shire::rag;
 use shire::watch;
 
 #[derive(Parser)]
-#[command(name = "shire", about = "Monorepo package index and MCP server")]
+#[command(name = "shire", version, about = "Monorepo package index and MCP server")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

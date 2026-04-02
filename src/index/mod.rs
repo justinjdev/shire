@@ -1014,6 +1014,7 @@ fn phase_extract_symbols(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
+    skip_deletes: bool,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
@@ -1049,9 +1050,12 @@ fn phase_extract_symbols(
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
-        // Always upsert (even if empty) to clear stale symbols for packages
-        // whose source files were all removed or excluded
-        upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
+        if skip_deletes {
+            // Symbols table already empty (force/full build) — insert only
+            batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
+        } else {
+            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
+        }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
         }
@@ -1997,7 +2001,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
     let pb_sym_clone = pb_sym.clone();
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)?;
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force)?;
         if git_index_changed {
             phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
         } else {

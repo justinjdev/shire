@@ -2086,7 +2086,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                     sp.set_style(
                         ProgressStyle::default_spinner()
                             .template("{spinner:.cyan} {msg}")
-                            .unwrap(),
+                            .expect("hardcoded spinner template must be valid"),
                     );
                     sp.set_message(format!("Embedding {num_files} files…"));
                     sp.enable_steady_tick(Duration::from_millis(80));
@@ -2095,7 +2095,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                     let embedder = match Embedder::new(&rag_config) {
                         Ok(e) => e,
                         Err(e) => {
-                            sp.finish_and_clear();
+                            sp.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: model init failed");
                             return;
                         }
@@ -2105,7 +2105,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                             match db::open_or_create(&db_path_owned, true) {
                                 Ok(bg_conn) => {
                                     if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
-                                        sp.finish_and_clear();
+                                        sp.finish_with_message(format!("Embedding failed: {e}"));
                                         tracing::warn!(error = %e, "RAG background: insert failed");
                                     } else {
                                         sp.finish_with_message(format!(
@@ -2115,13 +2115,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                                     }
                                 }
                                 Err(e) => {
-                                    sp.finish_and_clear();
+                                    sp.finish_with_message(format!("Embedding failed: {e}"));
                                     tracing::warn!(error = %e, "RAG background: DB open failed");
                                 }
                             }
                         }
                         Err(e) => {
-                            sp.finish_and_clear();
+                            sp.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: embed failed");
                         }
                     }
@@ -2205,11 +2205,16 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
 
-    // Wait for RAG embedding in interactive mode only.
-    // In quiet mode (watch daemon), let embedding continue in background.
-    if progress {
-        if let Some(handle) = rag_handle {
-            let _ = handle.join();
+    // Wait for RAG embedding to complete to avoid concurrent DB writes.
+    // Spinner is already hidden in quiet mode, so joining has no visual cost.
+    if let Some(handle) = rag_handle {
+        if let Err(panic_payload) = handle.join() {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            tracing::error!(panic = %msg, "RAG embedding thread panicked");
         }
     }
 

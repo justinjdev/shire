@@ -2076,9 +2076,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 let num_files = file_inputs.len();
                 let db_path_owned = db_path.clone();
                 let rag_config = config.rag.clone();
+                let show_progress = progress;
 
                 Some(std::thread::spawn(move || {
                     let sp = ProgressBar::new_spinner();
+                    if !show_progress {
+                        sp.set_draw_target(ProgressDrawTarget::hidden());
+                    }
                     sp.set_style(
                         ProgressStyle::default_spinner()
                             .template("{spinner:.cyan} {msg}")
@@ -2198,13 +2202,16 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Clear progress bars before printing summary
     mp.clear()?;
 
-    // Wait for RAG embedding to finish (spinner shows progress to user)
-    if let Some(handle) = rag_handle {
-        let _ = handle.join();
-    }
-
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
+
+    // Wait for RAG embedding in interactive mode only.
+    // In quiet mode (watch daemon), let embedding continue in background.
+    if progress {
+        if let Some(handle) = rag_handle {
+            let _ = handle.join();
+        }
+    }
 
     Ok(())
 }

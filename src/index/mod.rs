@@ -466,8 +466,14 @@ fn associate_files_with_packages(
     packages: &[(String, String)], // (name, path)
 ) -> Vec<(String, Option<String>, String, u64)> {
     // Sort package paths by length descending so longest prefix matches first
-    let mut sorted_pkgs: Vec<&(String, String)> = packages.iter().collect();
+    let mut sorted_pkgs: Vec<(&str, &str)> = packages.iter().map(|(n, p)| (n.as_str(), p.as_str())).collect();
     sorted_pkgs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    // Pre-allocate prefix strings with trailing slash to avoid per-file allocations
+    let prefixes: Vec<(&str, String)> = sorted_pkgs
+        .iter()
+        .map(|(name, path)| (*name, format!("{path}/")))
+        .collect();
 
     files
         .iter()
@@ -478,12 +484,12 @@ fn associate_files_with_packages(
                 .map(|(dir, _)| dir)
                 .unwrap_or("");
 
-            let package = sorted_pkgs.iter().find_map(|(name, path)| {
-                if path.is_empty() {
+            let package = prefixes.iter().find_map(|(name, prefix)| {
+                if prefix == "/" {
                     // Root-level package matches everything
-                    Some(name.clone())
-                } else if file_dir == path.as_str() || file_dir.starts_with(&format!("{}/", path)) {
-                    Some(name.clone())
+                    Some((*name).to_string())
+                } else if file_dir.starts_with(prefix.as_str()) || file_dir == &prefix[..prefix.len() - 1] {
+                    Some((*name).to_string())
                 } else {
                     None
                 }

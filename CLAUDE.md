@@ -16,6 +16,8 @@ cargo check                     # Type check without building
 
 The integration test (`tests/integration.rs`) builds the binary and runs it against fixture monorepos it creates in a temp directory.
 
+Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to verify before committing.
+
 ## Architecture
 
 Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, `init`, `install`, `uninstall`, `clean`.

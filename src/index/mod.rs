@@ -2005,6 +2005,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // returned so callers can optionally wait for it.
     #[cfg(feature = "rag")]
     let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
+        use crate::rag::embedder::{embed_files, Embedder, FileForEmbedding, FileSymbol};
+
         let changed_packages: Vec<String> = parsed_packages
             .iter()
             .map(|(name, _, _)| name.clone())
@@ -2035,7 +2037,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                  WHERE f.package IN ({placeholders}) \
                  AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
             );
-            let file_inputs: Vec<crate::rag::embedder::FileForEmbedding> = conn
+            let file_inputs: Vec<FileForEmbedding> = conn
                 .prepare(&file_sql)?
                 .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
@@ -2043,16 +2045,23 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(file_id, file_path, package)| {
-                    let symbols: Vec<(String, String)> = conn
-                        .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
+                    let symbols: Vec<FileSymbol> = conn
+                        .prepare("SELECT name, kind, signature FROM symbols WHERE file_path = ?1")
                         .and_then(|mut s| {
                             s.query_map([file_path.as_str()], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                                Ok(FileSymbol {
+                                    name: row.get(0)?,
+                                    kind: row.get(1)?,
+                                    signature: row.get(2)?,
+                                })
                             })
                             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                         })
-                        .unwrap_or_default();
-                    crate::rag::embedder::FileForEmbedding {
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(error = %e, file = %file_path, "failed to load symbols for embedding");
+                            Vec::new()
+                        });
+                    FileForEmbedding {
                         id: file_id,
                         file_path,
                         package,
@@ -2071,14 +2080,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 eprintln!("Embedding {num_files} files in background…");
                 Some(std::thread::spawn(move || {
                     let t = Instant::now();
-                    let embedder = match crate::rag::embedder::Embedder::new(&rag_config) {
+                    let embedder = match Embedder::new(&rag_config) {
                         Ok(e) => e,
                         Err(e) => {
                             tracing::warn!(error = %e, "RAG background: model init failed");
                             return;
                         }
                     };
-                    match crate::rag::embedder::embed_files(&embedder, &file_inputs) {
+                    match embed_files(&embedder, &file_inputs) {
                         Ok(embeddings) => {
                             match db::open_or_create(&db_path_owned, true) {
                                 Ok(bg_conn) => {

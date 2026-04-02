@@ -77,6 +77,7 @@ fn walk_manifests(
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(true)
+        .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str() {
                 if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -85,49 +86,57 @@ fn walk_manifests(
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    let mut manifests = Vec::new();
+    // Collect manifest paths first (parallel walk)
+    let manifest_paths = std::sync::Mutex::new(Vec::new());
 
-    for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
+    walker.run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let filename = match entry.file_name().to_str() {
+                Some(f) => f,
+                None => return ignore::WalkState::Continue,
+            };
+            if !manifest_filenames.contains(filename) || !enabled.contains(filename) {
+                return ignore::WalkState::Continue;
+            }
+            manifest_paths.lock().unwrap().push(entry.into_path());
+            ignore::WalkState::Continue
+        })
+    });
 
-        let filename = match entry.file_name().to_str() {
-            Some(f) => f.to_string(),
-            None => continue,
-        };
-
-        if !manifest_filenames.contains(filename.as_str())
-            || !enabled.contains(filename.as_str())
-        {
-            continue;
-        }
-
-        let file_path = entry.into_path();
-        let relative_dir = file_path
-            .parent()
-            .and_then(|p| p.strip_prefix(repo_root).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let manifest_key = if relative_dir.is_empty() {
-            filename.clone()
-        } else {
-            format!("{}/{}", relative_dir, filename)
-        };
-
-        let content_hash = hash::hash_file(&file_path)?;
-
-        manifests.push(WalkedManifest {
-            abs_path: file_path,
-            relative_dir,
-            manifest_key,
-            content_hash,
-        });
-    }
+    // Hash manifests in parallel (file reads + SHA-256)
+    let paths = manifest_paths.into_inner().unwrap();
+    let manifests: Vec<WalkedManifest> = paths
+        .into_par_iter()
+        .filter_map(|file_path| {
+            let filename = file_path.file_name()?.to_str()?.to_string();
+            let relative_dir = file_path
+                .parent()
+                .and_then(|p| p.strip_prefix(repo_root).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let manifest_key = if relative_dir.is_empty() {
+                filename
+            } else {
+                format!("{}/{}", relative_dir, filename)
+            };
+            let content_hash = hash::hash_file(&file_path).ok()?;
+            Some(WalkedManifest {
+                abs_path: file_path,
+                relative_dir,
+                manifest_key,
+                content_hash,
+            })
+        })
+        .collect();
 
     Ok(manifests)
 }

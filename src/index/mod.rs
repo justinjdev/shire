@@ -2077,12 +2077,21 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 let db_path_owned = db_path.clone();
                 let rag_config = config.rag.clone();
 
-                eprintln!("Embedding {num_files} files in background…");
                 Some(std::thread::spawn(move || {
+                    let sp = ProgressBar::new_spinner();
+                    sp.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.cyan} {msg}")
+                            .unwrap(),
+                    );
+                    sp.set_message(format!("Embedding {num_files} files…"));
+                    sp.enable_steady_tick(Duration::from_millis(80));
+
                     let t = Instant::now();
                     let embedder = match Embedder::new(&rag_config) {
                         Ok(e) => e,
                         Err(e) => {
+                            sp.finish_and_clear();
                             tracing::warn!(error = %e, "RAG background: model init failed");
                             return;
                         }
@@ -2092,15 +2101,25 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                             match db::open_or_create(&db_path_owned, true) {
                                 Ok(bg_conn) => {
                                     if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
+                                        sp.finish_and_clear();
                                         tracing::warn!(error = %e, "RAG background: insert failed");
                                     } else {
-                                        eprintln!("Embedded {num_files} files in {:.1}s", t.elapsed().as_secs_f64());
+                                        sp.finish_with_message(format!(
+                                            "Embedded {num_files} files in {:.1}s",
+                                            t.elapsed().as_secs_f64()
+                                        ));
                                     }
                                 }
-                                Err(e) => tracing::warn!(error = %e, "RAG background: DB open failed"),
+                                Err(e) => {
+                                    sp.finish_and_clear();
+                                    tracing::warn!(error = %e, "RAG background: DB open failed");
+                                }
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, "RAG background: embed failed"),
+                        Err(e) => {
+                            sp.finish_and_clear();
+                            tracing::warn!(error = %e, "RAG background: embed failed");
+                        }
                     }
                 }))
             }
@@ -2179,13 +2198,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Clear progress bars before printing summary
     mp.clear()?;
 
-    print_summary(&summary, &db_path, is_full_build, force);
-    print_timings(&timings, total_duration);
-
-    // Wait for background RAG embedding to complete before exiting
+    // Wait for RAG embedding to finish (spinner shows progress to user)
     if let Some(handle) = rag_handle {
         let _ = handle.join();
     }
+
+    print_summary(&summary, &db_path, is_full_build, force);
+    print_timings(&timings, total_duration);
 
     Ok(())
 }

@@ -5,7 +5,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let phase = parse_arg(&args, "--phase").unwrap_or_else(|| {
-        eprintln!("Usage: autoresearch --phase build|query|lifecycle|quality [--repo <path>] [--size small|medium|large|all]");
+        eprintln!("Usage: autoresearch --phase build|incremental|query|lifecycle|quality [--repo <path>] [--size small|medium|large|all]");
         std::process::exit(1);
     });
 
@@ -23,11 +23,12 @@ fn main() {
 
     match phase.as_str() {
         "build" => run_build_benchmark(&repos),
+        "incremental" => run_incremental_benchmark(&repos),
         "query" => run_query_benchmark(&repos),
         "lifecycle" => run_lifecycle_benchmark(&repos),
         "quality" => run_quality_checks(&repos),
         other => {
-            eprintln!("error: unknown phase '{}', expected build|query|lifecycle|quality", other);
+            eprintln!("error: unknown phase '{}', expected build|incremental|query|lifecycle|quality", other);
             std::process::exit(1);
         }
     }
@@ -168,6 +169,94 @@ fn run_build_benchmark(repos: &[PathBuf]) {
 
     let output = serde_json::json!({
         "phase": "build",
+        "repos": all_results,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+/// Measure incremental rebuild performance: full build once, then
+/// repeated no-change rebuilds (force=false, DB kept between iterations).
+fn run_incremental_benchmark(repos: &[PathBuf]) {
+    let mut all_results = Vec::new();
+
+    for repo_dir in repos {
+        let repo_name = repo_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let size = repo_size(repo_name);
+        let db_path = repo_dir.join(".shire").join("bench.db");
+        let config = shire::config::load_config(repo_dir).unwrap_or_default();
+
+        const TOTAL_ITERATIONS: usize = 6;
+        const WARMUP: usize = 1;
+
+        eprintln!("\n=== {} ({}) — incremental ===", repo_name, size);
+
+        // Initial full build (creates the DB from scratch)
+        let _ = std::fs::remove_file(&db_path);
+        eprintln!("[incremental] initial full build...");
+        let start = Instant::now();
+        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+            eprintln!("error: initial build failed for {}: {}", repo_name, e);
+            std::process::exit(1);
+        }
+        let full_build_ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[incremental] full build: {:.1} ms", full_build_ms);
+
+        // Incremental rebuilds (no changes, force=false, DB kept)
+        let mut durations_ms: Vec<f64> = Vec::with_capacity(TOTAL_ITERATIONS);
+
+        for i in 0..TOTAL_ITERATIONS {
+            eprintln!(
+                "[incremental] iteration {}/{} {}...",
+                i + 1,
+                TOTAL_ITERATIONS,
+                if i < WARMUP { "(warmup)" } else { "" }
+            );
+
+            let start = Instant::now();
+            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)) {
+                eprintln!("error: incremental build failed on {} iteration {}: {}", repo_name, i + 1, e);
+                std::process::exit(1);
+            }
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            durations_ms.push(elapsed_ms);
+
+            eprintln!("[incremental] iteration {} completed in {:.1} ms", i + 1, elapsed_ms);
+        }
+
+        let measured: Vec<f64> = durations_ms[WARMUP..].to_vec();
+
+        let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
+        let package_count: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0)).unwrap_or(0);
+        let symbol_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
+        drop(conn);
+
+        let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let stats = compute_stats(&measured);
+
+        all_results.push(serde_json::json!({
+            "repo": repo_name,
+            "size": size,
+            "phase": "incremental",
+            "full_build_ms": round1(full_build_ms),
+            "iterations": measured.len(),
+            "median_ms": round1(stats.median),
+            "p95_ms": round1(stats.p95),
+            "min_ms": round1(stats.min),
+            "stddev_ms": round1(stats.stddev),
+            "package_count": package_count,
+            "symbol_count": symbol_count,
+            "file_count": file_count,
+            "db_size_bytes": db_size_bytes,
+        }));
+    }
+
+    let output = serde_json::json!({
+        "phase": "incremental",
         "repos": all_results,
     });
 

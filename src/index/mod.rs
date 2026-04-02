@@ -2031,6 +2031,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .iter()
                 .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
                 .collect();
+            // Delete existing embeddings for changed packages so we can re-embed
+            conn.execute(
+                &format!(
+                    "DELETE FROM file_embeddings WHERE file_id IN \
+                     (SELECT id FROM files WHERE package IN ({placeholders}))"
+                ),
+                rusqlite::params_from_iter(params.iter()),
+            )?;
+
             let file_sql = format!(
                 "SELECT f.id, f.path, f.package \
                  FROM files f \
@@ -2199,10 +2208,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
-    print_summary(&summary, &db_path, is_full_build, force);
-    print_timings(&timings, total_duration);
-
-    // Wait for RAG embedding to complete to avoid concurrent DB writes.
+    // Wait for RAG embedding to complete before printing summary.
     // Spinner is already hidden in quiet mode, so joining has no visual cost.
     if let Some(handle) = rag_handle {
         if let Err(panic_payload) = handle.join() {
@@ -2214,6 +2220,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             tracing::error!(panic = %msg, "RAG embedding thread panicked");
         }
     }
+
+    print_summary(&summary, &db_path, is_full_build, force);
+    print_timings(&timings, total_duration);
 
     Ok(())
 }

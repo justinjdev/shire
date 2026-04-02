@@ -636,7 +636,12 @@ fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
 
 /// Append Shire guidance to ~/.claude/CLAUDE.md if not already present.
 fn ensure_claude_md_line() -> Result<()> {
-    let claude_md_path = home_dir()?.join(".claude/CLAUDE.md");
+    let claude_dir = home_dir()?.join(".claude");
+    ensure_claude_md_line_in(&claude_dir)
+}
+
+fn ensure_claude_md_line_in(claude_dir: &Path) -> Result<()> {
+    let claude_md_path = claude_dir.join("CLAUDE.md");
     if claude_md_path.exists() {
         let content = fs::read_to_string(&claude_md_path)
             .with_context(|| format!("Failed to read {}", claude_md_path.display()))?;
@@ -649,8 +654,7 @@ fn ensure_claude_md_line() -> Result<()> {
             .with_context(|| format!("Failed to update {}", claude_md_path.display()))?;
         print_created("Added Shire guidance to ~/.claude/CLAUDE.md");
     } else {
-        let claude_dir = home_dir()?.join(".claude");
-        fs::create_dir_all(&claude_dir)?;
+        fs::create_dir_all(claude_dir)?;
         fs::write(&claude_md_path, format!("{CLAUDE_MD_LINE}\n"))
             .with_context(|| format!("Failed to create {}", claude_md_path.display()))?;
         print_created("Created ~/.claude/CLAUDE.md with Shire guidance");
@@ -1139,5 +1143,51 @@ mod tests {
         ensure_gitignore(dir.path(), ".shire").unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(content.contains("node_modules\n/.shire/\n"));
+    }
+
+    // --- ensure_claude_md_line ---
+
+    #[test]
+    fn test_ensure_claude_md_creates_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.contains(CLAUDE_MD_LINE));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_ensure_claude_md_appends_to_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("CLAUDE.md"), "# My Config\n").unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.starts_with("# My Config\n"));
+        assert!(content.contains(CLAUDE_MD_LINE));
+    }
+
+    #[test]
+    fn test_ensure_claude_md_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert_eq!(content.matches(CLAUDE_MD_LINE).count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_claude_md_appends_without_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("CLAUDE.md"), "# No newline").unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.contains("# No newline\n\n"));
+        assert!(content.contains(CLAUDE_MD_LINE));
     }
 }

@@ -106,8 +106,8 @@ pub fn file_to_text(file: &FileForEmbedding) -> String {
     let mut used = 0;
     for sym in &sorted {
         let part = match &sym.signature {
-            Some(sig) => sig.clone(),
-            None => format!("{} {}", sym.kind, sym.name),
+            Some(sig) if !sig.is_empty() => sig.clone(),
+            _ => format!("{} {}", sym.kind, sym.name),
         };
         let cost = if parts.is_empty() { part.len() } else { part.len() + 2 };
         if used + cost > budget {

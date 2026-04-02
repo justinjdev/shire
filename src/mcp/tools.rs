@@ -340,7 +340,7 @@ pub struct ExploreParams {
 
 #[tool_router]
 impl ShireService {
-    #[tool(description = "Search packages by name or description")]
+    #[tool(description = "Search packages by name or description. Use instead of Grep for finding packages.")]
     fn search_packages(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -418,7 +418,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Search symbols by name or signature. Omit query with a package filter to list all symbols in that package.")]
+    #[tool(description = "Find functions, classes, types, methods by name or signature. Use instead of Grep for 'where is function X?' or 'what matches pattern Y?'. Omit query with a package filter to list all symbols in that package.")]
     fn search_symbols(
         &self,
         Parameters(params): Parameters<SearchSymbolsParams>,
@@ -474,7 +474,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List all symbols defined in a specific file")]
+    #[tool(description = "List all symbols defined in a specific file. Use instead of reading the file to understand its exports.")]
     fn get_file_symbols(
         &self,
         Parameters(params): Parameters<GetFileSymbolsParams>,
@@ -493,7 +493,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List all files in a package, optionally filtered by extension")]
+    #[tool(description = "List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents.")]
     fn list_package_files(
         &self,
         Parameters(params): Parameters<ListPackageFilesParams>,
@@ -524,7 +524,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Search files by path or name using full-text search. Useful for finding files like 'middleware', 'proto files', or files in a specific directory.")]
+    #[tool(description = "Find files by path or name. Use instead of Glob/find for locating files. Useful for 'middleware', 'proto files', or files in a specific directory.")]
     fn search_files(
         &self,
         Parameters(params): Parameters<SearchFilesParams>,
@@ -549,7 +549,7 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Semantic codebase exploration — search packages, symbols, and files for a concept. Returns a structured context map organized by package. Faster than Grep for broad searches.")]
+    #[tool(description = "Explore a concept across the codebase — searches packages, symbols, and files semantically. Use as the first tool when investigating unfamiliar code or broad topics like 'authentication' or 'error handling'. Returns a structured context map organized by package.")]
     fn explore(
         &self,
         Parameters(params): Parameters<ExploreParams>,

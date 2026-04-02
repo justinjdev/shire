@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use console::style;
 use dialoguer::{Confirm, Input, Select};
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -7,32 +8,30 @@ use std::path::{Path, PathBuf};
 
 use crate::config::default_exclude;
 
+fn print_created(msg: &str) {
+    eprintln!("  {} {msg}", style("✓").green().bold());
+}
+
+fn print_skipped(msg: &str) {
+    eprintln!("  {} {msg}", style("–").dim());
+}
+
+fn print_header(msg: &str) {
+    eprintln!("\n{}", style(msg).cyan().bold());
+}
+
+const CLAUDE_MD_LINE: &str = "When searching code, use Shire MCP tools (search_symbols, search_files, explore) instead of Grep/Glob.";
+
 const RULES_CONTENT: &str = r#"# Shire — codebase search index
 
-Shire provides a pre-built search index (FTS5 + optional vector search) for this codebase.
-It indexes packages, symbols, files, and the dependency graph.
+When you need to find code, use Shire MCP tools first:
 
-## Default to Shire for search
+- **Find functions/classes/types:** `search_symbols` (not Grep)
+- **Find files:** `search_files` (not Glob)
+- **Explore a concept:** `explore` (not Grep)
+- **Check dependencies:** `package_dependents` / `package_dependencies`
 
-Use Shire tools before falling back to Grep/Glob:
-
-- **Find a function/class/type:** `search_symbols` — returns structured results with signature, file path, and line number
-- **Find a file:** `search_files` — searches by path or name
-- **Find a package:** `search_packages` — searches by name or description
-- **Explore a concept:** `explore` — broad semantic search returning a structured context map
-- **Understand a file:** `get_file_symbols` — list all symbols without reading the file
-- **Understand a package's API:** `search_symbols` with a package filter — list all exported symbols
-
-## Use Grep/Glob when
-
-- Searching for literal strings, log messages, or error text
-- Searching inside function bodies (Shire indexes definitions, not implementations)
-- Pattern matching on file contents
-
-## Before modifying shared code
-
-- `package_dependents` — check what depends on the package you're changing
-- `package_dependencies` with depth>1 — see the full transitive dependency chain
+Fall back to Grep only for literal strings or content inside function bodies.
 "#;
 
 /// Extract the top-level directory component from a relative db_path.
@@ -69,6 +68,8 @@ pub struct InitOptions {
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
     pub generate_rules: bool,
+    /// When true, append Shire guidance to ~/.claude/CLAUDE.md.
+    pub patch_claude_md: bool,
     /// When true, add the db directory to .gitignore.
     pub gitignore_db_dir: bool,
     /// When true, skip interactive prompts for existing files.
@@ -83,6 +84,7 @@ impl InitOptions {
             extra_excludes: Vec::new(),
             rag_enabled: false,
             generate_rules: true,
+            patch_claude_md: false,
             gitignore_db_dir: true,
             non_interactive: true,
         }
@@ -95,6 +97,7 @@ impl InitOptions {
             extra_excludes: Vec::new(),
             rag_enabled: false,
             generate_rules: true,
+            patch_claude_md: false,
             gitignore_db_dir: false,
             non_interactive: true,
         }
@@ -165,12 +168,19 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(true)
         .interact()?;
 
+    // 7. Add Shire guidance to ~/.claude/CLAUDE.md
+    let patch_claude_md = Confirm::new()
+        .with_prompt("Add Shire search guidance to ~/.claude/CLAUDE.md?")
+        .default(true)
+        .interact()?;
+
     Ok(InitOptions {
         use_hook,
         db_path,
         extra_excludes,
         rag_enabled,
         generate_rules,
+        patch_claude_md,
         gitignore_db_dir,
         non_interactive: false,
     })
@@ -217,6 +227,8 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
 }
 
 pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
+    print_header("Shire — codebase search index");
+
     // In interactive mode, ask local vs global first
     if !yes && std::io::stdin().is_terminal() {
         let items = &["Local (this project only)", "Global (all projects)"];
@@ -245,7 +257,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     let config_exists = config_path.exists();
     let should_write = if config_exists {
         if opts.non_interactive {
-            println!("shire.toml already exists, skipping");
+            print_skipped("shire.toml already exists, skipping");
             false
         } else {
             Confirm::new()
@@ -260,11 +272,11 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         let content = generate_config_toml(&opts, false);
         fs::write(&config_path, content)
             .with_context(|| format!("Failed to write {}", config_path.display()))?;
-        println!(
+        print_created(&format!(
             "{} {}",
             if config_exists { "Updated" } else { "Created" },
             config_path.display()
-        );
+        ));
     }
 
     // 2. Write .mcp.json for MCP server config
@@ -290,7 +302,12 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
     }
 
-    // 5. Ensure the db directory is in .gitignore (only when config was actually written)
+    // 5. Append Shire guidance to ~/.claude/CLAUDE.md
+    if opts.patch_claude_md {
+        ensure_claude_md_line()?;
+    }
+
+    // 6. Ensure the db directory is in .gitignore (only when config was actually written)
     if should_write && opts.gitignore_db_dir {
         if let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
             ensure_gitignore(root, &dir)?;
@@ -298,10 +315,10 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     }
 
     if opts.use_hook {
-        println!("\nNext: run `shire build` in this repo to create the index.");
+        eprintln!("\n  Next: run {} in this repo to create the index.", style("shire build").green().bold());
     } else {
-        println!("\nOn-demand reindexing enabled. The MCP server will rebuild the index automatically when needed.");
-        println!("No PostToolUse hook installed.");
+        eprintln!("\n  On-demand reindexing enabled. The MCP server will rebuild the index automatically when needed.");
+        print_skipped("No PostToolUse hook installed.");
     }
     Ok(())
 }
@@ -335,7 +352,7 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     let config_exists = config_path.exists();
     let should_write = if config_exists {
         if opts.non_interactive {
-            println!("~/.claude/shire.toml already exists, skipping");
+            print_skipped("~/.claude/shire.toml already exists, skipping");
             false
         } else {
             Confirm::new()
@@ -350,10 +367,10 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
         let content = generate_config_toml(opts, true);
         fs::write(&config_path, content)
             .with_context(|| format!("Failed to write {}", config_path.display()))?;
-        println!(
+        print_created(&format!(
             "{} ~/.claude/shire.toml",
             if config_exists { "Updated" } else { "Created" }
-        );
+        ));
     }
 
     // 2. Write MCP server to ~/.claude.json (user-scoped MCP config)
@@ -381,11 +398,16 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
         write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
     }
 
+    // 5. Append Shire guidance to ~/.claude/CLAUDE.md
+    if opts.patch_claude_md {
+        ensure_claude_md_line()?;
+    }
+
     if opts.use_hook {
-        println!("\nNext: run `shire build` in each repo you want to index.");
+        eprintln!("\n  Next: run {} in each repo you want to index.", style("shire build").green().bold());
     } else {
-        println!("\nOn-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed.");
-        println!("No PostToolUse hook installed.");
+        eprintln!("\n  On-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed.");
+        print_skipped("No PostToolUse hook installed.");
     }
     Ok(())
 }
@@ -407,7 +429,7 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
         .or_insert_with(|| json!({}));
     if let Some(servers_obj) = servers.as_object_mut() {
         if servers_obj.contains_key("shire") {
-            println!("mcpServers.shire already configured in .mcp.json, skipping");
+            print_skipped("mcpServers.shire already configured in .mcp.json");
             return Ok(());
         }
         servers_obj.insert(
@@ -435,7 +457,7 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
             format!("Failed to rename {} to {}", tmp_path.display(), mcp_path.display())
         });
     }
-    println!("Added mcpServers.shire to .mcp.json");
+    print_created("Added mcpServers.shire to .mcp.json");
     Ok(())
 }
 
@@ -479,7 +501,7 @@ fn patch_claude_hooks(
             .unwrap_or(false);
 
         if has_shire_hook {
-            println!("hooks.PostToolUse shire rebuild already configured in {display_path}, skipping");
+            print_skipped(&format!("hooks.PostToolUse already configured in {display_path}"));
             return Ok(());
         }
 
@@ -516,7 +538,7 @@ fn patch_claude_hooks(
             format!("Failed to rename {} to {}", tmp_path.display(), settings_path.display())
         });
     }
-    println!("Added hooks.PostToolUse shire rebuild to {display_path}");
+    print_created(&format!("Added hooks.PostToolUse to {display_path}"));
     Ok(())
 }
 
@@ -536,7 +558,7 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
         .or_insert_with(|| json!({}));
     if let Some(servers_obj) = servers.as_object_mut() {
         if servers_obj.contains_key("shire") {
-            println!("mcpServers.shire already configured in ~/.claude.json, skipping");
+            print_skipped("mcpServers.shire already configured in ~/.claude.json");
             return Ok(());
         }
         servers_obj.insert(
@@ -564,7 +586,21 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
             format!("Failed to rename {} to {}", tmp_path.display(), path.display())
         });
     }
-    println!("Added mcpServers.shire to ~/.claude.json");
+    print_created("Added mcpServers.shire to ~/.claude.json");
+    Ok(())
+}
+
+/// Write content to a file atomically via a temp file + rename.
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!("Failed to rename {} to {}", tmp_path.display(), path.display())
+        });
+    }
     Ok(())
 }
 
@@ -586,13 +622,11 @@ fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
             return Ok(());
         }
         let separator = if content.ends_with('\n') { "" } else { "\n" };
-        fs::write(&gitignore_path, format!("{content}{separator}{entry}\n"))
-            .with_context(|| format!("Failed to update {}", gitignore_path.display()))?;
-        println!("Added {entry} to .gitignore");
+        atomic_write(&gitignore_path, &format!("{content}{separator}{entry}\n"))?;
+        print_created(&format!("Added {entry} to .gitignore"));
     } else {
-        fs::write(&gitignore_path, format!("{entry}\n"))
-            .with_context(|| format!("Failed to create {}", gitignore_path.display()))?;
-        println!("Created .gitignore with {entry}");
+        atomic_write(&gitignore_path, &format!("{entry}\n"))?;
+        print_created(&format!("Created .gitignore with {entry}"));
     }
     Ok(())
 }
@@ -603,12 +637,38 @@ fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
         .with_context(|| format!("Failed to create directory {}", rules_dir.display()))?;
     let rules_path = rules_dir.join("shire.md");
     if rules_path.exists() {
-        println!("{display_path} already exists, skipping");
+        print_skipped(&format!("{display_path} already exists"));
         return Ok(());
     }
     fs::write(&rules_path, RULES_CONTENT)
         .with_context(|| format!("Failed to write {}", rules_path.display()))?;
-    println!("Created {display_path}");
+    print_created(&format!("Created {display_path}"));
+    Ok(())
+}
+
+/// Append Shire guidance to ~/.claude/CLAUDE.md if not already present.
+fn ensure_claude_md_line() -> Result<()> {
+    let claude_dir = home_dir()?.join(".claude");
+    ensure_claude_md_line_in(&claude_dir)
+}
+
+fn ensure_claude_md_line_in(claude_dir: &Path) -> Result<()> {
+    let claude_md_path = claude_dir.join("CLAUDE.md");
+    if claude_md_path.exists() {
+        let content = fs::read_to_string(&claude_md_path)
+            .with_context(|| format!("Failed to read {}", claude_md_path.display()))?;
+        if content.contains(CLAUDE_MD_LINE) {
+            print_skipped("~/.claude/CLAUDE.md already has Shire guidance");
+            return Ok(());
+        }
+        let separator = if content.ends_with('\n') { "\n" } else { "\n\n" };
+        atomic_write(&claude_md_path, &format!("{content}{separator}{CLAUDE_MD_LINE}\n"))?;
+        print_created("Added Shire guidance to ~/.claude/CLAUDE.md");
+    } else {
+        fs::create_dir_all(claude_dir)?;
+        atomic_write(&claude_md_path, &format!("{CLAUDE_MD_LINE}\n"))?;
+        print_created("Created ~/.claude/CLAUDE.md with Shire guidance");
+    }
     Ok(())
 }
 
@@ -647,7 +707,7 @@ mod tests {
         let rules_path = dir.path().join(".claude/rules/shire.md");
         assert!(rules_path.exists());
         let content = fs::read_to_string(&rules_path).unwrap();
-        assert!(content.contains("Default to Shire for search"));
+        assert!(content.contains("use Shire MCP tools"));
     }
 
     #[test]
@@ -768,7 +828,7 @@ mod tests {
         let rules_path = claude_dir.join("rules/shire.md");
         assert!(rules_path.exists());
         let content = fs::read_to_string(&rules_path).unwrap();
-        assert!(content.contains("Default to Shire for search"));
+        assert!(content.contains("use Shire MCP tools"));
     }
 
     #[test]
@@ -978,6 +1038,7 @@ mod tests {
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
             generate_rules: true,
+            patch_claude_md: false,
             gitignore_db_dir: false,
             non_interactive: true,
         };
@@ -1092,5 +1153,51 @@ mod tests {
         ensure_gitignore(dir.path(), ".shire").unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(content.contains("node_modules\n/.shire/\n"));
+    }
+
+    // --- ensure_claude_md_line ---
+
+    #[test]
+    fn test_ensure_claude_md_creates_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.contains(CLAUDE_MD_LINE));
+        assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_ensure_claude_md_appends_to_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("CLAUDE.md"), "# My Config\n").unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.starts_with("# My Config\n"));
+        assert!(content.contains(CLAUDE_MD_LINE));
+    }
+
+    #[test]
+    fn test_ensure_claude_md_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert_eq!(content.matches(CLAUDE_MD_LINE).count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_claude_md_appends_without_trailing_newline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(claude_dir.join("CLAUDE.md"), "# No newline").unwrap();
+        ensure_claude_md_line_in(&claude_dir).unwrap();
+        let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.contains("# No newline\n\n"));
+        assert!(content.contains(CLAUDE_MD_LINE));
     }
 }

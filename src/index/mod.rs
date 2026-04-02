@@ -1731,7 +1731,7 @@ fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(len));
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len}")
+            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})")
             .unwrap()
             .progress_chars("━╸─"),
     );
@@ -2031,6 +2031,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .iter()
                 .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
                 .collect();
+            // Delete existing embeddings for changed packages so we can re-embed
+            conn.execute(
+                &format!(
+                    "DELETE FROM file_embeddings WHERE file_id IN \
+                     (SELECT id FROM files WHERE package IN ({placeholders}))"
+                ),
+                rusqlite::params_from_iter(params.iter()),
+            )?;
+
             let file_sql = format!(
                 "SELECT f.id, f.path, f.package \
                  FROM files f \
@@ -2076,31 +2085,54 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 let num_files = file_inputs.len();
                 let db_path_owned = db_path.clone();
                 let rag_config = config.rag.clone();
+                let show_progress = progress;
 
-                eprintln!("Embedding {num_files} files in background…");
                 Some(std::thread::spawn(move || {
+                    let pb = ProgressBar::new(num_files as u64);
+                    if !show_progress {
+                        pb.set_draw_target(ProgressDrawTarget::hidden());
+                    }
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})")
+                            .expect("hardcoded progress template must be valid")
+                            .progress_chars("━╸─"),
+                    );
+                    pb.set_message("Embedding files");
+
                     let t = Instant::now();
                     let embedder = match Embedder::new(&rag_config) {
                         Ok(e) => e,
                         Err(e) => {
+                            pb.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: model init failed");
                             return;
                         }
                     };
-                    match embed_files(&embedder, &file_inputs) {
+                    match embed_files(&embedder, &file_inputs, |n| pb.inc(n as u64)) {
                         Ok(embeddings) => {
                             match db::open_or_create(&db_path_owned, true) {
                                 Ok(bg_conn) => {
                                     if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
+                                        pb.finish_with_message(format!("Embedding failed: {e}"));
                                         tracing::warn!(error = %e, "RAG background: insert failed");
                                     } else {
-                                        eprintln!("Embedded {num_files} files in {:.1}s", t.elapsed().as_secs_f64());
+                                        pb.finish_with_message(format!(
+                                            "Embedded {num_files} files in {:.1}s",
+                                            t.elapsed().as_secs_f64()
+                                        ));
                                     }
                                 }
-                                Err(e) => tracing::warn!(error = %e, "RAG background: DB open failed"),
+                                Err(e) => {
+                                    pb.finish_with_message(format!("Embedding failed: {e}"));
+                                    tracing::warn!(error = %e, "RAG background: DB open failed");
+                                }
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, "RAG background: embed failed"),
+                        Err(e) => {
+                            pb.finish_with_message(format!("Embedding failed: {e}"));
+                            tracing::warn!(error = %e, "RAG background: embed failed");
+                        }
                     }
                 }))
             }
@@ -2176,16 +2208,21 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
-    // Clear progress bars before printing summary
-    mp.clear()?;
+    // Wait for RAG embedding to complete before printing summary.
+    // Spinner is already hidden in quiet mode, so joining has no visual cost.
+    if let Some(handle) = rag_handle {
+        if let Err(panic_payload) = handle.join() {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            tracing::error!(panic = %msg, "RAG embedding thread panicked");
+        }
+    }
 
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
-
-    // Wait for background RAG embedding to complete before exiting
-    if let Some(handle) = rag_handle {
-        let _ = handle.join();
-    }
 
     Ok(())
 }

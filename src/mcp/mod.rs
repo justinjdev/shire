@@ -30,27 +30,23 @@ impl ServerHandler for tools::ShireService {
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             instructions: Some(
-                "Shire is a pre-built search index for codebases. It indexes packages, symbols \
-                 (functions, classes, types, methods), files, and the dependency graph into SQLite \
-                 with FTS5 full-text search.\n\n\
-                 ## When to use Shire\n\n\
-                 **Default to Shire for codebase search.** Index lookups are faster than scanning files \
-                 with Grep/Glob and return structured results (symbol kind, signature, file path, line number).\n\n\
-                 - `search_symbols` — find functions, classes, types by name or signature. Use instead of Grep \
-                 for \"where is function X defined?\" or \"what functions match pattern Y?\"\n\
-                 - `search_packages` — find packages by name or description\n\
-                 - `search_files` — find files by path or name\n\
-                 - `get_file_symbols` — list all symbols in a file (functions, classes, types). Use to understand \
-                 a file's exports without reading the entire file\n\
-                 - `list_package_files` — list files in a package, optionally filtered by extension\n\
-                 - `explore` — broad semantic search across packages, symbols, and files for a concept. \
-                 Returns a structured context map. Use when exploring unfamiliar code\n\n\
-                 ## Dependency graph (unique to Shire)\n\n\
-                 - `package_dependencies` / `package_dependents` — navigate the dependency graph. \
-                 Set depth>1 on package_dependencies for transitive graph\n\n\
-                 ## When to fall back to Grep/Glob\n\n\
-                 Use Grep when searching for literal strings, log messages, or content inside function bodies. \
-                 Shire indexes symbol definitions, not implementations."
+                "Shire is a pre-built search index for this codebase. Use Shire tools instead of \
+                 Grep/Glob for codebase search — they return structured results (symbol kind, signature, \
+                 file path, line number) instantly from an index, no file scanning needed.\n\n\
+                 ## Tool selection guide\n\n\
+                 | Task | Use this | Instead of |\n\
+                 |------|----------|------------|\n\
+                 | Find a function/class/type | `search_symbols` | Grep |\n\
+                 | Find a file by name | `search_files` | Glob/find |\n\
+                 | Find a package | `search_packages` | Grep |\n\
+                 | List symbols in a file | `get_file_symbols` | Reading the file |\n\
+                 | List files in a package | `list_package_files` | Glob |\n\
+                 | Explore a concept | `explore` | Grep |\n\
+                 | Check what depends on X | `package_dependents` | Grep for imports |\n\
+                 | Check what X depends on | `package_dependencies` | Reading manifests |\n\n\
+                 ## Fall back to Grep/Glob when\n\n\
+                 - Searching for literal strings, log messages, or error text inside function bodies\n\
+                 - Shire indexes definitions, not implementations — use Grep for content within functions"
                     .into(),
             ),
         }

@@ -2775,6 +2775,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "console",
  "dialoguer",
  "fastembed",
  "glob",

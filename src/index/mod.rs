@@ -1816,7 +1816,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let walked = if !force && !is_fresh_db(&conn) && !git_index_changed_since_build(repo_root, &conn) {
+    let git_index_changed = force || is_fresh_db(&conn) || git_index_changed_since_build(repo_root, &conn);
+    let walked = if !git_index_changed {
         // .git/index unchanged — no files added/removed. Use cached manifest paths.
         match cached_manifest_walk(repo_root, &conn) {
             Some(cached) => {
@@ -1988,7 +1989,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     let pb_sym_clone = pb_sym.clone();
     let num_source_reextracted = with_transaction(&conn, || {
         phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)?;
-        phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
+        if git_index_changed {
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
+        } else {
+            // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
+            if let Some(pb) = &pb_sym_clone {
+                pb.inc(diff.unchanged.len() as u64);
+            }
+            Ok(0)
+        }
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");

@@ -2199,9 +2199,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
-    // Clear progress bars before printing summary
-    mp.clear()?;
-
     print_summary(&summary, &db_path, is_full_build, force);
     print_timings(&timings, total_duration);
 

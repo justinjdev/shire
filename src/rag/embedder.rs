@@ -101,7 +101,7 @@ pub fn file_to_text(file: &FileForEmbedding) -> String {
     sorted.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
 
     let prefix = format!("{} in {} — ", file.file_path, file.package);
-    let budget = 1800 - prefix.len();
+    let budget = 1800usize.saturating_sub(prefix.len());
     let mut parts = Vec::new();
     let mut used = 0;
     for sym in &sorted {

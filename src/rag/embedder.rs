@@ -122,19 +122,23 @@ pub fn file_to_text(file: &FileForEmbedding) -> String {
 pub fn embed_files(
     embedder: &Embedder,
     files: &[FileForEmbedding],
+    on_batch: impl Fn(usize),
 ) -> Result<Vec<(i64, Vec<f32>)>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
 
-    let texts: Vec<String> = files.iter().map(file_to_text).collect();
-    let embeddings = embedder.embed(texts)?;
+    const BATCH_SIZE: usize = 64;
+    let mut result = Vec::with_capacity(files.len());
 
-    let result: Vec<(i64, Vec<f32>)> = files
-        .iter()
-        .zip(embeddings)
-        .map(|(file, emb)| (file.id, emb))
-        .collect();
+    for chunk in files.chunks(BATCH_SIZE) {
+        let texts: Vec<String> = chunk.iter().map(file_to_text).collect();
+        let embeddings = embedder.embed(texts)?;
+        for (file, emb) in chunk.iter().zip(embeddings) {
+            result.push((file.id, emb));
+        }
+        on_batch(chunk.len());
+    }
 
     Ok(result)
 }

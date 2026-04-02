@@ -1731,7 +1731,7 @@ fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(len));
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len}")
+            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})")
             .unwrap()
             .progress_chars("━╸─"),
     );
@@ -2079,49 +2079,49 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 let show_progress = progress;
 
                 Some(std::thread::spawn(move || {
-                    let sp = ProgressBar::new_spinner();
+                    let pb = ProgressBar::new(num_files as u64);
                     if !show_progress {
-                        sp.set_draw_target(ProgressDrawTarget::hidden());
+                        pb.set_draw_target(ProgressDrawTarget::hidden());
                     }
-                    sp.set_style(
-                        ProgressStyle::default_spinner()
-                            .template("{spinner:.cyan} {msg}")
-                            .expect("hardcoded spinner template must be valid"),
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})")
+                            .expect("hardcoded progress template must be valid")
+                            .progress_chars("━╸─"),
                     );
-                    sp.set_message(format!("Embedding {num_files} files…"));
-                    sp.enable_steady_tick(Duration::from_millis(80));
+                    pb.set_message("Embedding files");
 
                     let t = Instant::now();
                     let embedder = match Embedder::new(&rag_config) {
                         Ok(e) => e,
                         Err(e) => {
-                            sp.finish_with_message(format!("Embedding failed: {e}"));
+                            pb.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: model init failed");
                             return;
                         }
                     };
-                    match embed_files(&embedder, &file_inputs) {
+                    match embed_files(&embedder, &file_inputs, |n| pb.inc(n as u64)) {
                         Ok(embeddings) => {
                             match db::open_or_create(&db_path_owned, true) {
                                 Ok(bg_conn) => {
                                     if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
-                                        sp.finish_with_message(format!("Embedding failed: {e}"));
+                                        pb.finish_with_message(format!("Embedding failed: {e}"));
                                         tracing::warn!(error = %e, "RAG background: insert failed");
                                     } else {
-                                        sp.finish_with_message(format!(
+                                        pb.finish_with_message(format!(
                                             "Embedded {num_files} files in {:.1}s",
                                             t.elapsed().as_secs_f64()
                                         ));
                                     }
                                 }
                                 Err(e) => {
-                                    sp.finish_with_message(format!("Embedding failed: {e}"));
+                                    pb.finish_with_message(format!("Embedding failed: {e}"));
                                     tracing::warn!(error = %e, "RAG background: DB open failed");
                                 }
                             }
                         }
                         Err(e) => {
-                            sp.finish_with_message(format!("Embedding failed: {e}"));
+                            pb.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: embed failed");
                         }
                     }

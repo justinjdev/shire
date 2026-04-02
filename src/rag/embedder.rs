@@ -80,26 +80,43 @@ pub fn embed_symbols(
     Ok(result)
 }
 
+pub struct FileSymbol {
+    pub name: String,
+    pub kind: String,
+    pub signature: Option<String>,
+}
+
 pub struct FileForEmbedding {
     pub id: i64,
     pub file_path: String,
     pub package: String,
-    pub symbols: Vec<(String, String)>, // (name, kind)
+    pub symbols: Vec<FileSymbol>,
 }
 
 pub fn file_to_text(file: &FileForEmbedding) -> String {
     if file.symbols.is_empty() {
         return format!("file {} in {}", file.file_path, file.package);
     }
-    let mut sorted_symbols: Vec<&(String, String)> = file.symbols.iter().collect();
-    sorted_symbols.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    let symbol_list: String = sorted_symbols
-        .iter()
-        .take(50) // cap to avoid exceeding token limits
-        .map(|(name, kind)| format!("{kind} {name}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{} in {} — {}", file.file_path, file.package, symbol_list)
+    let mut sorted: Vec<&FileSymbol> = file.symbols.iter().collect();
+    sorted.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+
+    let prefix = format!("{} in {} — ", file.file_path, file.package);
+    let budget = 1800 - prefix.len();
+    let mut parts = Vec::new();
+    let mut used = 0;
+    for sym in &sorted {
+        let part = match &sym.signature {
+            Some(sig) => sig.clone(),
+            None => format!("{} {}", sym.kind, sym.name),
+        };
+        let cost = if parts.is_empty() { part.len() } else { part.len() + 2 };
+        if used + cost > budget {
+            break;
+        }
+        used += cost;
+        parts.push(part);
+    }
+    format!("{prefix}{}", parts.join(", "))
 }
 
 pub fn embed_files(

@@ -2043,11 +2043,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(file_id, file_path, package)| {
-                    let symbols: Vec<(String, String)> = conn
-                        .prepare("SELECT name, kind FROM symbols WHERE file_path = ?1")
+                    let symbols: Vec<crate::rag::embedder::FileSymbol> = conn
+                        .prepare("SELECT name, kind, signature FROM symbols WHERE file_path = ?1")
                         .and_then(|mut s| {
                             s.query_map([file_path.as_str()], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                                Ok(crate::rag::embedder::FileSymbol {
+                                    name: row.get(0)?,
+                                    kind: row.get(1)?,
+                                    signature: row.get(2)?,
+                                })
                             })
                             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                         })

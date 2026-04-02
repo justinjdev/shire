@@ -590,6 +590,20 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     Ok(())
 }
 
+/// Write content to a file atomically via a temp file + rename.
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!("Failed to rename {} to {}", tmp_path.display(), path.display())
+        });
+    }
+    Ok(())
+}
+
 /// Ensure `dir` is listed in `.gitignore` at the project root.
 /// Creates the file if it doesn't exist, appends if the entry isn't already present.
 fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
@@ -608,12 +622,10 @@ fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
             return Ok(());
         }
         let separator = if content.ends_with('\n') { "" } else { "\n" };
-        fs::write(&gitignore_path, format!("{content}{separator}{entry}\n"))
-            .with_context(|| format!("Failed to update {}", gitignore_path.display()))?;
+        atomic_write(&gitignore_path, &format!("{content}{separator}{entry}\n"))?;
         print_created(&format!("Added {entry} to .gitignore"));
     } else {
-        fs::write(&gitignore_path, format!("{entry}\n"))
-            .with_context(|| format!("Failed to create {}", gitignore_path.display()))?;
+        atomic_write(&gitignore_path, &format!("{entry}\n"))?;
         print_created(&format!("Created .gitignore with {entry}"));
     }
     Ok(())
@@ -650,13 +662,11 @@ fn ensure_claude_md_line_in(claude_dir: &Path) -> Result<()> {
             return Ok(());
         }
         let separator = if content.ends_with('\n') { "\n" } else { "\n\n" };
-        fs::write(&claude_md_path, format!("{content}{separator}{CLAUDE_MD_LINE}\n"))
-            .with_context(|| format!("Failed to update {}", claude_md_path.display()))?;
+        atomic_write(&claude_md_path, &format!("{content}{separator}{CLAUDE_MD_LINE}\n"))?;
         print_created("Added Shire guidance to ~/.claude/CLAUDE.md");
     } else {
         fs::create_dir_all(claude_dir)?;
-        fs::write(&claude_md_path, format!("{CLAUDE_MD_LINE}\n"))
-            .with_context(|| format!("Failed to create {}", claude_md_path.display()))?;
+        atomic_write(&claude_md_path, &format!("{CLAUDE_MD_LINE}\n"))?;
         print_created("Created ~/.claude/CLAUDE.md with Shire guidance");
     }
     Ok(())

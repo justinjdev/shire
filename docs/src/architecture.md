@@ -56,10 +56,10 @@ When [RAG is enabled](./configuration.md#rag-vector-search), the build produces 
 The text representation (`file_to_text`) works as follows:
 - Symbols are sorted by kind then name
 - Signatures are preferred over `kind name` fallback when available
-- A **character budget of 1800** controls text length — symbols are added until the budget is exhausted, replacing the previous fixed cap of 50 symbols
+- A **total character budget of 1800** caps the output text — after the file path prefix is accounted for, remaining budget is filled with symbols until exhausted
 - Files with no symbols produce a minimal `file <path> in <package>` string
 
-Embedding runs in a background thread after the main build completes:
+Embedding runs in a **background thread** spawned during the build, executing concurrently with post-build housekeeping:
 - Files are processed in **batches of 64** to balance throughput and memory
 - A progress callback reports batch completion for progress bar updates
 - Errors (model init, embedding, DB write) are reported on the progress bar rather than failing the build

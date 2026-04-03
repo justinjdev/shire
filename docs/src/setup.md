@@ -46,7 +46,7 @@ If accepted, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Co
 - **–** (dimmed) — a file or config entry already exists, skipped
 - Section headers appear in **cyan**
 
-All file writes (`.gitignore`, `CLAUDE.md`, `settings.json`, `.mcp.json`) use **atomic writes** — content is written to a temporary file first, then renamed into place. This prevents partial writes if the process is interrupted.
+Most file writes (`.gitignore`, `CLAUDE.md`, `settings.json`, `.mcp.json`, `~/.claude.json`) use **atomic writes** — content is written to a temporary file first, then renamed into place. This prevents partial writes if the process is interrupted.
 
 ### Project-level setup
 
@@ -161,8 +161,8 @@ Symbol extraction and source hashing are **parallelized** across packages and wi
 
 `shire build` shows real-time progress for each build phase:
 
-- **Spinners** for quick phases (discovering manifests, workspace context, recomputing internals)
-- **Progress bars with ETAs** for longer phases (parsing manifests, extracting symbols, indexing files)
+- **Spinners** for quick phases (discovering manifests, workspace context, recomputing internals, indexing files)
+- **Progress bars with ETAs** for longer phases (parsing manifests, extracting symbols)
 - When [RAG is enabled](./configuration.md#rag-vector-search), an **embedding progress bar** tracks file embedding in the background, displaying error messages on failure
 
 Progress bars persist after completion so you can see the full build history in your terminal. Quiet mode (used internally by the MCP server for on-demand rebuilds) hides all progress output.

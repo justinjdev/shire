@@ -15,6 +15,8 @@ pub mod rust_lang;
 pub mod scala;
 pub mod sql;
 pub mod swift;
+// Named toml_lang to avoid collision with the `toml` crate
+pub mod toml_lang;
 pub mod typescript;
 pub mod yaml;
 pub mod zig;

@@ -198,6 +198,42 @@ fn create_schema(conn: &Connection) -> Result<()> {
             INSERT INTO symbols_fts(rowid, name, kind, signature, file_path)
             VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path);
         END;
+
+        CREATE TABLE IF NOT EXISTS docs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            path       TEXT NOT NULL UNIQUE,
+            package    TEXT REFERENCES packages(name) ON DELETE SET NULL,
+            title      TEXT,
+            body       TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_docs_package ON docs(package);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+            title, body, path,
+            content='docs',
+            content_rowid='rowid',
+            tokenize=\"unicode61 tokenchars '_-'\",
+            prefix='2,3'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+            INSERT INTO docs_fts(rowid, title, body, path)
+            VALUES (new.rowid, new.title, new.body, new.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, title, body, path)
+            VALUES ('delete', old.rowid, old.title, old.body, old.path);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, title, body, path)
+            VALUES ('delete', old.rowid, old.title, old.body, old.path);
+            INSERT INTO docs_fts(rowid, title, body, path)
+            VALUES (new.rowid, new.title, new.body, new.path);
+        END;
         ",
     )?;
     Ok(())
@@ -232,7 +268,36 @@ pub fn recreate_symbols_fts_triggers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const FTS_SCHEMA_VERSION: &str = "2";
+pub fn drop_docs_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS docs_ai;
+         DROP TRIGGER IF EXISTS docs_ad;
+         DROP TRIGGER IF EXISTS docs_au;",
+    )?;
+    Ok(())
+}
+
+pub fn recreate_docs_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+            INSERT INTO docs_fts(rowid, title, body, path)
+            VALUES (new.rowid, new.title, new.body, new.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, title, body, path)
+            VALUES ('delete', old.rowid, old.title, old.body, old.path);
+        END;
+        CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+            INSERT INTO docs_fts(docs_fts, rowid, title, body, path)
+            VALUES ('delete', old.rowid, old.title, old.body, old.path);
+            INSERT INTO docs_fts(rowid, title, body, path)
+            VALUES (new.rowid, new.title, new.body, new.path);
+        END;",
+    )?;
+    Ok(())
+}
+
+const FTS_SCHEMA_VERSION: &str = "3";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     let current: Option<String> = conn
@@ -263,9 +328,13 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS symbols_ai;
          DROP TRIGGER IF EXISTS symbols_ad;
          DROP TRIGGER IF EXISTS symbols_au;
+         DROP TRIGGER IF EXISTS docs_ai;
+         DROP TRIGGER IF EXISTS docs_ad;
+         DROP TRIGGER IF EXISTS docs_au;
          DROP TABLE IF EXISTS packages_fts;
          DROP TABLE IF EXISTS files_fts;
-         DROP TABLE IF EXISTS symbols_fts;",
+         DROP TABLE IF EXISTS symbols_fts;
+         DROP TABLE IF EXISTS docs_fts;",
     )?;
 
     create_schema(conn)?;
@@ -273,7 +342,8 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "INSERT INTO packages_fts(packages_fts) VALUES('rebuild');
          INSERT INTO files_fts(files_fts) VALUES('rebuild');
-         INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');",
+         INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');
+         INSERT INTO docs_fts(docs_fts) VALUES('rebuild');",
     )?;
 
     conn.execute(
@@ -371,6 +441,7 @@ mod tests {
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"symbols".to_string()));
         assert!(tables.contains(&"file_hashes".to_string()));
+        assert!(tables.contains(&"docs".to_string()));
     }
 
     #[test]
@@ -390,6 +461,25 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(results, vec!["auth-service"]);
+    }
+
+    #[test]
+    fn test_docs_fts_search() {
+        let conn = in_memory_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/setup.md", Option::<String>::None, "Getting Started", "How to install and configure the service", 42),
+        )
+        .unwrap();
+
+        let results: Vec<String> = conn
+            .prepare("SELECT path FROM docs_fts WHERE docs_fts MATCH ?1")
+            .unwrap()
+            .query_map(["install"], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(results, vec!["docs/setup.md"]);
     }
 
     #[test]

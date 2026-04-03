@@ -1556,7 +1556,12 @@ fn phase_index_docs(
 
         let size_bytes = content.len() as i64;
         let body = if content.len() > max_size as usize {
-            &content[..max_size as usize]
+            // Find a valid UTF-8 boundary at or before max_size
+            let mut end = max_size as usize;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            &content[..end]
         } else {
             content.as_str()
         };
@@ -2901,5 +2906,74 @@ anyhow = "1"
 
         // hashed_at should NOT be updated when mtime precheck skips
         assert_eq!(hashed_at_1, hashed_at_2);
+    }
+
+    #[test]
+    fn test_extract_doc_title_markdown_heading() {
+        assert_eq!(
+            extract_doc_title("# My Title\n\nSome content"),
+            Some("My Title".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_leading_blank_lines() {
+        assert_eq!(
+            extract_doc_title("\n\n# Title After Blanks\n"),
+            Some("Title After Blanks".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_no_heading() {
+        assert_eq!(
+            extract_doc_title("Just plain text\nMore text"),
+            Some("Just plain text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_empty() {
+        assert_eq!(extract_doc_title(""), None);
+        assert_eq!(extract_doc_title("\n\n\n"), None);
+    }
+
+    #[test]
+    fn test_phase_index_docs_with_utf8_truncation() {
+        // Verify that multi-byte UTF-8 characters at the truncation boundary
+        // don't cause a panic. "é" is 2 bytes, "日" is 3 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        create_test_monorepo(dir.path());
+
+        let config = Config {
+            docs: crate::config::DocsConfig {
+                extensions: vec![".md".into()],
+                max_file_size: 5, // truncate at 5 bytes
+            },
+            ..Config::default()
+        };
+
+        // Build index first to populate files table
+        let db_path = dir.path().join(".shire/index.db");
+        build_index(dir.path(), &config, true, Some(&db_path)).unwrap();
+
+        // Create a doc file with multi-byte chars near the boundary
+        let doc_path = dir.path().join("services/auth/README.md");
+        fs::write(&doc_path, "abc日本語").unwrap(); // "abc" = 3 bytes, "日" starts at byte 3 (3 bytes)
+
+        // Rebuild to index the doc file
+        build_index(dir.path(), &config, true, Some(&db_path)).unwrap();
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM docs WHERE path LIKE '%README.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // max_file_size=5, "abc日" would be 6 bytes, so truncated to "abc" (3 bytes at char boundary)
+        assert_eq!(body, "abc");
+        assert!(body.len() <= 5);
     }
 }

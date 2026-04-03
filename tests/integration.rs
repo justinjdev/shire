@@ -330,7 +330,11 @@ fn test_symbol_extraction_typescript() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -353,7 +357,10 @@ fn test_symbol_extraction_typescript() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(sig.contains("token"), "signature should contain param: {sig}");
+    assert!(
+        sig.contains("token"),
+        "signature should contain param: {sig}"
+    );
 
     // AuthService class should be extracted
     let kind: String = conn
@@ -462,7 +469,11 @@ fn test_symbol_extraction_rust() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -554,7 +565,8 @@ fn test_symbol_incremental_update() {
     assert!(
         updated_count > initial_count,
         "Should have more symbols after adding function: {} vs {}",
-        updated_count, initial_count
+        updated_count,
+        initial_count
     );
 
     // Verify the new function is there
@@ -669,7 +681,8 @@ fn test_source_change_triggers_reextraction() {
     assert!(
         updated_count > initial_count,
         "Should have more symbols after adding function: {} vs {}",
-        updated_count, initial_count
+        updated_count,
+        initial_count
     );
 
     // Verify the new symbol is present
@@ -680,7 +693,10 @@ fn test_source_change_triggers_reextraction() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1, "revokeToken should be extracted via source-level incremental");
+    assert_eq!(
+        count, 1,
+        "revokeToken should be extracted via source-level incremental"
+    );
 }
 
 #[test]
@@ -729,7 +745,10 @@ fn test_force_clears_and_recomputes_source_hashes() {
     let hash_count_before: i64 = conn
         .query_row("SELECT COUNT(*) FROM source_hashes", [], |row| row.get(0))
         .unwrap();
-    assert!(hash_count_before > 0, "should have source hashes after first build");
+    assert!(
+        hash_count_before > 0,
+        "should have source hashes after first build"
+    );
     drop(conn);
 
     // Force rebuild
@@ -794,7 +813,10 @@ fn test_delete_package_removes_source_hash() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!has_gateway_hash, "gateway source hash should be removed after package deletion");
+    assert!(
+        !has_gateway_hash,
+        "gateway source hash should be removed after package deletion"
+    );
 
     // Also verify the package itself is gone
     let pkg_count: i64 = conn
@@ -866,7 +888,8 @@ export class PermissionManager {
     assert!(
         updated_count > initial_count,
         "Should have more symbols after adding new file: {} vs {}",
-        updated_count, initial_count
+        updated_count,
+        initial_count
     );
 
     // Verify the new file's exports are present
@@ -877,7 +900,10 @@ export class PermissionManager {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(check_perm, 1, "checkPermission should be extracted from new file");
+    assert_eq!(
+        check_perm, 1,
+        "checkPermission should be extracted from new file"
+    );
 
     let perm_mgr: i64 = conn
         .query_row(
@@ -886,7 +912,10 @@ export class PermissionManager {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(perm_mgr, 1, "PermissionManager should be extracted from new file");
+    assert_eq!(
+        perm_mgr, 1,
+        "PermissionManager should be extracted from new file"
+    );
 }
 
 #[test]
@@ -992,7 +1021,10 @@ fn test_file_index_null_package_for_unowned_files() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(pkg.is_none(), "file outside any package should have NULL package");
+    assert!(
+        pkg.is_none(),
+        "file outside any package should have NULL package"
+    );
 }
 
 #[test]
@@ -1079,7 +1111,11 @@ fn test_file_index_rebuild_includes_new_file() {
 #[test]
 fn test_maven_index_basic() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     // Create a Maven project
@@ -1114,14 +1150,16 @@ fn test_maven_index_basic() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     // Check package indexed correctly
     let name: String = conn
@@ -1156,7 +1194,11 @@ fn test_maven_index_basic() {
 #[test]
 fn test_maven_parent_pom_inheritance() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     // Parent POM at root (aggregator — not indexed as package)
@@ -1211,14 +1253,16 @@ fn test_maven_parent_pom_inheritance() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     // Only child should be indexed (parent is aggregator POM)
     let pkg_count: i64 = conn
@@ -1252,7 +1296,11 @@ fn test_maven_parent_pom_inheritance() {
 #[test]
 fn test_gradle_index_basic() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     let app_dir = dir.path().join("app");
@@ -1276,17 +1324,23 @@ dependencies {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     let name: String = conn
-        .query_row("SELECT name FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .query_row(
+            "SELECT name FROM packages WHERE kind = 'gradle'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(name, "com.example:app");
 
@@ -1303,7 +1357,11 @@ dependencies {
 #[test]
 fn test_gradle_settings_workspace() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     // settings.gradle
@@ -1345,18 +1403,24 @@ include ':app', ':lib'
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     // 3 packages: root, app, lib
     let pkg_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE kind = 'gradle'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(pkg_count, 3);
 
@@ -1376,7 +1440,11 @@ include ':app', ':lib'
 #[test]
 fn test_mixed_maven_gradle_ecosystem() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     // Maven project
@@ -1415,14 +1483,16 @@ fn test_mixed_maven_gradle_ecosystem() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     // All 3 packages indexed
     let pkg_count: i64 = conn
@@ -1432,17 +1502,29 @@ fn test_mixed_maven_gradle_ecosystem() {
 
     // Check each kind
     let maven_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'maven'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE kind = 'maven'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(maven_count, 1);
 
     let gradle_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'gradle'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE kind = 'gradle'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(gradle_count, 1);
 
     let npm_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM packages WHERE kind = 'npm'", [], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE kind = 'npm'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(npm_count, 1);
 }
@@ -1450,7 +1532,11 @@ fn test_mixed_maven_gradle_ecosystem() {
 #[test]
 fn test_maven_incremental_rebuild() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     let svc_dir = dir.path().join("svc");
@@ -1492,14 +1578,15 @@ fn test_maven_incremental_rebuild() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("updated"), "Should show updated count: {stdout}");
+    assert!(
+        stdout.contains("updated"),
+        "Should show updated count: {stdout}"
+    );
 
     let db_path = dir.path().join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     let version: String = conn
         .query_row(
@@ -1548,12 +1635,7 @@ fn test_rebuild_no_fk_violation() {
 
     // Force rebuild — this would trigger FK violation with INSERT OR REPLACE
     let output = Command::new(&bin)
-        .args([
-            "build",
-            "--root",
-            dir.path().to_str().unwrap(),
-            "--force",
-        ])
+        .args(["build", "--root", dir.path().to_str().unwrap(), "--force"])
         .output()
         .unwrap();
     assert!(
@@ -1571,7 +1653,10 @@ fn test_rebuild_no_fk_violation() {
     let dep_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
         .unwrap();
-    assert!(dep_count > 0, "Dependencies should still exist after rebuild");
+    assert!(
+        dep_count > 0,
+        "Dependencies should still exist after rebuild"
+    );
 }
 
 #[test]
@@ -1674,7 +1759,11 @@ fn test_dual_manifest_same_directory_no_fk_violation() {
 #[test]
 fn test_kind_agnostic_symbol_extraction_proto_in_gradle() {
     let dir = tempfile::TempDir::new().unwrap();
-    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::write(
+        dir.path().join("shire.toml"),
+        "db_path = \".shire/index.db\"\n",
+    )
+    .unwrap();
     let bin = cargo_bin();
 
     // Gradle package with a proto file inside
@@ -1857,11 +1946,9 @@ enabled = true
 
     // Verify symbol_embeddings table exists and is populated
     let embed_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM symbol_embeddings",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM symbol_embeddings", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(
         embed_count > 0,
@@ -1877,9 +1964,7 @@ enabled = true
         "Expected one embedding per symbol: {embed_count} embeddings vs {symbol_count} symbols"
     );
 
-    eprintln!(
-        "RAG build: {symbol_count} symbols, {embed_count} embeddings"
-    );
+    eprintln!("RAG build: {symbol_count} symbols, {embed_count} embeddings");
 }
 
 #[test]
@@ -2000,7 +2085,11 @@ fn test_build_linked_worktree_db_path() {
     fs::write(repo.join("shire.toml"), &config_content).unwrap();
 
     // Commit so config is available in worktree
-    Command::new("git").args(["add", "."]).current_dir(&repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
     Command::new("git")
         .args(["commit", "-m", "add fixture"])
         .current_dir(&repo)
@@ -2014,11 +2103,21 @@ fn test_build_linked_worktree_db_path() {
     // Create a linked worktree
     let wt_path = dir.path().join("feat-branch");
     let output = Command::new("git")
-        .args(["worktree", "add", wt_path.to_str().unwrap(), "-b", "feat-branch"])
+        .args([
+            "worktree",
+            "add",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "feat-branch",
+        ])
         .current_dir(&repo)
         .output()
         .expect("git worktree add failed");
-    assert!(output.status.success(), "git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Build from the worktree
     let output = Command::new(&bin)
@@ -2032,12 +2131,26 @@ fn test_build_linked_worktree_db_path() {
     );
 
     // DB should be at <db_base>/my-project/feat-branch/index.db
-    let expected_db = db_base.join("my-project").join("feat-branch").join("index.db");
-    assert!(expected_db.exists(), "Expected DB at {} but it doesn't exist", expected_db.display());
+    let expected_db = db_base
+        .join("my-project")
+        .join("feat-branch")
+        .join("index.db");
+    assert!(
+        expected_db.exists(),
+        "Expected DB at {} but it doesn't exist",
+        expected_db.display()
+    );
 
     // {repo} should resolve to main repo name, not worktree dir name
-    let wrong_db = db_base.join("feat-branch").join("feat-branch").join("index.db");
-    assert!(!wrong_db.exists(), "DB should NOT be at {} (wrong repo name)", wrong_db.display());
+    let wrong_db = db_base
+        .join("feat-branch")
+        .join("feat-branch")
+        .join("index.db");
+    assert!(
+        !wrong_db.exists(),
+        "DB should NOT be at {} (wrong repo name)",
+        wrong_db.display()
+    );
 
     let conn = rusqlite::Connection::open(&expected_db).unwrap();
     let count: i64 = conn
@@ -2062,7 +2175,11 @@ fn test_worktree_seed_from_main_db() {
     );
     fs::write(repo.join("shire.toml"), &config_content).unwrap();
 
-    Command::new("git").args(["add", "."]).current_dir(&repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
     Command::new("git")
         .args(["commit", "-m", "add fixture"])
         .current_dir(&repo)
@@ -2078,15 +2195,32 @@ fn test_worktree_seed_from_main_db() {
         .args(["build", "--root", repo.to_str().unwrap()])
         .output()
         .expect("Failed to run shire build on main");
-    assert!(output.status.success(), "Main build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Main build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let main_db = db_base.join("seed-project").join("_primary").join("index.db");
-    assert!(main_db.exists(), "Main DB should exist at {}", main_db.display());
+    let main_db = db_base
+        .join("seed-project")
+        .join("_primary")
+        .join("index.db");
+    assert!(
+        main_db.exists(),
+        "Main DB should exist at {}",
+        main_db.display()
+    );
 
     // Create a linked worktree and build
     let wt_path = dir.path().join("seed-branch");
     let output = Command::new("git")
-        .args(["worktree", "add", wt_path.to_str().unwrap(), "-b", "seed-branch"])
+        .args([
+            "worktree",
+            "add",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "seed-branch",
+        ])
         .current_dir(&repo)
         .output()
         .expect("git worktree add failed");
@@ -2098,13 +2232,21 @@ fn test_worktree_seed_from_main_db() {
         .expect("Failed to run shire build on worktree");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "Worktree build failed: {stderr}");
-    assert!(stderr.contains("Seeded DB from"), "Should print seed message, got stderr: {stderr}");
+    assert!(
+        stderr.contains("Seeded DB from"),
+        "Should print seed message, got stderr: {stderr}"
+    );
 
     // Verify worktree DB has data
-    let wt_db = db_base.join("seed-project").join("seed-branch").join("index.db");
+    let wt_db = db_base
+        .join("seed-project")
+        .join("seed-branch")
+        .join("index.db");
     assert!(wt_db.exists());
     let conn = rusqlite::Connection::open(&wt_db).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))
+        .unwrap();
     assert!(count > 0, "Worktree DB should have packages from seed");
     drop(conn);
 
@@ -2115,7 +2257,10 @@ fn test_worktree_seed_from_main_db() {
         .expect("Failed to run shire rebuild on worktree");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success());
-    assert!(!stderr.contains("Seeded DB from"), "Should NOT re-seed on second build");
+    assert!(
+        !stderr.contains("Seeded DB from"),
+        "Should NOT re-seed on second build"
+    );
 }
 
 #[test]
@@ -2133,7 +2278,9 @@ fn test_docs_indexing_and_search() {
 
     fs::File::create(dir.path().join("README.md"))
         .unwrap()
-        .write_all(b"# Monorepo Overview\n\nThis project contains multiple services for the platform.\n")
+        .write_all(
+            b"# Monorepo Overview\n\nThis project contains multiple services for the platform.\n",
+        )
         .unwrap();
 
     let bin = cargo_bin();
@@ -2141,10 +2288,18 @@ fn test_docs_indexing_and_search() {
         .args(["build", "--root", dir.path().to_str().unwrap()])
         .output()
         .expect("Failed to run shire build");
-    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("docs"), "Build output should mention docs: {}", stdout);
+    assert!(
+        stdout.contains("docs"),
+        "Build output should mention docs: {}",
+        stdout
+    );
 
     // Verify docs were indexed
     let db_path = dir.path().join(".shire/index.db");
@@ -2153,7 +2308,11 @@ fn test_docs_indexing_and_search() {
     let doc_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM docs", [], |row| row.get(0))
         .unwrap();
-    assert!(doc_count >= 2, "Expected at least 2 docs indexed, got {}", doc_count);
+    assert!(
+        doc_count >= 2,
+        "Expected at least 2 docs indexed, got {}",
+        doc_count
+    );
 
     // Verify FTS search works
     let results: Vec<String> = conn

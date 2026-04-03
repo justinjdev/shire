@@ -256,6 +256,30 @@ multiply <- function(a, b) a * b
     }
 
     #[test]
+    fn test_r_uppercase_extension() {
+        let source = r#"analyze <- function(data) data
+"#;
+        let symbols = extract_file("R", source, Arc::from("script.R"));
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "analyze");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_r_dots_parameter() {
+        let source = r#"wrapper <- function(x, ...) {
+    inner(x, ...)
+}
+"#;
+        let symbols = extract_file("r", source, Arc::from("wrap.r"));
+        assert_eq!(symbols.len(), 1);
+        let params = symbols[0].parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[1].name, "...");
+    }
+
+    #[test]
     fn test_r_setrefclass() {
         let source = r#"setRefClass("Counter",
   fields = list(

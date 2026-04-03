@@ -47,14 +47,18 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 2. Create `src/symbols/hooks/<language>.rs` implementing `LanguageHooks` (visibility, signatures, params, return types, post-processing)
 3. Add `pub mod <language>;` to `src/symbols/hooks/mod.rs`
 4. Add a `LanguageEntry` to `src/symbols/registry.rs` with the grammar, query, hooks, and file extensions
-5. Add extensions to `all_extensions()` in `src/symbols/walker.rs`
+5. Add extensions to `all_extensions()` in `src/symbols/walker.rs` and add assertions in `test_all_extensions`
+6. Add the language to the symbols module description in this file (the parenthetical language list)
+7. Add a row to the Symbol extraction table in `docs/src/ecosystems.md`
 
 **Regex-based languages (when tree-sitter grammar is impractical):**
 
 1. Create `src/symbols/<language>.rs` with `pub fn extract(source: &str, file_path: &str) -> Vec<SymbolInfo>`
 2. Add `pub mod <language>;` to `src/symbols/mod.rs`
 3. Add a match arm in `extract_file()` in `src/symbols/registry.rs`
-4. Add extensions to `all_extensions()` in `src/symbols/walker.rs`
+4. Add extensions to `all_extensions()` in `src/symbols/walker.rs` and add assertions in `test_all_extensions`
+5. Add the language to the symbols module description in this file (the parenthetical language list)
+6. Add a row to the Symbol extraction table in `docs/src/ecosystems.md`
 
 ## Platform Notes
 

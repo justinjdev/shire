@@ -200,12 +200,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
         END;
 
         CREATE TABLE IF NOT EXISTS docs (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            path       TEXT NOT NULL UNIQUE,
-            package    TEXT REFERENCES packages(name) ON DELETE SET NULL,
-            title      TEXT,
-            body       TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL DEFAULT 0
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            path         TEXT NOT NULL UNIQUE,
+            package      TEXT REFERENCES packages(name) ON DELETE SET NULL,
+            title        TEXT,
+            body         TEXT NOT NULL,
+            size_bytes   INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_docs_package ON docs(package);

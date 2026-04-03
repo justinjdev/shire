@@ -1502,17 +1502,11 @@ fn phase_index_docs(
         return Ok(0);
     }
 
-    // Load existing docs for incremental diff (path → content_hash stored in body hash)
+    // Load existing docs for incremental diff (path → content_hash)
     let existing_docs: HashMap<String, String> = {
-        let mut stmt = conn.prepare("SELECT path, body FROM docs")?;
+        let mut stmt = conn.prepare("SELECT path, content_hash FROM docs WHERE content_hash IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
-            let path: String = row.get(0)?;
-            let body: String = row.get(1)?;
-            // Compute hash of stored body for comparison
-            let mut hasher = Sha256::new();
-            hasher.update(body.as_bytes());
-            let hash = format!("{:x}", hasher.finalize());
-            Ok((path, hash))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut map = HashMap::new();
         for row in rows {
@@ -1540,10 +1534,13 @@ fn phase_index_docs(
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
+    // Drop FTS triggers for bulk performance (consistent with symbols pattern)
+    db::drop_docs_fts_triggers(conn)?;
+
     // Read and upsert doc files
     let mut upsert_stmt = conn.prepare(
-        "INSERT OR REPLACE INTO docs (path, package, title, body, size_bytes)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR REPLACE INTO docs (path, package, title, body, size_bytes, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
 
     let mut count = 0usize;
@@ -1551,7 +1548,10 @@ fn phase_index_docs(
         let abs_path = repo_root.join(rel_path);
         let content = match std::fs::read_to_string(&abs_path) {
             Ok(c) => c,
-            Err(_) => continue, // skip unreadable files (binary, permissions, etc.)
+            Err(e) => {
+                tracing::debug!(path = %rel_path, error = %e, "skipping unreadable doc file");
+                continue;
+            }
         };
 
         let size_bytes = content.len() as i64;
@@ -1582,9 +1582,13 @@ fn phase_index_docs(
         // Extract title: first markdown heading or first non-empty line
         let title = extract_doc_title(body);
 
-        upsert_stmt.execute(rusqlite::params![rel_path, package, title, body, size_bytes])?;
+        upsert_stmt.execute(rusqlite::params![rel_path, package, title, body, size_bytes, content_hash])?;
         count += 1;
     }
+
+    // Rebuild FTS index and recreate triggers
+    conn.execute("INSERT INTO docs_fts(docs_fts) VALUES('rebuild')", [])?;
+    db::recreate_docs_fts_triggers(conn)?;
 
     Ok(count)
 }

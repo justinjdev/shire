@@ -154,6 +154,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::r::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["hs"],
+                ts_language: || tree_sitter_haskell::LANGUAGE.into(),
+                query_source: include_str!("queries/haskell.scm"),
+                hooks: super::hooks::haskell::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

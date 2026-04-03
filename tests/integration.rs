@@ -130,6 +130,9 @@ func HybridServe(addr string) error {
         )
         .unwrap();
 
+    // Default config to isolate tests from any global ~/.claude/shire.toml
+    fs::write(dir.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
     // A node_modules dir that should be skipped
     let nm = dir.join("services/auth/node_modules/leftpad");
     fs::create_dir_all(&nm).unwrap();
@@ -284,6 +287,9 @@ fn test_build_command_indexes_fixture() {
 }
 
 fn create_fixture_with_rust(dir: &Path) {
+    // Default config to isolate tests from any global ~/.claude/shire.toml
+    fs::write(dir.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
     // Cargo package with Rust source
     let crate_dir = dir.join("crates/core");
     fs::create_dir_all(crate_dir.join("src")).unwrap();
@@ -1073,6 +1079,7 @@ fn test_file_index_rebuild_includes_new_file() {
 #[test]
 fn test_maven_index_basic() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     // Create a Maven project
@@ -1149,6 +1156,7 @@ fn test_maven_index_basic() {
 #[test]
 fn test_maven_parent_pom_inheritance() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     // Parent POM at root (aggregator — not indexed as package)
@@ -1244,6 +1252,7 @@ fn test_maven_parent_pom_inheritance() {
 #[test]
 fn test_gradle_index_basic() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     let app_dir = dir.path().join("app");
@@ -1294,6 +1303,7 @@ dependencies {
 #[test]
 fn test_gradle_settings_workspace() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     // settings.gradle
@@ -1366,6 +1376,7 @@ include ':app', ':lib'
 #[test]
 fn test_mixed_maven_gradle_ecosystem() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     // Maven project
@@ -1439,6 +1450,7 @@ fn test_mixed_maven_gradle_ecosystem() {
 #[test]
 fn test_maven_incremental_rebuild() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     let svc_dir = dir.path().join("svc");
@@ -1662,6 +1674,7 @@ fn test_dual_manifest_same_directory_no_fk_violation() {
 #[test]
 fn test_kind_agnostic_symbol_extraction_proto_in_gradle() {
     let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
     let bin = cargo_bin();
 
     // Gradle package with a proto file inside
@@ -2121,12 +2134,6 @@ fn test_docs_indexing_and_search() {
     fs::File::create(dir.path().join("README.md"))
         .unwrap()
         .write_all(b"# Monorepo Overview\n\nThis project contains multiple services for the platform.\n")
-        .unwrap();
-
-    // Local config to ensure DB goes to the expected path (override any global shire.toml)
-    fs::File::create(dir.path().join("shire.toml"))
-        .unwrap()
-        .write_all(b"db_path = \".shire/index.db\"\n")
         .unwrap();
 
     let bin = cargo_bin();

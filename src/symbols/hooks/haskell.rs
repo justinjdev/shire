@@ -133,7 +133,7 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
     let sig_text = find_type_signature(node, source, fn_name)?;
 
     // Parse "name :: A -> B -> C" to extract "C"
-    let after_colons = sig_text.split("::").nth(1)?.trim();
+    let after_colons = sig_text.splitn(2, "::").nth(1)?.trim();
     // Split on " -> " and take the last segment
     let parts: Vec<&str> = split_arrow_type(after_colons);
     if parts.len() > 1 {
@@ -153,8 +153,8 @@ fn split_arrow_type(ty: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'(' | b'[' => depth += 1,
-            b')' | b']' => depth -= 1,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
             b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
                 parts.push(ty[start..i].trim());
                 i += 2;

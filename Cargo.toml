@@ -70,6 +70,7 @@ tree-sitter-swift = "0.6"
 tree-sitter-bash = "0.23"
 tree-sitter-r = "1.2"
 tree-sitter-haskell = "0.23"
+tree-sitter-yaml = "0.7"
 
 [features]
 default = ["rag"]

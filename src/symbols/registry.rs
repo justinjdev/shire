@@ -161,6 +161,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::haskell::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["yaml", "yml"],
+                ts_language: || tree_sitter_yaml::LANGUAGE.into(),
+                query_source: include_str!("queries/yaml.scm"),
+                hooks: super::hooks::yaml::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

@@ -1,37 +1,56 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, SymbolKind};
+use super::{find_child_by_kind, node_text, LanguageHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
+
+/// Strip surrounding quotes from a YAML key name.
+fn strip_quotes(name: &str) -> String {
+    if (name.starts_with('"') && name.ends_with('"'))
+        || (name.starts_with('\'') && name.ends_with('\''))
+    {
+        name[1..name.len() - 1].to_string()
+    } else {
+        name.to_string()
+    }
+}
 
 /// Build signature for YAML top-level keys.
 /// Shows the key name with a hint about the value type (mapping, sequence, or scalar).
 fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> String {
+    let clean_name = strip_quotes(name);
     if let Some(value_node) = node.child_by_field_name("value") {
         let value_kind = value_node.kind();
         // block_node wraps nested mappings and sequences
         if value_kind == "block_node" {
             if let Some(inner) = find_child_by_kind(&value_node, "block_mapping") {
                 let count = inner.named_child_count();
-                return format!("{}: {{...}} ({} keys)", name, count);
+                return format!("{}: {{...}} ({} keys)", clean_name, count);
             }
             if let Some(inner) = find_child_by_kind(&value_node, "block_sequence") {
                 let count = inner.named_child_count();
-                return format!("{}: [...] ({} items)", name, count);
+                return format!("{}: [...] ({} items)", clean_name, count);
             }
         }
         // flow_node wraps inline scalars
         if let Some(text) = node_text(&value_node, source) {
-            let text = text.trim();
+            let text = text.trim().replace('\n', " ");
             if text.len() <= 60 {
-                return format!("{}: {}", name, text);
+                return format!("{}: {}", clean_name, text);
             }
         }
     }
-    name.to_string()
+    clean_name
+}
+
+/// Post-process: strip quotes from key names captured by the double/single quote patterns.
+fn post_process(mut sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolInfo> {
+    sym.name = strip_quotes(&sym.name);
+    Some(sym)
 }
 
 /// Return YAML language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
         build_signature: Some(build_signature),
+        post_process: Some(post_process),
         ..Default::default()
     }
 }
@@ -100,5 +119,46 @@ mod tests {
         let symbols = extract_file("yml", source, Arc::from("test.yml"));
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "key");
+    }
+
+    #[test]
+    fn test_double_quoted_key() {
+        let source = "\"on\": push\n";
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "on");
+    }
+
+    #[test]
+    fn test_single_quoted_key() {
+        let source = "'version': \"2.0\"\n";
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "version");
+    }
+
+    #[test]
+    fn test_mixed_quoted_and_plain_keys() {
+        let source = "name: app\n\"on\":\n  push:\n    branches: [main]\n'jobs':\n  build:\n    runs-on: ubuntu-latest\n";
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 3);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+        assert!(names.contains(&"name"));
+        assert!(names.contains(&"on"));
+        assert!(names.contains(&"jobs"));
+    }
+
+    #[test]
+    fn test_empty_yaml() {
+        let source = "";
+        let symbols = extract(source);
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn test_comment_only_yaml() {
+        let source = "# This is a comment\n# Another comment\n";
+        let symbols = extract(source);
+        assert!(symbols.is_empty());
     }
 }

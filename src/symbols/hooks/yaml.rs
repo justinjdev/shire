@@ -3,13 +3,13 @@ use tree_sitter::Node;
 
 /// Strip surrounding quotes from a YAML key name.
 fn strip_quotes(name: &str) -> String {
-    if (name.starts_with('"') && name.ends_with('"'))
-        || (name.starts_with('\'') && name.ends_with('\''))
-    {
-        name[1..name.len() - 1].to_string()
-    } else {
-        name.to_string()
+    if let Some(stripped) = name.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return stripped.to_string();
     }
+    if let Some(stripped) = name.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return stripped.to_string();
+    }
+    name.to_string()
 }
 
 /// Build signature for YAML top-level keys.

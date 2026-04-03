@@ -1544,3 +1544,167 @@ sub baz {
     assert_eq!(symbols[1].line, 3); // sub bar
     assert_eq!(symbols[2].line, 7); // sub baz
 }
+
+// ============================================================
+// Ruby tests
+// ============================================================
+
+#[test]
+fn test_ruby_class() {
+    let source = r#"class UserService
+  def initialize(db)
+    @db = db
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("app/services/user_service.rb"));
+
+    let class_sym = symbols.iter().find(|s| s.name == "UserService").unwrap();
+    assert_eq!(class_sym.kind, SymbolKind::Class);
+    assert_eq!(class_sym.signature.as_deref(), Some("class UserService"));
+    assert_eq!(class_sym.line, 1);
+}
+
+#[test]
+fn test_ruby_module() {
+    let source = r#"module Authentication
+  def authenticate(token)
+    verify(token)
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("app/concerns/authentication.rb"));
+
+    let mod_sym = symbols.iter().find(|s| s.name == "Authentication").unwrap();
+    assert_eq!(mod_sym.kind, SymbolKind::Class);
+    assert_eq!(mod_sym.signature.as_deref(), Some("module Authentication"));
+}
+
+#[test]
+fn test_ruby_instance_method() {
+    let source = r#"class OrderProcessor
+  def process(order_id, amount)
+    # process logic
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("app/services/order_processor.rb"));
+
+    let method_sym = symbols.iter().find(|s| s.name == "process").unwrap();
+    assert_eq!(method_sym.kind, SymbolKind::Method);
+    assert_eq!(method_sym.parent_symbol.as_deref(), Some("OrderProcessor"));
+    assert_eq!(
+        method_sym.signature.as_deref(),
+        Some("def process(order_id, amount)")
+    );
+
+    let params = method_sym.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "order_id");
+    assert_eq!(params[1].name, "amount");
+}
+
+#[test]
+fn test_ruby_class_method() {
+    let source = r#"class Config
+  def self.load(path)
+    new(path)
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("lib/config.rb"));
+
+    let method_sym = symbols.iter().find(|s| s.name == "load").unwrap();
+    assert_eq!(method_sym.kind, SymbolKind::Function);
+    assert_eq!(method_sym.parent_symbol.as_deref(), Some("Config"));
+    assert_eq!(method_sym.signature.as_deref(), Some("def self.load(path)"));
+}
+
+#[test]
+fn test_ruby_top_level_function() {
+    let source = r#"def main
+  puts "hello"
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("script.rb"));
+
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "main");
+    assert_eq!(sym.kind, SymbolKind::Function);
+    assert!(sym.parent_symbol.is_none());
+    assert_eq!(sym.signature.as_deref(), Some("def main"));
+}
+
+#[test]
+fn test_ruby_inheritance() {
+    let source = r#"class AdminController < ApplicationController
+  def index
+    render :index
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("app/controllers/admin_controller.rb"));
+
+    let class_sym = symbols.iter().find(|s| s.name == "AdminController").unwrap();
+    assert_eq!(class_sym.kind, SymbolKind::Class);
+    assert_eq!(
+        class_sym.signature.as_deref(),
+        Some("class AdminController < ApplicationController")
+    );
+
+    let method_sym = symbols.iter().find(|s| s.name == "index").unwrap();
+    assert_eq!(method_sym.kind, SymbolKind::Method);
+    assert_eq!(method_sym.parent_symbol.as_deref(), Some("AdminController"));
+}
+
+#[test]
+fn test_ruby_nested_class_in_module() {
+    let source = r#"module Payments
+  class Processor
+    def charge(amount)
+      # charge logic
+    end
+  end
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("lib/payments/processor.rb"));
+
+    let mod_sym = symbols.iter().find(|s| s.name == "Payments").unwrap();
+    assert_eq!(mod_sym.kind, SymbolKind::Class);
+
+    let class_sym = symbols.iter().find(|s| s.name == "Processor").unwrap();
+    assert_eq!(class_sym.kind, SymbolKind::Class);
+    assert_eq!(class_sym.parent_symbol.as_deref(), Some("Payments"));
+
+    let method_sym = symbols.iter().find(|s| s.name == "charge").unwrap();
+    assert_eq!(method_sym.kind, SymbolKind::Method);
+    assert_eq!(method_sym.parent_symbol.as_deref(), Some("Processor"));
+}
+
+#[test]
+fn test_ruby_method_with_special_params() {
+    let source = r#"def create(name, *args, **opts, &block)
+  # ...
+end
+"#;
+    let symbols = extract_file("rb", source, Arc::from("factory.rb"));
+
+    assert_eq!(symbols.len(), 1);
+    let params = symbols[0].parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 4);
+    assert_eq!(params[0].name, "name");
+    assert!(params[0].type_annotation.is_none());
+    assert_eq!(params[1].name, "args");
+    assert_eq!(params[1].type_annotation.as_deref(), Some("*"));
+    assert_eq!(params[2].name, "opts");
+    assert_eq!(params[2].type_annotation.as_deref(), Some("**"));
+    assert_eq!(params[3].name, "block");
+    assert_eq!(params[3].type_annotation.as_deref(), Some("&"));
+}
+
+#[test]
+fn test_ruby_empty_source() {
+    let symbols = extract_file("rb", "", Arc::from("empty.rb"));
+    assert!(symbols.is_empty());
+}

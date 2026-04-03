@@ -40,6 +40,6 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | HCL / Terraform | tree-sitter |
 | TOML | tree-sitter |
 | Perl | tree-sitter |
+| Ruby | tree-sitter |
 | Elixir | regex-based |
 | COBOL | regex-based |
-| Ruby | regex-based |

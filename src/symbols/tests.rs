@@ -1266,3 +1266,134 @@ end
     let symbols = extract_file("ex", source, Arc::from("lib/my_app.ex"));
     assert!(!symbols.iter().any(|s| s.name == "internal_helper"));
 }
+
+// ============================================================
+// Haskell tests
+// ============================================================
+
+#[test]
+fn test_haskell_function_with_type_signature() {
+    let source = r#"
+process :: Int -> String -> Bool
+process x y = length (show x) > length y
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Lib.hs"));
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "process");
+    assert_eq!(sym.kind, SymbolKind::Function);
+    assert_eq!(
+        sym.signature.as_deref(),
+        Some("process :: Int -> String -> Bool")
+    );
+    assert_eq!(sym.return_type.as_deref(), Some("Bool"));
+    let params = sym.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "x");
+    assert_eq!(params[1].name, "y");
+}
+
+#[test]
+fn test_haskell_function_without_type_signature() {
+    let source = r#"
+greet name = "Hello " ++ name
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Lib.hs"));
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "greet");
+    assert_eq!(sym.kind, SymbolKind::Function);
+    assert!(sym.return_type.is_none());
+    let params = sym.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "name");
+}
+
+#[test]
+fn test_haskell_data_type() {
+    let source = r#"
+data Maybe a = Nothing | Just a
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Data.hs"));
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "Maybe");
+    assert_eq!(sym.kind, SymbolKind::Struct);
+}
+
+#[test]
+fn test_haskell_newtype() {
+    let source = r#"
+newtype Wrapper a = Wrapper a
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Types.hs"));
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "Wrapper");
+    assert_eq!(sym.kind, SymbolKind::Struct);
+}
+
+#[test]
+fn test_haskell_type_alias() {
+    let source = r#"
+type Name = String
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Types.hs"));
+    assert_eq!(symbols.len(), 1);
+    let sym = &symbols[0];
+    assert_eq!(sym.name, "Name");
+    assert_eq!(sym.kind, SymbolKind::Type);
+}
+
+#[test]
+fn test_haskell_type_class_with_methods() {
+    let source = r#"
+class Printable a where
+    display :: a -> String
+    preview :: a -> Int -> String
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Class.hs"));
+    // class + 2 method signatures
+    assert_eq!(symbols.len(), 3);
+
+    assert_eq!(symbols[0].name, "Printable");
+    assert_eq!(symbols[0].kind, SymbolKind::Trait);
+
+    assert_eq!(symbols[1].name, "display");
+    assert_eq!(symbols[1].kind, SymbolKind::Method);
+    assert_eq!(symbols[1].parent_symbol.as_deref(), Some("Printable"));
+
+    assert_eq!(symbols[2].name, "preview");
+    assert_eq!(symbols[2].kind, SymbolKind::Method);
+    assert_eq!(symbols[2].parent_symbol.as_deref(), Some("Printable"));
+}
+
+#[test]
+fn test_haskell_multiple_declarations() {
+    let source = r#"
+data Color = Red | Green | Blue
+
+type Palette = [Color]
+
+fromString :: String -> Maybe Color
+fromString "red" = Just Red
+fromString "green" = Just Green
+fromString "blue" = Just Blue
+fromString _ = Nothing
+"#;
+    let symbols = extract_file("hs", source, Arc::from("Color.hs"));
+    assert_eq!(symbols.len(), 3);
+
+    assert_eq!(symbols[0].name, "Color");
+    assert_eq!(symbols[0].kind, SymbolKind::Struct);
+
+    assert_eq!(symbols[1].name, "Palette");
+    assert_eq!(symbols[1].kind, SymbolKind::Type);
+
+    assert_eq!(symbols[2].name, "fromString");
+    assert_eq!(symbols[2].kind, SymbolKind::Function);
+    assert_eq!(
+        symbols[2].return_type.as_deref(),
+        Some("Maybe Color")
+    );
+}

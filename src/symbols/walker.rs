@@ -62,6 +62,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "sh", "bash",                        // Bash/Shell
         "r", "R",                            // R
         "cob", "cbl", "cpy",                // COBOL
+        "hs",                                // Haskell
     ]
 }
 

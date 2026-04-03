@@ -333,6 +333,16 @@ pub struct SearchFilesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchDocsParams {
+    /// Search query to find documentation by content, title, or path
+    pub query: String,
+    /// Filter to docs from a specific package
+    pub package: Option<String>,
+    /// Max results (default 20)
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExploreParams {
     /// Concept to explore (e.g. "authentication", "error handling", "messaging interfaces")
     pub query: String,
@@ -549,7 +559,33 @@ impl ShireService {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Explore a concept across the codebase — searches packages, symbols, and files semantically. Use as the first tool when investigating unfamiliar code or broad topics like 'authentication' or 'error handling'. Returns a structured context map organized by package.")]
+    #[tool(description = "Search documentation files by content, title, or path. Returns matching docs with relevant text snippets. Use for finding guides, READMEs, and written documentation.")]
+    fn search_docs(
+        &self,
+        Parameters(params): Parameters<SearchDocsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "search_docs", query = %params.query, package = ?params.package, limit = ?params.limit);
+        self.maybe_rebuild();
+        if params.query.trim().is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Search query must not be empty",
+            )]));
+        }
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = params.limit.unwrap_or(20);
+        let results = queries::search_docs(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            limit,
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like 'authentication' or 'error handling'. Returns a structured context map organized by package.")]
     fn explore(
         &self,
         Parameters(params): Parameters<ExploreParams>,

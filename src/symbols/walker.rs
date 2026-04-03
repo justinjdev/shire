@@ -60,6 +60,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "ex", "exs",                         // Elixir
         "zig",                               // Zig
         "sh", "bash",                        // Bash/Shell
+        "r", "R",                            // R
     ]
 }
 
@@ -152,6 +153,8 @@ mod tests {
         assert!(exts.contains(&"py"));
         assert!(exts.contains(&"java"));
         assert!(exts.contains(&"proto"));
+        assert!(exts.contains(&"r"));
+        assert!(exts.contains(&"R"));
     }
 
     #[test]

@@ -85,6 +85,13 @@ fn registry() -> &'static [LanguageEntry] {
                 compiled_query: OnceLock::new(),
             },
             LanguageEntry {
+                extensions: &["dart"],
+                ts_language: tree_sitter_dart::language,
+                query_source: include_str!("queries/dart.scm"),
+                hooks: super::hooks::dart::hooks,
+                compiled_query: OnceLock::new(),
+            },
+            LanguageEntry {
                 extensions: &["proto"],
                 ts_language: || tree_sitter_proto::LANGUAGE.into(),
                 query_source: include_str!("queries/proto.scm"),

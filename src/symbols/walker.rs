@@ -48,6 +48,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "rs",                                // Rust
         "py",                                // Python
         "java", "kt",                       // Java/Kotlin
+        "dart",                              // Dart
         "proto",                             // Protobuf
         "pm", "pl",                          // Perl
         "rb",                                // Ruby

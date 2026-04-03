@@ -37,7 +37,7 @@ src/
 │   └── elixir.rs    # Elixir extractor (regex-based)
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
-│   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding
+│   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding (64 files/batch)
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
@@ -48,3 +48,18 @@ src/
     ├── daemon.rs    # Process management (start/stop/is_running via PID)
     └── protocol.rs  # Hook input parsing, Bash read-only denylist
 ```
+
+## File embeddings
+
+When [RAG is enabled](./configuration.md#rag-vector-search), the build produces file-level vector embeddings for hybrid search. Each file is represented as a `FileForEmbedding` containing its symbols via `FileSymbol` (name, kind, and optional signature).
+
+The text representation (`file_to_text`) works as follows:
+- Symbols are sorted by kind then name
+- Signatures are preferred over `kind name` fallback when available
+- A **character budget of 1800** controls text length — symbols are added until the budget is exhausted, replacing the previous fixed cap of 50 symbols
+- Files with no symbols produce a minimal `file <path> in <package>` string
+
+Embedding runs in a background thread after the main build completes:
+- Files are processed in **batches of 64** to balance throughput and memory
+- A progress callback reports batch completion for progress bar updates
+- Errors (model init, embedding, DB write) are reported on the progress bar rather than failing the build

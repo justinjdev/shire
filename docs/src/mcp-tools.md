@@ -6,16 +6,29 @@ Shire exposes the following tools over the Model Context Protocol:
 
 | Tool | Description |
 |---|---|
-| `search_packages` | Search packages by name or description |
+| `search_packages` | Search packages by name or description. Use instead of Grep for finding packages. |
 | `list_packages` | List all indexed packages, optionally filtered by kind |
-| `package_dependencies` | List a package's dependencies (set `depth>1` for transitive graph) |
+| `package_dependencies` | List a package's dependencies. Set `depth>1` for transitive graph (returns edge list with different schema). |
 | `package_dependents` | Find all packages that depend on this package |
-| `search_symbols` | Search symbols by name or signature; supports hybrid FTS + vector search when [RAG is enabled](./configuration.md#rag-vector-search) |
-| `get_file_symbols` | List all symbols defined in a specific file |
-| `search_files` | Search files by path or name using full-text search |
-| `list_package_files` | List all files in a package, optionally filtered by extension |
-| `explore` | Semantic codebase exploration — search packages, symbols, and files for a concept |
+| `search_symbols` | Find functions, classes, types, methods by name or signature. Use instead of Grep for "where is function X?" or "what matches pattern Y?". Omit query with a package filter to list all symbols in that package. Supports hybrid FTS + vector search when [RAG is enabled](./configuration.md#rag-vector-search). |
+| `get_file_symbols` | List all symbols defined in a specific file. Use instead of reading the file to understand its exports. |
+| `search_files` | Find files by path or name. Use instead of Glob/find for locating files. Useful for "middleware", "proto files", or files in a specific directory. |
+| `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
+| `explore` | Explore a concept across the codebase — searches packages, symbols, and files semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
+
+### When to use Shire vs Grep/Glob
+
+| Task | Use | Not |
+|---|---|---|
+| Find a function, class, or type by name | `search_symbols` | Grep |
+| Find a file by name or path | `search_files` | Glob / find |
+| List files in a package | `list_package_files` | Glob |
+| Find a package | `search_packages` | Grep |
+| Explore an unfamiliar area | `explore` | multiple Grep calls |
+| Search for a literal string or log message | Grep | Shire |
+| Search inside function bodies | Grep | Shire |
+| Pattern match on file contents | Grep | Shire |
 
 ## Prompts
 

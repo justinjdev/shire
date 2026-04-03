@@ -36,6 +36,7 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | R | tree-sitter |
 | Haskell | tree-sitter |
 | YAML | tree-sitter |
+| SQL | tree-sitter |
 | Elixir | regex-based |
 | COBOL | regex-based |
 | Perl | regex-based |

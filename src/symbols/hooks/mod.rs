@@ -12,6 +12,7 @@ pub mod python;
 pub mod r;
 pub mod rust_lang;
 pub mod scala;
+pub mod sql;
 pub mod swift;
 pub mod typescript;
 pub mod yaml;

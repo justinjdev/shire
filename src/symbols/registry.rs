@@ -168,6 +168,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::yaml::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["sql"],
+                ts_language: || tree_sitter_sequel::LANGUAGE.into(),
+                query_source: include_str!("queries/sql.scm"),
+                hooks: super::hooks::sql::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

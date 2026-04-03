@@ -64,6 +64,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "cob", "cbl", "cpy",                // COBOL
         "hs",                                // Haskell
         "yaml", "yml",                       // YAML
+        "sql",                               // SQL
     ]
 }
 
@@ -160,6 +161,7 @@ mod tests {
         assert!(exts.contains(&"R"));
         assert!(exts.contains(&"yaml"));
         assert!(exts.contains(&"yml"));
+        assert!(exts.contains(&"sql"));
     }
 
     #[test]

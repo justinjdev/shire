@@ -1,7 +1,6 @@
 pub mod cobol;
 pub mod elixir;
 mod hooks;
-pub mod perl;
 mod query_extract;
 mod registry;
 pub mod ruby;

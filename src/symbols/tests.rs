@@ -1397,3 +1397,150 @@ fromString _ = Nothing
         Some("Maybe Color")
     );
 }
+
+// ============================================================
+// Perl tests
+// ============================================================
+
+#[test]
+fn test_perl_package_declaration() {
+    let source = "package Foo::Bar;\n\nuse strict;\n";
+    let symbols = extract_file("pm", source, Arc::from("lib/Foo/Bar.pm"));
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Foo::Bar");
+    assert_eq!(symbols[0].kind, SymbolKind::Class);
+    assert_eq!(symbols[0].signature.as_deref(), Some("package Foo::Bar"));
+    assert_eq!(symbols[0].line, 1);
+}
+
+#[test]
+fn test_perl_top_level_sub() {
+    let source = r#"sub greet {
+    my ($name) = @_;
+    print "Hello, $name\n";
+}
+"#;
+    let symbols = extract_file("pl", source, Arc::from("script.pl"));
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "greet");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+    assert_eq!(symbols[0].signature.as_deref(), Some("sub greet"));
+    assert!(symbols[0].parent_symbol.is_none());
+}
+
+#[test]
+fn test_perl_method_inside_package() {
+    let source = r#"package MyApp::Auth;
+
+sub new {
+    my ($class, %args) = @_;
+    return bless \%args, $class;
+}
+
+sub validate {
+    my ($self, $token) = @_;
+    return 1;
+}
+"#;
+    let symbols = extract_file("pm", source, Arc::from("lib/MyApp/Auth.pm"));
+
+    assert_eq!(symbols.len(), 3);
+
+    assert_eq!(symbols[0].name, "MyApp::Auth");
+    assert_eq!(symbols[0].kind, SymbolKind::Class);
+
+    assert_eq!(symbols[1].name, "new");
+    assert_eq!(symbols[1].kind, SymbolKind::Method);
+    assert_eq!(symbols[1].parent_symbol.as_deref(), Some("MyApp::Auth"));
+    assert_eq!(
+        symbols[1].signature.as_deref(),
+        Some("sub MyApp::Auth::new")
+    );
+
+    assert_eq!(symbols[2].name, "validate");
+    assert_eq!(symbols[2].kind, SymbolKind::Method);
+    assert_eq!(symbols[2].parent_symbol.as_deref(), Some("MyApp::Auth"));
+}
+
+#[test]
+fn test_perl_skip_private_subs() {
+    let source = r#"package Foo;
+
+sub public_method {
+    return 1;
+}
+
+sub _private_helper {
+    return 2;
+}
+"#;
+    let symbols = extract_file("pm", source, Arc::from("lib/Foo.pm"));
+
+    assert_eq!(symbols.len(), 2); // package + public_method only
+    assert_eq!(symbols[0].name, "Foo");
+    assert_eq!(symbols[1].name, "public_method");
+}
+
+#[test]
+fn test_perl_multiple_packages() {
+    let source = r#"package First::Package;
+
+sub alpha {
+    return 1;
+}
+
+package Second::Package;
+
+sub beta {
+    return 2;
+}
+"#;
+    let symbols = extract_file("pm", source, Arc::from("lib/Multi.pm"));
+
+    assert_eq!(symbols.len(), 4);
+
+    assert_eq!(symbols[0].name, "First::Package");
+    assert_eq!(symbols[0].kind, SymbolKind::Class);
+
+    assert_eq!(symbols[1].name, "alpha");
+    assert_eq!(symbols[1].kind, SymbolKind::Method);
+    assert_eq!(symbols[1].parent_symbol.as_deref(), Some("First::Package"));
+
+    assert_eq!(symbols[2].name, "Second::Package");
+    assert_eq!(symbols[2].kind, SymbolKind::Class);
+
+    assert_eq!(symbols[3].name, "beta");
+    assert_eq!(symbols[3].kind, SymbolKind::Method);
+    assert_eq!(
+        symbols[3].parent_symbol.as_deref(),
+        Some("Second::Package")
+    );
+}
+
+#[test]
+fn test_perl_empty_source() {
+    let symbols = extract_file("pl", "", Arc::from("empty.pl"));
+    assert!(symbols.is_empty());
+}
+
+#[test]
+fn test_perl_line_numbers() {
+    let source = r#"package Foo;
+
+sub bar {
+    return 1;
+}
+
+sub baz {
+    return 2;
+}
+"#;
+    let symbols = extract_file("pm", source, Arc::from("lib/Foo.pm"));
+
+    assert_eq!(symbols.len(), 3);
+    assert_eq!(symbols[0].line, 1); // package Foo
+    assert_eq!(symbols[1].line, 3); // sub bar
+    assert_eq!(symbols[2].line, 7); // sub baz
+}

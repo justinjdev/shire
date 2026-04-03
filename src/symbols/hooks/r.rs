@@ -13,12 +13,16 @@ const R6_CLASS_FNS: &[&str] = &["R6Class"];
 fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
     match kind {
         SymbolKind::Function => {
+            let operator = node
+                .child_by_field_name("operator")
+                .and_then(|n| node_text(&n, source))
+                .unwrap_or("<-");
             let params_text = node
                 .child_by_field_name("rhs")
                 .and_then(|rhs| rhs.child_by_field_name("parameters"))
                 .and_then(|n| node_text(&n, source))
                 .unwrap_or("()");
-            format!("{} <- function{}", name, params_text)
+            format!("{} {} function{}", name, operator, params_text)
         }
         SymbolKind::Class => {
             if node.kind() == "call" {
@@ -158,6 +162,7 @@ mod tests {
         let sym = &symbols[0];
         assert_eq!(sym.name, "process");
         assert_eq!(sym.kind, SymbolKind::Function);
+        assert_eq!(sym.signature.as_deref(), Some("process = function(data)"));
     }
 
     #[test]

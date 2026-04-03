@@ -153,6 +153,8 @@ mod tests {
         assert!(exts.contains(&"py"));
         assert!(exts.contains(&"java"));
         assert!(exts.contains(&"proto"));
+        assert!(exts.contains(&"r"));
+        assert!(exts.contains(&"R"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub fn list() -> Vec<Prompt> {
     vec![
         Prompt::new(
             "explore",
-            Some("Semantic codebase exploration — search packages, symbols, and files for a concept and return a structured context map"),
+            Some("Semantic codebase exploration — search packages, symbols, files, and documentation for a concept and return a structured context map"),
             Some(vec![PromptArgument {
                 name: "query".into(),
                 description: Some("Concept to explore (e.g. \"authentication\", \"error handling\", \"messaging interfaces\")".into()),

@@ -110,34 +110,56 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
 }
 
 /// Extract parameters from a let_binding.
-/// Parameters are direct `parameter` children containing `value_pattern`.
+/// Parameters are direct `parameter` children. Each parameter may contain:
+/// - `value_pattern` directly (simple: `let f x = ...`)
+/// - `typed_pattern` > `value_pattern` (typed: `let f (x : int) = ...`)
+/// - `~`/`?` prefix + `value_pattern` (labeled/optional: `let f ~label ?opt = ...`)
 fn extract_let_binding_params(node: &Node, source: &str) -> Vec<Parameter> {
     let mut params = Vec::new();
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "parameter" {
-            let name = find_child_by_kind(&child, "value_pattern")
-                .or_else(|| find_child_by_kind(&child, "parenthesized_pattern"))
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .unwrap_or("")
-                .to_string();
+        if child.kind() != "parameter" {
+            continue;
+        }
 
-            // Check for type annotation: (param : type)
-            let type_ann = if child.kind() == "parameter" {
-                extract_typed_param(&child, source)
-            } else {
-                None
-            };
+        let (name, type_ann) = extract_param_name_and_type(&child, source);
 
-            if !name.is_empty() {
-                params.push(Parameter {
-                    name,
-                    type_annotation: type_ann,
-                });
-            }
+        if !name.is_empty() {
+            params.push(Parameter {
+                name,
+                type_annotation: type_ann,
+            });
         }
     }
     params
+}
+
+/// Extract parameter name and optional type from a parameter node.
+/// Handles: value_pattern, typed_pattern (x : type), labeled (~x), optional (?x).
+fn extract_param_name_and_type(param: &Node, source: &str) -> (String, Option<String>) {
+    // Check for typed_pattern first (contains both name and type)
+    if let Some(typed) = find_child_by_kind(param, "typed_pattern") {
+        let name = find_child_by_kind(&typed, "value_pattern")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .unwrap_or("")
+            .to_string();
+        let type_ann = typed
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(|s| s.to_string());
+        return (name, type_ann);
+    }
+
+    // Try type annotation from nested structures
+    let type_ann = extract_typed_param(param, source);
+
+    // Simple value_pattern (possibly with ~ or ? label prefix)
+    let name = find_child_by_kind(param, "value_pattern")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        .unwrap_or("")
+        .to_string();
+
+    (name, type_ann)
 }
 
 /// Extract type annotation from a typed parameter like `(x : int)`.
@@ -332,20 +354,60 @@ fn is_function_binding(node: &Node) -> bool {
     false
 }
 
+/// Check if a let_binding is a local binding inside a let-in expression.
+/// Local bindings should be filtered out — they're not top-level definitions.
+fn is_local_let_binding(node: &Node) -> bool {
+    // Walk up: let_binding -> value_definition -> let_expression
+    if let Some(val_def) = node.parent() {
+        if val_def.kind() == "value_definition" {
+            if let Some(grandparent) = val_def.parent() {
+                return grandparent.kind() == "let_expression";
+            }
+        }
+    }
+    false
+}
+
+/// Check if a value_specification has a function type (is a function, not a value).
+fn has_function_type(node: &Node) -> bool {
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        if child.kind() == ":" {
+            // Check the next sibling for function_type
+            if let Some(next) = node.child(i + 1) {
+                return next.kind() == "function_type";
+            }
+        }
+    }
+    false
+}
+
 /// Post-process OCaml symbols.
+/// - Filter out local let-in bindings (not top-level definitions).
 /// - Reclassify parameterless let_bindings (non-fun) from Function to Constant.
-/// - Map exception_definition constructor to Type kind (already correct from query).
+/// - Reclassify value_specification without function_type to Constant.
 fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<SymbolInfo> {
     match node.kind() {
         "let_binding" => {
+            // Filter local let-in bindings
+            if is_local_let_binding(node) {
+                return None;
+            }
             if !is_function_binding(node) {
                 sym.kind = SymbolKind::Constant;
                 sym.parameters = None;
                 sym.return_type = None;
             }
         }
+        "value_specification" => {
+            // val x : int (non-function) should be Constant
+            if !has_function_type(node) {
+                sym.kind = SymbolKind::Constant;
+                sym.parameters = None;
+                sym.return_type = None;
+            }
+        }
         "module_binding" => {
-            // Keep as Class (definition.module maps to Class)
             sym.signature = Some(format!("module {}", sym.name));
         }
         "constructor_declaration" => {
@@ -551,6 +613,57 @@ end
 
         let mt = symbols.iter().find(|s| s.name == "Printable").unwrap();
         assert_eq!(mt.kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_ocaml_typed_parameters() {
+        let source = "let add (x : int) (y : int) = x + y\n";
+        let symbols = extract_ml(source);
+        assert_eq!(symbols.len(), 1);
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "add");
+        assert_eq!(sym.kind, SymbolKind::Function);
+        let params = sym.parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "x");
+        assert_eq!(params[0].type_annotation.as_deref(), Some("int"));
+        assert_eq!(params[1].name, "y");
+        assert_eq!(params[1].type_annotation.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn test_ocaml_local_let_filtered() {
+        let source = r#"let result =
+  let helper x = x + 1 in
+  helper 42
+"#;
+        let symbols = extract_ml(source);
+        // Only "result" should appear, not "helper" (which is local)
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "result");
+        assert_eq!(symbols[0].kind, SymbolKind::Constant);
+    }
+
+    #[test]
+    fn test_ocaml_labeled_params() {
+        let source = "let process ~label ?optional_arg value = value\n";
+        let symbols = extract_ml(source);
+        assert_eq!(symbols.len(), 1);
+        let params = symbols[0].parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].name, "label");
+        assert_eq!(params[1].name, "optional_arg");
+        assert_eq!(params[2].name, "value");
+    }
+
+    #[test]
+    fn test_ocaml_mli_non_function_val() {
+        let source = "val x : int\n";
+        let symbols = extract_mli(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "x");
+        assert_eq!(symbols[0].kind, SymbolKind::Constant);
+        assert!(symbols[0].parameters.is_none());
     }
 
     #[test]

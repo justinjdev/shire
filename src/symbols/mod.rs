@@ -3,7 +3,6 @@ pub mod elixir;
 mod hooks;
 mod query_extract;
 mod registry;
-pub mod ruby;
 pub mod walker;
 
 use serde::Serialize;

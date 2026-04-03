@@ -12,6 +12,7 @@ pub mod php;
 pub mod proto;
 pub mod python;
 pub mod r;
+pub mod ruby;
 pub mod rust_lang;
 pub mod scala;
 pub mod sql;

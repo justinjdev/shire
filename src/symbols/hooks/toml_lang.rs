@@ -59,33 +59,20 @@ fn pair_value_type(pair_node: &Node, _source: &str) -> &'static str {
 
 /// Post-process to fix names for dotted_key and quoted_key nodes.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    // The @name capture on a dotted_key gives the full node text (e.g., "database.auth")
-    // but we want to ensure it's clean. For quoted_key, strip the quotes.
     let name_node = find_name_child(node);
     if let Some(name_node) = name_node {
         match name_node.kind() {
             "dotted_key" => {
-                // Extract all bare_key children and join with "."
+                // Recursively collect leaf keys (bare_key/quoted_key) from nested dotted_key nodes
                 let mut parts = Vec::new();
-                for i in 0..name_node.child_count() {
-                    if let Some(child) = name_node.child(i) {
-                        if child.kind() == "bare_key" || child.kind() == "quoted_key" {
-                            if let Some(text) = node_text(&child, source) {
-                                let text = text.trim_matches('"').trim_matches('\'');
-                                parts.push(text.to_string());
-                            }
-                        }
-                    }
-                }
+                collect_dotted_key_parts(&name_node, source, &mut parts);
                 if !parts.is_empty() {
                     let dotted_name = parts.join(".");
-                    // Update signature with the clean dotted name
                     sym.signature = Some(if node.kind() == "table_array_element" {
                         format!("[[{}]]", dotted_name)
                     } else if node.kind() == "table" {
                         format!("[{}]", dotted_name)
                     } else {
-                        // constant (pair) with dotted key
                         let pair_node = find_ancestor(&name_node, "pair");
                         if let Some(pair_node) = pair_node {
                             let value_type = pair_value_type(&pair_node, source);
@@ -99,10 +86,16 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             }
             "quoted_key" => {
                 if let Some(text) = node_text(&name_node, source) {
-                    let clean = text.trim_matches('"').trim_matches('\'');
+                    let clean = strip_quotes(text);
                     sym.name = clean.to_string();
                     // Rebuild signature with clean name
-                    if sym.kind == SymbolKind::Constant {
+                    if sym.kind == SymbolKind::Class {
+                        sym.signature = Some(if node.kind() == "table_array_element" {
+                            format!("[[{}]]", clean)
+                        } else {
+                            format!("[{}]", clean)
+                        });
+                    } else if sym.kind == SymbolKind::Constant {
                         let pair_node = find_ancestor(&name_node, "pair");
                         if let Some(pair_node) = pair_node {
                             let value_type = pair_value_type(&pair_node, source);
@@ -115,6 +108,38 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         }
     }
     Some(sym)
+}
+
+/// Recursively collect leaf key parts from a dotted_key node.
+/// dotted_key nodes nest recursively: `a.b.c` → dotted_key(dotted_key(bare_key("a"), bare_key("b")), bare_key("c"))
+fn collect_dotted_key_parts(node: &Node, source: &str, parts: &mut Vec<String>) {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            match child.kind() {
+                "dotted_key" => collect_dotted_key_parts(&child, source, parts),
+                "bare_key" => {
+                    if let Some(text) = node_text(&child, source) {
+                        parts.push(text.to_string());
+                    }
+                }
+                "quoted_key" => {
+                    if let Some(text) = node_text(&child, source) {
+                        parts.push(strip_quotes(text).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Strip surrounding quotes (double or single) from a TOML key.
+fn strip_quotes(s: &str) -> &str {
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Find the @name child node within a definition node.
@@ -327,5 +352,40 @@ server = "localhost"
         assert_eq!(title.line, 1);
         let db = symbols.iter().find(|s| s.name == "database").unwrap();
         assert_eq!(db.line, 3);
+    }
+
+    #[test]
+    fn test_deep_dotted_table() {
+        let source = r#"[tool.poetry.dependencies]
+python = "^3.8"
+"#;
+        let symbols = extract(source);
+        let table = symbols.iter().find(|s| s.kind == SymbolKind::Class).unwrap();
+        assert_eq!(table.name, "tool.poetry.dependencies");
+        assert_eq!(table.signature.as_deref(), Some("[tool.poetry.dependencies]"));
+    }
+
+    #[test]
+    fn test_quoted_key_table() {
+        let source = r#"["special-table"]
+key = "value"
+"#;
+        let symbols = extract(source);
+        let tables: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "special-table");
+        assert_eq!(tables[0].signature.as_deref(), Some("[special-table]"));
+    }
+
+    #[test]
+    fn test_mixed_dotted_quoted_key() {
+        let source = r#"[[servers."beta".config]]
+host = "10.0.0.1"
+"#;
+        let symbols = extract(source);
+        let arrays: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        assert_eq!(arrays.len(), 1);
+        assert_eq!(arrays[0].name, "servers.beta.config");
+        assert_eq!(arrays[0].signature.as_deref(), Some("[[servers.beta.config]]"));
     }
 }

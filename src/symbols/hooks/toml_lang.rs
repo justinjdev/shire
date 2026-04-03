@@ -88,11 +88,13 @@ fn collect_dotted_key_parts(node: &Node, source: &str, parts: &mut Vec<String>) 
 
 /// Strip surrounding quotes (double or single) from a TOML key.
 fn strip_quotes(s: &str) -> &str {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        &s[1..s.len() - 1]
-    } else {
-        s
+    if let Some(stripped) = s.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')) {
+        return stripped;
     }
+    if let Some(stripped) = s.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+        return stripped;
+    }
+    s
 }
 
 /// Find the @name child node within a definition node.

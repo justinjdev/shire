@@ -16,7 +16,7 @@ static FD_RE: LazyLock<Regex> =
 static LEVEL_01_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*01\s+([\w-]+)").unwrap());
 static PARAGRAPH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*([A-Z][\w-]*)\s*\.\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)^\s*([A-Z0-9][\w-]*)\s*\.\s*$").unwrap());
 
 /// Extract symbols from COBOL source code using regex-based parsing.
 ///
@@ -180,6 +180,9 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                     | "COMPUTE" | "DISPLAY" | "ACCEPT" | "READ" | "WRITE" | "OPEN"
                     | "CLOSE" | "RETURN" | "EVALUATE" | "WHEN" | "NOT" | "SET"
                     | "INITIALIZE" | "STRING" | "UNSTRING" | "INSPECT" | "SEARCH"
+                    | "ALTER" | "CONTINUE" | "GOBACK" | "DELETE" | "SORT" | "MERGE"
+                    | "REWRITE" | "START" | "GENERATE" | "TERMINATE" | "RELEASE"
+                    | "REPLACE" | "EXEC"
                 ) {
                     continue;
                 }
@@ -493,5 +496,30 @@ mod tests {
         assert_eq!(start.parent_symbol.as_deref(), Some("MAIN-SECTION"));
         let calc = symbols.iter().find(|s| s.name == "CALC-PARA").unwrap();
         assert_eq!(calc.parent_symbol.as_deref(), Some("CALC-SECTION"));
+    }
+
+    #[test]
+    fn test_numeric_prefixed_paragraphs() {
+        let source = "\
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST-PROG.
+       PROCEDURE DIVISION.
+       1000-INIT.
+           DISPLAY \"INITIALIZING\".
+       2000-PROCESS.
+           DISPLAY \"PROCESSING\".
+       9999-EXIT.
+           STOP RUN.
+       ";
+        let symbols = extract(source, Arc::from("test.cob"));
+
+        let paragraphs: Vec<&SymbolInfo> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(paragraphs.len(), 3);
+        assert_eq!(paragraphs[0].name, "1000-INIT");
+        assert_eq!(paragraphs[1].name, "2000-PROCESS");
+        assert_eq!(paragraphs[2].name, "9999-EXIT");
     }
 }

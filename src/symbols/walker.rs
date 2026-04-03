@@ -59,6 +59,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "scala", "sc",                       // Scala
         "ex", "exs",                         // Elixir
         "zig",                               // Zig
+        "sh", "bash",                        // Bash/Shell
     ]
 }
 

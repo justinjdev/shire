@@ -13,8 +13,9 @@ Shire exposes the following tools over the Model Context Protocol:
 | `search_symbols` | Find functions, classes, types, methods by name or signature. Use instead of Grep for "where is function X?" or "what matches pattern Y?". Omit query with a package filter to list all symbols in that package. Supports hybrid FTS + vector search when [RAG is enabled](./configuration.md#rag-vector-search). |
 | `get_file_symbols` | List all symbols defined in a specific file. Use instead of reading the file to understand its exports. |
 | `search_files` | Find files by path or name. Use instead of Glob/find for locating files. Useful for "middleware", "proto files", or files in a specific directory. |
+| `search_docs` | Search documentation files by content, title, or path — returns matching docs with text snippets |
 | `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
-| `explore` | Explore a concept across the codebase — searches packages, symbols, and files semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
+| `explore` | Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
 
 ### When to use Shire vs Grep/Glob
@@ -36,4 +37,4 @@ Prompts are pre-built templates that compose multiple queries into structured co
 
 | Prompt | Args | Description |
 |---|---|---|
-| `explore` | `query` | Search packages, symbols, and files for a concept — returns a structured context map organized by package |
+| `explore` | `query` | Search packages, symbols, files, and documentation for a concept — returns a structured context map organized by package |

@@ -370,22 +370,48 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         }
     }
 
-    // Named constructors: constructor_signature has multiple `name` identifiers
+    // Named constructors: collect all identifier parts into a dotted name.
     // e.g., Dog.fromJson — the query captures "Dog" but we want "Dog.fromJson"
-    if node.kind() == "constructor_signature" {
-        let names: Vec<&str> = (0..node.child_count())
-            .filter_map(|i| {
-                let child = node.child(i).unwrap();
-                if child.kind() == "identifier" {
-                    child.utf8_text(source.as_bytes()).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if names.len() > 1 {
-            sym.name = names.join(".");
+    match node.kind() {
+        "constructor_signature" | "factory_constructor_signature"
+        | "redirecting_factory_constructor_signature" => {
+            let names: Vec<&str> = (0..node.child_count())
+                .filter_map(|i| {
+                    let child = node.child(i).unwrap();
+                    if child.kind() == "identifier" {
+                        child.utf8_text(source.as_bytes()).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if names.len() > 1 {
+                sym.name = names.join(".");
+            }
         }
+        "constant_constructor_signature" => {
+            // The name is inside a `qualified` node: (qualified (identifier) "." (identifier))
+            for i in 0..node.child_count() {
+                let child = node.child(i).unwrap();
+                if child.kind() == "qualified" {
+                    let names: Vec<&str> = (0..child.child_count())
+                        .filter_map(|j| {
+                            let gc = child.child(j).unwrap();
+                            if gc.kind() == "identifier" {
+                                gc.utf8_text(source.as_bytes()).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if names.len() > 1 {
+                        sym.name = names.join(".");
+                    }
+                    break;
+                }
+            }
+        }
+        _ => {}
     }
 
     Some(sym)
@@ -707,6 +733,31 @@ class Dog {
             Some("Future<int>"),
             "generic type args should be included"
         );
+    }
+
+    #[test]
+    fn test_const_named_constructor() {
+        let source = r#"
+class Dog {
+  const Dog.named(int x);
+}
+"#;
+        let syms = extract(source);
+        let ctors: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert!(ctors.iter().any(|s| s.name == "Dog.named"), "const named constructor should have dotted name, got: {:?}", ctors.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_factory_named_constructor() {
+        let source = r#"
+class Dog {
+  factory Dog.create() => Dog._();
+  Dog._();
+}
+"#;
+        let syms = extract(source);
+        let ctors: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method && !s.name.starts_with('_')).collect();
+        assert!(ctors.iter().any(|s| s.name == "Dog.create"), "factory named constructor should have dotted name, got: {:?}", ctors.iter().map(|s| &s.name).collect::<Vec<_>>());
     }
 
     #[test]

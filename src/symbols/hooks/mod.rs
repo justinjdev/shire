@@ -6,6 +6,8 @@ pub mod go;
 pub mod haskell;
 pub mod hcl;
 pub mod java;
+// Named toml_lang to avoid collision with the `toml` crate
+pub mod toml_lang;
 pub mod kotlin;
 pub mod php;
 pub mod proto;

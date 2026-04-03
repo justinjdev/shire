@@ -182,6 +182,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::hcl::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["toml"],
+                ts_language: || tree_sitter_toml_ng::LANGUAGE.into(),
+                query_source: include_str!("queries/toml.scm"),
+                hooks: super::hooks::toml_lang::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

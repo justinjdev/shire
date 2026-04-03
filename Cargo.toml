@@ -73,6 +73,7 @@ tree-sitter-haskell = "0.23"
 tree-sitter-yaml = "0.7"
 tree-sitter-sequel = "0.3"
 tree-sitter-hcl = { git = "https://github.com/tree-sitter-grammars/tree-sitter-hcl", rev = "de10d494dbd6b71cdf07a678fecbf404dbfe4398" }
+tree-sitter-toml-ng = "0.7"
 
 [features]
 default = ["rag"]

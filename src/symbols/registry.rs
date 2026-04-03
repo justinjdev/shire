@@ -175,6 +175,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::sql::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["hcl", "tf"],
+                ts_language: tree_sitter_hcl::language,
+                query_source: include_str!("queries/hcl.scm"),
+                hooks: super::hooks::hcl::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

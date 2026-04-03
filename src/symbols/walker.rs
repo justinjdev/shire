@@ -153,20 +153,44 @@ mod tests {
     #[test]
     fn test_all_extensions() {
         let exts = all_extensions();
+        // Tree-sitter languages
         assert!(exts.contains(&"ts"));
+        assert!(exts.contains(&"tsx"));
+        assert!(exts.contains(&"js"));
+        assert!(exts.contains(&"jsx"));
         assert!(exts.contains(&"go"));
         assert!(exts.contains(&"rs"));
         assert!(exts.contains(&"py"));
         assert!(exts.contains(&"java"));
+        assert!(exts.contains(&"kt"));
         assert!(exts.contains(&"proto"));
+        assert!(exts.contains(&"swift"));
+        assert!(exts.contains(&"c"));
+        assert!(exts.contains(&"h"));
+        assert!(exts.contains(&"cpp"));
+        assert!(exts.contains(&"cs"));
+        assert!(exts.contains(&"php"));
+        assert!(exts.contains(&"scala"));
+        assert!(exts.contains(&"zig"));
+        assert!(exts.contains(&"sh"));
+        assert!(exts.contains(&"bash"));
         assert!(exts.contains(&"r"));
         assert!(exts.contains(&"R"));
+        assert!(exts.contains(&"hs"));
         assert!(exts.contains(&"yaml"));
         assert!(exts.contains(&"yml"));
         assert!(exts.contains(&"sql"));
         assert!(exts.contains(&"hcl"));
         assert!(exts.contains(&"tf"));
         assert!(exts.contains(&"toml"));
+        assert!(exts.contains(&"pm"));
+        assert!(exts.contains(&"pl"));
+        assert!(exts.contains(&"rb"));
+        // Regex-based languages
+        assert!(exts.contains(&"ex"));
+        assert!(exts.contains(&"exs"));
+        assert!(exts.contains(&"cob"));
+        assert!(exts.contains(&"cbl"));
     }
 
     #[test]

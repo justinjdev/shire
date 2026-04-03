@@ -32,9 +32,8 @@ src/
 │   ├── query_extract.rs # Generic tree-sitter query executor with hook callbacks
 │   ├── queries/     # Tree-sitter .scm query files (one per language)
 │   ├── hooks/       # Language-specific hooks (visibility, signatures, params, post-processing)
-│   ├── perl.rs      # Perl extractor (regex-based)
-│   ├── ruby.rs      # Ruby extractor (regex-based)
-│   └── elixir.rs    # Elixir extractor (regex-based)
+│   ├── elixir.rs    # Elixir extractor (regex-based)
+│   └── cobol.rs     # COBOL extractor (regex-based)
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
 │   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding (64 files/batch)

@@ -3,7 +3,7 @@ use tree_sitter::Node;
 
 /// For methods inside a class declaration, resolve the class name.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
-    // signature -> class_decl -> class_declarations -> class
+    // signature -> class_declarations -> class
     let class_node = find_ancestor(node, "class")?;
     class_node
         .child_by_field_name("name")

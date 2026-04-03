@@ -147,6 +147,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::bash::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["r"],
+                ts_language: || tree_sitter_r::LANGUAGE.into(),
+                query_source: include_str!("queries/r.scm"),
+                hooks: super::hooks::r::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

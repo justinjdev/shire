@@ -30,6 +30,24 @@ The index is ready. Claude Code will automatically use it via the MCP server.
 
 The file is only written once — if it already exists, `shire init` leaves it untouched, so your customizations are preserved.
 
+### CLAUDE.md integration
+
+During interactive setup, `shire init` prompts:
+
+> Add Shire search guidance to ~/.claude/CLAUDE.md?
+
+If accepted, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Code to prefer Shire MCP tools over Grep/Glob for code search. The line is idempotent — running init again won't duplicate it. If `~/.claude/CLAUDE.md` doesn't exist yet, it creates the file.
+
+### Terminal output
+
+`shire init` uses styled terminal output to show what it does:
+
+- **✓** (green) — a file or config entry was created or updated
+- **–** (dimmed) — a file or config entry already exists, skipped
+- Section headers appear in **cyan**
+
+Most file writes (`.gitignore`, `CLAUDE.md`, `settings.json`, `.mcp.json`, `~/.claude.json`) use **atomic writes** — content is written to a temporary file first, then renamed into place. This prevents partial writes if the process is interrupted.
+
 ### Project-level setup
 
 To create a `shire.toml` in the current repo instead of globally:
@@ -138,3 +156,13 @@ Subsequent builds are **incremental** — only manifests whose content has chang
 File indexing is also incremental — a file-tree hash detects structural changes, skipping the file indexing phase entirely when no files have been added, removed, or resized.
 
 Symbol extraction and source hashing are **parallelized** across packages and within packages using rayon for multi-core throughput. Files are read once per build (single-pass hash + extraction). All database writes use **batched multi-row INSERTs** within explicit transactions, with FTS5 triggers temporarily disabled during bulk operations for maximum SQLite throughput.
+
+## Build progress
+
+`shire build` shows real-time progress for each build phase:
+
+- **Spinners** for quick phases (discovering manifests, workspace context, recomputing internals, indexing files)
+- **Progress bars with ETAs** for longer phases (parsing manifests, extracting symbols)
+- When [RAG is enabled](./configuration.md#rag-vector-search), an **embedding progress bar** tracks file embedding in the background, displaying error messages on failure
+
+Progress bars persist after completion so you can see the full build history in your terminal. Quiet mode (used internally by the MCP server for on-demand rebuilds) hides all progress output.

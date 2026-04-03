@@ -36,6 +36,7 @@ pub struct IndexStatus {
     pub package_count: Option<String>,
     pub symbol_count: Option<String>,
     pub file_count: Option<String>,
+    pub doc_count: Option<String>,
     pub total_duration_ms: Option<String>,
 }
 
@@ -645,6 +646,7 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
         package_count: get_meta("package_count")?,
         symbol_count: get_meta("symbol_count")?,
         file_count: get_meta("file_count")?,
+        doc_count: get_meta("doc_count")?,
         total_duration_ms: get_meta("total_duration_ms")?,
     })
 }

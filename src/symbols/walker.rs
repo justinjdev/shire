@@ -165,6 +165,7 @@ mod tests {
         assert!(exts.contains(&"java"));
         assert!(exts.contains(&"kt"));
         assert!(exts.contains(&"proto"));
+        assert!(exts.contains(&"dart"));
         assert!(exts.contains(&"swift"));
         assert!(exts.contains(&"c"));
         assert!(exts.contains(&"h"));

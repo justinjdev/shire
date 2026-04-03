@@ -1427,4 +1427,45 @@ mod tests {
         let results = search_docs(&conn, "", None, 20).unwrap();
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn test_search_docs_special_characters() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/oauth.md", Some("auth-service"), "OAuth Setup", r#"Configure "OAuth" providers with client_id and client_secret"#, 60),
+        ).unwrap();
+
+        // Query with double quotes should not cause FTS5 syntax error
+        let results = search_docs(&conn, r#"configure "OAuth""#, None, 20).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_search_docs_limit_clamping() {
+        let conn = test_db();
+        // Insert more docs than the limit cap
+        for i in 0..5 {
+            conn.execute(
+                "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (format!("docs/guide{i}.md"), Some("auth-service"), format!("Guide {i}"), "How to configure authentication setup", 35),
+            ).unwrap();
+        }
+
+        let results = search_docs(&conn, "configure", None, 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_docs_null_package() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("README.md", Option::<String>::None, "Project Overview", "Welcome to the project documentation", 36),
+        ).unwrap();
+
+        let results = search_docs(&conn, "project", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].package.is_none());
+    }
 }

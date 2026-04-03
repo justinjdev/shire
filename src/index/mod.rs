@@ -1470,6 +1470,8 @@ fn phase_index_docs(
 ) -> Result<usize> {
     let extensions = &config.docs.extensions;
     if extensions.is_empty() {
+        // No doc extensions configured — clear any previously indexed docs
+        conn.execute("DELETE FROM docs", [])?;
         return Ok(0);
     }
     let max_size = config.docs.max_file_size;
@@ -1499,19 +1501,21 @@ fn phase_index_docs(
         .collect::<Result<Vec<_>, _>>()?;
 
     if doc_files.is_empty() {
+        // No matching doc files found — clear any previously indexed docs
+        conn.execute("DELETE FROM docs", [])?;
         return Ok(0);
     }
 
-    // Load existing docs for incremental diff (path → content_hash)
-    let existing_docs: HashMap<String, String> = {
-        let mut stmt = conn.prepare("SELECT path, content_hash FROM docs WHERE content_hash IS NOT NULL")?;
+    // Load existing docs for incremental diff (path → (content_hash, package, size_bytes))
+    let existing_docs: HashMap<String, (String, Option<String>, i64)> = {
+        let mut stmt = conn.prepare("SELECT path, content_hash, package, size_bytes FROM docs WHERE content_hash IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)))
         })?;
         let mut map = HashMap::new();
         for row in rows {
-            let (path, hash) = row?;
-            map.insert(path, hash);
+            let (path, state) = row?;
+            map.insert(path, state);
         }
         map
     };
@@ -1544,17 +1548,19 @@ fn phase_index_docs(
     )?;
 
     let mut count = 0usize;
+    let read_limit = max_size as usize + 4; // +4 for max UTF-8 char width
     for (rel_path, package) in &doc_files {
         let abs_path = repo_root.join(rel_path);
-        let content = match std::fs::read_to_string(&abs_path) {
-            Ok(c) => c,
+
+        // Read only up to max_file_size + 4 bytes to avoid loading huge files
+        let (content, size_bytes) = match read_doc_file(&abs_path, read_limit) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::debug!(path = %rel_path, error = %e, "skipping unreadable doc file");
                 continue;
             }
         };
 
-        let size_bytes = content.len() as i64;
         let body = if content.len() > max_size as usize {
             // Find a valid UTF-8 boundary at or before max_size
             let mut end = max_size as usize;
@@ -1571,9 +1577,12 @@ fn phase_index_docs(
         hasher.update(body.as_bytes());
         let content_hash = format!("{:x}", hasher.finalize());
 
-        // Skip if content unchanged
-        if let Some(existing_hash) = existing_docs.get(rel_path) {
-            if *existing_hash == content_hash {
+        // Skip if content, package, and size are all unchanged
+        if let Some((existing_hash, existing_package, existing_size)) = existing_docs.get(rel_path) {
+            if *existing_hash == content_hash
+                && existing_package == package
+                && *existing_size == size_bytes
+            {
                 count += 1;
                 continue;
             }
@@ -1610,6 +1619,20 @@ fn extract_doc_title(content: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     None
+}
+
+/// Read a doc file, returning (content as UTF-8 string, original file size in bytes).
+/// Reads at most `limit` bytes to avoid loading huge files into memory.
+fn read_doc_file(path: &Path, limit: usize) -> Result<(String, i64)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len() as i64;
+    let mut reader = file.take(limit as u64);
+    let mut buf = Vec::with_capacity(limit.min(file_size as usize));
+    reader.read_to_end(&mut buf)?;
+    let content = String::from_utf8(buf)
+        .map_err(|_| anyhow::anyhow!("not valid UTF-8"))?;
+    Ok((content, file_size))
 }
 
 /// Apply config overrides (custom package descriptions).

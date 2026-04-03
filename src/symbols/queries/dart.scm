@@ -32,10 +32,31 @@
   (setter_signature
     name: (identifier) @name) @definition.function)
 
-; Methods inside class/mixin/extension bodies
+; Methods inside class/mixin/extension bodies (with function_body sibling)
 (method_signature
   (function_signature
     name: (identifier) @name)) @definition.method
+
+; Abstract/external methods (inside declaration node, no function_body)
+(class_body
+  (class_member_definition
+    (declaration
+      (function_signature
+        name: (identifier) @name)) @definition.method))
+
+; Abstract/external getters (inside declaration node)
+(class_body
+  (class_member_definition
+    (declaration
+      (getter_signature
+        name: (identifier) @name)) @definition.method))
+
+; Abstract/external setters (inside declaration node)
+(class_body
+  (class_member_definition
+    (declaration
+      (setter_signature
+        name: (identifier) @name)) @definition.method))
 
 ; Getter methods
 (method_signature
@@ -50,6 +71,11 @@
 ; Constructors
 (constructor_signature
   name: (identifier) @name) @definition.method
+
+; Const constructors (name is inside qualified node)
+(constant_constructor_signature
+  (qualified
+    (identifier) @name)) @definition.method
 
 ; Factory constructors
 (factory_constructor_signature

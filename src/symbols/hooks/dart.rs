@@ -39,12 +39,43 @@ fn extract_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
         return Some(name);
     }
 
+    // For method_signature, dig into the inner signature to find the name
+    if node.kind() == "method_signature" {
+        let inner_kinds = [
+            "function_signature", "getter_signature", "setter_signature",
+            "constructor_signature",
+        ];
+        for i in 0..node.child_count() {
+            let child = node.child(i).unwrap();
+            if inner_kinds.contains(&child.kind()) {
+                return extract_name(&child, source);
+            }
+        }
+    }
+
+    // For declaration nodes wrapping a signature, dig in
+    if node.kind() == "declaration" {
+        let sig_kinds = [
+            "function_signature", "getter_signature", "setter_signature",
+        ];
+        for i in 0..node.child_count() {
+            let child = node.child(i).unwrap();
+            if sig_kinds.contains(&child.kind()) {
+                return extract_name(&child, source);
+            }
+        }
+    }
+
     // For nodes without a name field (mixin_declaration, factory constructors),
     // find the first identifier child
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         if child.kind() == "identifier" || child.kind() == "type_identifier" {
             return child.utf8_text(source.as_bytes()).ok();
+        }
+        // For constant_constructor_signature, name is inside qualified node
+        if child.kind() == "qualified" {
+            return extract_name(&child, source);
         }
     }
 
@@ -55,8 +86,9 @@ fn extract_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 /// resolve the parent type name.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
-        "method_signature" | "constructor_signature" | "constant_constructor_signature"
-        | "factory_constructor_signature" | "redirecting_factory_constructor_signature" => {}
+        "method_signature" | "declaration" | "constructor_signature"
+        | "constant_constructor_signature" | "factory_constructor_signature"
+        | "redirecting_factory_constructor_signature" => {}
         _ => return None,
     }
 
@@ -135,8 +167,10 @@ fn build_type_signature(node: &Node, source: &str, name: &str) -> String {
 
 /// Extract parameters from a Dart function/method/constructor.
 fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
-    // For method_signature, dig into the inner signature node
-    let sig_node = find_inner_signature(node).unwrap_or(*node);
+    // For method_signature or declaration, dig into the inner signature node
+    let sig_node = find_inner_signature(node)
+        .or_else(|| find_inner_declaration_sig(node))
+        .unwrap_or(*node);
 
     let params_node = match sig_node
         .child_by_field_name("parameters")
@@ -208,7 +242,7 @@ fn extract_single_param(param_node: &Node, source: &str) -> Option<Parameter> {
     })
 }
 
-/// Find the type annotation for a parameter.
+/// Find the type annotation for a parameter, including generic type arguments.
 fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
     let type_kinds = ["type_identifier", "void_type", "function_type", "inferred_type"];
 
@@ -216,8 +250,16 @@ fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
         let child = param_node.child(i).unwrap();
         if type_kinds.contains(&child.kind()) {
             let mut type_text = child.utf8_text(source.as_bytes()).ok()?.to_string();
+            let mut next_idx = i + 1;
+            // Append generic type_arguments if present (e.g., List<String>)
+            if let Some(next) = param_node.child(next_idx) {
+                if next.kind() == "type_arguments" {
+                    type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
+                    next_idx += 1;
+                }
+            }
             // Check for nullable `?` following the type
-            if let Some(next) = param_node.child(i + 1) {
+            if let Some(next) = param_node.child(next_idx) {
                 if next.kind() == "?" {
                     type_text.push('?');
                 }
@@ -234,23 +276,55 @@ fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
 
 /// Extract return type from a Dart function/getter signature.
 /// In the 0.0.4 grammar, function_signature has no `return_type` field;
-/// the return type is a type_identifier or void_type child.
+/// the return type is a type_identifier or void_type child, potentially
+/// followed by type_arguments for generics (e.g., Future<int>).
 fn extract_return_type(node: &Node, source: &str) -> Option<String> {
-    let sig_node = find_inner_signature(node).unwrap_or(*node);
+    let sig_node = find_inner_signature(node)
+        .or_else(|| find_inner_declaration_sig(node))
+        .unwrap_or(*node);
 
+    extract_type_with_generics(&sig_node, source)
+}
+
+/// Extract a type from a node's children, including generic type arguments.
+/// Handles patterns like `type_identifier type_arguments ?` -> `Future<int>?`
+fn extract_type_with_generics(node: &Node, source: &str) -> Option<String> {
     let type_kinds = ["type_identifier", "void_type", "function_type"];
 
-    for i in 0..sig_node.child_count() {
-        let child = sig_node.child(i).unwrap();
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
         if type_kinds.contains(&child.kind()) {
             let mut type_text = child.utf8_text(source.as_bytes()).ok()?.to_string();
+            // Append generic type_arguments if present (e.g., Future<int>)
+            let mut next_idx = i + 1;
+            if let Some(next) = node.child(next_idx) {
+                if next.kind() == "type_arguments" {
+                    type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
+                    next_idx += 1;
+                }
+            }
             // Check for nullable `?`
-            if let Some(next) = sig_node.child(i + 1) {
+            if let Some(next) = node.child(next_idx) {
                 if next.kind() == "?" {
                     type_text.push('?');
                 }
             }
             return Some(type_text);
+        }
+    }
+    None
+}
+
+/// For declaration nodes, find the inner function/getter/setter signature.
+fn find_inner_declaration_sig<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
+    if node.kind() != "declaration" {
+        return None;
+    }
+    let sig_kinds = ["function_signature", "getter_signature", "setter_signature"];
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        if sig_kinds.contains(&child.kind()) {
+            return Some(child);
         }
     }
     None
@@ -281,10 +355,10 @@ fn find_inner_signature<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
 }
 
 /// Post-process Dart symbols.
-fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<SymbolInfo> {
-    // Set visibility based on name
+fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
+    // Defense-in-depth: filter private symbols that slipped through is_visible
     if sym.name.starts_with('_') {
-        sym.visibility = "private".to_string();
+        return None;
     }
 
     // Skip operator methods (they have no useful name capture)
@@ -293,6 +367,24 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
             if inner.kind() == "operator_signature" {
                 return None;
             }
+        }
+    }
+
+    // Named constructors: constructor_signature has multiple `name` identifiers
+    // e.g., Dog.fromJson — the query captures "Dog" but we want "Dog.fromJson"
+    if node.kind() == "constructor_signature" {
+        let names: Vec<&str> = (0..node.child_count())
+            .filter_map(|i| {
+                let child = node.child(i).unwrap();
+                if child.kind() == "identifier" {
+                    child.utf8_text(source.as_bytes()).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if names.len() > 1 {
+            sym.name = names.join(".");
         }
     }
 
@@ -534,5 +626,100 @@ typedef Callback = void Function();
         assert!(names.contains(&"greet"));
         assert!(names.contains(&"Callback"));
         assert!(names.contains(&"makeSound"));
+    }
+
+    // --- Balrog findings: HIGH ---
+
+    #[test]
+    fn test_private_method_filtered() {
+        let source = r#"
+class MyClass {
+  void _privateMethod() {}
+  void publicMethod() {}
+}
+"#;
+        let syms = extract(source);
+        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert_eq!(methods.len(), 1, "private method should be filtered");
+        assert_eq!(methods[0].name, "publicMethod");
+    }
+
+    #[test]
+    fn test_abstract_method() {
+        let source = r#"
+abstract class Animal {
+  void makeSound();
+  String get name;
+}
+"#;
+        let syms = extract(source);
+        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        assert!(methods.len() >= 1, "abstract methods should be captured");
+        let names: Vec<&str> = methods.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"makeSound"), "abstract method missing");
+        assert!(names.contains(&"name"), "abstract getter missing");
+    }
+
+    // --- Balrog findings: MEDIUM ---
+
+    #[test]
+    fn test_const_constructor() {
+        let source = r#"
+class Color {
+  const Color(this.value);
+  final int value;
+}
+"#;
+        let syms = extract(source);
+        let ctors: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method && s.name == "Color")
+            .collect();
+        assert_eq!(ctors.len(), 1, "const constructor should be captured");
+    }
+
+    #[test]
+    fn test_named_constructor() {
+        let source = r#"
+class Dog {
+  Dog(String name) {}
+  Dog.fromJson(Map json) {}
+}
+"#;
+        let syms = extract(source);
+        let ctors: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert_eq!(ctors.len(), 2, "both constructors should be captured");
+        let names: Vec<&str> = ctors.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Dog"));
+        assert!(names.contains(&"Dog.fromJson"), "named constructor should have dotted name, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_generic_return_type() {
+        let source = "Future<int> compute() async => 42;";
+        let syms = extract(source);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(
+            syms[0].return_type.as_deref(),
+            Some("Future<int>"),
+            "generic type args should be included"
+        );
+    }
+
+    #[test]
+    fn test_generic_param_type() {
+        let source = "void process(List<String> items) {}";
+        let syms = extract(source);
+        assert_eq!(syms.len(), 1);
+        let params = syms[0].parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].type_annotation.as_deref(),
+            Some("List<String>"),
+            "generic param type args should be included"
+        );
     }
 }

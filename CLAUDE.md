@@ -28,8 +28,8 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 
 - **index/** — Build orchestrator. Walks the repo, discovers manifests, parses them via the `ManifestParser` trait (one impl per ecosystem: npm, go, cargo, python, maven, gradle, perl, ruby), extracts symbols, writes to SQLite. Builds are incremental at file granularity via SHA-256 content hashing (`file_hashes` table), with mtime pre-checks to skip unchanged packages entirely. Single-pass read+hash+extract avoids double file reads. File tree walk capped at 500k files.
 - **symbols/** — Source code symbol extraction. Uses tree-sitter query patterns + language-specific hooks for most languages (TS/JS, Go, Rust, Python, Java, Kotlin, C, C++, C#, Swift, PHP, Scala, Zig, Protobuf), regex for Perl, Ruby, and Elixir. Parallelized across packages and within packages with rayon. Tree-sitter queries compiled once per language via `OnceLock`. All extractors produce the same `SymbolInfo` struct (uses `Arc<str>` for file paths).
-- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files) with custom tokenizers (`unicode61` with `tokenchars` for underscores/hyphens) and prefix indexes. FTS triggers dropped/recreated during bulk operations for performance. Schema versioned via `shire_meta` with automatic FTS migration on upgrade. Read-only connections use `query_only` and `prepare_cached`.
-- **mcp/** — MCP server over stdio using the `rmcp` crate. 10 tools + 1 prompt template for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
+- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files, docs) with custom tokenizers (`unicode61` with `tokenchars` for underscores/hyphens) and prefix indexes. FTS triggers dropped/recreated during bulk operations for performance. Schema versioned via `shire_meta` with automatic FTS migration on upgrade. Read-only connections use `query_only` and `prepare_cached`.
+- **mcp/** — MCP server over stdio using the `rmcp` crate. 11 tools + 1 prompt template for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
 - **watch/** — Unix-only background daemon. Uses Unix domain sockets (`.shire/watch.sock`) for IPC, PID file for process management, configurable debounce. Filters rebuilds by file relevance.
 
 ### Adding a new manifest parser
@@ -86,7 +86,7 @@ The docs site lives in `docs/src/` (mdBook). When changing user-facing behavior,
 
 ## Configuration
 
-`shire.toml` at repo root, with fallback to `~/.claude/shire.toml` if no local config exists. Key settings: `db_path`, `discovery.manifests`, `discovery.exclude`, `discovery.custom` rules, `symbols.exclude_extensions`, `watch.debounce_ms`, `log.level`, `log.dir`, `log.max_days`, `[[packages]]` overrides. Relative `db_path` values are resolved against the repo root. `SHIRE_LOG` env var overrides `log.level`.
+`shire.toml` at repo root, with fallback to `~/.claude/shire.toml` if no local config exists. Key settings: `db_path`, `discovery.manifests`, `discovery.exclude`, `discovery.custom` rules, `symbols.exclude_extensions`, `docs.extensions`, `docs.max_file_size`, `watch.debounce_ms`, `log.level`, `log.dir`, `log.max_days`, `[[packages]]` overrides. Relative `db_path` values are resolved against the repo root. `SHIRE_LOG` env var overrides `log.level`.
 
 ## License
 

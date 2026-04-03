@@ -41,7 +41,7 @@ src/
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 10 tool handlers (+ hybrid search when RAG enabled)
+│   ├── tools.rs     # 11 tool handlers (+ hybrid search when RAG enabled)
 │   └── prompts.rs   # explore prompt template for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

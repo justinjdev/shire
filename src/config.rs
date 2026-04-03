@@ -13,6 +13,8 @@ pub struct Config {
     #[serde(default)]
     pub symbols: SymbolsConfig,
     #[serde(default)]
+    pub docs: DocsConfig,
+    #[serde(default)]
     pub watch: WatchConfig,
     #[serde(default)]
     pub serve: ServeConfig,
@@ -31,6 +33,38 @@ pub struct SymbolsConfig {
     /// (e.g. "zz_generated." — note the trailing dot).
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DocsConfig {
+    /// File extensions to index as documentation (e.g. ".md", ".rst", ".txt", ".adoc").
+    #[serde(default = "default_doc_extensions")]
+    pub extensions: Vec<String>,
+    /// Maximum file size in bytes for doc content indexing. Files larger than this are truncated.
+    #[serde(default = "default_doc_max_file_size")]
+    pub max_file_size: u64,
+}
+
+impl Default for DocsConfig {
+    fn default() -> Self {
+        Self {
+            extensions: default_doc_extensions(),
+            max_file_size: default_doc_max_file_size(),
+        }
+    }
+}
+
+fn default_doc_extensions() -> Vec<String> {
+    vec![
+        ".md".into(),
+        ".rst".into(),
+        ".txt".into(),
+        ".adoc".into(),
+    ]
+}
+
+fn default_doc_max_file_size() -> u64 {
+    262_144 // 256 KB
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -768,5 +802,24 @@ manifests = ["package.json"]
         .unwrap();
         assert_eq!(config.symbols.exclude_patterns.len(), 2);
         assert!(config.symbols.exclude_patterns.contains(&"_mock.go".to_string()));
+    }
+
+    #[test]
+    fn test_docs_config_defaults() {
+        let config = Config::default();
+        assert_eq!(config.docs.extensions, vec![".md", ".rst", ".txt", ".adoc"]);
+        assert_eq!(config.docs.max_file_size, 262_144);
+    }
+
+    #[test]
+    fn test_parse_docs_config() {
+        let toml_str = r#"
+[docs]
+extensions = [".md", ".mdx"]
+max_file_size = 524288
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.docs.extensions, vec![".md", ".mdx"]);
+        assert_eq!(config.docs.max_file_size, 524_288);
     }
 }

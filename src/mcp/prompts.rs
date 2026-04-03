@@ -17,7 +17,7 @@ pub fn list() -> Vec<Prompt> {
     vec![
         Prompt::new(
             "explore",
-            Some("Semantic codebase exploration — search packages, symbols, and files for a concept and return a structured context map"),
+            Some("Semantic codebase exploration — search packages, symbols, files, and documentation for a concept and return a structured context map"),
             Some(vec![PromptArgument {
                 name: "query".into(),
                 description: Some("Concept to explore (e.g. \"authentication\", \"error handling\", \"messaging interfaces\")".into()),
@@ -69,6 +69,7 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
     let packages = queries::search_packages(conn, query, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
     let symbols = queries::search_symbols(conn, query, None, None, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
     let files = queries::search_files(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let docs = queries::search_docs(conn, query, None, 10).map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Codebase exploration: \"{query}\"\n\n");
 
@@ -84,7 +85,13 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
         files_by_pkg.entry(file.package.as_deref()).or_default().push(file);
     }
 
-    if packages.is_empty() && symbols.is_empty() && files.is_empty() {
+    // Organize docs by package
+    let mut docs_by_pkg: HashMap<Option<&str>, Vec<&queries::DocRow>> = HashMap::new();
+    for doc in &docs {
+        docs_by_pkg.entry(doc.package.as_deref()).or_default().push(doc);
+    }
+
+    if packages.is_empty() && symbols.is_empty() && files.is_empty() && docs.is_empty() {
         text.push_str("No results found.\n");
     } else {
         // Package matches
@@ -116,6 +123,15 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
                         text.push_str(&format!("- `{}`\n", f.path));
                     }
                 }
+
+                // Docs in this package
+                if let Some(ds) = docs_by_pkg.get(&Some(pkg.name.as_str())) {
+                    text.push_str(&format!("\n**Matching docs ({}):**\n", ds.len()));
+                    for d in ds {
+                        let title = d.title.as_deref().unwrap_or("(untitled)");
+                        text.push_str(&format!("- **{}** — `{}`\n  {}\n", title, d.path, d.snippet));
+                    }
+                }
                 text.push('\n');
             }
         }
@@ -144,6 +160,23 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
             for f in &orphan_files {
                 let pkg_label = f.package.as_deref().unwrap_or("(unowned)");
                 text.push_str(&format!("- `{}` [{}]\n", f.path, pkg_label));
+            }
+            text.push('\n');
+        }
+
+        // Docs not in matched packages
+        let orphan_docs: Vec<_> = docs.iter().filter(|d| {
+            match &d.package {
+                Some(pkg) => !matched_pkg_names.contains(pkg.as_str()),
+                None => true,
+            }
+        }).collect();
+        if !orphan_docs.is_empty() {
+            text.push_str(&format!("## Documentation matches ({})\n\n", orphan_docs.len()));
+            for d in &orphan_docs {
+                let title = d.title.as_deref().unwrap_or("(untitled)");
+                let pkg_label = d.package.as_deref().unwrap_or("(unowned)");
+                text.push_str(&format!("- **{}** — `{}` [{}]\n  {}\n", title, d.path, pkg_label, d.snippet));
             }
             text.push('\n');
         }

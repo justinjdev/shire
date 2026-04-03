@@ -709,6 +709,7 @@ struct BuildSummary {
     num_skipped: usize,
     num_source_reextracted: usize,
     num_files: usize,
+    num_docs: usize,
     total_packages: i64,
     total_symbols: i64,
     failures: Vec<(String, String)>,
@@ -1460,6 +1461,180 @@ fn phase_index_files(
     Ok(num_files)
 }
 
+/// Index documentation files: read content from doc files in the files table,
+/// extract a title, and upsert into the docs table for FTS search.
+fn phase_index_docs(
+    conn: &Connection,
+    repo_root: &Path,
+    config: &Config,
+) -> Result<usize> {
+    let extensions = &config.docs.extensions;
+    if extensions.is_empty() {
+        // No doc extensions configured — clear any previously indexed docs
+        conn.execute("DELETE FROM docs", [])?;
+        return Ok(0);
+    }
+    let max_size = config.docs.max_file_size;
+
+    // Query files table for doc files by extension
+    let placeholders: String = (1..=extensions.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT path, package FROM files WHERE extension IN ({placeholders})"
+    );
+    let ext_params: Vec<String> = extensions
+        .iter()
+        .map(|e| e.strip_prefix('.').unwrap_or(e).to_string())
+        .collect();
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = ext_params
+        .iter()
+        .map(|e| Box::new(e.clone()) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+
+    let doc_files: Vec<(String, Option<String>)> = conn
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if doc_files.is_empty() {
+        // No matching doc files found — clear any previously indexed docs
+        conn.execute("DELETE FROM docs", [])?;
+        return Ok(0);
+    }
+
+    // Load existing docs for incremental diff (path → (content_hash, package, size_bytes))
+    let existing_docs: HashMap<String, (String, Option<String>, i64)> = {
+        let mut stmt = conn.prepare("SELECT path, content_hash, package, size_bytes FROM docs WHERE content_hash IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, state) = row?;
+            map.insert(path, state);
+        }
+        map
+    };
+
+    let new_paths: HashSet<&str> = doc_files.iter().map(|(p, _)| p.as_str()).collect();
+
+    // Delete docs no longer in the files table
+    let to_delete: Vec<&str> = existing_docs
+        .keys()
+        .filter(|p| !new_paths.contains(p.as_str()))
+        .map(|p| p.as_str())
+        .collect();
+    for chunk in to_delete.chunks(500) {
+        let placeholders: String = chunk.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM docs WHERE path IN ({})", placeholders);
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk.iter().map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
+    }
+
+    // Drop FTS triggers for bulk performance (consistent with symbols pattern)
+    db::drop_docs_fts_triggers(conn)?;
+
+    // Read and upsert doc files
+    let mut upsert_stmt = conn.prepare(
+        "INSERT OR REPLACE INTO docs (path, package, title, body, size_bytes, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+
+    let mut count = 0usize;
+    let read_limit = max_size as usize + 4; // +4 for max UTF-8 char width
+    for (rel_path, package) in &doc_files {
+        let abs_path = repo_root.join(rel_path);
+
+        // Read only up to max_file_size + 4 bytes to avoid loading huge files
+        let (content, size_bytes) = match read_doc_file(&abs_path, read_limit) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(path = %rel_path, error = %e, "skipping unreadable doc file");
+                continue;
+            }
+        };
+
+        let body = if content.len() > max_size as usize {
+            // Find a valid UTF-8 boundary at or before max_size
+            let mut end = max_size as usize;
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            &content[..end]
+        } else {
+            content.as_str()
+        };
+
+        // Compute hash for incremental check
+        let mut hasher = Sha256::new();
+        hasher.update(body.as_bytes());
+        let content_hash = format!("{:x}", hasher.finalize());
+
+        // Skip if content, package, and size are all unchanged
+        if let Some((existing_hash, existing_package, existing_size)) = existing_docs.get(rel_path) {
+            if *existing_hash == content_hash
+                && existing_package == package
+                && *existing_size == size_bytes
+            {
+                count += 1;
+                continue;
+            }
+        }
+
+        // Extract title: first markdown heading or first non-empty line
+        let title = extract_doc_title(body);
+
+        upsert_stmt.execute(rusqlite::params![rel_path, package, title, body, size_bytes, content_hash])?;
+        count += 1;
+    }
+
+    // Rebuild FTS index and recreate triggers
+    conn.execute("INSERT INTO docs_fts(docs_fts) VALUES('rebuild')", [])?;
+    db::recreate_docs_fts_triggers(conn)?;
+
+    Ok(count)
+}
+
+/// Extract a title from doc content. For markdown, uses the first `# ` heading.
+/// Falls back to the first non-empty line.
+fn extract_doc_title(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Markdown heading
+        if let Some(heading) = trimmed.strip_prefix("# ") {
+            return Some(heading.trim().to_string());
+        }
+        // RST title (underlined with = or -)
+        // Just return the first non-empty line as title
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Read a doc file, returning (content as UTF-8 string, original file size in bytes).
+/// Reads at most `limit` bytes to avoid loading huge files into memory.
+fn read_doc_file(path: &Path, limit: usize) -> Result<(String, i64)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len() as i64;
+    let mut reader = file.take(limit as u64);
+    let mut buf = Vec::with_capacity(limit.min(file_size as usize));
+    reader.read_to_end(&mut buf)?;
+    let content = String::from_utf8(buf)
+        .map_err(|_| anyhow::anyhow!("not valid UTF-8"))?;
+    Ok((content, file_size))
+}
+
 /// Apply config overrides (custom package descriptions).
 fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
     for override_pkg in &config.packages {
@@ -1582,6 +1757,10 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_count', ?1)",
         [summary.num_files.to_string()],
     )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('doc_count', ?1)",
+        [summary.num_docs.to_string()],
+    )?;
     if let Some(commit) = git_commit {
         conn.execute(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('git_commit', ?1)",
@@ -1603,22 +1782,22 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
 
     if is_full_build || force {
         println!(
-            "Indexed {} packages, {} symbols, {} files into {}",
-            summary.total_packages, summary.total_symbols, summary.num_files,
+            "Indexed {} packages, {} symbols, {} files, {} docs into {}",
+            summary.total_packages, summary.total_symbols, summary.num_files, summary.num_docs,
             db_path.display()
         );
     } else if summary.num_source_reextracted > 0 {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} files into {}",
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} files, {} docs into {}",
             summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols, summary.num_files,
+            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols, summary.num_files, summary.num_docs,
             db_path.display()
         );
     } else {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} files into {}",
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} files, {} docs into {}",
             summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.total_symbols, summary.num_files,
+            summary.num_skipped, summary.total_symbols, summary.num_files, summary.num_docs,
             db_path.display()
         );
     }
@@ -1801,6 +1980,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM source_hashes", [])?;
             conn.execute("DELETE FROM file_hashes", [])?;
+            conn.execute("DELETE FROM docs", [])?;
             conn.execute("DELETE FROM shire_meta WHERE key = 'file_tree_hash'", [])?;
             Ok(())
         })?;
@@ -2027,6 +2207,16 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
 
+    // Phase 9.5: Index documentation content
+    tracing::debug!("phase 9.5: index docs");
+    let sp = make_spinner(&mp, "Indexing docs…");
+    let t = Instant::now();
+    let num_docs = with_transaction(&conn, || {
+        phase_index_docs(&conn, repo_root, config)
+    })?;
+    timings.push(("index-docs", t.elapsed()));
+    sp.finish_with_message(format!("Indexed {} docs", num_docs));
+
     // Phase 10: RAG file-level embedding (optional, runs in background thread)
     // Build completes and prints summary immediately. Embedding continues in a
     // background thread that opens its own DB connection. The thread handle is
@@ -2187,6 +2377,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         num_skipped,
         num_source_reextracted,
         num_files,
+        num_docs,
         total_packages,
         total_symbols,
         failures,
@@ -2229,7 +2420,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         conn.execute_batch(
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
              INSERT INTO files_fts(files_fts, rank) VALUES('merge', 500);
-             INSERT INTO symbols_fts(symbols_fts, rank) VALUES('merge', 500);",
+             INSERT INTO symbols_fts(symbols_fts, rank) VALUES('merge', 500);
+             INSERT INTO docs_fts(docs_fts, rank) VALUES('merge', 500);",
         )?;
     }
 
@@ -2741,5 +2933,74 @@ anyhow = "1"
 
         // hashed_at should NOT be updated when mtime precheck skips
         assert_eq!(hashed_at_1, hashed_at_2);
+    }
+
+    #[test]
+    fn test_extract_doc_title_markdown_heading() {
+        assert_eq!(
+            extract_doc_title("# My Title\n\nSome content"),
+            Some("My Title".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_leading_blank_lines() {
+        assert_eq!(
+            extract_doc_title("\n\n# Title After Blanks\n"),
+            Some("Title After Blanks".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_no_heading() {
+        assert_eq!(
+            extract_doc_title("Just plain text\nMore text"),
+            Some("Just plain text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_doc_title_empty() {
+        assert_eq!(extract_doc_title(""), None);
+        assert_eq!(extract_doc_title("\n\n\n"), None);
+    }
+
+    #[test]
+    fn test_phase_index_docs_with_utf8_truncation() {
+        // Verify that multi-byte UTF-8 characters at the truncation boundary
+        // don't cause a panic. "é" is 2 bytes, "日" is 3 bytes.
+        let dir = tempfile::TempDir::new().unwrap();
+        create_test_monorepo(dir.path());
+
+        let config = Config {
+            docs: crate::config::DocsConfig {
+                extensions: vec![".md".into()],
+                max_file_size: 5, // truncate at 5 bytes
+            },
+            ..Config::default()
+        };
+
+        // Build index first to populate files table
+        let db_path = dir.path().join(".shire/index.db");
+        build_index(dir.path(), &config, true, Some(&db_path)).unwrap();
+
+        // Create a doc file with multi-byte chars near the boundary
+        let doc_path = dir.path().join("services/auth/README.md");
+        fs::write(&doc_path, "abc日本語").unwrap(); // "abc" = 3 bytes, "日" starts at byte 3 (3 bytes)
+
+        // Rebuild to index the doc file
+        build_index(dir.path(), &config, true, Some(&db_path)).unwrap();
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM docs WHERE path LIKE '%README.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // max_file_size=5, "abc日" would be 6 bytes, so truncated to "abc" (3 bytes at char boundary)
+        assert_eq!(body, "abc");
+        assert!(body.len() <= 5);
     }
 }

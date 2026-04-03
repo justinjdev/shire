@@ -39,6 +39,7 @@ impl ServerHandler for tools::ShireService {
                  | Find a function/class/type | `search_symbols` | Grep |\n\
                  | Find a file by name | `search_files` | Glob/find |\n\
                  | Find a package | `search_packages` | Grep |\n\
+                 | Search documentation | `search_docs` | Grep/reading docs |\n\
                  | List symbols in a file | `get_file_symbols` | Reading the file |\n\
                  | List files in a package | `list_package_files` | Glob |\n\
                  | Explore a concept | `explore` | Grep |\n\

@@ -36,6 +36,7 @@ pub struct IndexStatus {
     pub package_count: Option<String>,
     pub symbol_count: Option<String>,
     pub file_count: Option<String>,
+    pub doc_count: Option<String>,
     pub total_duration_ms: Option<String>,
 }
 
@@ -645,6 +646,7 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
         package_count: get_meta("package_count")?,
         symbol_count: get_meta("symbol_count")?,
         file_count: get_meta("file_count")?,
+        doc_count: get_meta("doc_count")?,
         total_duration_ms: get_meta("total_duration_ms")?,
     })
 }
@@ -695,6 +697,77 @@ pub fn reverse_dependency_graph(
     }
 
     Ok(edges)
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocRow {
+    pub path: String,
+    pub package: Option<String>,
+    pub title: Option<String>,
+    pub snippet: String,
+    pub size_bytes: i64,
+}
+
+/// FTS5 search across documentation content (title, body, path).
+pub fn search_docs(
+    conn: &Connection,
+    query: &str,
+    package_filter: Option<&str>,
+    limit: u32,
+) -> Result<Vec<DocRow>> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
+    let limit = limit.min(200) as i64;
+
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match package_filter {
+        Some(pkg) => (
+            "SELECT d.path, d.package, d.title,
+                    snippet(docs_fts, 1, '**', '**', '…', 40) AS snippet,
+                    d.size_bytes
+             FROM docs_fts f
+             JOIN docs d ON d.rowid = f.rowid
+             WHERE docs_fts MATCH ?1 AND d.package = ?2
+             ORDER BY rank
+             LIMIT ?3",
+            vec![
+                Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(pkg.to_string()),
+                Box::new(limit),
+            ],
+        ),
+        None => (
+            "SELECT d.path, d.package, d.title,
+                    snippet(docs_fts, 1, '**', '**', '…', 40) AS snippet,
+                    d.size_bytes
+             FROM docs_fts f
+             JOIN docs d ON d.rowid = f.rowid
+             WHERE docs_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+            vec![
+                Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
+        ),
+    };
+
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(DocRow {
+            path: row.get(0)?,
+            package: row.get(1)?,
+            title: row.get(2)?,
+            snippet: row.get(3)?,
+            size_bytes: row.get(4)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1310,5 +1383,89 @@ mod tests {
         assert_eq!(sym.package, "auth-service");
         assert_eq!(sym.parent_symbol.as_deref(), Some("AuthService"));
         assert_eq!(sym.return_type.as_deref(), Some("Promise<boolean>"));
+    }
+
+    #[test]
+    fn test_search_docs() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/auth.md", Some("auth-service"), "Authentication Guide", "How to configure authentication and set up OAuth providers", 55),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("README.md", Option::<String>::None, "Project Overview", "Welcome to the monorepo project documentation", 48),
+        ).unwrap();
+
+        let results = search_docs(&conn, "authentication", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "docs/auth.md");
+        assert_eq!(results[0].package.as_deref(), Some("auth-service"));
+        assert_eq!(results[0].title.as_deref(), Some("Authentication Guide"));
+    }
+
+    #[test]
+    fn test_search_docs_with_package_filter() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/auth.md", Some("auth-service"), "Auth Setup", "How to configure authentication", 30),
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/gateway.md", Some("api-gateway"), "Gateway Setup", "How to configure the gateway authentication proxy", 50),
+        ).unwrap();
+
+        let results = search_docs(&conn, "configure", Some("auth-service"), 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "docs/auth.md");
+    }
+
+    #[test]
+    fn test_search_docs_empty_query() {
+        let conn = test_db();
+        let results = search_docs(&conn, "", None, 20).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_docs_special_characters() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("docs/oauth.md", Some("auth-service"), "OAuth Setup", r#"Configure "OAuth" providers with client_id and client_secret"#, 60),
+        ).unwrap();
+
+        // Query with double quotes should not cause FTS5 syntax error
+        let results = search_docs(&conn, r#"configure "OAuth""#, None, 20).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_search_docs_limit_clamping() {
+        let conn = test_db();
+        // Insert more docs than the limit cap
+        for i in 0..5 {
+            conn.execute(
+                "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (format!("docs/guide{i}.md"), Some("auth-service"), format!("Guide {i}"), "How to configure authentication setup", 35),
+            ).unwrap();
+        }
+
+        let results = search_docs(&conn, "configure", None, 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_docs_null_package() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+            ("README.md", Option::<String>::None, "Project Overview", "Welcome to the project documentation", 36),
+        ).unwrap();
+
+        let results = search_docs(&conn, "project", None, 20).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].package.is_none());
     }
 }

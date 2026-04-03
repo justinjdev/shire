@@ -14,6 +14,11 @@ exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", 
 [symbols]
 exclude_extensions = [".proto", ".pl"]
 
+# Documentation indexing
+[docs]
+extensions = [".md", ".rst", ".txt", ".adoc"]
+max_file_size = 262144  # 256 KB — files larger than this are truncated
+
 # Override package descriptions
 [[packages]]
 name = "legacy-auth"

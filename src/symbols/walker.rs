@@ -65,6 +65,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "hs",                                // Haskell
         "yaml", "yml",                       // YAML
         "sql",                               // SQL
+        "hcl", "tf",                         // HCL/Terraform
     ]
 }
 
@@ -162,6 +163,8 @@ mod tests {
         assert!(exts.contains(&"yaml"));
         assert!(exts.contains(&"yml"));
         assert!(exts.contains(&"sql"));
+        assert!(exts.contains(&"hcl"));
+        assert!(exts.contains(&"tf"));
     }
 
     #[test]

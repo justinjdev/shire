@@ -1,41 +1,9 @@
-use super::{find_ancestor, node_text, LanguageHooks, SymbolKind};
+use super::{node_text, LanguageHooks};
 use crate::symbols::SymbolInfo;
 use tree_sitter::Node;
 
-/// Build a readable signature for TOML symbols.
-fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
-    match kind {
-        SymbolKind::Class => {
-            // Class comes from definition.module — could be table or table_array_element
-            if node.kind() == "table_array_element" {
-                format!("[[{}]]", name)
-            } else {
-                format!("[{}]", name)
-            }
-        }
-        SymbolKind::Constant => {
-            // Top-level key-value pair — show key = <value_type>
-            if let Some(pair_node) = if node.kind() == "pair" {
-                Some(*node)
-            } else {
-                find_ancestor(node, "pair")
-            } {
-                let value_type = pair_value_type(&pair_node, source);
-                format!("{} = {}", name, value_type)
-            } else {
-                format!("{} = ...", name)
-            }
-        }
-        _ => node_text(node, source)
-            .unwrap_or(name)
-            .trim()
-            .to_string(),
-    }
-}
-
 /// Determine the type label for a TOML pair's value.
-fn pair_value_type(pair_node: &Node, _source: &str) -> &'static str {
-    // The value is the last named child of the pair (after `=`)
+fn pair_value_type(pair_node: &Node) -> &'static str {
     for i in (0..pair_node.child_count()).rev() {
         if let Some(child) = pair_node.child(i) {
             if child.is_named() {
@@ -57,56 +25,41 @@ fn pair_value_type(pair_node: &Node, _source: &str) -> &'static str {
     "<value>"
 }
 
-/// Post-process to fix names for dotted_key and quoted_key nodes.
+/// Build the signature for a TOML symbol given its cleaned name and definition node.
+fn format_signature(name: &str, node: &Node) -> String {
+    match node.kind() {
+        "table_array_element" => format!("[[{}]]", name),
+        "table" => format!("[{}]", name),
+        "pair" => {
+            let value_type = pair_value_type(node);
+            format!("{} = {}", name, value_type)
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Normalize the symbol name (handle dotted/quoted keys) and build the signature.
+/// All name cleaning and signature formatting happens here in a single pass.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
     let name_node = find_name_child(node);
-    if let Some(name_node) = name_node {
-        match name_node.kind() {
-            "dotted_key" => {
-                // Recursively collect leaf keys (bare_key/quoted_key) from nested dotted_key nodes
-                let mut parts = Vec::new();
-                collect_dotted_key_parts(&name_node, source, &mut parts);
-                if !parts.is_empty() {
-                    let dotted_name = parts.join(".");
-                    sym.signature = Some(if node.kind() == "table_array_element" {
-                        format!("[[{}]]", dotted_name)
-                    } else if node.kind() == "table" {
-                        format!("[{}]", dotted_name)
-                    } else {
-                        let pair_node = find_ancestor(&name_node, "pair");
-                        if let Some(pair_node) = pair_node {
-                            let value_type = pair_value_type(&pair_node, source);
-                            format!("{} = {}", dotted_name, value_type)
-                        } else {
-                            format!("{} = ...", dotted_name)
-                        }
-                    });
-                    sym.name = dotted_name;
-                }
-            }
-            "quoted_key" => {
-                if let Some(text) = node_text(&name_node, source) {
-                    let clean = strip_quotes(text);
-                    sym.name = clean.to_string();
-                    // Rebuild signature with clean name
-                    if sym.kind == SymbolKind::Class {
-                        sym.signature = Some(if node.kind() == "table_array_element" {
-                            format!("[[{}]]", clean)
-                        } else {
-                            format!("[{}]", clean)
-                        });
-                    } else if sym.kind == SymbolKind::Constant {
-                        let pair_node = find_ancestor(&name_node, "pair");
-                        if let Some(pair_node) = pair_node {
-                            let value_type = pair_value_type(&pair_node, source);
-                            sym.signature = Some(format!("{} = {}", clean, value_type));
-                        }
-                    }
-                }
-            }
-            _ => {}
+    let clean_name = match name_node.as_ref().map(|n| n.kind()) {
+        Some("dotted_key") => {
+            let mut parts = Vec::new();
+            collect_dotted_key_parts(name_node.as_ref().unwrap(), source, &mut parts);
+            if parts.is_empty() { None } else { Some(parts.join(".")) }
         }
+        Some("quoted_key") => {
+            node_text(name_node.as_ref().unwrap(), source)
+                .map(|t| strip_quotes(t).to_string())
+        }
+        _ => None,
+    };
+
+    if let Some(name) = clean_name {
+        sym.name = name;
     }
+
+    sym.signature = Some(format_signature(&sym.name, node));
     Some(sym)
 }
 
@@ -158,7 +111,6 @@ fn find_name_child<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
 /// Return TOML language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        build_signature: Some(build_signature),
         post_process: Some(post_process),
         ..Default::default()
     }

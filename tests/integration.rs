@@ -2104,3 +2104,78 @@ fn test_worktree_seed_from_main_db() {
     assert!(output.status.success());
     assert!(!stderr.contains("Seeded DB from"), "Should NOT re-seed on second build");
 }
+
+#[test]
+fn test_docs_indexing_and_search() {
+    let dir = tempfile::TempDir::new().unwrap();
+    create_fixture_monorepo(dir.path());
+
+    // Add documentation files
+    let auth_docs = dir.path().join("services/auth/docs");
+    fs::create_dir_all(&auth_docs).unwrap();
+    fs::File::create(auth_docs.join("setup.md"))
+        .unwrap()
+        .write_all(b"# Authentication Setup\n\nHow to configure OAuth providers and JWT tokens for the auth service.\n")
+        .unwrap();
+
+    fs::File::create(dir.path().join("README.md"))
+        .unwrap()
+        .write_all(b"# Monorepo Overview\n\nThis project contains multiple services for the platform.\n")
+        .unwrap();
+
+    // Local config to ensure DB goes to the expected path (override any global shire.toml)
+    fs::File::create(dir.path().join("shire.toml"))
+        .unwrap()
+        .write_all(b"db_path = \".shire/index.db\"\n")
+        .unwrap();
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to run shire build");
+    assert!(output.status.success(), "Build failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("docs"), "Build output should mention docs: {}", stdout);
+
+    // Verify docs were indexed
+    let db_path = dir.path().join(".shire/index.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    let doc_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM docs", [], |row| row.get(0))
+        .unwrap();
+    assert!(doc_count >= 2, "Expected at least 2 docs indexed, got {}", doc_count);
+
+    // Verify FTS search works
+    let results: Vec<String> = conn
+        .prepare("SELECT path FROM docs_fts WHERE docs_fts MATCH '\"OAuth\"' ORDER BY rank")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!results.is_empty(), "Should find OAuth in docs FTS");
+    assert!(results.iter().any(|p| p.contains("setup.md")));
+
+    // Verify title extraction
+    let title: Option<String> = conn
+        .query_row(
+            "SELECT title FROM docs WHERE path LIKE '%setup.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(title.as_deref(), Some("Authentication Setup"));
+
+    // Verify package association
+    let pkg: Option<String> = conn
+        .query_row(
+            "SELECT package FROM docs WHERE path LIKE '%setup.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkg.as_deref(), Some("auth-service"));
+}

@@ -1,9 +1,9 @@
-use super::{LanguageHooks, SymbolKind};
+use super::{LanguageHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Build signature for SQL DDL definitions.
 /// Extracts the statement header up to (but not including) the body.
-fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
+fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> String {
     let start = node.start_byte();
 
     // Find the end of the signature: look for body-like children
@@ -15,16 +15,7 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
     }
 
     // Trim trailing semicolons and whitespace
-    let sig = sig.trim_end_matches(';').trim();
-
-    // For single-line signatures, return as-is; for multi-line, take the first line
-    match kind {
-        SymbolKind::Class => {
-            // Tables: take up to (but not including) column definitions
-            sig.to_string()
-        }
-        _ => sig.to_string(),
-    }
+    sig.trim_end_matches(';').trim().to_string()
 }
 
 /// Find the byte offset where the "body" of a DDL statement begins.
@@ -37,11 +28,11 @@ fn find_body_start(node: &Node) -> Option<usize> {
             "column_definitions" => return Some(child.start_byte()),
             // Function/procedure body
             "function_body" | "procedure_body" => return Some(child.start_byte()),
-            // View query (the AS ... SELECT part)
-            "keyword_as" => return Some(child.start_byte()),
+            // View query body (the SELECT ... part after AS)
+            "create_query" => return Some(child.start_byte()),
             // Index fields
             "index_fields" => return Some(child.start_byte()),
-            // Enum elements for CREATE TYPE
+            // Enum elements for CREATE TYPE ... AS ENUM (...)
             "enum_elements" => return Some(child.start_byte()),
             // Trigger execution clause
             "keyword_execute" => return Some(child.start_byte()),
@@ -51,10 +42,23 @@ fn find_body_start(node: &Node) -> Option<usize> {
     None
 }
 
+/// Strip leading/trailing quote characters from SQL identifiers.
+/// Handles double-quoted ("Users") and backtick-quoted (`users`) identifiers.
+fn post_process(mut sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolInfo> {
+    let name: &str = sym.name.as_ref();
+    if (name.starts_with('"') && name.ends_with('"'))
+        || (name.starts_with('`') && name.ends_with('`'))
+    {
+        sym.name = name[1..name.len() - 1].into();
+    }
+    Some(sym)
+}
+
 /// Return SQL language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
         build_signature: Some(build_signature),
+        post_process: Some(post_process),
         ..Default::default()
     }
 }
@@ -175,5 +179,54 @@ CREATE TYPE priority AS ENUM ('low', 'medium', 'high');"#;
         let sig = symbols[0].signature.as_ref().unwrap();
         assert!(sig.starts_with("CREATE TABLE"));
         assert!(!sig.contains("INT PRIMARY KEY"));
+    }
+
+    #[test]
+    fn test_quoted_identifiers_stripped() {
+        let source = r#"CREATE TABLE "Users" (id INT PRIMARY KEY);"#;
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Users");
+    }
+
+    #[test]
+    fn test_backtick_identifiers_stripped() {
+        let source = r#"CREATE TABLE `users` (id INT PRIMARY KEY);"#;
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "users");
+    }
+
+    #[test]
+    fn test_type_signature_includes_as_enum() {
+        let source = r#"CREATE TYPE status_type AS ENUM ('active', 'inactive');"#;
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("AS ENUM"));
+    }
+
+    #[test]
+    fn test_view_signature_includes_as() {
+        let source = r#"CREATE OR REPLACE VIEW active_users AS
+SELECT * FROM users WHERE active = true;"#;
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("VIEW"));
+        assert!(sig.contains("AS"));
+        // Should not include the SELECT query
+        assert!(!sig.contains("SELECT"));
+    }
+
+    #[test]
+    fn test_create_or_replace_function() {
+        let source = r#"CREATE OR REPLACE FUNCTION calc(x INT)
+RETURNS INT
+AS $$ BEGIN RETURN x * 2; END; $$ LANGUAGE plpgsql;"#;
+        let symbols = extract(source);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "calc");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
     }
 }

@@ -19,6 +19,7 @@
     name: (identifier) @name)) @definition.function
 
 ; Index definitions
+; Note: the grammar uses `column` as the field name for the index name (a naming quirk)
 (create_index
   column: (identifier) @name) @definition.constant
 

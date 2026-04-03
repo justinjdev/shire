@@ -14,6 +14,7 @@ pub mod rust_lang;
 pub mod scala;
 pub mod swift;
 pub mod typescript;
+pub mod yaml;
 pub mod zig;
 
 use super::{Parameter, SymbolInfo, SymbolKind};

@@ -24,6 +24,7 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | Python | tree-sitter |
 | Java | tree-sitter |
 | Kotlin | tree-sitter |
+| Dart | tree-sitter |
 | Protobuf | tree-sitter |
 | C | tree-sitter |
 | C++ | tree-sitter |

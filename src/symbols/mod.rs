@@ -1,5 +1,4 @@
 pub mod cobol;
-pub mod elixir;
 mod hooks;
 mod query_extract;
 mod registry;

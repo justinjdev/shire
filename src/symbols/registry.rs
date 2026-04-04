@@ -231,6 +231,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::lua::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["ex", "exs"],
+                ts_language: || tree_sitter_elixir::LANGUAGE.into(),
+                query_source: include_str!("queries/elixir.scm"),
+                hooks: super::hooks::elixir::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }
@@ -243,7 +250,6 @@ fn registry() -> &'static [LanguageEntry] {
 pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     // Regex-based extractors (no tree-sitter)
     match ext {
-        "ex" | "exs" => return super::elixir::extract(source, file_path),
         "cob" | "cbl" | "cpy" => return super::cobol::extract(source, file_path),
         _ => {}
     }

@@ -75,6 +75,7 @@ tree-sitter-sequel = "0.3"
 tree-sitter-hcl = { git = "https://github.com/tree-sitter-grammars/tree-sitter-hcl", rev = "de10d494dbd6b71cdf07a678fecbf404dbfe4398" }
 tree-sitter-toml-ng = "0.7"
 tree-sitter-perl = { git = "https://github.com/justinjdev/tree-sitter-perl", rev = "6227fd9825e4e1ad7879ff91c4ec4263fbeb9531" }
+tree-sitter-dart = "0.0.4"
 
 [features]
 default = ["rag"]

@@ -48,6 +48,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "rs",                                // Rust
         "py",                                // Python
         "java", "kt",                       // Java/Kotlin
+        "dart",                              // Dart
         "proto",                             // Protobuf
         "pm", "pl",                          // Perl
         "rb",                                // Ruby
@@ -164,6 +165,7 @@ mod tests {
         assert!(exts.contains(&"java"));
         assert!(exts.contains(&"kt"));
         assert!(exts.contains(&"proto"));
+        assert!(exts.contains(&"dart"));
         assert!(exts.contains(&"swift"));
         assert!(exts.contains(&"c"));
         assert!(exts.contains(&"h"));

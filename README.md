@@ -348,6 +348,18 @@ max_depth = 4
 
 Custom discovery runs alongside manifest-based discovery. Directories already found by manifest parsers are skipped. Subdirectories of matched directories are also skipped to prevent nested matches.
 
+## Performance
+
+Benchmarked on real-world monorepos (full rebuild, no incremental cache):
+
+| Repo | Packages | Symbols | Files | Build time |
+|---|---|---|---|---|
+| [turborepo](https://github.com/vercel/turborepo) | 400 | 10,686 | 5,451 | ~570ms |
+| [grafana](https://github.com/grafana/grafana) | 28 | 35,104 | 14,054 | ~1.1s |
+| [kubernetes](https://github.com/kubernetes/kubernetes) | 34 | 78,458 | 18,275 | ~1.7s |
+
+All queries return in **under 2ms**, most under 0.3ms. See [Performance](https://justinjdev.github.io/shire/performance.html) for detailed benchmarks and reproduction instructions.
+
 ## Architecture
 
 ```

@@ -17,4 +17,5 @@
 # Reference
 
 - [Supported Ecosystems](./ecosystems.md)
+- [Performance](./performance.md)
 - [Architecture](./architecture.md)

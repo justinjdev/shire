@@ -8,6 +8,7 @@ pub mod haskell;
 pub mod hcl;
 pub mod java;
 pub mod kotlin;
+pub mod lua;
 pub mod ocaml;
 pub mod perl;
 pub mod php;

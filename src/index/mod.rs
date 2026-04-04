@@ -1991,6 +1991,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // up any orphaned rows.
     conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
 
+    // Try MEMORY journal mode to eliminate WAL checkpoint overhead on COMMIT.
+    // Falls back silently to WAL if another connection holds a lock.
+    let switched_journal: String = conn
+        .query_row("PRAGMA journal_mode=MEMORY", [], |row| row.get(0))
+        .unwrap_or_else(|_| "wal".to_string());
+    let restore_wal = switched_journal == "memory";
+
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
         Box::new(go::GoParser),
@@ -2427,6 +2434,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
+
+    // Restore WAL mode for read-heavy query workloads after the build.
+    if restore_wal {
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    }
 
     // Wait for RAG embedding to complete before printing summary.
     // Spinner is already hidden in quiet mode, so joining has no visual cost.

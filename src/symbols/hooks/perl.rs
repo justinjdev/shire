@@ -23,7 +23,7 @@ fn is_visible(node: &Node, source: &str) -> bool {
 }
 
 /// Resolve package name as parent for subs defined inside a package.
-/// Walk backwards through siblings from the function_definition to find the
+/// Walk backwards through siblings from the subroutine_declaration_statement to find the
 /// nearest preceding package_statement.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     if node.kind() != "subroutine_declaration_statement" {

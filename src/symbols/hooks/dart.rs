@@ -390,7 +390,7 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             }
         }
         "constant_constructor_signature" => {
-            // In 0.1.0 grammar, name parts are in the `name` field (multiple identifiers with ".")
+            // Collect all identifier children to form dotted names (e.g., Dog.named)
             let names: Vec<&str> = (0..node.child_count())
                 .filter_map(|i| {
                     let child = node.child(i).unwrap();

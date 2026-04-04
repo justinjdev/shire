@@ -280,6 +280,7 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::nix::hooks,
                 compiled_query: OnceLock::new(),
             },
+            // tree-sitter-nim is a git dep that exports language() fn, not a LANGUAGE const
             LanguageEntry {
                 extensions: &["nim", "nims"],
                 ts_language: tree_sitter_nim::language,

@@ -67,34 +67,22 @@ fn collect_params(args_node: &Node, source: &str) -> Vec<Parameter> {
                 }
             }
             "typed_expression" => {
-                // name::Type
-                let mut pname = String::new();
-                let mut ptype = None;
-                for j in 0..child.child_count() {
-                    let inner = child.child(j).unwrap();
-                    match inner.kind() {
-                        "identifier" if pname.is_empty() => {
-                            pname = inner
-                                .utf8_text(source.as_bytes())
-                                .unwrap_or("")
-                                .to_string();
-                        }
-                        "identifier" if !pname.is_empty() => {
-                            ptype = Some(
-                                inner
-                                    .utf8_text(source.as_bytes())
-                                    .unwrap_or("")
-                                    .to_string(),
-                            );
-                        }
-                        _ => {}
+                // name::Type — first named child is name, last is type
+                // Type can be identifier, parametrized_type_expression, etc.
+                let first = child.named_child(0);
+                let last_idx = child.named_child_count().saturating_sub(1);
+                let last = if last_idx > 0 { child.named_child(last_idx) } else { None };
+                if let Some(name_node) = first {
+                    let pname = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !pname.is_empty() {
+                        let ptype = last.and_then(|t| {
+                            t.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+                        });
+                        params.push(Parameter {
+                            name: pname,
+                            type_annotation: ptype,
+                        });
                     }
-                }
-                if !pname.is_empty() {
-                    params.push(Parameter {
-                        name: pname,
-                        type_annotation: ptype,
-                    });
                 }
             }
             _ => {}
@@ -128,7 +116,13 @@ fn find_arg_list<'a>(node: &Node<'a>) -> Option<Node<'a>> {
             }
         }
         "assignment" => {
-            let call = child_by_kind(node, "call_expression")?;
+            // Direct: f(x) = expr
+            if let Some(call) = child_by_kind(node, "call_expression") {
+                return child_by_kind(&call, "argument_list");
+            }
+            // Typed: f(x)::T = expr
+            let typed = child_by_kind(node, "typed_expression")?;
+            let call = child_by_kind(&typed, "call_expression")?;
             child_by_kind(&call, "argument_list")
         }
         _ => None,
@@ -143,24 +137,24 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     }
 }
 
-/// Extract return type from Julia function definitions.
-/// Julia can annotate return types as `function name(args)::ReturnType`.
+/// Extract return type from Julia function definitions and typed assignments.
 fn extract_return_type(node: &Node, source: &str) -> Option<String> {
-    if node.kind() != "function_definition" {
-        return None;
-    }
-    // signature > typed_expression means there's a return type annotation
-    let sig = child_by_kind(node, "signature")?;
-    let typed = child_by_kind(&sig, "typed_expression")?;
-    // The return type is the last identifier in the typed_expression (after ::)
-    let child_count = typed.child_count();
-    if child_count >= 1 {
-        let last = typed.child(child_count - 1)?;
-        if last.kind() == "identifier" {
-            return node_text(&last, source).map(|s| s.to_string());
+    let typed = match node.kind() {
+        "function_definition" => {
+            // signature > typed_expression
+            let sig = child_by_kind(node, "signature")?;
+            child_by_kind(&sig, "typed_expression")?
         }
-    }
-    None
+        "assignment" => {
+            // Direct typed_expression child: f(x)::T = expr
+            child_by_kind(node, "typed_expression")?
+        }
+        _ => return None,
+    };
+    // The last named child of typed_expression is the type
+    let last_idx = typed.named_child_count().checked_sub(1)?;
+    let type_node = typed.named_child(last_idx)?;
+    node_text(&type_node, source).map(|s| s.to_string())
 }
 
 /// Post-process: reclassify macro_definition symbols.

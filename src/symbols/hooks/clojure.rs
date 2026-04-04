@@ -43,12 +43,28 @@ fn is_visible(node: &Node, source: &str) -> bool {
     PUBLIC_DEF_KEYWORDS.contains(&keyword)
 }
 
-/// Find the first vec_lit named child of a list_lit (the parameter vector).
+/// Find the parameter vector for a defn/defmacro form.
+/// Single-arity: `(defn f [x y] ...)` — vec_lit is a direct child.
+/// Multi-arity: `(defn f ([x] ...) ([x y] ...))` — vec_lit is inside nested list_lit children.
+/// For multi-arity, returns the first arity's parameter vector.
 fn find_param_vector<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
+    // Try single-arity first: direct vec_lit child
     for i in 0..node.named_child_count() {
         let child = node.named_child(i).unwrap();
         if child.kind() == "vec_lit" {
             return Some(child);
+        }
+    }
+    // Multi-arity fallback: find first nested list_lit containing a vec_lit
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i).unwrap();
+        if child.kind() == "list_lit" {
+            for j in 0..child.named_child_count() {
+                let gc = child.named_child(j).unwrap();
+                if gc.kind() == "vec_lit" {
+                    return Some(gc);
+                }
+            }
         }
     }
     None

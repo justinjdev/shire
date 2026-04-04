@@ -48,10 +48,6 @@ fn count_named_children_in_args(clause: &Node) -> usize {
             let gc = args.child(j).unwrap();
             if args.field_name_for_child(j as u32) == Some("args") {
                 count += 1;
-            } else if gc.is_named() && gc.kind() != "(" && gc.kind() != ")" {
-                // Fallback: count named non-punctuation children
-                // This won't execute if field_name_for_child works,
-                // but is a safety net.
             }
         }
         if count > 0 {
@@ -129,15 +125,10 @@ fn extract_return_type(_node: &Node, _source: &str) -> Option<String> {
     None
 }
 
-/// Post-process: deduplicate function clauses.
-/// Multiple clauses of the same function produce multiple fun_decl nodes.
-/// We keep them all since the framework already deduplicates by (start_byte, end_byte),
-/// and each clause is at a different position — letting the index handle it.
-/// However, we reclassify module_attribute from Class to Module kind.
+/// Post-process: no transformations needed.
+/// Multiple function clauses are kept since the framework deduplicates by position.
+/// Module attributes are mapped to Class by the query, which is acceptable for display.
 fn post_process(sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolInfo> {
-    // module_attribute gets mapped to definition.module -> SymbolKind::Class by query_extract
-    // (because "definition.module" maps to Class). We want Module behavior but the
-    // framework maps it to Class, which is fine for display.
     Some(sym)
 }
 

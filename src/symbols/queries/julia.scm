@@ -20,6 +20,12 @@
   (call_expression
     (identifier) @name)) @definition.function
 
+; Short function form with return type: f(x)::T = expr
+(assignment
+  (typed_expression
+    (call_expression
+      (identifier) @name))) @definition.function
+
 ; Struct definitions: struct Name ... end / mutable struct Name ... end
 (struct_definition
   (type_head

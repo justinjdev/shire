@@ -77,7 +77,11 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
                 .and_then(|n| node_text(&n, source));
             match value {
                 Some(v) => {
-                    let v_short = if v.len() > 40 { &v[..40] } else { v };
+                    let mut end = 40.min(v.len());
+                    while end > 0 && !v.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let v_short = &v[..end];
                     format!("const {} = {}", name, v_short)
                 }
                 None => format!("const {}", name),

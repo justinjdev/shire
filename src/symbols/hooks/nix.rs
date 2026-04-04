@@ -96,7 +96,11 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
         _ => {
             // For simple values, show a short preview
             let text = node_text(&value, source).unwrap_or("...");
-            let preview = if text.len() > 40 { &text[..40] } else { text };
+            let mut end = 40.min(text.len());
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let preview = &text[..end];
             let preview = preview.replace('\n', " ");
             format!("{} = {}", name, preview)
         }

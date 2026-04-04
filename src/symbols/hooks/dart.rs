@@ -13,7 +13,7 @@ fn is_visible(node: &Node, source: &str) -> bool {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "class_definition" | "mixin_declaration" | "enum_declaration"
+            "class_declaration" | "mixin_declaration" | "enum_declaration"
             | "extension_declaration" => {
                 if let Some(ancestor_name) = extract_name(&n, source) {
                     if ancestor_name.starts_with('_') {
@@ -92,7 +92,7 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
         _ => return None,
     }
 
-    let parent = find_ancestor(node, "class_definition")
+    let parent = find_ancestor(node, "class_declaration")
         .or_else(|| find_ancestor(node, "mixin_declaration"))
         .or_else(|| find_ancestor(node, "enum_declaration"))
         .or_else(|| find_ancestor(node, "extension_declaration"))?;
@@ -142,7 +142,7 @@ fn next_sibling_body_start(node: &Node) -> Option<usize> {
 /// Build signature for class-like types (class, mixin, extension).
 fn build_type_signature(node: &Node, source: &str, name: &str) -> String {
     match node.kind() {
-        "class_definition" | "mixin_declaration" | "extension_declaration" => {
+        "class_declaration" | "mixin_declaration" | "extension_declaration" => {
             let start = node.start_byte();
             let end = node
                 .child_by_field_name("body")
@@ -390,25 +390,19 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             }
         }
         "constant_constructor_signature" => {
-            // The name is inside a `qualified` node: (qualified (identifier) "." (identifier))
-            for i in 0..node.child_count() {
-                let child = node.child(i).unwrap();
-                if child.kind() == "qualified" {
-                    let names: Vec<&str> = (0..child.child_count())
-                        .filter_map(|j| {
-                            let gc = child.child(j).unwrap();
-                            if gc.kind() == "identifier" {
-                                gc.utf8_text(source.as_bytes()).ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if names.len() > 1 {
-                        sym.name = names.join(".");
+            // In 0.1.0 grammar, name parts are in the `name` field (multiple identifiers with ".")
+            let names: Vec<&str> = (0..node.child_count())
+                .filter_map(|i| {
+                    let child = node.child(i).unwrap();
+                    if child.kind() == "identifier" {
+                        child.utf8_text(source.as_bytes()).ok()
+                    } else {
+                        None
                     }
-                    break;
-                }
+                })
+                .collect();
+            if names.len() > 1 {
+                sym.name = names.join(".");
             }
         }
         _ => {}

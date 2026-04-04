@@ -70,6 +70,13 @@ pub fn all_extensions() -> Vec<&'static str> {
         "toml",                              // TOML
         "ml", "mli",                         // OCaml
         "lua",                               // Lua
+        "clj", "cljs", "cljc", "edn",       // Clojure
+        "erl", "hrl",                        // Erlang
+        "jl",                                // Julia
+        "gleam",                             // Gleam
+        "odin",                              // Odin
+        "nix",                               // Nix
+        "nim", "nims",                       // Nim
     ]
 }
 
@@ -195,6 +202,25 @@ mod tests {
         assert!(exts.contains(&"lua"));
         assert!(exts.contains(&"ex"));
         assert!(exts.contains(&"exs"));
+        // Clojure
+        assert!(exts.contains(&"clj"));
+        assert!(exts.contains(&"cljs"));
+        assert!(exts.contains(&"cljc"));
+        assert!(exts.contains(&"edn"));
+        // Erlang
+        assert!(exts.contains(&"erl"));
+        assert!(exts.contains(&"hrl"));
+        // Julia
+        assert!(exts.contains(&"jl"));
+        // Gleam
+        assert!(exts.contains(&"gleam"));
+        // Odin
+        assert!(exts.contains(&"odin"));
+        // Nix
+        assert!(exts.contains(&"nix"));
+        // Nim
+        assert!(exts.contains(&"nim"));
+        assert!(exts.contains(&"nims"));
         // Regex-based languages
         assert!(exts.contains(&"cob"));
         assert!(exts.contains(&"cbl"));

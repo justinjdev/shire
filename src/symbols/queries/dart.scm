@@ -1,12 +1,12 @@
-; Dart symbol extraction queries (tree-sitter-dart 0.0.4 grammar)
+; Dart symbol extraction queries (tree-sitter-dart 0.1.0 grammar)
 
 ; Classes
-(class_definition
+(class_declaration
   name: (identifier) @name) @definition.class
 
-; Mixins (post_process sets signature to "mixin Name")
+; Mixins
 (mixin_declaration
-  (identifier) @name) @definition.class
+  name: (identifier) @name) @definition.class
 
 ; Extensions
 (extension_declaration
@@ -16,19 +16,18 @@
 (enum_declaration
   name: (identifier) @name) @definition.enum
 
-; Top-level functions (wrapped in lambda_expression in this grammar)
-(program
-  (lambda_expression
-    parameters: (function_signature
-      name: (identifier) @name) @definition.function))
+; Top-level functions
+(source_file
+  (function_signature
+    name: (identifier) @name) @definition.function)
 
-; Top-level getters (direct children of program)
-(program
+; Top-level getters (direct children of source_file)
+(source_file
   (getter_signature
     name: (identifier) @name) @definition.function)
 
-; Top-level setters (direct children of program)
-(program
+; Top-level setters (direct children of source_file)
+(source_file
   (setter_signature
     name: (identifier) @name) @definition.function)
 
@@ -39,21 +38,21 @@
 
 ; Abstract/external methods (inside declaration node, no function_body)
 (class_body
-  (class_member_definition
+  (class_member
     (declaration
       (function_signature
         name: (identifier) @name)) @definition.method))
 
 ; Abstract/external getters (inside declaration node)
 (class_body
-  (class_member_definition
+  (class_member
     (declaration
       (getter_signature
         name: (identifier) @name)) @definition.method))
 
 ; Abstract/external setters (inside declaration node)
 (class_body
-  (class_member_definition
+  (class_member
     (declaration
       (setter_signature
         name: (identifier) @name)) @definition.method))
@@ -72,18 +71,17 @@
 (constructor_signature
   name: (identifier) @name) @definition.method
 
-; Const constructors (name is inside qualified node)
+; Const constructors
 (constant_constructor_signature
-  (qualified
-    (identifier) @name)) @definition.method
+  name: (identifier) @name) @definition.method
 
 ; Factory constructors
 (factory_constructor_signature
-  (identifier) @name) @definition.method
+  name: (identifier) @name) @definition.method
 
 ; Redirecting factory constructors
 (redirecting_factory_constructor_signature
-  (identifier) @name) @definition.method
+  name: (identifier) @name) @definition.method
 
 ; Typedefs
 (type_alias

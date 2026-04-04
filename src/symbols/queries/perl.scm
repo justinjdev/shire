@@ -2,8 +2,8 @@
 
 ; Package declarations
 (package_statement
-  (package_name) @name) @definition.class
+  name: (package) @name) @definition.class
 
 ; Subroutine definitions
-(function_definition
-  (identifier) @name) @definition.function
+(subroutine_declaration_statement
+  name: (bareword) @name) @definition.function

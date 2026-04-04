@@ -45,4 +45,11 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | OCaml | tree-sitter |
 | Lua | tree-sitter |
 | Elixir | tree-sitter |
+| Clojure | tree-sitter |
+| Erlang | tree-sitter |
+| Julia | tree-sitter |
+| Gleam | tree-sitter |
+| Odin | tree-sitter |
+| Nix | tree-sitter |
+| Nim | tree-sitter |
 | COBOL | regex-based |

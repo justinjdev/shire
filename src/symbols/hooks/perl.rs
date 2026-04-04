@@ -3,7 +3,7 @@ use tree_sitter::Node;
 
 /// Skip private subs (starting with _).
 fn is_visible(node: &Node, source: &str) -> bool {
-    if node.kind() == "function_definition" {
+    if node.kind() == "subroutine_declaration_statement" {
         if let Some(name_node) = node.child_by_field_name("name") {
             if let Some(name) = node_text(&name_node, source) {
                 return !name.starts_with('_');
@@ -12,7 +12,7 @@ fn is_visible(node: &Node, source: &str) -> bool {
         // No field name — find first identifier child
         for i in 0..node.child_count() {
             let child = node.child(i).unwrap();
-            if child.kind() == "identifier" {
+            if child.kind() == "bareword" {
                 if let Some(name) = node_text(&child, source) {
                     return !name.starts_with('_');
                 }
@@ -23,10 +23,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
 }
 
 /// Resolve package name as parent for subs defined inside a package.
-/// Walk backwards through siblings from the function_definition to find the
+/// Walk backwards through siblings from the subroutine_declaration_statement to find the
 /// nearest preceding package_statement.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
-    if node.kind() != "function_definition" {
+    if node.kind() != "subroutine_declaration_statement" {
         return None;
     }
 
@@ -50,15 +50,9 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     None
 }
 
-/// Find the package_name child of a package_statement node.
+/// Find the package name node from a package_statement.
 fn find_package_name<'a>(node: &Node<'a>) -> Option<Node<'a>> {
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        if child.kind() == "package_name" {
-            return Some(child);
-        }
-    }
-    None
+    node.child_by_field_name("name")
 }
 
 /// Build signature for Perl symbols.

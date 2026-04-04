@@ -5,7 +5,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let phase = parse_arg(&args, "--phase").unwrap_or_else(|| {
-        eprintln!("Usage: autoresearch --phase build|incremental|query|lifecycle|quality [--repo <path>] [--size small|medium|large|all]");
+        eprintln!("Usage: autoresearch --phase build|incremental|query|lifecycle|quality [--repo <path>] [--size small|medium|large|xlarge|all]");
         std::process::exit(1);
     });
 
@@ -47,6 +47,7 @@ fn repo_size(name: &str) -> &'static str {
         "turborepo" => "small",
         "grafana" => "medium",
         "kubernetes" => "large",
+        "rust" => "xlarge",
         _ => "unknown",
     }
 }
@@ -65,14 +66,15 @@ fn find_repos(size_filter: &str) -> Vec<PathBuf> {
             }
         }
     }
-    // Sort by size category: small, medium, large
+    // Sort by size category: small, medium, large, xlarge
     repos.sort_by_key(|p| {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         match repo_size(name) {
             "small" => 0,
             "medium" => 1,
             "large" => 2,
-            _ => 3,
+            "xlarge" => 3,
+            _ => 4,
         }
     });
     repos

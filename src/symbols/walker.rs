@@ -193,9 +193,9 @@ mod tests {
         assert!(exts.contains(&"ml"));
         assert!(exts.contains(&"mli"));
         assert!(exts.contains(&"lua"));
-        // Regex-based languages
         assert!(exts.contains(&"ex"));
         assert!(exts.contains(&"exs"));
+        // Regex-based languages
         assert!(exts.contains(&"cob"));
         assert!(exts.contains(&"cbl"));
     }

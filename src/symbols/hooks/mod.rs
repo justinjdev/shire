@@ -3,6 +3,7 @@ pub mod c;
 pub mod cpp;
 pub mod csharp;
 pub mod dart;
+pub mod elixir;
 pub mod go;
 pub mod haskell;
 pub mod hcl;

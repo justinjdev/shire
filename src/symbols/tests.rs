@@ -1231,7 +1231,7 @@ fn test_zig_const() {
 }
 
 // ============================================================
-// Elixir tests (via regex)
+// Elixir tests (tree-sitter)
 // ============================================================
 
 #[test]
@@ -1243,28 +1243,250 @@ fn test_elixir_module() {
 end
 "#;
     let symbols = extract_file("ex", source, Arc::from("lib/users.ex"));
-    assert!(symbols.iter().any(|s| s.name == "MyApp.Users" && s.kind == SymbolKind::Class));
-    assert!(symbols.iter().any(|s| s.name == "get_user" && s.kind == SymbolKind::Function));
+    let module = symbols.iter().find(|s| s.name == "MyApp.Users").unwrap();
+    assert_eq!(module.kind, SymbolKind::Class);
+    assert_eq!(module.signature.as_deref(), Some("defmodule MyApp.Users do"));
+    assert!(module.parent_symbol.is_none());
+
+    let func = symbols.iter().find(|s| s.name == "get_user").unwrap();
+    assert_eq!(func.kind, SymbolKind::Function);
+    assert_eq!(func.signature.as_deref(), Some("def get_user(id)"));
+    assert_eq!(func.parent_symbol.as_deref(), Some("MyApp.Users"));
+    let params = func.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "id");
 }
 
 #[test]
 fn test_elixir_protocol() {
-    let source = r#"defprotocol Stringify do
-  def to_string(value)
+    let source = r#"defprotocol MyApp.Serializable do
+  @doc "Serializes the given value"
+  def serialize(value)
 end
 "#;
-    let symbols = extract_file("ex", source, Arc::from("lib/stringify.ex"));
-    assert!(symbols.iter().any(|s| s.name == "Stringify" && s.kind == SymbolKind::Interface));
+    let symbols = extract_file("ex", source, Arc::from("lib/serializable.ex"));
+    let proto = symbols.iter().find(|s| s.name == "MyApp.Serializable").unwrap();
+    assert_eq!(proto.kind, SymbolKind::Interface);
+    assert_eq!(proto.signature.as_deref(), Some("defprotocol MyApp.Serializable do"));
+
+    let func = symbols.iter().find(|s| s.name == "serialize").unwrap();
+    assert_eq!(func.kind, SymbolKind::Function);
+    assert_eq!(func.parent_symbol.as_deref(), Some("MyApp.Serializable"));
 }
 
 #[test]
 fn test_elixir_skip_private() {
     let source = r#"defmodule MyApp do
-  defp internal_helper(x), do: x * 2
+  def public_fn do
+    :ok
+  end
+
+  defp private_fn do
+    :secret
+  end
+
+  defmacrop private_macro(x), do: x
 end
 "#;
     let symbols = extract_file("ex", source, Arc::from("lib/my_app.ex"));
-    assert!(!symbols.iter().any(|s| s.name == "internal_helper"));
+    assert!(symbols.iter().any(|s| s.name == "public_fn"));
+    assert!(!symbols.iter().any(|s| s.name == "private_fn"));
+    assert!(!symbols.iter().any(|s| s.name == "private_macro"));
+}
+
+#[test]
+fn test_elixir_macro() {
+    let source = r#"defmodule MyApp.Router do
+  defmacro route(path, handler) do
+    quote do
+      @routes [{unquote(path), unquote(handler)} | @routes]
+    end
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/router.ex"));
+    let mac = symbols.iter().find(|s| s.name == "route").unwrap();
+    assert_eq!(mac.kind, SymbolKind::Function);
+    assert_eq!(mac.signature.as_deref(), Some("defmacro route(path, handler)"));
+    assert_eq!(mac.parent_symbol.as_deref(), Some("MyApp.Router"));
+    let params = mac.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "path");
+    assert_eq!(params[1].name, "handler");
+}
+
+#[test]
+fn test_elixir_callback() {
+    let source = r#"defmodule MyApp.Behaviour do
+  @callback init(opts :: keyword()) :: {:ok, state :: term()} | {:error, reason :: term()}
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/behaviour.ex"));
+    let cb = symbols.iter().find(|s| s.name == "init").unwrap();
+    assert_eq!(cb.kind, SymbolKind::Method);
+    assert!(cb.signature.as_deref().unwrap().starts_with("@callback init("));
+    assert_eq!(cb.parent_symbol.as_deref(), Some("MyApp.Behaviour"));
+    assert!(cb.return_type.is_some());
+}
+
+#[test]
+fn test_elixir_type() {
+    let source = r#"defmodule MyApp.Types do
+  @type name :: String.t()
+  @type pair(a, b) :: {a, b}
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/types.ex"));
+    let name_type = symbols.iter().find(|s| s.name == "name").unwrap();
+    assert_eq!(name_type.kind, SymbolKind::Type);
+    assert_eq!(name_type.signature.as_deref(), Some("@type name :: String.t()"));
+    assert_eq!(name_type.return_type.as_deref(), Some("String.t()"));
+
+    let pair_type = symbols.iter().find(|s| s.name == "pair").unwrap();
+    assert_eq!(pair_type.kind, SymbolKind::Type);
+}
+
+#[test]
+fn test_elixir_nested_modules() {
+    let source = r#"defmodule MyApp.Outer do
+  defmodule Inner do
+    def hello do
+      :world
+    end
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/outer.ex"));
+    let outer = symbols.iter().find(|s| s.name == "MyApp.Outer").unwrap();
+    assert!(outer.parent_symbol.is_none());
+
+    let inner = symbols.iter().find(|s| s.name == "Inner").unwrap();
+    assert_eq!(inner.parent_symbol.as_deref(), Some("MyApp.Outer"));
+
+    let func = symbols.iter().find(|s| s.name == "hello").unwrap();
+    assert_eq!(func.parent_symbol.as_deref(), Some("Inner"));
+}
+
+#[test]
+fn test_elixir_function_with_defaults() {
+    let source = r#"defmodule Config do
+  def load(path, opts \\ []) do
+    :ok
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/config.ex"));
+    let func = symbols.iter().find(|s| s.name == "load").unwrap();
+    let params = func.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "path");
+    assert_eq!(params[1].name, "opts");
+}
+
+#[test]
+fn test_elixir_function_with_guard() {
+    let source = r#"defmodule Math do
+  def abs(x) when x >= 0 do
+    x
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/math.ex"));
+    let func = symbols.iter().find(|s| s.name == "abs").unwrap();
+    assert_eq!(func.kind, SymbolKind::Function);
+    assert_eq!(func.signature.as_deref(), Some("def abs(x)"));
+}
+
+#[test]
+fn test_elixir_one_line_function() {
+    let source = r#"defmodule MyModule do
+  def greet(name), do: "Hello, #{name}"
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/my_module.ex"));
+    let func = symbols.iter().find(|s| s.name == "greet").unwrap();
+    assert_eq!(func.kind, SymbolKind::Function);
+    assert_eq!(func.parent_symbol.as_deref(), Some("MyModule"));
+}
+
+#[test]
+fn test_elixir_empty_source() {
+    let symbols = extract_file("ex", "", Arc::from("empty.ex"));
+    assert!(symbols.is_empty());
+}
+
+#[test]
+fn test_elixir_comments_ignored() {
+    let source = r#"defmodule Foo do
+  # def not_a_function do
+  #   :nope
+  # end
+
+  def real_function do
+    :ok
+  end
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/foo.ex"));
+    assert!(!symbols.iter().any(|s| s.name == "not_a_function"));
+    assert!(symbols.iter().any(|s| s.name == "real_function"));
+}
+
+#[test]
+fn test_elixir_dotted_module_name() {
+    let source = "defmodule MyApp.Web.Controllers.UserController do\nend\n";
+    let symbols = extract_file("ex", source, Arc::from("lib/user_controller.ex"));
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "MyApp.Web.Controllers.UserController");
+    assert_eq!(symbols[0].kind, SymbolKind::Class);
+}
+
+#[test]
+fn test_elixir_exs_extension() {
+    let source = r#"defmodule MyApp.MixProject do
+  def project do
+    [app: :my_app]
+  end
+end
+"#;
+    let symbols = extract_file("exs", source, Arc::from("mix.exs"));
+    assert!(symbols.iter().any(|s| s.name == "MyApp.MixProject" && s.kind == SymbolKind::Class));
+    assert!(symbols.iter().any(|s| s.name == "project" && s.kind == SymbolKind::Function));
+}
+
+#[test]
+fn test_elixir_defdelegate() {
+    let source = r#"defmodule MyApp.Facade do
+  defdelegate greet(name), to: MyApp.Greeter
+  defdelegate version, to: MyApp.Config
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/facade.ex"));
+    let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+    assert_eq!(greet.kind, SymbolKind::Function);
+    assert_eq!(greet.signature.as_deref(), Some("defdelegate greet(name)"));
+    assert_eq!(greet.parent_symbol.as_deref(), Some("MyApp.Facade"));
+    let params = greet.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "name");
+
+    let version = symbols.iter().find(|s| s.name == "version").unwrap();
+    assert_eq!(version.kind, SymbolKind::Function);
+    assert_eq!(version.signature.as_deref(), Some("defdelegate version"));
+}
+
+#[test]
+fn test_elixir_opaque_type() {
+    let source = r#"defmodule MyApp.Token do
+  @opaque t :: %__MODULE__{value: String.t()}
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/token.ex"));
+    let opaque = symbols.iter().find(|s| s.name == "t").unwrap();
+    assert_eq!(opaque.kind, SymbolKind::Type);
+    assert!(opaque.signature.as_deref().unwrap().starts_with("@opaque t ::"));
+    assert!(opaque.return_type.is_some());
+    assert_eq!(opaque.parent_symbol.as_deref(), Some("MyApp.Token"));
 }
 
 // ============================================================

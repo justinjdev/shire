@@ -45,7 +45,6 @@ fn count_named_children_in_args(clause: &Node) -> usize {
         // Count only the `args:` field children (the actual parameters)
         let mut count = 0;
         for j in 0..args.child_count() {
-            let gc = args.child(j).unwrap();
             if args.field_name_for_child(j as u32) == Some("args") {
                 count += 1;
             }

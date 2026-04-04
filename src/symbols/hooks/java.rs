@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility};
 use tree_sitter::Node;
 
 /// Check modifiers on a declaration node.
@@ -155,9 +155,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 
     // Set visibility string
     if public {
-        sym.visibility = "public".to_string();
+        sym.visibility = Visibility::Public;
     } else if protected {
-        sym.visibility = "protected".to_string();
+        sym.visibility = Visibility::Protected;
     }
 
     match sym.kind {

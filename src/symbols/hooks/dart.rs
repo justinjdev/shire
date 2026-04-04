@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "MyApp");
         assert_eq!(syms[0].kind, SymbolKind::Class);
-        assert_eq!(syms[0].visibility, "public");
+        assert_eq!(syms[0].visibility, crate::symbols::Visibility::Public);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
-use super::{SymbolInfo, SymbolKind};
+use super::{SymbolInfo, SymbolKind, Visibility};
 use regex::Regex;
 
 static PROGRAM_ID_RE: LazyLock<Regex> =
@@ -75,7 +75,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                 signature: Some(signature),
                 file_path: file_path.clone(),
                 line: line_number,
-                visibility: "public".to_string(),
+                visibility: Visibility::Public,
                 parent_symbol: None,
                 return_type: None,
                 parameters: None,
@@ -94,7 +94,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                 signature: Some(signature),
                 file_path: file_path.clone(),
                 line: line_number,
-                visibility: "public".to_string(),
+                visibility: Visibility::Public,
                 parent_symbol: None,
                 return_type: None,
                 parameters: None,
@@ -113,7 +113,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                 signature: Some(signature),
                 file_path: file_path.clone(),
                 line: line_number,
-                visibility: "public".to_string(),
+                visibility: Visibility::Public,
                 parent_symbol: None,
                 return_type: None,
                 parameters: None,
@@ -136,7 +136,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                 signature: Some(signature),
                 file_path: file_path.clone(),
                 line: line_number,
-                visibility: "public".to_string(),
+                visibility: Visibility::Public,
                 parent_symbol: None,
                 return_type: None,
                 parameters: None,
@@ -157,7 +157,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                     signature: Some(signature),
                     file_path: file_path.clone(),
                     line: line_number,
-                    visibility: "public".to_string(),
+                    visibility: Visibility::Public,
                     parent_symbol: None,
                     return_type: None,
                     parameters: None,
@@ -193,7 +193,7 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                     signature: None,
                     file_path: file_path.clone(),
                     line: line_number,
-                    visibility: "public".to_string(),
+                    visibility: Visibility::Public,
                     parent_symbol: current_section.clone(),
                     return_type: None,
                     parameters: None,

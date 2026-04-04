@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "greet");
         assert_eq!(syms[0].kind, SymbolKind::Function);
-        assert_eq!(syms[0].visibility, "public");
+        assert_eq!(syms[0].visibility, crate::symbols::Visibility::Public);
         let sig = syms[0].signature.as_ref().unwrap();
         assert!(sig.contains("pub fn greet"), "signature: {}", sig);
         assert!(

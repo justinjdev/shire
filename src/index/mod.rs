@@ -317,7 +317,7 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
             &sym.signature,
             sym.file_path.as_ref(),
             sym.line as i64,
-            &sym.visibility,
+            sym.visibility.as_str(),
             &sym.parent_symbol,
             &sym.return_type,
             &params_json,

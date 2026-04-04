@@ -34,7 +34,7 @@ pub mod typescript;
 pub mod yaml;
 pub mod zig;
 
-use super::{Parameter, SymbolInfo, SymbolKind};
+use super::{Parameter, SymbolInfo, SymbolKind, Visibility};
 use tree_sitter::Node;
 
 /// Hooks for language-specific symbol enrichment.

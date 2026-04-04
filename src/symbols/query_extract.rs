@@ -4,7 +4,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use super::hooks::LanguageHooks;
-use super::{SymbolInfo, SymbolKind};
+use super::{SymbolInfo, SymbolKind, Visibility};
 
 thread_local! {
     /// Per-thread pooled QueryCursor to avoid repeated allocation.
@@ -132,7 +132,7 @@ pub fn extract(
             signature: Some(signature),
             file_path: file_path.clone(),
             line,
-            visibility: "public".to_string(),
+            visibility: Visibility::Public,
             parent_symbol: parent,
             return_type,
             parameters,

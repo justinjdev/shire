@@ -1454,6 +1454,41 @@ end
     assert!(symbols.iter().any(|s| s.name == "project" && s.kind == SymbolKind::Function));
 }
 
+#[test]
+fn test_elixir_defdelegate() {
+    let source = r#"defmodule MyApp.Facade do
+  defdelegate greet(name), to: MyApp.Greeter
+  defdelegate version, to: MyApp.Config
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/facade.ex"));
+    let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+    assert_eq!(greet.kind, SymbolKind::Function);
+    assert_eq!(greet.signature.as_deref(), Some("defdelegate greet(name)"));
+    assert_eq!(greet.parent_symbol.as_deref(), Some("MyApp.Facade"));
+    let params = greet.parameters.as_ref().unwrap();
+    assert_eq!(params.len(), 1);
+    assert_eq!(params[0].name, "name");
+
+    let version = symbols.iter().find(|s| s.name == "version").unwrap();
+    assert_eq!(version.kind, SymbolKind::Function);
+    assert_eq!(version.signature.as_deref(), Some("defdelegate version"));
+}
+
+#[test]
+fn test_elixir_opaque_type() {
+    let source = r#"defmodule MyApp.Token do
+  @opaque t :: %__MODULE__{value: String.t()}
+end
+"#;
+    let symbols = extract_file("ex", source, Arc::from("lib/token.ex"));
+    let opaque = symbols.iter().find(|s| s.name == "t").unwrap();
+    assert_eq!(opaque.kind, SymbolKind::Type);
+    assert!(opaque.signature.as_deref().unwrap().starts_with("@opaque t ::"));
+    assert!(opaque.return_type.is_some());
+    assert_eq!(opaque.parent_symbol.as_deref(), Some("MyApp.Token"));
+}
+
 // ============================================================
 // Haskell tests
 // ============================================================

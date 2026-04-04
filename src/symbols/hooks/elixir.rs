@@ -2,10 +2,10 @@ use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Paramet
 use tree_sitter::Node;
 
 /// Valid public definition keywords for call nodes.
-const PUBLIC_DEF_KEYWORDS: &[&str] = &["def", "defmacro", "defguard", "defmodule", "defprotocol"];
+const PUBLIC_DEF_KEYWORDS: &[&str] = &["def", "defmacro", "defguard", "defdelegate", "defmodule", "defprotocol"];
 
 /// Valid attribute names for unary_operator (@attr) nodes.
-const ATTR_KEYWORDS: &[&str] = &["type", "callback"];
+const ATTR_KEYWORDS: &[&str] = &["type", "opaque", "callback"];
 
 /// Get the target identifier text of a call node.
 fn call_target_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {

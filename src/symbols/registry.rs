@@ -210,6 +210,20 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::ruby::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["ml"],
+                ts_language: || tree_sitter_ocaml::LANGUAGE_OCAML.into(),
+                query_source: include_str!("queries/ocaml.scm"),
+                hooks: super::hooks::ocaml::hooks,
+                compiled_query: OnceLock::new(),
+            },
+            LanguageEntry {
+                extensions: &["mli"],
+                ts_language: || tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE.into(),
+                query_source: include_str!("queries/ocaml.scm"),
+                hooks: super::hooks::ocaml::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

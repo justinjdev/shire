@@ -68,6 +68,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "sql",                               // SQL
         "hcl", "tf",                         // HCL/Terraform
         "toml",                              // TOML
+        "ml", "mli",                         // OCaml
     ]
 }
 

@@ -224,6 +224,13 @@ fn registry() -> &'static [LanguageEntry] {
                 hooks: super::hooks::ocaml::hooks,
                 compiled_query: OnceLock::new(),
             },
+            LanguageEntry {
+                extensions: &["lua"],
+                ts_language: || tree_sitter_lua::LANGUAGE.into(),
+                query_source: include_str!("queries/lua.scm"),
+                hooks: super::hooks::lua::hooks,
+                compiled_query: OnceLock::new(),
+            },
         ]
     })
 }

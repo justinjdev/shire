@@ -69,6 +69,7 @@ pub fn all_extensions() -> Vec<&'static str> {
         "hcl", "tf",                         // HCL/Terraform
         "toml",                              // TOML
         "ml", "mli",                         // OCaml
+        "lua",                               // Lua
     ]
 }
 
@@ -189,6 +190,9 @@ mod tests {
         assert!(exts.contains(&"pm"));
         assert!(exts.contains(&"pl"));
         assert!(exts.contains(&"rb"));
+        assert!(exts.contains(&"ml"));
+        assert!(exts.contains(&"mli"));
+        assert!(exts.contains(&"lua"));
         // Regex-based languages
         assert!(exts.contains(&"ex"));
         assert!(exts.contains(&"exs"));

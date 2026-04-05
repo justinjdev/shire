@@ -789,21 +789,75 @@ pub fn batch_insert_references(
     if refs.is_empty() {
         return Ok(());
     }
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    for r in refs {
-        stmt.execute(rusqlite::params![
-            r.name,
-            r.kind.as_str(),
-            &*r.file_path,
-            r.line as i64,
-            package,
-            r.enclosing_symbol,
-        ])?;
+
+    // Multi-row INSERT batching: group rows into chunks and bind many rows per
+    // statement. SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 32766 (modern
+    // builds). With 6 columns per row, a chunk of 128 rows uses 768 parameters
+    // — well under the limit — and collapses ~520k per-statement calls into
+    // ~4k prepared-statement executions.
+    const ROWS_PER_CHUNK: usize = 128;
+    const COLS_PER_ROW: usize = 6;
+
+    // Build the multi-row placeholder template once (reused across full chunks)
+    let full_chunk_sql = build_multi_row_insert_sql(ROWS_PER_CHUNK, COLS_PER_ROW);
+    let mut full_stmt = conn.prepare_cached(&full_chunk_sql)?;
+
+    let mut iter = refs.chunks_exact(ROWS_PER_CHUNK);
+    for chunk in &mut iter {
+        let params = bind_refs(chunk, package);
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        full_stmt.execute(rusqlite::params_from_iter(param_refs.iter().copied()))?;
     }
+
+    // Handle the tail (rows that didn't fit a full chunk) with a sized statement.
+    let remainder = iter.remainder();
+    if !remainder.is_empty() {
+        let tail_sql = build_multi_row_insert_sql(remainder.len(), COLS_PER_ROW);
+        let mut tail_stmt = conn.prepare_cached(&tail_sql)?;
+        let params = bind_refs(remainder, package);
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+        tail_stmt.execute(rusqlite::params_from_iter(param_refs.iter().copied()))?;
+    }
+
     Ok(())
+}
+
+fn build_multi_row_insert_sql(rows: usize, cols: usize) -> String {
+    let mut sql = String::from(
+        "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) VALUES ",
+    );
+    for r in 0..rows {
+        if r > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        for c in 0..cols {
+            if c > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+fn bind_refs<'a>(
+    chunk: &'a [ReferenceInfo],
+    package: Option<&'a str>,
+) -> Vec<Box<dyn rusqlite::ToSql + 'a>> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql + 'a>> = Vec::with_capacity(chunk.len() * 6);
+    for r in chunk {
+        params.push(Box::new(r.name.clone()));
+        params.push(Box::new(r.kind.as_str()));
+        params.push(Box::new(r.file_path.to_string()));
+        params.push(Box::new(r.line as i64));
+        params.push(Box::new(package.map(|s| s.to_string())));
+        params.push(Box::new(r.enclosing_symbol.clone()));
+    }
+    params
 }
 
 /// Delete all rows in `symbol_refs` for a given file path. Used during

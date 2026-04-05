@@ -1081,6 +1081,7 @@ fn phase_extract_symbols(
     // Drop FTS triggers once before processing all packages
     db::drop_symbols_fts_triggers(conn)?;
     db::drop_symbol_refs_fts_triggers(conn)?;
+    db::drop_symbol_refs_indexes(conn)?;
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
@@ -1139,6 +1140,7 @@ fn phase_extract_symbols(
     // Recreate FTS triggers (needed even if we skipped rebuild)
     db::recreate_symbols_fts_triggers(conn)?;
     db::recreate_symbol_refs_fts_triggers(conn)?;
+    db::recreate_symbol_refs_indexes(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
     let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();

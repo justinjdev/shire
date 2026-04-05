@@ -367,6 +367,30 @@ pub fn recreate_symbol_refs_fts_triggers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Drop the non-FTS indexes on `symbol_refs` before bulk insert.
+/// Combined with `recreate_symbol_refs_indexes` after the bulk insert,
+/// this moves per-row B-tree updates into one sorted build per index —
+/// substantially faster for large batches.
+pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_refs_name;
+         DROP INDEX IF EXISTS idx_refs_file;
+         DROP INDEX IF EXISTS idx_refs_enclosing;
+         DROP INDEX IF EXISTS idx_refs_package;",
+    )?;
+    Ok(())
+}
+
+pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+         CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_refs(file_path);
+         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
+         CREATE INDEX IF NOT EXISTS idx_refs_package ON symbol_refs(package);",
+    )?;
+    Ok(())
+}
+
 const FTS_SCHEMA_VERSION: &str = "4";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {

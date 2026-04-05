@@ -208,6 +208,10 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
         [&pkg.path, &pkg.name],
     )?;
     conn.execute(
+        "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
+        [&pkg.path, &pkg.name],
+    )?;
+    conn.execute(
         "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
         [&pkg.path, &pkg.name],
     )?;
@@ -286,6 +290,10 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
             [],
         )?;
         conn.execute(
+            "DELETE FROM symbol_refs WHERE package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
             "DELETE FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
             [],
         )?;
@@ -330,8 +338,9 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
 /// Upsert symbols for a package without managing FTS triggers or FTS sync.
 /// Caller is responsible for dropping triggers before, rebuilding FTS after.
 fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
-    // Delete old symbols (FTS entries will be rebuilt in bulk later)
+    // Delete old symbols and references (FTS entries will be rebuilt in bulk later)
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
+    conn.execute("DELETE FROM symbol_refs WHERE package = ?1", [package])?;
 
     // Batch insert new symbols (no triggers fire)
     batch_insert_symbols(conn, package, syms)?;
@@ -339,8 +348,14 @@ fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols:
     Ok(())
 }
 
-/// Upsert symbols for a single file within a package. Uses triggers (small operation).
-fn upsert_symbols_for_file(conn: &Connection, package: &str, file_path: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+/// Upsert symbols and references for a single file within a package. Uses triggers (small operation).
+fn upsert_symbols_and_refs_for_file(
+    conn: &Connection,
+    package: &str,
+    file_path: &str,
+    syms: &[symbols::SymbolInfo],
+    refs: &[symbols::ReferenceInfo],
+) -> Result<()> {
     // Delete old symbols for this specific file (triggers handle FTS)
     conn.execute(
         "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
@@ -348,6 +363,12 @@ fn upsert_symbols_for_file(conn: &Connection, package: &str, file_path: &str, sy
     )?;
     // Insert new symbols (triggers handle FTS)
     batch_insert_symbols(conn, package, syms)?;
+
+    conn.execute(
+        "DELETE FROM symbol_refs WHERE file_path = ?1",
+        rusqlite::params![file_path],
+    )?;
+    crate::db::queries::batch_insert_references(conn, Some(package), refs)?;
     Ok(())
 }
 
@@ -866,6 +887,10 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             [relative_dir],
         )?;
         conn.execute(
+            "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+            [relative_dir],
+        )?;
+        conn.execute(
             "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
             [relative_dir],
         )?;
@@ -912,6 +937,7 @@ fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result
 struct PackageExtractResult {
     pkg_name: String,
     symbols: Vec<symbols::SymbolInfo>,
+    references: Vec<symbols::ReferenceInfo>,
     aggregate_hash: String,
     file_hashes: Vec<(String, String)>, // (relative_path, content_hash)
 }
@@ -922,6 +948,7 @@ struct FileExtractResult {
     content_hash_hex: String,
     raw_digest: [u8; 32],
     symbols: Vec<symbols::SymbolInfo>,
+    references: Vec<symbols::ReferenceInfo>,
 }
 
 /// Single-pass: walk source files, read once, hash + extract symbols.
@@ -931,11 +958,11 @@ fn single_pass_extract(
     _pkg_kind: &str,
     exclude_extensions: &[String],
     exclude_patterns: &[String],
-) -> Result<(Vec<symbols::SymbolInfo>, String, Vec<(String, String)>)> {
+) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
         let empty_hash = hash::hash_bytes_hex(b"");
-        return Ok((Vec::new(), empty_hash, Vec::new()));
+        return Ok((Vec::new(), Vec::new(), empty_hash, Vec::new()));
     }
 
     let all_exts = symbols::walker::all_extensions();
@@ -950,7 +977,7 @@ fn single_pass_extract(
 
     if source_files.is_empty() {
         let empty_hash = hash::hash_bytes_hex(b"");
-        return Ok((Vec::new(), empty_hash, Vec::new()));
+        return Ok((Vec::new(), Vec::new(), empty_hash, Vec::new()));
     }
 
     tracing::debug!(package = %pkg_path, files = source_files.len(), "extracting symbols");
@@ -972,23 +999,25 @@ fn single_pass_extract(
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
-            let syms = String::from_utf8(content).ok()
+            let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(ext, &source, file_path_arc)
+                    symbols::extract_file_full(ext, &source, file_path_arc)
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
                 relative_path,
                 content_hash_hex,
                 raw_digest,
                 symbols: syms,
+                references: refs,
             })
         })
         .collect();
 
-    // Aggregate: collect symbols, build aggregate hash, collect per-file hashes
+    // Aggregate: collect symbols and references, build aggregate hash, collect per-file hashes
     let mut all_symbols = Vec::new();
+    let mut all_references = Vec::new();
     let mut file_hashes = Vec::new();
     // Sort by path for deterministic aggregate hash
     let mut sorted_results = file_results;
@@ -997,13 +1026,14 @@ fn single_pass_extract(
     let mut hasher = Sha256::new();
     for r in sorted_results {
         all_symbols.extend(r.symbols);
+        all_references.extend(r.references);
         // Feed raw digest bytes into aggregate hasher
         hasher.update(r.raw_digest);
         file_hashes.push((r.relative_path, r.content_hash_hex));
     }
     let aggregate_hash = format!("{:x}", hasher.finalize());
 
-    Ok((all_symbols, aggregate_hash, file_hashes))
+    Ok((all_symbols, all_references, aggregate_hash, file_hashes))
 }
 
 /// Phase 7: Extract symbols for new/changed packages (parallel).
@@ -1027,9 +1057,10 @@ fn phase_extract_symbols(
                 pb.inc(1);
             }
             match result {
-                Ok((symbols, aggregate_hash, file_hashes)) => PackageExtractResult {
+                Ok((symbols, references, aggregate_hash, file_hashes)) => PackageExtractResult {
                     pkg_name: pkg_name.clone(),
                     symbols,
+                    references,
                     aggregate_hash,
                     file_hashes,
                 },
@@ -1038,6 +1069,7 @@ fn phase_extract_symbols(
                     PackageExtractResult {
                         pkg_name: pkg_name.clone(),
                         symbols: Vec::new(),
+                        references: Vec::new(),
                         aggregate_hash: String::new(),
                         file_hashes: Vec::new(),
                     }
@@ -1052,10 +1084,12 @@ fn phase_extract_symbols(
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if skip_deletes {
-            // Symbols table already empty (force/full build) — insert only
+            // Symbols and refs tables already empty (force/full build) — insert only
             batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
+            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references)?;
         } else {
             upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
+            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references)?;
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -1107,6 +1141,7 @@ struct FileResult {
     content_hash: String,
     raw_digest: [u8; 32],
     symbols: Option<Vec<symbols::SymbolInfo>>, // None if unchanged
+    references: Option<Vec<symbols::ReferenceInfo>>, // None if unchanged
 }
 
 /// Result of parallel phase 8 work for a single package.
@@ -1223,23 +1258,26 @@ fn phase_source_incremental(
                                 content_hash,
                                 raw_digest,
                                 symbols: None,
+                                references: None,
                             })
                         } else {
-                            // File changed or new — extract symbols if valid UTF-8
+                            // File changed or new — extract symbols and references if valid UTF-8
                             let ext = file_path
                                 .extension()
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("");
-                            let syms = String::from_utf8(content).ok()
+                            let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file(ext, &source, file_path_arc)
-                                });
+                                    symbols::extract_file_full(ext, &source, file_path_arc)
+                                })
+                                .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {
                                 file_path: relative_path,
                                 content_hash,
                                 raw_digest,
-                                symbols: syms,
+                                symbols: Some(syms),
+                                references: Some(refs),
                             })
                         }
                     })
@@ -1292,11 +1330,15 @@ fn phase_source_incremental(
     for result in &results {
         match result {
             SourceCheckResult::NeedsUpdate { pkg_name, file_results: all_files, deleted_files, aggregate_hash } => {
-                // Delete symbols for deleted files
+                // Delete symbols and references for deleted files
                 for del_path in deleted_files {
                     conn.execute(
                         "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
                         rusqlite::params![pkg_name, del_path],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM symbol_refs WHERE file_path = ?1",
+                        rusqlite::params![del_path],
                     )?;
                 }
                 // Delete file_hashes for deleted files
@@ -1314,8 +1356,10 @@ fn phase_source_incremental(
                 for fr in all_files {
                     fh_entries.push((fr.file_path.as_str(), fr.content_hash.as_str()));
                     if let Some(syms) = &fr.symbols {
-                        // File changed — upsert symbols for this file
-                        upsert_symbols_for_file(conn, pkg_name, &fr.file_path, syms)?;
+                        // File changed — upsert symbols and references for this file
+                        let empty_refs = Vec::new();
+                        let refs = fr.references.as_ref().unwrap_or(&empty_refs);
+                        upsert_symbols_and_refs_for_file(conn, pkg_name, &fr.file_path, syms, refs)?;
                         had_changes = true;
                     }
                 }
@@ -1978,6 +2022,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         with_transaction(&conn, || {
             conn.execute("DELETE FROM manifest_hashes", [])?;
             conn.execute("DELETE FROM symbols", [])?;
+            conn.execute("DELETE FROM symbol_refs", [])?;
             conn.execute("DELETE FROM source_hashes", [])?;
             conn.execute("DELETE FROM file_hashes", [])?;
             conn.execute("DELETE FROM docs", [])?;

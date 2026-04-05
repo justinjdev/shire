@@ -24,6 +24,15 @@ pub fn list() -> Vec<Prompt> {
                 required: Some(true),
             }]),
         ),
+        Prompt::new(
+            "reference_audit",
+            Some("Refactor safety audit — traces all references to a symbol, classifies them by kind, follows call chains upward, and summarizes rename/change risk"),
+            Some(vec![PromptArgument {
+                name: "name".into(),
+                description: Some("Symbol name to audit (e.g. \"parse_manifest\", \"UserService\", \"MAX_RETRIES\")".into()),
+                required: Some(true),
+            }]),
+        ),
     ]
 }
 
@@ -34,6 +43,7 @@ pub fn handle(
 ) -> Result<GetPromptResult, PromptError> {
     match name {
         "explore" => handle_explore(conn, args),
+        "reference_audit" => handle_reference_audit(args),
         _ => Err(PromptError::InvalidParams(format!("Unknown prompt: {name}"))),
     }
 }
@@ -61,6 +71,77 @@ fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a s
     args.get(key)
         .map(|s| s.as_str())
         .ok_or_else(|| PromptError::InvalidParams(format!("Missing required argument: {key}")))
+}
+
+fn handle_reference_audit(args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
+    let name = require_arg(args, "name")?;
+
+    let text = format!(
+r#"# Reference audit: `{name}`
+
+Perform a refactor safety analysis for the symbol `{name}` by following these steps.
+
+## Step 1 — Gather all references
+
+Call `symbol_references` with `name={name}` to retrieve every location where this symbol
+is referenced across the codebase.
+
+## Step 2 — Classify by kind
+
+Group the results by the `kind` field and note what each signals:
+
+| Kind     | What it means for refactor safety |
+|----------|------------------------------------|
+| `call`   | Active invocation — callers will break if the signature or name changes |
+| `type`   | Used as a type annotation — renaming requires updating all type sites |
+| `import` | Imported by other modules — public API surface, possibly cross-package |
+| `impl`   | Implements or extends this symbol — structural coupling, subtypes affected |
+
+Record the counts per kind and the packages that contain them.
+
+## Step 3 — Trace call chains upward
+
+For each unique `enclosing_symbol` returned in the `call` results, call
+`symbol_callers` on that enclosing symbol to walk the call chain one level higher.
+Repeat for any new enclosing symbols if the chain is shallow (≤ 3 hops).
+
+This reveals whether the blast radius is contained within one package or fans out
+across many.
+
+## Step 4 — Identify cross-package references
+
+Cross-package references are rows where the `package` field differs from the package
+that defines `{name}`. These are the highest-risk references because they cross module
+boundaries and may not be visible to a local search.
+
+List each cross-package reference with: caller package, file, line, kind.
+
+## Step 5 — Summarize
+
+Produce a concise safety summary covering:
+
+- **Direct call sites:** count and packages
+- **External callers:** packages outside the defining package that call this symbol
+- **Implementers / subtypes:** count of `impl`-kind references
+- **Type sites:** count of `type`-kind references
+- **Overall risk:** Low / Medium / High with a one-sentence rationale
+  - Low — all refs are internal to one package, no cross-package callers
+  - Medium — cross-package refs exist but are limited in number/depth
+  - High — widely imported public API with deep or broad call chains
+
+> **Known limitation:** Matching is by name only. If two different symbols share the
+> same name across packages, refs to both will appear. Use the `package` field to
+> distinguish them and discard false positives before drawing conclusions.
+"#
+    );
+
+    Ok(GetPromptResult {
+        description: Some(format!("Reference audit for symbol \"{name}\"")),
+        messages: vec![PromptMessage {
+            role: PromptMessageRole::User,
+            content: PromptMessageContent::text(text),
+        }],
+    })
 }
 
 fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {

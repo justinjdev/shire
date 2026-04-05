@@ -1247,6 +1247,7 @@ fn phase_source_incremental(
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
     references_enabled: bool,
+    force_source_reextract: bool,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
@@ -1277,13 +1278,16 @@ fn phase_source_incremental(
         .par_iter()
         .filter_map(|(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
             let result = (|| -> Option<SourceCheckResult> {
-                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
-                if let Some(ts_str) = hashed_at {
-                    if let Some(since) = parse_hashed_at(ts_str) {
-                        if !hash::has_newer_source_files(repo_root, pkg_path, since) {
-                            return None; // No files changed — skip entirely
-                        }
-                    }
+                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely.
+                // `force_source_reextract` bypasses this fast-path — used during a
+                // references_enabled false→true transition, where refs must populate
+                // even for packages whose source files haven't been touched.
+                if !force_source_reextract
+                    && let Some(ts_str) = hashed_at
+                    && let Some(since) = parse_hashed_at(ts_str)
+                    && !hash::has_newer_source_files(repo_root, pkg_path, since)
+                {
+                    return None; // No files changed — skip entirely
                 }
 
                 // Mtime says check needed — walk files and do per-file comparison
@@ -1317,8 +1321,12 @@ fn phase_source_incremental(
                             .to_string();
 
                         let stored = stored_file_hashes.get(&relative_path);
-                        if stored == Some(&content_hash) {
-                            // File unchanged — include in results for aggregate hash but no symbols
+                        if stored == Some(&content_hash) && !force_source_reextract {
+                            // File unchanged — include in results for aggregate hash but no symbols.
+                            // `force_source_reextract` skips this fast-path so refs
+                            // populate for every file during a refs-enabled transition,
+                            // while leaving `stored_file_hashes` intact so the caller
+                            // can still compute `deleted_files` against it below.
                             Some(FileResult {
                                 file_path: relative_path,
                                 content_hash,
@@ -2361,24 +2369,25 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     let pb_sym_clone = pb_sym.clone();
     let refs_enabled = config.symbols.references_enabled;
     // Detect a false→true transition. In the unchanged case, the per-file
-    // hash matches the stored hash, so `phase_source_incremental` skips
-    // extraction and leaves `symbol_refs` empty for every unchanged file —
-    // the user sees a partial ref index with no indication it's stale. To
-    // repair, we wipe `file_hashes`/`source_hashes` on the transition so
-    // the next phase re-extracts every source file.
+    // hash matches the stored hash, so `phase_source_incremental`'s
+    // fast-paths skip extraction and leave `symbol_refs` empty for every
+    // unchanged file — the user sees a partial ref index with no
+    // indication it's stale. We repair by passing `force_source_reextract`
+    // into `phase_source_incremental`, which bypasses the mtime and
+    // per-file-hash fast-paths while PRESERVING `file_hashes` — the
+    // stored hashes are still needed to compute `deleted_files` (files
+    // removed since the last build). Wiping the hashes here would break
+    // deleted-file cleanup.
     let prior_refs_enabled = crate::db::read_references_enabled(&conn);
     let refs_just_enabled = is_refs_transition_enable(refs_enabled, prior_refs_enabled);
-    if refs_transition_requires_rehash(refs_just_enabled, is_full_build, force) {
+    let force_source_reextract =
+        refs_transition_requires_rehash(refs_just_enabled, is_full_build, force);
+    if force_source_reextract {
         tracing::warn!(
             prior = ?prior_refs_enabled,
-            "references_enabled transitioned to true — invalidating file hashes to force \
-             full re-extraction so symbol_refs is populated for every source file"
+            "references_enabled transitioned to true — forcing source re-extraction \
+             so symbol_refs is populated for every source file"
         );
-        with_transaction(&conn, || {
-            conn.execute("DELETE FROM file_hashes", [])?;
-            conn.execute("DELETE FROM source_hashes", [])?;
-            Ok(())
-        })?;
     }
     let num_source_reextracted = with_transaction(&conn, || {
         // Wipe symbol_refs if the user has turned the experimental refs
@@ -2395,7 +2404,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)?
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled, force_source_reextract)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

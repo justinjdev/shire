@@ -2819,3 +2819,112 @@ fn test_force_rebuild_keeps_refs_flag_consistent_with_refs_table() {
     // build would leave the atomic wipe committed (flag=false, refs
     // empty) — a consistent state MCP can reason about.
 }
+
+/// Regression test for CodeRabbit finding on PR #96: during a refs
+/// off→on transition, deleted-file cleanup in `phase_source_incremental`
+/// depends on the stored `file_hashes` map — it diffs current files
+/// against those hashes to compute `deleted_files`. Wiping
+/// `file_hashes` to force re-extraction would make that diff empty,
+/// leaving stale symbols for files that were removed while refs were
+/// off.
+///
+/// This test: deletes `old.go` while refs are off, flips refs on,
+/// rebuilds, and asserts the deleted file's symbols are gone AND the
+/// surviving file's refs populate.
+#[test]
+fn test_refs_transition_cleans_up_files_deleted_while_refs_off() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc Alive() { Callee() }\nfunc Callee() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("svc/old.go"),
+        "package svc\n\nfunc Doomed() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // Build 1: refs disabled. Both Doomed and Alive get indexed into
+    // symbols (no refs extraction), file_hashes captures both files.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let doomed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(doomed > 0, "Doomed should be indexed after first build");
+    }
+
+    // Delete old.go while refs are still off.
+    fs::remove_file(root.join("svc/old.go")).unwrap();
+
+    // Build 2: flip refs on. The transition triggers
+    // force_source_reextract, which must still let the deleted-file
+    // diff compute correctly against file_hashes.
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let doomed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'Doomed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        doomed, 0,
+        "Doomed must be removed — old.go was deleted before this build"
+    );
+
+    // Alive should still be indexed and its call-ref to Callee should
+    // now be populated (proves the refs transition actually took effect).
+    let alive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'Alive'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(alive, 1, "Alive should survive the rebuild");
+    let call_refs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Callee' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        call_refs, 1,
+        "call-ref to Callee must populate — the point of the refs transition"
+    );
+}

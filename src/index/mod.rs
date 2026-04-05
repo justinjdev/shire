@@ -1080,7 +1080,6 @@ fn phase_extract_symbols(
 
     // Drop FTS triggers once before processing all packages
     db::drop_symbols_fts_triggers(conn)?;
-    db::drop_symbol_refs_fts_triggers(conn)?;
     db::drop_symbol_refs_indexes(conn)?;
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
@@ -1103,7 +1102,6 @@ fn phase_extract_symbols(
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
-
     // Drop and recreate FTS table, then rebuild from content table.
     // Skip entirely when phase 7 had no packages to process.
     if !results.is_empty() {
@@ -1120,26 +1118,10 @@ fn phase_extract_symbols(
             "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
             [],
         )?;
-
-        // Rebuild symbol_refs FTS from content table
-        conn.execute_batch("DROP TABLE IF EXISTS symbol_refs_fts")?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS symbol_refs_fts USING fts5(
-                name, kind, enclosing_symbol,
-                content='symbol_refs',
-                content_rowid='rowid',
-                tokenize='unicode61 tokenchars ''_'''
-            )",
-        )?;
-        conn.execute(
-            "INSERT INTO symbol_refs_fts(symbol_refs_fts) VALUES('rebuild')",
-            [],
-        )?;
     }
 
     // Recreate FTS triggers (needed even if we skipped rebuild)
     db::recreate_symbols_fts_triggers(conn)?;
-    db::recreate_symbol_refs_fts_triggers(conn)?;
     db::recreate_symbol_refs_indexes(conn)?;
 
     // Batch-upsert all source hashes collected in this phase
@@ -2492,7 +2474,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             "INSERT INTO packages_fts(packages_fts, rank) VALUES('merge', 500);
              INSERT INTO files_fts(files_fts, rank) VALUES('merge', 500);
              INSERT INTO symbols_fts(symbols_fts, rank) VALUES('merge', 500);
-             INSERT INTO symbol_refs_fts(symbol_refs_fts, rank) VALUES('merge', 500);
              INSERT INTO docs_fts(docs_fts, rank) VALUES('merge', 500);",
         )?;
     }

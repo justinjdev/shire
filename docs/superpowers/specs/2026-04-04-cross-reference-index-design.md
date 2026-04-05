@@ -97,12 +97,18 @@ CREATE TABLE symbol_refs (
 CREATE INDEX idx_refs_name ON symbol_refs(name);
 CREATE INDEX idx_refs_file ON symbol_refs(file_path);
 CREATE INDEX idx_refs_enclosing ON symbol_refs(enclosing_symbol);
-CREATE INDEX idx_refs_package ON symbol_refs(package);
 ```
 
-`idx_refs_package` supports bulk package-scoped deletes (no `name` or `enclosing_symbol` predicate to use the higher-selectivity indexes).
+Three B-tree indexes, one per MCP query pattern:
+- `idx_refs_name` — `symbol_references`, `symbol_callers` filter by referenced name
+- `idx_refs_file` — `delete_references_for_file` during file-granularity incremental rebuild
+- `idx_refs_enclosing` — `symbol_callees` filter by enclosing symbol
 
-Plus an FTS5 virtual table over `name` (same tokenizer as `symbols_fts`, triggers dropped/recreated during bulk writes).
+No FTS5 virtual table for `symbol_refs` — the MCP tools all use exact-name lookups via the B-tree indexes. Adding an FTS table that isn't queried would add per-row trigger overhead on inserts for no benefit.
+
+Package-level deletes (`delete_references_for_package`) fall back to a table scan. This path runs only when a package is removed entirely, a rare operation; avoiding the per-build cost of a fourth index on 520k+ rows outweighs the amortized scan cost.
+
+Index creation is deferred to after bulk insert — indexes are dropped before inserting refs and recreated afterward, turning per-row B-tree updates into sorted builds.
 
 **Import-name normalization**: several grammars expose import paths as string-literal nodes that include the quote characters (e.g. Go `import "fmt"` captures as `"fmt"`, Ruby `require 'json'` captures as `'json'`). The extractor strips surrounding `"`/`'`/`` ` `` quotes when emitting a reference with `kind = Import`. This normalization lives in the shared `query_extract` layer so per-language `.scm` files can capture the whole string-literal node without needing inner-content captures.
 

@@ -27,9 +27,9 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 ### Key modules
 
 - **index/** — Build orchestrator. Walks the repo, discovers manifests, parses them via the `ManifestParser` trait (one impl per ecosystem: npm, go, cargo, python, maven, gradle, perl, ruby), extracts symbols, writes to SQLite. Builds are incremental at file granularity via SHA-256 content hashing (`file_hashes` table), with mtime pre-checks to skip unchanged packages entirely. Single-pass read+hash+extract avoids double file reads. File tree walk capped at 500k files.
-- **symbols/** — Source code symbol extraction. Uses tree-sitter query patterns + language-specific hooks for most languages (TS/JS, Go, Rust, Python, Java, Kotlin, Dart, C, C++, C#, Swift, PHP, Scala, Zig, Protobuf, Bash, R, Haskell, YAML, SQL, HCL, TOML, Perl, Ruby, OCaml, Lua, Elixir, Clojure, Erlang, Julia, Gleam, Odin, Nix, Nim), regex for COBOL. Parallelized across packages and within packages with rayon. Tree-sitter queries compiled once per language via `OnceLock`. All extractors produce the same `SymbolInfo` struct (uses `Arc<str>` for file paths).
-- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files, docs) with custom tokenizers (`unicode61` with `tokenchars` for underscores/hyphens) and prefix indexes. FTS triggers dropped/recreated during bulk operations for performance. Schema versioned via `shire_meta` with automatic FTS migration on upgrade. Read-only connections use `query_only` and `prepare_cached`.
-- **mcp/** — MCP server over stdio using the `rmcp` crate. 11 tools + 1 prompt template for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness).
+- **symbols/** — Source code symbol extraction. Uses tree-sitter query patterns + language-specific hooks for most languages (TS/JS, Go, Rust, Python, Java, Kotlin, Dart, C, C++, C#, Swift, PHP, Scala, Zig, Protobuf, Bash, R, Haskell, YAML, SQL, HCL, TOML, Perl, Ruby, OCaml, Lua, Elixir, Clojure, Erlang, Julia, Gleam, Odin, Nix, Nim), regex for COBOL. Parallelized across packages and within packages with rayon. Tree-sitter queries compiled once per language via `OnceLock`. All extractors produce the same `SymbolInfo` struct (uses `Arc<str>` for file paths). Cross-reference extraction (call, type, import, impl) is supported for 8 tier-1 languages: Go, Python, Java, TypeScript, JavaScript, Perl, Ruby, Scala — captured via `@reference.*` tree-sitter captures and written to the `symbol_refs` table.
+- **db/** — SQLite with WAL mode, FTS5 full-text search (packages, symbols, files, docs) with custom tokenizers (`unicode61` with `tokenchars` for underscores/hyphens) and prefix indexes. FTS triggers dropped/recreated during bulk operations for performance. Schema versioned via `shire_meta` with automatic FTS migration on upgrade. Read-only connections use `query_only` and `prepare_cached`. The `symbol_refs` table stores cross-reference records (call, type, import, impl) with an FTS5 index on `ref_name`; records are rebuilt at file granularity alongside symbol extraction.
+- **mcp/** — MCP server over stdio using the `rmcp` crate. 14 tools + 1 prompt template for semantic codebase exploration. Supports on-demand reindexing via `serve --root` (checks `.git/index` mtime for staleness). Three new reference tools: `symbol_references` (all refs to a name), `symbol_callers` (call-site callers), `symbol_callees` (outbound call graph).
 - **watch/** — Unix-only background daemon. Uses Unix domain sockets (`.shire/watch.sock`) for IPC, PID file for process management, configurable debounce. Filters rebuilds by file relevance.
 
 ### Adding a new manifest parser
@@ -60,6 +60,16 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 5. Add the language to the symbols module description in this file (the parenthetical language list)
 6. Add a row to the Symbol extraction table in `docs/src/ecosystems.md`
 
+### Adding reference extraction to a language
+
+Only applicable to languages that already have tree-sitter-based symbol extraction.
+
+1. Add `@reference.call`, `@reference.type`, `@reference.import`, `@reference.impl` captures to the language's `.scm` file alongside existing `@definition.X` captures
+2. In the language's hooks file (`src/symbols/hooks/<lang>.rs`), set `enclosing_ancestors: &[...]` with the grammar's function/method/class node kinds
+3. Set `reference_stoplist: &[...]` with language built-ins that should be skipped
+4. Add unit tests in `src/symbols/tests.rs` asserting each ref kind is extracted
+5. Add a row to the Reference extraction table in `docs/src/ecosystems.md`
+
 ## Platform Notes
 
 - The `watch` module is Unix-only (Unix domain sockets, Unix signals, `kill` for process management). No Windows build target.
@@ -84,6 +94,7 @@ The docs site lives in `docs/src/` (mdBook). When changing user-facing behavior,
 - New/changed config options → `docs/src/configuration.md`, `CLAUDE.md` (Configuration section)
 - New manifest parser → `docs/src/ecosystems.md`
 - New symbol extractor → `docs/src/ecosystems.md` (Symbol extraction table)
+- New reference extractor → `docs/src/ecosystems.md` (Reference extraction table)
 - Changes to `shire init` behavior → `docs/src/setup.md`
 - Changes to watch daemon → `docs/src/watch-daemon.md`
 - Changes to worktree handling → `docs/src/worktrees.md`

@@ -39,7 +39,7 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 ## What it does
 
-`shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
+`shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. For 8 tier-1 languages (Go, Python, Java, TypeScript, JavaScript, Perl, Ruby, Scala), shire also extracts cross-references — calls, type references, imports, and implementations — stored in the `symbol_refs` table for call-graph and impact queries. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
 
 Optionally, shire can augment symbol search with **vector similarity** (RAG). When enabled, symbols are embedded at index time using [fastembed](https://github.com/Anush008/fastembed-rs) (BAAI/bge-small-en-v1.5, fully offline after first model download) and stored via [sqlite-vec](https://github.com/asg017/sqlite-vec). Queries like "find the auth middleware" can then match `verify_jwt_token` even without keyword overlap. Results are merged with FTS5 using Reciprocal Rank Fusion. See [RAG vector search](#rag-vector-search) for setup.
 
@@ -152,6 +152,9 @@ The index is written to `.shire/index.db` inside the repo root by default. You c
 | `get_file_symbols` | List all symbols defined in a specific file |
 | `list_package_files` | List all files in a package, optionally filtered by extension |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
+| `symbol_references` | Find all references to a symbol by name (call, type, import, impl) |
+| `symbol_callers` | List all callers of a function or method |
+| `symbol_callees` | List what a function calls (outbound call graph) |
 
 ### MCP prompts
 
@@ -402,7 +405,7 @@ src/
 │   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 8 tool handlers (+ hybrid search when RAG enabled)
+│   ├── tools.rs     # 14 tool handlers (+ hybrid search when RAG enabled)
 │   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

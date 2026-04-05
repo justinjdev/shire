@@ -17,6 +17,9 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
 | `explore` | Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
+| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. Note: matching is name-based — same-name symbols across different packages are merged. |
+| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, call_sites}]`. Accepts optional `package` filter. |
+| `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, call_sites}]`. Accepts optional `package` filter. |
 
 ### When to use Shire vs Grep/Glob
 

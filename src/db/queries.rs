@@ -770,6 +770,49 @@ pub fn search_docs(
     Ok(result)
 }
 
+use crate::symbols::ReferenceInfo;
+
+pub fn batch_insert_references(
+    conn: &Connection,
+    package: Option<&str>,
+    refs: &[ReferenceInfo],
+) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for r in refs {
+        stmt.execute(rusqlite::params![
+            r.name,
+            r.kind.as_str(),
+            &*r.file_path,
+            r.line as i64,
+            package,
+            r.enclosing_symbol,
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn delete_references_for_file(conn: &Connection, file_path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM symbol_refs WHERE file_path = ?1",
+        [file_path],
+    )?;
+    Ok(())
+}
+
+pub fn delete_references_for_package(conn: &Connection, package: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM symbol_refs WHERE package = ?1",
+        [package],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,5 +1510,89 @@ mod tests {
         let results = search_docs(&conn, "project", None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].package.is_none());
+    }
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use super::*;
+    use crate::db::open_or_create;
+    use crate::symbols::{ReferenceInfo, ReferenceKind};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_batch_insert_and_delete_by_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        let refs = vec![
+            ReferenceInfo {
+                name: "foo".into(),
+                kind: ReferenceKind::Call,
+                file_path: Arc::from("a.rs"),
+                line: 10,
+                enclosing_symbol: Some("bar".into()),
+            },
+            ReferenceInfo {
+                name: "Baz".into(),
+                kind: ReferenceKind::Type,
+                file_path: Arc::from("a.rs"),
+                line: 12,
+                enclosing_symbol: None,
+            },
+            ReferenceInfo {
+                name: "quux".into(),
+                kind: ReferenceKind::Call,
+                file_path: Arc::from("b.rs"),
+                line: 3,
+                enclosing_symbol: None,
+            },
+        ];
+        batch_insert_references(&conn, Some("mypkg"), &refs).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        delete_references_for_file(&conn, "a.rs").unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 1, "only b.rs ref should remain");
+    }
+
+    #[test]
+    fn test_delete_references_for_package() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("t2.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        let refs_p1 = vec![ReferenceInfo {
+            name: "foo".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from("x.rs"),
+            line: 1,
+            enclosing_symbol: None,
+        }];
+        let refs_p2 = vec![ReferenceInfo {
+            name: "bar".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from("y.rs"),
+            line: 1,
+            enclosing_symbol: None,
+        }];
+        batch_insert_references(&conn, Some("pkg1"), &refs_p1).unwrap();
+        batch_insert_references(&conn, Some("pkg2"), &refs_p2).unwrap();
+
+        delete_references_for_package(&conn, "pkg1").unwrap();
+
+        let remaining_pkg: String = conn
+            .query_row("SELECT package FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_pkg, "pkg2");
     }
 }

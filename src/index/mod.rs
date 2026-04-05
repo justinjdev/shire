@@ -1958,6 +1958,31 @@ fn git_index_changed_since_build(repo_root: &Path, conn: &Connection) -> bool {
     }
 }
 
+/// True when `references_enabled` flipped off→on since the last build.
+///
+/// `prior` is the value read from `shire_meta.references_enabled`:
+/// - `Some(true)`: last build already populated `symbol_refs`, nothing to do.
+/// - `Some(false)` or `None`: we cannot assume `symbol_refs` is in sync with
+///   the current source tree; treat as a transition if refs are now enabled.
+///
+/// Kept as a pure predicate so the transition logic inside
+/// `build_index_inner` is exercised by `cargo test --lib` without having
+/// to stand up a full build context.
+fn is_refs_transition_enable(current: bool, prior: Option<bool>) -> bool {
+    current && prior != Some(true)
+}
+
+/// True when a refs transition should force re-hashing. A full build
+/// (`is_full_build`) or `--force` run already re-extracts everything, so
+/// the hash wipe is redundant in those cases.
+fn refs_transition_requires_rehash(
+    refs_just_enabled: bool,
+    is_full_build: bool,
+    force: bool,
+) -> bool {
+    refs_just_enabled && !is_full_build && !force
+}
+
 /// Check if the DB has been populated (has manifest hashes).
 fn is_fresh_db(conn: &Connection) -> bool {
     let count: i64 = conn
@@ -2337,8 +2362,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // repair, we wipe `file_hashes`/`source_hashes` on the transition so
     // the next phase re-extracts every source file.
     let prior_refs_enabled = crate::db::read_references_enabled(&conn);
-    let refs_just_enabled = refs_enabled && prior_refs_enabled != Some(true);
-    if refs_just_enabled && !is_full_build && !force {
+    let refs_just_enabled = is_refs_transition_enable(refs_enabled, prior_refs_enabled);
+    if refs_transition_requires_rehash(refs_just_enabled, is_full_build, force) {
         tracing::warn!(
             prior = ?prior_refs_enabled,
             "references_enabled transitioned to true — invalidating file hashes to force \
@@ -2638,6 +2663,56 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn test_is_refs_transition_enable_off_to_on() {
+        // None/false→true is the load-bearing transition: symbol_refs
+        // cannot be trusted without a re-extraction pass.
+        assert!(is_refs_transition_enable(true, None));
+        assert!(is_refs_transition_enable(true, Some(false)));
+    }
+
+    #[test]
+    fn test_is_refs_transition_enable_no_change() {
+        // Already-on or never-enabled: no transition.
+        assert!(!is_refs_transition_enable(true, Some(true)));
+        assert!(!is_refs_transition_enable(false, Some(false)));
+        assert!(!is_refs_transition_enable(false, None));
+    }
+
+    #[test]
+    fn test_is_refs_transition_enable_on_to_off() {
+        // On→off is handled separately (wipe symbol_refs) — not a refs
+        // transition this predicate cares about.
+        assert!(!is_refs_transition_enable(false, Some(true)));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_default_path() {
+        // Incremental build with a genuine transition: must re-hash.
+        assert!(refs_transition_requires_rehash(true, false, false));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_full_build() {
+        // A full build already re-extracts everything; wiping hashes on
+        // top is redundant work.
+        assert!(!refs_transition_requires_rehash(true, true, false));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_forced() {
+        // --force paths already walk every file; same rationale.
+        assert!(!refs_transition_requires_rehash(true, false, true));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_no_transition() {
+        // No transition → nothing to repair.
+        assert!(!refs_transition_requires_rehash(false, false, false));
+        assert!(!refs_transition_requires_rehash(false, true, false));
+        assert!(!refs_transition_requires_rehash(false, false, true));
+    }
 
     fn create_test_monorepo(dir: &Path) {
         // npm package

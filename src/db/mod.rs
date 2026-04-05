@@ -70,6 +70,12 @@ fn create_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (package, dependency, dep_kind)
         );
 
+        -- Reverse-dep lookup index. The PK leads with `package`, so queries
+        -- filtering on `dependency` (package_dependents, reverse_dependency_graph,
+        -- change_impact's BFS — the last runs once per BFS node) would full-scan
+        -- without this index.
+        CREATE INDEX IF NOT EXISTS idx_dependencies_dependency ON dependencies(dependency);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS packages_fts USING fts5(
             name, description, path,
             content='packages',

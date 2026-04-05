@@ -2088,6 +2088,51 @@ sub baz {
     assert_eq!(symbols[2].line, 7); // sub baz
 }
 
+#[test]
+fn test_perl_call_references() {
+    let source = r#"package My::Service;
+
+use strict;
+
+sub load {
+    my ($path) = @_;
+    my $raw = read_file($path);
+    return parse_raw($raw);
+}
+
+sub parse_raw { my ($r) = @_; return {}; }
+
+1;
+"#;
+    let (_syms, refs) = extract_file_full("pm", source, Arc::from("Service.pm"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"read_file"), "got {:?}", names);
+    assert!(names.contains(&"parse_raw"));
+}
+
+#[test]
+fn test_perl_use_references() {
+    let source = r#"package Main;
+use strict;
+use My::Utils;
+use JSON::PP;
+1;
+"#;
+    let (_syms, refs) = extract_file_full("pm", source, Arc::from("Main.pm"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    // Capture module names. `strict` is in stoplist — skip.
+    assert!(imp_names.iter().any(|n| n.contains("Utils")), "got {:?}", imp_names);
+    assert!(imp_names.iter().any(|n| n.contains("JSON")));
+}
+
 // ============================================================
 // Ruby tests
 // ============================================================

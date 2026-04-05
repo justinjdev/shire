@@ -89,7 +89,15 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: None,
         extract_return_type: None,
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        enclosing_ancestors: &[
+            "subroutine_declaration_statement",
+            "package_statement",
+        ],
+        reference_stoplist: &[
+            "strict", "warnings", "utf8", "feature", "parent", "base",
+            "print", "say", "die", "warn", "use", "require",
+            "my", "our", "local", "sub", "return", "if", "unless",
+            "undef", "defined",
+        ],
     }
 }

@@ -7,6 +7,7 @@ pub mod gradle_settings;
 pub mod hash;
 pub mod manifest;
 pub mod maven;
+pub mod nix;
 pub mod npm;
 pub mod perl;
 pub mod python;
@@ -79,11 +80,10 @@ fn walk_manifests(
         .hidden(true)
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
-            if let Some(name) = entry.file_name().to_str() {
-                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if let Some(name) = entry.file_name().to_str()
+                && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                     return !exclude_set.contains(name);
                 }
-            }
             true
         })
         .build_parallel();
@@ -97,7 +97,7 @@ fn walk_manifests(
                 Ok(e) => e,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
             let filename = match entry.file_name().to_str() {
@@ -465,11 +465,10 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
         .hidden(true)
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
-            if let Some(name) = entry.file_name().to_str() {
-                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if let Some(name) = entry.file_name().to_str()
+                && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                     return !exclude_set.contains(name);
                 }
-            }
             true
         })
         .build_parallel();
@@ -487,7 +486,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
                 Ok(e) => e,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
 
@@ -653,11 +652,10 @@ fn incremental_upsert_files(
         "UPDATE files SET package = ?1, extension = ?2, size_bytes = ?3 WHERE path = ?4",
     )?;
     for (path, pkg, ext, size) in files {
-        if let Some((old_pkg, old_ext, old_size)) = existing.get(path) {
-            if old_pkg != pkg || old_ext != ext || *old_size != *size as i64 {
+        if let Some((old_pkg, old_ext, old_size)) = existing.get(path)
+            && (old_pkg != pkg || old_ext != ext || *old_size != *size as i64) {
                 update_stmt.execute(rusqlite::params![pkg, ext, *size as i64, path])?;
             }
-        }
     }
 
     Ok(())
@@ -674,11 +672,10 @@ fn collect_cargo_workspace_context(walked: &[WalkedManifest]) -> HashMap<String,
             .and_then(|f| f.to_str())
             .unwrap_or("");
 
-        if filename == "Cargo.toml" {
-            if let Ok(deps) = cargo::collect_cargo_workspace_deps(&manifest.abs_path) {
+        if filename == "Cargo.toml"
+            && let Ok(deps) = cargo::collect_cargo_workspace_deps(&manifest.abs_path) {
                 all_ws_deps.extend(deps);
             }
-        }
     }
 
     all_ws_deps
@@ -695,8 +692,8 @@ fn collect_go_workspace_context(walked: &[WalkedManifest]) -> HashSet<String> {
             .and_then(|f| f.to_str())
             .unwrap_or("");
 
-        if filename == "go.work" {
-            if let Ok(use_dirs) = go_work::parse_go_work(&manifest.abs_path) {
+        if filename == "go.work"
+            && let Ok(use_dirs) = go_work::parse_go_work(&manifest.abs_path) {
                 for d in use_dirs {
                     // go.work use directives are relative to the go.work location
                     let full_dir = if manifest.relative_dir.is_empty() {
@@ -707,7 +704,6 @@ fn collect_go_workspace_context(walked: &[WalkedManifest]) -> HashSet<String> {
                     dirs.insert(full_dir);
                 }
             }
-        }
     }
 
     dirs
@@ -774,6 +770,7 @@ struct BuildSummary {
 }
 
 /// Phase 3: Parse new and changed manifests into packages.
+#[allow(clippy::type_complexity)]
 fn phase_parse(
     to_parse: &[&WalkedManifest],
     conn: &Connection,
@@ -989,6 +986,7 @@ struct FileExtractResult {
 }
 
 /// Single-pass: walk source files, read once, hash + extract symbols.
+#[allow(clippy::type_complexity)]
 fn single_pass_extract(
     repo_root: &Path,
     pkg_path: &str,
@@ -1083,6 +1081,7 @@ fn single_pass_extract(
 
 /// Phase 7: Extract symbols for new/changed packages (parallel).
 /// Uses single-pass read+hash+extract to avoid double file reads.
+#[allow(clippy::too_many_arguments)]
 fn phase_extract_symbols(
     conn: &Connection,
     repo_root: &Path,
@@ -1236,6 +1235,7 @@ fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<S
 
 /// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
 /// Uses per-file hashing for granular incremental updates.
+#[allow(clippy::too_many_arguments)]
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
@@ -1247,6 +1247,7 @@ fn phase_source_incremental(
     force_source_reextract: bool,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
+    #[allow(clippy::type_complexity)]
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
         .iter()
         .filter_map(|manifest| {
@@ -1371,7 +1372,7 @@ fn phase_source_incremental(
                     .iter()
                     .map(|r| (r.file_path.as_str(), &r.raw_digest))
                     .collect();
-                sorted_for_hash.sort_by(|a, b| a.0.cmp(&b.0));
+                sorted_for_hash.sort_by(|a, b| a.0.cmp(b.0));
 
                 let mut hasher = Sha256::new();
                 for (_, raw_digest) in &sorted_for_hash {
@@ -1495,9 +1496,8 @@ fn phase_index_files(
         .ok();
     if let (Ok(git_meta), Some(stored_ts)) =
         (std::fs::metadata(&git_index_path), &stored_file_index_at)
-    {
-        if let Ok(git_mtime) = git_meta.modified() {
-            if let Some(since) = parse_hashed_at(stored_ts) {
+        && let Ok(git_mtime) = git_meta.modified()
+            && let Some(since) = parse_hashed_at(stored_ts) {
                 let margin = std::time::Duration::from_secs(1);
                 if git_mtime <= since.checked_add(margin).unwrap_or(since) {
                     tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
@@ -1508,8 +1508,6 @@ fn phase_index_files(
                     return Ok(num_files);
                 }
             }
-        }
-    }
 
     let walked_files = walk_files(repo_root, config)?;
 
@@ -1703,15 +1701,14 @@ fn phase_index_docs(
         let content_hash = format!("{:x}", hasher.finalize());
 
         // Skip if content, package, and size are all unchanged
-        if let Some((existing_hash, existing_package, existing_size)) = existing_docs.get(rel_path) {
-            if *existing_hash == content_hash
+        if let Some((existing_hash, existing_package, existing_size)) = existing_docs.get(rel_path)
+            && *existing_hash == content_hash
                 && existing_package == package
                 && *existing_size == size_bytes
             {
                 count += 1;
                 continue;
             }
-        }
 
         // Extract title: first markdown heading or first non-empty line
         let title = extract_doc_title(body);
@@ -2119,15 +2116,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
 
     // Seed from main worktree's DB if this is a new linked-worktree build.
-    if !db_path.exists() {
-        if let Some(seed_path) = crate::config::seed_db_path(config, repo_root, &wt_info)? {
-            if seed_path.exists() {
+    if !db_path.exists()
+        && let Some(seed_path) = crate::config::seed_db_path(config, repo_root, &wt_info)?
+            && seed_path.exists() {
                 crate::db::seed_db(&seed_path, &db_path)?;
                 tracing::info!(seed = %seed_path.display(), "seeded DB from main worktree");
                 eprintln!("Seeded DB from {}", seed_path.display());
             }
-        }
-    }
 
     let conn = db::open_or_create(&db_path, config.rag.enabled)?;
 
@@ -2171,6 +2166,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         Box::new(gradle::GradleKtsParser),
         Box::new(perl::CpanfileParser),
         Box::new(ruby::RubyParser),
+        Box::new(nix::FlakeNixParser),
     ];
 
     // Phase 1: Walk manifests
@@ -2654,8 +2650,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // The background RAG thread opened its own connection to this DB; switching
     // back to WAL requires an exclusive lock, which can fail with SQLITE_BUSY
     // if the RAG thread's connection is still active.
-    if let Some(handle) = rag_handle {
-        if let Err(panic_payload) = handle.join() {
+    if let Some(handle) = rag_handle
+        && let Err(panic_payload) = handle.join() {
             let msg = panic_payload
                 .downcast_ref::<&str>()
                 .copied()
@@ -2663,7 +2659,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .unwrap_or("unknown panic");
             tracing::error!(panic = %msg, "RAG embedding thread panicked");
         }
-    }
 
     // Restore WAL mode for read-heavy query workloads after the build.
     if restore_wal {

@@ -44,9 +44,7 @@ fn parse_cpanfile(content: &str, out: &mut Vec<DepInfo>) {
                 match ch {
                     '{' => brace_depth += 1,
                     '}' => {
-                        if brace_depth > 0 {
-                            brace_depth -= 1;
-                        }
+                        brace_depth = brace_depth.saturating_sub(1);
                         if brace_depth == 0 {
                             in_test_block = false;
                         }
@@ -72,9 +70,7 @@ fn parse_cpanfile(content: &str, out: &mut Vec<DepInfo>) {
                 match ch {
                     '{' => brace_depth += 1,
                     '}' => {
-                        if brace_depth > 0 {
-                            brace_depth -= 1;
-                        }
+                        brace_depth = brace_depth.saturating_sub(1);
                         if brace_depth == 0 {
                             in_test_block = false;
                         }

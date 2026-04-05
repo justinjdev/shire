@@ -41,11 +41,10 @@ fn is_relevant(
     }
 
     // Source file with a tracked extension
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if source_exts.contains(ext) {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && source_exts.contains(ext) {
             return true;
         }
-    }
 
     false
 }

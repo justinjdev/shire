@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
         }
         Commands::Serve { root, db, config: cfg_path } => {
             let cwd = std::fs::canonicalize(".")?;
-            let repo_root = root.as_ref().map(|r| std::fs::canonicalize(r)).transpose()?;
+            let repo_root = root.as_ref().map(std::fs::canonicalize).transpose()?;
             let effective_root = repo_root.as_deref().unwrap_or(&cwd);
             let cfg = config::load_config_from(cfg_path.as_deref(), effective_root)?;
             let _sid = logging::init(&cfg.log, effective_root, "serve");

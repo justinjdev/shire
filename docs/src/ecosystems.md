@@ -11,6 +11,7 @@
 | `build.gradle` / `build.gradle.kts` | gradle | `settings.gradle` project inclusion |
 | `cpanfile` | perl | `requires` / `on 'test'` blocks |
 | `Gemfile` | ruby | `gem` / `group :test` blocks |
+| `flake.nix` | nix | `inputs` attrset (dotted and block forms) |
 
 ## Symbol extraction
 

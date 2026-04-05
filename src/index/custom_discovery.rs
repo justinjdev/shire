@@ -180,7 +180,7 @@ fn check_requires(dir: &Path, patterns: &[glob::Pattern]) -> bool {
     let entries: Vec<String> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
             .collect(),
         Err(_) => return false,

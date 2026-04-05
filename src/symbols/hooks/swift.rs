@@ -28,23 +28,19 @@ fn is_visible(node: &Node, source: &str) -> bool {
 fn has_private_modifier(node: &Node, source: &str) -> bool {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "visibility_modifier" {
-            if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                if text == "private" || text == "fileprivate" {
+        if child.kind() == "visibility_modifier"
+            && let Ok(text) = child.utf8_text(source.as_bytes())
+                && (text == "private" || text == "fileprivate") {
                     return true;
                 }
-            }
-        }
         if child.kind() == "modifiers" {
             for j in 0..child.child_count() {
                 let grandchild = child.child(j).unwrap();
-                if grandchild.kind() == "visibility_modifier" {
-                    if let Ok(text) = grandchild.utf8_text(source.as_bytes()) {
-                        if text == "private" || text == "fileprivate" {
+                if grandchild.kind() == "visibility_modifier"
+                    && let Ok(text) = grandchild.utf8_text(source.as_bytes())
+                        && (text == "private" || text == "fileprivate") {
                             return true;
                         }
-                    }
-                }
             }
         }
     }
@@ -147,11 +143,10 @@ fn find_param_name(source: &str, param_node: &Node) -> Option<String> {
     let mut identifiers = Vec::new();
     for i in 0..param_node.child_count() {
         let child = param_node.child(i).unwrap();
-        if child.kind() == "simple_identifier" {
-            if let Ok(text) = child.utf8_text(source.as_bytes()) {
+        if child.kind() == "simple_identifier"
+            && let Ok(text) = child.utf8_text(source.as_bytes()) {
                 identifiers.push(text.to_string());
             }
-        }
     }
 
     match identifiers.len() {
@@ -219,7 +214,7 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Detect the class-like keyword from a class_declaration node.
 /// Swift uses a single `class_declaration` for class, struct, enum, extension, and actor.
-fn detect_class_keyword<'a>(node: &Node, source: &'a str) -> &'static str {
+fn detect_class_keyword(node: &Node, source: &str) -> &'static str {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         if let Ok(text) = child.utf8_text(source.as_bytes()) {

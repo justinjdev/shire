@@ -69,8 +69,8 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
                     let outer_args = find_child_by_kind(node, "arguments");
                     let inner_call = outer_args.as_ref().and_then(find_inner_call);
 
-                    if let Some(inner) = inner_call {
-                        if let Some(args_node) = find_child_by_kind(&inner, "arguments") {
+                    if let Some(inner) = inner_call
+                        && let Some(args_node) = find_child_by_kind(&inner, "arguments") {
                             let args_text = node_text(&args_node, source).unwrap_or("()");
                             let trimmed = args_text.trim();
                             if let Some(inner_text) =
@@ -79,19 +79,17 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
                                 return format!("{keyword} {name}({})", inner_text.trim());
                             }
                         }
-                    }
                     format!("{keyword} {name}")
                 }
             }
         }
         "unary_operator" => {
             let attr = attr_name(node, source).unwrap_or("type");
-            if let Some(operand) = node.child_by_field_name("operand") {
-                if let Some(args) = find_child_by_kind(&operand, "arguments") {
+            if let Some(operand) = node.child_by_field_name("operand")
+                && let Some(args) = find_child_by_kind(&operand, "arguments") {
                     let text = node_text(&args, source).unwrap_or(name);
                     return format!("@{attr} {}", text.trim());
                 }
-            }
             format!("@{attr} {name}")
         }
         _ => name.to_string(),
@@ -129,16 +127,14 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
             }
             "binary_operator" => {
                 // Default value: name \\ default
-                if let Some(left) = child.child_by_field_name("left") {
-                    if left.kind() == "identifier" {
-                        if let Some(name) = node_text(&left, source) {
+                if let Some(left) = child.child_by_field_name("left")
+                    && left.kind() == "identifier"
+                        && let Some(name) = node_text(&left, source) {
                             params.push(Parameter {
                                 name: name.to_string(),
                                 type_annotation: None,
                             });
                         }
-                    }
-                }
             }
             _ => {}
         }
@@ -182,9 +178,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         }
         "unary_operator" => {
             let attr = attr_name(node, source)?;
-            if let Some(operand) = node.child_by_field_name("operand") {
-                if let Some(args) = find_child_by_kind(&operand, "arguments") {
-                    if let Some(binop) = find_child_by_kind(&args, "binary_operator") {
+            if let Some(operand) = node.child_by_field_name("operand")
+                && let Some(args) = find_child_by_kind(&operand, "arguments")
+                    && let Some(binop) = find_child_by_kind(&args, "binary_operator") {
                         let return_type = binop
                             .child_by_field_name("right")
                             .and_then(|r| node_text(&r, source))
@@ -193,15 +189,12 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 
                         if attr == "callback" {
                             sym.kind = SymbolKind::Method;
-                            if let Some(left) = binop.child_by_field_name("left") {
-                                if left.kind() == "call" {
+                            if let Some(left) = binop.child_by_field_name("left")
+                                && left.kind() == "call" {
                                     sym.parameters = Some(extract_callback_params(&left, source));
                                 }
-                            }
                         }
                     }
-                }
-            }
         }
         _ => {}
     }

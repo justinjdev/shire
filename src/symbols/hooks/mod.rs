@@ -38,8 +38,15 @@ pub mod zig;
 use super::{Parameter, SymbolInfo, SymbolKind, Visibility};
 use tree_sitter::Node;
 
+/// Function pointer type for building a symbol's signature from its definition node.
+pub type SignatureFn = fn(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String;
+
+/// Function pointer type for post-processing a matched symbol; returning None drops it.
+pub type PostProcessFn = fn(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo>;
+
 /// Hooks for language-specific symbol enrichment.
 /// All fields are optional — None means use the default behavior.
+#[derive(Default)]
 pub struct LanguageHooks {
     /// Filter: return true if the symbol should be included (is visible/exported).
     /// Receives the definition node and source. Default: include all.
@@ -51,8 +58,7 @@ pub struct LanguageHooks {
 
     /// Build signature string. Receives definition node, source, name, and kind.
     /// Default: "kind name" (e.g., "class Foo").
-    pub build_signature:
-        Option<fn(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String>,
+    pub build_signature: Option<SignatureFn>,
 
     /// Extract function/method parameters. Receives definition node and source.
     /// Default: empty vec.
@@ -64,8 +70,7 @@ pub struct LanguageHooks {
 
     /// Post-process a matched symbol before adding to results.
     /// Return None to skip the symbol.
-    pub post_process:
-        Option<fn(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo>>,
+    pub post_process: Option<PostProcessFn>,
 
     /// Node kinds that qualify as an enclosing symbol for references.
     /// The extractor walks up from a reference node through ancestors, stopping
@@ -78,20 +83,6 @@ pub struct LanguageHooks {
     pub reference_stoplist: &'static [&'static str],
 }
 
-impl Default for LanguageHooks {
-    fn default() -> Self {
-        Self {
-            is_visible: None,
-            resolve_parent: None,
-            build_signature: None,
-            extract_parameters: None,
-            extract_return_type: None,
-            post_process: None,
-            enclosing_ancestors: &[],
-            reference_stoplist: &[],
-        }
-    }
-}
 
 /// Helper: find first child node with the given kind.
 pub fn find_child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {

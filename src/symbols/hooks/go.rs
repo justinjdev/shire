@@ -4,8 +4,8 @@ use tree_sitter::Node;
 /// Go visibility: only symbols starting with an uppercase letter are exported.
 fn is_visible(node: &Node, source: &str) -> bool {
     let name = field_text(node, "name", source);
-    name.map_or(false, |n| {
-        n.chars().next().map_or(false, |c| c.is_uppercase())
+    name.is_some_and(|n| {
+        n.chars().next().is_some_and(|c| c.is_uppercase())
     })
 }
 
@@ -18,12 +18,11 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     let receiver = node.child_by_field_name("receiver")?;
     for i in 0..receiver.child_count() {
         let child = receiver.child(i).unwrap();
-        if child.kind() == "parameter_declaration" {
-            if let Some(type_node) = child.child_by_field_name("type") {
+        if child.kind() == "parameter_declaration"
+            && let Some(type_node) = child.child_by_field_name("type") {
                 let type_text = node_text(&type_node, source)?;
                 return Some(type_text.trim_start_matches('*').to_string());
             }
-        }
     }
     None
 }
@@ -102,15 +101,14 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process: reclassify type_spec nodes to Struct/Interface based on their type child.
 fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<SymbolInfo> {
-    if sym.kind == SymbolKind::Type && node.kind() == "type_spec" {
-        if let Some(type_node) = node.child_by_field_name("type") {
+    if sym.kind == SymbolKind::Type && node.kind() == "type_spec"
+        && let Some(type_node) = node.child_by_field_name("type") {
             sym.kind = match type_node.kind() {
                 "struct_type" => SymbolKind::Struct,
                 "interface_type" => SymbolKind::Interface,
                 _ => SymbolKind::Type,
             };
         }
-    }
     Some(sym)
 }
 

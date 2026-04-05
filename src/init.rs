@@ -350,11 +350,10 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     }
 
     // 6. Ensure the db directory is in .gitignore (only when config was actually written)
-    if should_write && opts.gitignore_db_dir {
-        if let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
+    if should_write && opts.gitignore_db_dir
+        && let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
             ensure_gitignore(root, &dir)?;
         }
-    }
 
     if opts.use_hook {
         eprintln!("\n  Next: run {} in this repo to create the index.", style("shire build").green().bold());

@@ -15,11 +15,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
         match n.kind() {
             "class_declaration" | "mixin_declaration" | "enum_declaration"
             | "extension_declaration" => {
-                if let Some(ancestor_name) = extract_name(&n, source) {
-                    if ancestor_name.starts_with('_') {
+                if let Some(ancestor_name) = extract_name(&n, source)
+                    && ancestor_name.starts_with('_') {
                         return false;
                     }
-                }
             }
             _ => {}
         }
@@ -198,11 +197,10 @@ fn collect_parameters(params_node: &Node, source: &str, params: &mut Vec<Paramet
             "optional_formal_parameters" => {
                 for j in 0..child.child_count() {
                     let opt_child = child.child(j).unwrap();
-                    if opt_child.kind() == "formal_parameter" {
-                        if let Some(param) = extract_single_param(&opt_child, source) {
+                    if opt_child.kind() == "formal_parameter"
+                        && let Some(param) = extract_single_param(&opt_child, source) {
                             params.push(param);
                         }
-                    }
                 }
             }
             _ => {}
@@ -252,18 +250,16 @@ fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
             let mut type_text = child.utf8_text(source.as_bytes()).ok()?.to_string();
             let mut next_idx = i + 1;
             // Append generic type_arguments if present (e.g., List<String>)
-            if let Some(next) = param_node.child(next_idx) {
-                if next.kind() == "type_arguments" {
+            if let Some(next) = param_node.child(next_idx)
+                && next.kind() == "type_arguments" {
                     type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
                     next_idx += 1;
                 }
-            }
             // Check for nullable `?` following the type
-            if let Some(next) = param_node.child(next_idx) {
-                if next.kind() == "?" {
+            if let Some(next) = param_node.child(next_idx)
+                && next.kind() == "?" {
                     type_text.push('?');
                 }
-            }
             return Some(type_text);
         }
         // Handle constructor_param (this.name)
@@ -297,18 +293,16 @@ fn extract_type_with_generics(node: &Node, source: &str) -> Option<String> {
             let mut type_text = child.utf8_text(source.as_bytes()).ok()?.to_string();
             // Append generic type_arguments if present (e.g., Future<int>)
             let mut next_idx = i + 1;
-            if let Some(next) = node.child(next_idx) {
-                if next.kind() == "type_arguments" {
+            if let Some(next) = node.child(next_idx)
+                && next.kind() == "type_arguments" {
                     type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
                     next_idx += 1;
                 }
-            }
             // Check for nullable `?`
-            if let Some(next) = node.child(next_idx) {
-                if next.kind() == "?" {
+            if let Some(next) = node.child(next_idx)
+                && next.kind() == "?" {
                     type_text.push('?');
                 }
-            }
             return Some(type_text);
         }
     }
@@ -362,13 +356,11 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
     }
 
     // Skip operator methods (they have no useful name capture)
-    if node.kind() == "method_signature" {
-        if let Some(inner) = find_inner_signature(node) {
-            if inner.kind() == "operator_signature" {
+    if node.kind() == "method_signature"
+        && let Some(inner) = find_inner_signature(node)
+            && inner.kind() == "operator_signature" {
                 return None;
             }
-        }
-    }
 
     // Named constructors: collect all identifier parts into a dotted name.
     // e.g., Dog.fromJson — the query captures "Dog" but we want "Dog.fromJson"
@@ -676,7 +668,7 @@ abstract class Animal {
 "#;
         let syms = extract(source);
         let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
-        assert!(methods.len() >= 1, "abstract methods should be captured");
+        assert!(!methods.is_empty(), "abstract methods should be captured");
         let names: Vec<&str> = methods.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"makeSound"), "abstract method missing");
         assert!(names.contains(&"name"), "abstract getter missing");

@@ -1519,6 +1519,48 @@ fn test_scala_skip_private() {
     assert!(symbols.is_empty());
 }
 
+#[test]
+fn test_scala_call_references() {
+    let source = r#"package com.example
+
+object Service {
+  def process(req: Request): Response = {
+    val cfg = parseConfig(req.body)
+    buildResponse(cfg)
+  }
+
+  def parseConfig(body: String): Config = Config(body)
+  def buildResponse(cfg: Config): Response = Response(cfg.key)
+}
+"#;
+    let (_syms, refs) = extract_file_full("scala", source, Arc::from("svc.scala"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"parseConfig"), "got {:?}", names);
+    assert!(names.contains(&"buildResponse"));
+}
+
+#[test]
+fn test_scala_impl_references() {
+    let source = r#"trait Service
+trait Cacheable
+class Base
+class MyService extends Base with Service with Cacheable
+"#;
+    let (_syms, refs) = extract_file_full("scala", source, Arc::from("s.scala"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Service"));
+    assert!(impl_names.contains(&"Cacheable"));
+}
+
 // ============================================================
 // Zig tests
 // ============================================================

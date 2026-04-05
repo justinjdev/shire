@@ -17,13 +17,11 @@ fn collect_formal_names(formals: &Node, source: &str) -> Vec<String> {
     let count = formals.child_count();
     for i in 0..count {
         let child = formals.child(i).unwrap();
-        if child.kind() == "formal" {
-            if let Some(name_node) = child.child_by_field_name("name") {
-                if let Some(text) = node_text(&name_node, source) {
+        if child.kind() == "formal"
+            && let Some(name_node) = child.child_by_field_name("name")
+                && let Some(text) = node_text(&name_node, source) {
                     names.push(text.to_string());
                 }
-            }
-        }
     }
     names
 }
@@ -42,14 +40,13 @@ fn collect_all_params(func_node: &Node, source: &str) -> Vec<Parameter> {
 
     loop {
         // Check for universal parameter (simple `arg:` binding)
-        if let Some(universal) = current.child_by_field_name("universal") {
-            if let Some(text) = node_text(&universal, source) {
+        if let Some(universal) = current.child_by_field_name("universal")
+            && let Some(text) = node_text(&universal, source) {
                 params.push(Parameter {
                     name: text.to_string(),
                     type_annotation: None,
                 });
             }
-        }
 
         // Check for formals ({ arg1, arg2, ... }: pattern)
         if let Some(formals) = current.child_by_field_name("formals") {
@@ -116,11 +113,10 @@ fn build_param_string(func_node: &Node, source: &str) -> String {
     let mut current = *func_node;
 
     loop {
-        if let Some(universal) = current.child_by_field_name("universal") {
-            if let Some(text) = node_text(&universal, source) {
+        if let Some(universal) = current.child_by_field_name("universal")
+            && let Some(text) = node_text(&universal, source) {
                 parts.push(text.to_string());
             }
-        }
 
         if let Some(formals) = current.child_by_field_name("formals") {
             let names = collect_formal_names(&formals, source);

@@ -69,8 +69,8 @@ fn count_named_children_in_args(clause: &Node) -> usize {
 /// Count parameters in a callback node.
 fn callback_arity(node: &Node) -> usize {
     // callback > sigs: type_sig > args: expr_args
-    if let Some(sigs) = node.child_by_field_name("sigs") {
-        if let Some(args) = sigs.child_by_field_name("args") {
+    if let Some(sigs) = node.child_by_field_name("sigs")
+        && let Some(args) = sigs.child_by_field_name("args") {
             let mut count = 0;
             for j in 0..args.child_count() {
                 let gc = args.child(j).unwrap();
@@ -80,7 +80,6 @@ fn callback_arity(node: &Node) -> usize {
             }
             return count;
         }
-    }
     0
 }
 
@@ -89,11 +88,10 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     // node is a fun_decl; find the first function_clause's args
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "function_clause" {
-            if let Some(args) = child.child_by_field_name("args") {
+        if child.kind() == "function_clause"
+            && let Some(args) = child.child_by_field_name("args") {
                 return extract_params_from_args(&args, source);
             }
-        }
     }
     Vec::new()
 }
@@ -237,7 +235,7 @@ fib(N) -> fib(N-1) + fib(N-2).
         // Each clause is a separate fun_decl, so we get 3 entries
         let fib_syms: Vec<_> = syms.iter().filter(|s| s.name == "fib").collect();
         assert!(
-            fib_syms.len() >= 1,
+            !fib_syms.is_empty(),
             "at least one fib clause should be captured"
         );
         assert!(fib_syms.iter().all(|s| s.kind == SymbolKind::Function));

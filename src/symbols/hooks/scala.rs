@@ -35,24 +35,20 @@ fn is_visible(node: &Node, source: &str) -> bool {
 fn has_private_modifier(node: &Node, source: &str) -> bool {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "access_modifier" {
-            if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                if text.starts_with("private") {
+        if child.kind() == "access_modifier"
+            && let Ok(text) = child.utf8_text(source.as_bytes())
+                && text.starts_with("private") {
                     return true;
                 }
-            }
-        }
         // The grammar wraps access_modifier inside a `modifiers` node
         if child.kind() == "modifiers" {
             for j in 0..child.child_count() {
                 let grandchild = child.child(j).unwrap();
-                if grandchild.kind() == "access_modifier" {
-                    if let Ok(text) = grandchild.utf8_text(source.as_bytes()) {
-                        if text.starts_with("private") {
+                if grandchild.kind() == "access_modifier"
+                    && let Ok(text) = grandchild.utf8_text(source.as_bytes())
+                        && text.starts_with("private") {
                             return true;
                         }
-                    }
-                }
             }
         }
     }

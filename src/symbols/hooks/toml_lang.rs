@@ -5,8 +5,8 @@ use tree_sitter::Node;
 /// Determine the type label for a TOML pair's value.
 fn pair_value_type(pair_node: &Node) -> &'static str {
     for i in (0..pair_node.child_count()).rev() {
-        if let Some(child) = pair_node.child(i) {
-            if child.is_named() {
+        if let Some(child) = pair_node.child(i)
+            && child.is_named() {
                 return match child.kind() {
                     "string" | "literal_string" => "<string>",
                     "integer" => "<integer>",
@@ -20,7 +20,6 @@ fn pair_value_type(pair_node: &Node) -> &'static str {
                     _ => "<value>",
                 };
             }
-        }
     }
     "<value>"
 }
@@ -253,7 +252,7 @@ port = 8080
         // Tables: database, server.http
         let tables: Vec<_> = symbols
             .iter()
-            .filter(|s| s.kind == SymbolKind::Class && s.signature.as_deref().map_or(false, |s| s.starts_with('[')))
+            .filter(|s| s.kind == SymbolKind::Class && s.signature.as_deref().is_some_and(|s| s.starts_with('[')))
             .filter(|s| !s.signature.as_deref().unwrap_or("").starts_with("[["))
             .collect();
         assert_eq!(tables.len(), 2);
@@ -268,7 +267,7 @@ port = 8080
                 s.kind == SymbolKind::Class
                     && s.signature
                         .as_deref()
-                        .map_or(false, |sig| sig.starts_with("[["))
+                        .is_some_and(|sig| sig.starts_with("[["))
             })
             .collect();
         assert_eq!(arrays.len(), 2);

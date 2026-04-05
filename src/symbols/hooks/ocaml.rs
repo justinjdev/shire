@@ -174,11 +174,10 @@ fn extract_typed_param(param_node: &Node, source: &str) -> Option<String> {
                     .and_then(|n| n.utf8_text(source.as_bytes()).ok())
                     .map(|s| s.to_string());
             }
-            if child.kind() == "parenthesized_pattern" {
-                if let Some(result) = try_extract_type(&child, source) {
+            if child.kind() == "parenthesized_pattern"
+                && let Some(result) = try_extract_type(&child, source) {
                     return Some(result);
                 }
-            }
         }
         None
     }
@@ -258,8 +257,8 @@ fn extract_function_type_params(node: &Node, source: &str) -> Vec<Parameter> {
     }
 
     // If codomain is also a function_type, recurse; otherwise it's the return type
-    if let Some(c) = codomain {
-        if c.kind() == "function_type" {
+    if let Some(c) = codomain
+        && c.kind() == "function_type" {
             let mut sub_params = extract_function_type_params(&c, source);
             // Renumber parameters
             for p in &mut sub_params {
@@ -272,7 +271,6 @@ fn extract_function_type_params(node: &Node, source: &str) -> Vec<Parameter> {
             }
         }
         // else: it's the return type, not a parameter
-    }
 
     params
 }
@@ -358,13 +356,11 @@ fn is_function_binding(node: &Node) -> bool {
 /// Local bindings should be filtered out — they're not top-level definitions.
 fn is_local_let_binding(node: &Node) -> bool {
     // Walk up: let_binding -> value_definition -> let_expression
-    if let Some(val_def) = node.parent() {
-        if val_def.kind() == "value_definition" {
-            if let Some(grandparent) = val_def.parent() {
+    if let Some(val_def) = node.parent()
+        && val_def.kind() == "value_definition"
+            && let Some(grandparent) = val_def.parent() {
                 return grandparent.kind() == "let_expression";
             }
-        }
-    }
     false
 }
 

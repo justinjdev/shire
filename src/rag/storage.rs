@@ -11,9 +11,14 @@ pub fn load_extension() -> Result<()> {
     // (i.e. fn(db, err_msg, api) -> c_int). The transmute casts the typed function
     // pointer to the generic Option<unsafe extern "C" fn()> that the FFI expects.
     let rc = unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )))
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite_vec::sqlite3_vec_init as *const ())))
     };
     if rc != 0 {
         anyhow::bail!(

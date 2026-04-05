@@ -115,7 +115,7 @@ function run {
 }"#;
         let symbols = extract(source);
         assert_eq!(symbols.len(), 1);
-        assert!(symbols[0].parameters.as_ref().map_or(true, |p| p.is_empty()));
+        assert!(symbols[0].parameters.as_ref().is_none_or(|p| p.is_empty()));
         assert!(symbols[0].return_type.is_none());
     }
 

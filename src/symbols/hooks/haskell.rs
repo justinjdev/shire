@@ -23,11 +23,10 @@ fn find_type_signature<'a>(node: &Node<'a>, source: &'a str, name: &str) -> Opti
     while let Some(sib) = sibling {
         if sib.kind() == "signature" {
             // The function name is the first `variable` child of the signature
-            if let Some(sig_name) = first_variable_child(&sib) {
-                if node_text(&sig_name, source) == Some(name) {
+            if let Some(sig_name) = first_variable_child(&sib)
+                && node_text(&sig_name, source) == Some(name) {
                     return source.get(sib.start_byte()..sib.end_byte());
                 }
-            }
             // Stop scanning once we hit a non-matching signature
             return None;
         }
@@ -133,7 +132,7 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
     let sig_text = find_type_signature(node, source, fn_name)?;
 
     // Parse "name :: A -> B -> C" to extract "C"
-    let after_colons = sig_text.splitn(2, "::").nth(1)?.trim();
+    let after_colons = sig_text.split_once("::")?.1.trim();
     // Split on " -> " and take the last segment
     let parts: Vec<&str> = split_arrow_type(after_colons);
     if parts.len() > 1 {
@@ -184,15 +183,12 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         "function" => {
             // Deduplicate multi-equation functions: skip if a preceding sibling
             // is a `function` with the same name
-            if let Some(prev) = node.prev_named_sibling() {
-                if prev.kind() == "function" {
-                    if let Some(prev_name) = first_variable_child(&prev) {
-                        if node_text(&prev_name, source) == Some(&sym.name) {
+            if let Some(prev) = node.prev_named_sibling()
+                && prev.kind() == "function"
+                    && let Some(prev_name) = first_variable_child(&prev)
+                        && node_text(&prev_name, source) == Some(&sym.name) {
                             return None;
                         }
-                    }
-                }
-            }
         }
         _ => {}
     }

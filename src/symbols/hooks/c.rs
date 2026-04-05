@@ -6,13 +6,11 @@ use tree_sitter::Node;
 fn is_visible(node: &Node, source: &str) -> bool {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "storage_class_specifier" {
-            if let Some(text) = node_text(&child, source) {
-                if text == "static" {
+        if child.kind() == "storage_class_specifier"
+            && let Some(text) = node_text(&child, source)
+                && text == "static" {
                     return false;
                 }
-            }
-        }
     }
     true
 }

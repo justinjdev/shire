@@ -94,12 +94,7 @@ fn collect_params(args_node: &Node, source: &str) -> Vec<Parameter> {
 /// Find a child by kind without lifetime constraints (uses tree-sitter cursor).
 fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    node.children(&mut cursor).find(|&child| child.kind() == kind)
 }
 
 /// Find the argument_list node for a function-like definition.

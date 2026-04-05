@@ -127,8 +127,8 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     let mut params = Vec::new();
     for i in 0..vec_node.named_child_count() {
         let child = vec_node.named_child(i).unwrap();
-        if child.kind() == "sym_lit" {
-            if let Some(text) = node_text(&child, source) {
+        if child.kind() == "sym_lit"
+            && let Some(text) = node_text(&child, source) {
                 // Skip the & rest parameter marker
                 if text == "&" {
                     continue;
@@ -138,7 +138,6 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
                     type_annotation: None,
                 });
             }
-        }
     }
     params
 }
@@ -159,14 +158,12 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
     // For ns, use the full namespace name including dots.
     // The @name capture gets sym_name (just the last segment after any dot).
     // We need the full sym_lit text for dotted namespaces like "my.namespace".
-    if keyword == "ns" {
-        if let Some(ns_sym) = second_sym_lit(node) {
-            if let Some(full_name) = node_text(&ns_sym, source) {
+    if keyword == "ns"
+        && let Some(ns_sym) = second_sym_lit(node)
+            && let Some(full_name) = node_text(&ns_sym, source) {
                 sym.name = full_name.to_string();
                 sym.signature = Some(format!("(ns {full_name})"));
             }
-        }
-    }
 
     Some(sym)
 }

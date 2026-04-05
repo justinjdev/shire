@@ -114,11 +114,10 @@ impl ShireService {
         // lost — the next check after the window expires triggers a rebuild that
         // reads current file state.
         let debounce_s = ctx.config.serve.debounce_s;
-        if let Ok(elapsed) = last.elapsed() {
-            if elapsed < std::time::Duration::from_secs(debounce_s) {
+        if let Ok(elapsed) = last.elapsed()
+            && elapsed < std::time::Duration::from_secs(debounce_s) {
                 return false;
             }
-        }
 
         // Check .git/index mtime
         let git_index = ctx.repo_root.join(".git/index");

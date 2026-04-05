@@ -49,8 +49,8 @@ fn is_visible(node: &Node, source: &str) -> bool {
             "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
         ) {
             // Walk up through the declaration_list to the type node
-            if let Some(type_node) = n.parent() {
-                if matches!(
+            if let Some(type_node) = n.parent()
+                && matches!(
                     type_node.kind(),
                     "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
                 ) {
@@ -59,7 +59,6 @@ fn is_visible(node: &Node, source: &str) -> bool {
                         return false;
                     }
                 }
-            }
         }
         current = n.parent();
     }

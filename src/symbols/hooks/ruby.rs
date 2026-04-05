@@ -27,11 +27,10 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
             // Check for superclass — the field includes the `<` token, so find
             // the constant child inside the superclass node
             if let Some(superclass) = node.child_by_field_name("superclass") {
-                if let Some(sc_const) = find_child_by_kind(&superclass, "constant") {
-                    if let Some(sc_name) = node_text(&sc_const, source) {
+                if let Some(sc_const) = find_child_by_kind(&superclass, "constant")
+                    && let Some(sc_name) = node_text(&sc_const, source) {
                         return format!("class {name} < {sc_name}");
                     }
-                }
                 // Fallback to scope_resolution for namespaced superclasses
                 if let Some(sc_name) = node_text(&superclass, source) {
                     let sc_name = sc_name.trim_start_matches('<').trim();
@@ -100,58 +99,53 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
             }
             "splat_parameter" => {
                 // *args
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if let Some(name) = node_text(&name_node, source) {
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = node_text(&name_node, source) {
                         params.push(Parameter {
                             name: name.to_string(),
                             type_annotation: Some("*".to_string()),
                         });
                     }
-                }
             }
             "hash_splat_parameter" => {
                 // **opts
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if let Some(name) = node_text(&name_node, source) {
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = node_text(&name_node, source) {
                         params.push(Parameter {
                             name: name.to_string(),
                             type_annotation: Some("**".to_string()),
                         });
                     }
-                }
             }
             "block_parameter" => {
                 // &block
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if let Some(name) = node_text(&name_node, source) {
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = node_text(&name_node, source) {
                         params.push(Parameter {
                             name: name.to_string(),
                             type_annotation: Some("&".to_string()),
                         });
                     }
-                }
             }
             "keyword_parameter" => {
                 // name: or name: default
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if let Some(name) = node_text(&name_node, source) {
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = node_text(&name_node, source) {
                         params.push(Parameter {
                             name: name.to_string(),
                             type_annotation: None,
                         });
                     }
-                }
             }
             "optional_parameter" => {
                 // name = default
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if let Some(name) = node_text(&name_node, source) {
+                if let Some(name_node) = child.child_by_field_name("name")
+                    && let Some(name) = node_text(&name_node, source) {
                         params.push(Parameter {
                             name: name.to_string(),
                             type_annotation: None,
                         });
                     }
-                }
             }
             _ => {}
         }

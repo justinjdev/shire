@@ -205,8 +205,8 @@ fn build_managed_deps(
     }
 
     // Override with this POM's own dependencyManagement
-    if let Some(mgmt) = dep_mgmt {
-        if let Some(deps) = &mgmt.dependencies {
+    if let Some(mgmt) = dep_mgmt
+        && let Some(deps) = &mgmt.dependencies {
             for dep in &deps.dependencies {
                 let group = dep.group_id.as_deref().unwrap_or("");
                 let artifact = dep.artifact_id.as_deref().unwrap_or("");
@@ -215,7 +215,6 @@ fn build_managed_deps(
                 }
             }
         }
-    }
 
     managed
 }
@@ -272,8 +271,8 @@ pub(crate) fn collect_maven_parent_context(
         );
 
         let mut managed_deps = HashMap::new();
-        if let Some(mgmt) = &pom.dependency_management {
-            if let Some(deps) = &mgmt.dependencies {
+        if let Some(mgmt) = &pom.dependency_management
+            && let Some(deps) = &mgmt.dependencies {
                 for dep in &deps.dependencies {
                     let g = dep.group_id.as_deref().unwrap_or("");
                     let a = dep.artifact_id.as_deref().unwrap_or("");
@@ -282,7 +281,6 @@ pub(crate) fn collect_maven_parent_context(
                     }
                 }
             }
-        }
 
         context.insert(
             key,

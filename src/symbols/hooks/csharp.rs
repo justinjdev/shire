@@ -13,8 +13,8 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool, 
     let mut is_readonly = false;
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.kind() == "modifier" {
+        if let Some(child) = node.child(i)
+            && child.kind() == "modifier" {
                 let text = child.utf8_text(source.as_bytes()).unwrap_or("");
                 match text {
                     "public" => public = true,
@@ -26,7 +26,6 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool, 
                     _ => {}
                 }
             }
-        }
     }
 
     (public, protected, private, internal, is_static, is_readonly)
@@ -200,7 +199,7 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             if private || internal || !(public || protected) {
                 return None;
             }
-            if !is_const && !(is_static && is_readonly) {
+            if !(is_const || is_static && is_readonly) {
                 return None;
             }
 
@@ -242,14 +241,13 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Check if a specific modifier is present on the node.
 fn has_modifier(node: &Node, source: &str, modifier: &str) -> bool {
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.kind() == "modifier" {
+        if let Some(child) = node.child(i)
+            && child.kind() == "modifier" {
                 let text = child.utf8_text(source.as_bytes()).unwrap_or("");
                 if text == modifier {
                     return true;
                 }
             }
-        }
     }
     false
 }

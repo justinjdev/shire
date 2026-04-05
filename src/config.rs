@@ -104,6 +104,7 @@ fn default_doc_max_file_size() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct RagConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -113,15 +114,6 @@ pub struct RagConfig {
     pub cache_dir: Option<String>,
 }
 
-impl Default for RagConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            model: None,
-            cache_dir: None,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LogConfig {

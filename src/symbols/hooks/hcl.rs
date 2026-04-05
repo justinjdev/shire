@@ -17,11 +17,10 @@ fn collect_labels<'a>(node: &Node, source: &'a str) -> Vec<&'a str> {
     let mut labels = Vec::new();
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
-        if child.kind() == "string_lit" {
-            if let Some(text) = string_lit_text(&child, source) {
+        if child.kind() == "string_lit"
+            && let Some(text) = string_lit_text(&child, source) {
                 labels.push(text);
             }
-        }
     }
     labels
 }

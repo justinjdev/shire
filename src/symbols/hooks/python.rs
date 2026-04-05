@@ -15,21 +15,18 @@ fn is_visible(node: &Node, source: &str) -> bool {
     };
 
     // Only apply underscore filtering to methods (functions inside a class body)
-    if node.kind() == "function_definition" {
-        if let Some(parent) = node.parent() {
+    if node.kind() == "function_definition"
+        && let Some(parent) = node.parent() {
             // parent is the `block` node; its parent is the `class_definition`
-            if parent.kind() == "block" {
-                if let Some(grandparent) = parent.parent() {
-                    if grandparent.kind() == "class_definition" {
+            if parent.kind() == "block"
+                && let Some(grandparent) = parent.parent()
+                    && grandparent.kind() == "class_definition" {
                         // Inside a class: skip _private except __init__
                         if name.starts_with('_') && name != "__init__" {
                             return false;
                         }
                     }
-                }
-            }
         }
-    }
 
     true
 }
@@ -59,7 +56,7 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
                 .unwrap_or_default();
             format!("def {}{}{}", name, params_text, ret)
         }
-        _ => format!("{}", name),
+        _ => name.to_string(),
     }
 }
 

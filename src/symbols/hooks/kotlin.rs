@@ -30,13 +30,11 @@ fn has_private_or_internal_modifier(node: &Node, source: &str) -> bool {
         if child.kind() == "modifiers" {
             for j in 0..child.child_count() {
                 let modifier = child.child(j).unwrap();
-                if modifier.kind() == "visibility_modifier" {
-                    if let Ok(text) = modifier.utf8_text(source.as_bytes()) {
-                        if text == "private" || text == "internal" {
+                if modifier.kind() == "visibility_modifier"
+                    && let Ok(text) = modifier.utf8_text(source.as_bytes())
+                        && (text == "private" || text == "internal") {
                             return true;
                         }
-                    }
-                }
             }
         }
     }

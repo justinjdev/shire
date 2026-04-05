@@ -351,15 +351,14 @@ fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Regis
         let check = Command::new(&claude_path)
             .args(["mcp", "get", "-s", "user", "shire"])
             .output();
-        if let Ok(o) = check {
-            if o.status.success() {
+        if let Ok(o) = check
+            && o.status.success() {
                 println!("  MCP server already registered (scope: user)");
                 return Registration {
                     tool: "Claude Code",
                     status: RegStatus::AlreadyRegistered("via claude mcp".into()),
                 };
             }
-        }
     } else {
         // Force: remove existing entry first
         let _ = Command::new(&claude_path)
@@ -695,11 +694,10 @@ fn remove_codex_mcp(dry_run: bool) {
 
     if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
         mcp_servers.remove("shire");
-        if mcp_servers.is_empty() {
-            if let Some(root) = doc.as_table_mut() {
+        if mcp_servers.is_empty()
+            && let Some(root) = doc.as_table_mut() {
                 root.remove("mcp_servers");
             }
-        }
     }
 
     let output = toml::to_string_pretty(&doc).unwrap_or_default();

@@ -28,7 +28,7 @@ fn session_id() -> String {
 pub fn init(log_config: &LogConfig, repo_root: &Path, command: &str) -> String {
     let sid = session_id();
     let level = std::env::var("SHIRE_LOG").unwrap_or_else(|_| log_config.level.clone());
-    let filter = EnvFilter::try_new(&format!("shire={level}"))
+    let filter = EnvFilter::try_new(format!("shire={level}"))
         .unwrap_or_else(|_| EnvFilter::new("shire=warn"));
 
     if !log_config.dir.is_empty() {
@@ -109,12 +109,10 @@ fn evict_old_logs(log_dir: &Path, max_days: u32) {
         if !name.starts_with("shire.log") {
             continue;
         }
-        if let Ok(meta) = path.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if modified < cutoff {
+        if let Ok(meta) = path.metadata()
+            && let Ok(modified) = meta.modified()
+                && modified < cutoff {
                     let _ = std::fs::remove_file(&path);
                 }
-            }
-        }
     }
 }

@@ -9,24 +9,20 @@ use tree_sitter::Node;
 fn is_visible(node: &Node, source: &str) -> bool {
     if node.kind() == "method_definition" {
         // Check for #private names
-        if let Some(name_node) = node.child_by_field_name("name") {
-            if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
-                if name.starts_with('#') {
+        if let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source.as_bytes())
+                && name.starts_with('#') {
                     return false;
                 }
-            }
-        }
 
         // Check for private/protected accessibility modifier
         for i in 0..node.child_count() {
             let child = node.child(i).unwrap();
-            if child.kind() == "accessibility_modifier" {
-                if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                    if text == "private" || text == "protected" {
+            if child.kind() == "accessibility_modifier"
+                && let Ok(text) = child.utf8_text(source.as_bytes())
+                    && (text == "private" || text == "protected") {
                         return false;
                     }
-                }
-            }
         }
     }
 
@@ -60,18 +56,17 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
         }
         SymbolKind::Constant => {
             // For constants, get the lexical_declaration parent text (first line)
-            if let Some(parent) = node.parent() {
-                if parent.kind() == "lexical_declaration" {
+            if let Some(parent) = node.parent()
+                && parent.kind() == "lexical_declaration" {
                     return node_text(&parent, source)
                         .map(|t| t.lines().next().unwrap_or(t).to_string())
                         .unwrap_or_else(|| format!("const {}", name));
                 }
-            }
             node_text(node, source)
                 .map(|t| t.lines().next().unwrap_or(t).to_string())
                 .unwrap_or_else(|| format!("const {}", name))
         }
-        _ => format!("{}", name),
+        _ => name.to_string(),
     }
 }
 
@@ -199,12 +194,11 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
     if sym.kind == SymbolKind::Constant && node.kind() == "variable_declarator" {
         // Name is already captured by @name on the variable_declarator's name field.
         // Set signature from the parent lexical_declaration.
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "lexical_declaration" {
+        if let Some(parent) = node.parent()
+            && parent.kind() == "lexical_declaration" {
                 sym.signature = node_text(&parent, source)
                     .map(|t| t.lines().next().unwrap_or(t).to_string());
             }
-        }
     }
 
     if sym.kind == SymbolKind::Type && node.kind() == "type_alias_declaration" {

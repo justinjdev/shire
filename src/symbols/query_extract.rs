@@ -107,7 +107,7 @@ pub fn extract(
         // without re-running the query (avoids double-parse overhead).
         let all_matches: Vec<_> = {
             let mut buf = Vec::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+            let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
             while let Some(m) = matches.next() {
                 // Clone captures so we can store them independent of the cursor.
                 buf.push(m.captures.to_vec());
@@ -132,19 +132,17 @@ pub fn extract(
             let mut ref_node = None;
             for capture in captures.iter() {
                 let cname = capture_names[capture.index as usize];
-                if def_kind.is_none() {
-                    if let Some(k) = capture_name_to_kind(cname) {
+                if def_kind.is_none()
+                    && let Some(k) = capture_name_to_kind(cname) {
                         def_kind = Some(k);
                         def_node = Some(capture.node);
                         continue;
                     }
-                }
-                if ref_kind.is_none() {
-                    if let Some(k) = capture_name_to_ref_kind(cname) {
+                if ref_kind.is_none()
+                    && let Some(k) = capture_name_to_ref_kind(cname) {
                         ref_kind = Some(k);
                         ref_node = Some(capture.node);
                     }
-                }
             }
 
             // Definition path
@@ -159,11 +157,10 @@ pub fn extract(
                     def_name_ranges
                         .insert((nc.node.start_byte(), nc.node.end_byte()));
                 }
-                if let Some(is_visible) = hooks.is_visible {
-                    if !is_visible(&node, source) {
+                if let Some(is_visible) = hooks.is_visible
+                    && !is_visible(&node, source) {
                         continue;
                     }
-                }
                 let line = node.start_position().row + 1;
                 let parent = hooks.resolve_parent.and_then(|f| f(&node, source));
                 let signature = hooks

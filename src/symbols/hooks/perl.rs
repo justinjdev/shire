@@ -4,19 +4,17 @@ use tree_sitter::Node;
 /// Skip private subs (starting with _).
 fn is_visible(node: &Node, source: &str) -> bool {
     if node.kind() == "subroutine_declaration_statement" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            if let Some(name) = node_text(&name_node, source) {
+        if let Some(name_node) = node.child_by_field_name("name")
+            && let Some(name) = node_text(&name_node, source) {
                 return !name.starts_with('_');
             }
-        }
         // No field name — find first identifier child
         for i in 0..node.child_count() {
             let child = node.child(i).unwrap();
-            if child.kind() == "bareword" {
-                if let Some(name) = node_text(&child, source) {
+            if child.kind() == "bareword"
+                && let Some(name) = node_text(&child, source) {
                     return !name.starts_with('_');
                 }
-            }
         }
     }
     true
@@ -31,20 +29,18 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     }
 
     // First check if we're inside a package_statement ancestor
-    if let Some(pkg) = find_ancestor(node, "package_statement") {
-        if let Some(name_node) = find_package_name(&pkg) {
+    if let Some(pkg) = find_ancestor(node, "package_statement")
+        && let Some(name_node) = find_package_name(&pkg) {
             return node_text(&name_node, source).map(|s| s.to_string());
         }
-    }
 
     // Otherwise scan preceding siblings for a package_statement
     let mut sibling = node.prev_named_sibling();
     while let Some(sib) = sibling {
-        if sib.kind() == "package_statement" {
-            if let Some(name_node) = find_package_name(&sib) {
+        if sib.kind() == "package_statement"
+            && let Some(name_node) = find_package_name(&sib) {
                 return node_text(&name_node, source).map(|s| s.to_string());
             }
-        }
         sibling = sib.prev_named_sibling();
     }
     None
@@ -72,11 +68,10 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
 
 /// Post-process: reclassify subs inside a package as methods.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    if sym.kind == SymbolKind::Function {
-        if resolve_parent(node, source).is_some() {
+    if sym.kind == SymbolKind::Function
+        && resolve_parent(node, source).is_some() {
             sym.kind = SymbolKind::Method;
         }
-    }
     Some(sym)
 }
 

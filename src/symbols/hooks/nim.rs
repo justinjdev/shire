@@ -59,8 +59,8 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
         "type_symbol_declaration" => {
             // Look at sibling to determine what kind of type it is
             let parent = node.parent();
-            if let Some(parent) = parent {
-                if parent.kind() == "type_declaration" {
+            if let Some(parent) = parent
+                && parent.kind() == "type_declaration" {
                     if find_child_by_kind(&parent, "enum_declaration").is_some() {
                         return format!("type {} = enum", name);
                     }
@@ -68,7 +68,6 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
                         return format!("type {} = object", name);
                     }
                 }
-            }
             format!("type {}", name)
         }
         "variable_declaration" => {
@@ -125,8 +124,8 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
             if let Some(sdl) = find_child_by_kind(&child, "symbol_declaration_list") {
                 for j in 0..sdl.child_count() {
                     let sd = sdl.child(j).unwrap();
-                    if sd.kind() == "symbol_declaration" {
-                        if let Some(name_node) = sd.child_by_field_name("name") {
+                    if sd.kind() == "symbol_declaration"
+                        && let Some(name_node) = sd.child_by_field_name("name") {
                             let pname = match name_node.kind() {
                                 "exported_symbol" => {
                                     find_child_by_kind(&name_node, "identifier")
@@ -144,7 +143,6 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
                                 });
                             }
                         }
-                    }
                 }
             }
         }
@@ -167,8 +165,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
         }
         "type_symbol_declaration" => {
             // Check sibling nodes in the parent type_declaration to determine the actual kind
-            if let Some(parent) = node.parent() {
-                if parent.kind() == "type_declaration" {
+            if let Some(parent) = node.parent()
+                && parent.kind() == "type_declaration" {
                     if find_child_by_kind(&parent, "enum_declaration").is_some() {
                         sym.kind = SymbolKind::Enum;
                         return Some(sym);
@@ -178,7 +176,6 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
                         return Some(sym);
                     }
                 }
-            }
             sym.kind = SymbolKind::Type;
         }
         "variable_declaration" => {

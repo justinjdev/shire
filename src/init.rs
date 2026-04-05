@@ -676,11 +676,29 @@ fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
 /// Write .claude/rules/shire.md with Shire usage guidance. When
 /// `refs_enabled` is true, appends the cross-reference tool guidance so
 /// users who opt into the experimental index discover the new tools.
+///
+/// If the file already exists and refs were just enabled for the first
+/// time, upgrades the existing file in place by appending the refs section
+/// — otherwise an early opt-in would leave users without discovery docs
+/// for the new MCP tools.
 fn write_rules_file(rules_dir: &Path, display_path: &str, refs_enabled: bool) -> Result<()> {
     fs::create_dir_all(rules_dir)
         .with_context(|| format!("Failed to create directory {}", rules_dir.display()))?;
     let rules_path = rules_dir.join("shire.md");
     if rules_path.exists() {
+        // Upgrade path: file was created before the user opted into refs,
+        // so the refs guidance section is missing. Append it in place.
+        if refs_enabled {
+            let existing = fs::read_to_string(&rules_path)
+                .with_context(|| format!("Failed to read {}", rules_path.display()))?;
+            if !existing.contains("symbol_references") {
+                let sep = if existing.ends_with('\n') { "" } else { "\n" };
+                let updated = format!("{existing}{sep}{RULES_CONTENT_REFS}");
+                atomic_write(&rules_path, &updated)?;
+                print_created(&format!("Updated {display_path} with cross-reference guidance"));
+                return Ok(());
+            }
+        }
         print_skipped(&format!("{display_path} already exists"));
         return Ok(());
     }
@@ -689,8 +707,7 @@ fn write_rules_file(rules_dir: &Path, display_path: &str, refs_enabled: bool) ->
     } else {
         RULES_CONTENT.to_string()
     };
-    fs::write(&rules_path, content)
-        .with_context(|| format!("Failed to write {}", rules_path.display()))?;
+    atomic_write(&rules_path, &content)?;
     print_created(&format!("Created {display_path}"));
     Ok(())
 }
@@ -1140,6 +1157,48 @@ mod tests {
         assert!(!content.contains("symbol_callers"));
         assert!(!content.contains("symbol_callees"));
         assert!(!content.contains("reference_audit"));
+    }
+
+    #[test]
+    fn test_write_rules_file_upgrades_existing_when_refs_enabled() {
+        // Simulates: user ran `shire init` without refs, then re-runs it after
+        // enabling refs. The existing shire.md must get the refs guidance
+        // appended rather than being silently skipped.
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+
+        // First pass: refs off.
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+        let before = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(!before.contains("symbol_references"));
+
+        // Second pass: refs on — should upgrade the existing file.
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let after = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(after.contains("symbol_references"));
+        assert!(after.contains("symbol_callers"));
+        assert!(after.contains("reference_audit"));
+        // Original content preserved.
+        assert!(after.contains("search_symbols"));
+    }
+
+    #[test]
+    fn test_write_rules_file_idempotent_upgrade() {
+        // Upgrade must be idempotent: running twice with refs_enabled must
+        // not duplicate the refs section.
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let first = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let second = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert_eq!(first, second, "second upgrade should be a no-op");
+        assert_eq!(
+            second.matches("## Cross-reference index (experimental)").count(),
+            1,
+            "refs section must appear exactly once"
+        );
     }
 
     #[test]

@@ -558,6 +558,76 @@ public class Service {
     assert_eq!(methods[0].name, "publicMethod");
 }
 
+#[test]
+fn test_java_call_references() {
+    let source = r#"package com.example;
+
+import java.util.List;
+
+public class UserService {
+    private Database db;
+
+    public User fetchUser(String id) {
+        return db.lookup(id);
+    }
+
+    public void saveUser(User u) {
+        validate(u);
+        db.insert(u);
+    }
+
+    private void validate(User u) {}
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("UserService.java"));
+    let call_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(call_names.contains(&"lookup"), "got {:?}", call_names);
+    assert!(call_names.contains(&"validate"), "got {:?}", call_names);
+    assert!(call_names.contains(&"insert"), "got {:?}", call_names);
+
+    let lookup_ref = refs.iter().find(|r| r.name == "lookup" && r.kind == ReferenceKind::Call).unwrap();
+    assert_eq!(lookup_ref.enclosing_symbol.as_deref(), Some("fetchUser"));
+}
+
+#[test]
+fn test_java_impl_references() {
+    let source = r#"package com.example;
+
+public class ConcreteService extends BaseService implements Cacheable, Auditable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("CS.java"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"BaseService"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Cacheable"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Auditable"), "got {:?}", impl_names);
+}
+
+#[test]
+fn test_java_import_references() {
+    let source = r#"package com.example;
+
+import java.util.List;
+import java.util.Map;
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("X.java"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.iter().any(|n| n.contains("List")), "got {:?}", imp_names);
+    assert!(imp_names.iter().any(|n| n.contains("Map")), "got {:?}", imp_names);
+}
+
 // ============================================================
 // Kotlin tests (ported from kotlin.rs)
 // ============================================================

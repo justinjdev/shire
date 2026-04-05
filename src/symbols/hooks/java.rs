@@ -246,7 +246,18 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        enclosing_ancestors: &[
+            "method_declaration",
+            "constructor_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ],
+        reference_stoplist: &[
+            "true", "false", "null", "this", "super",
+            "String", "Integer", "Long", "Boolean", "Double", "Float", "Object",
+            "void", "int", "long", "boolean", "double", "float", "byte", "char", "short",
+            "System", "Math",
+        ],
     }
 }

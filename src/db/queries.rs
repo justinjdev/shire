@@ -813,6 +813,138 @@ pub fn delete_references_for_package(conn: &Connection, package: &str) -> Result
     Ok(())
 }
 
+// ── Cross-reference queries ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReferenceRow {
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub line: i64,
+    pub package: Option<String>,
+    pub enclosing_symbol: Option<String>,
+}
+
+pub fn query_symbol_references(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ReferenceRow>> {
+    let mut sql = String::from(
+        "SELECT name, kind, file_path, line, package, enclosing_symbol \
+         FROM symbol_refs WHERE name = ?1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
+    if let Some(k) = kind {
+        sql.push_str(" AND kind = ?");
+        sql.push_str(&(params.len() + 1).to_string());
+        params.push(Box::new(k.to_string()));
+    }
+    if let Some(p) = package {
+        sql.push_str(" AND package = ?");
+        sql.push_str(&(params.len() + 1).to_string());
+        params.push(Box::new(p.to_string()));
+    }
+    sql.push_str(" ORDER BY file_path, line LIMIT ?");
+    sql.push_str(&(params.len() + 1).to_string());
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(ReferenceRow {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            file_path: row.get(2)?,
+            line: row.get(3)?,
+            package: row.get(4)?,
+            enclosing_symbol: row.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CallerRow {
+    pub caller_name: String,
+    pub caller_file: String,
+    pub caller_line: i64,
+    pub call_sites: i64,
+}
+
+pub fn query_symbol_callers(
+    conn: &Connection,
+    name: &str,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CallerRow>> {
+    let mut sql = String::from(
+        "SELECT enclosing_symbol, file_path, MIN(line), COUNT(*) \
+         FROM symbol_refs \
+         WHERE name = ?1 AND kind = 'call' AND enclosing_symbol IS NOT NULL",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
+    if let Some(p) = package {
+        sql.push_str(" AND package = ?");
+        sql.push_str(&(params.len() + 1).to_string());
+        params.push(Box::new(p.to_string()));
+    }
+    sql.push_str(" GROUP BY enclosing_symbol, file_path ORDER BY 4 DESC, 1 ASC LIMIT ?");
+    sql.push_str(&(params.len() + 1).to_string());
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(CallerRow {
+            caller_name: row.get(0)?,
+            caller_file: row.get(1)?,
+            caller_line: row.get(2)?,
+            call_sites: row.get(3)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CalleeRow {
+    pub callee_name: String,
+    pub call_sites: i64,
+}
+
+pub fn query_symbol_callees(
+    conn: &Connection,
+    enclosing: &str,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CalleeRow>> {
+    let mut sql = String::from(
+        "SELECT name, COUNT(*) FROM symbol_refs \
+         WHERE enclosing_symbol = ?1 AND kind = 'call'",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
+    if let Some(p) = package {
+        sql.push_str(" AND package = ?");
+        sql.push_str(&(params.len() + 1).to_string());
+        params.push(Box::new(p.to_string()));
+    }
+    sql.push_str(" GROUP BY name ORDER BY 2 DESC, 1 ASC LIMIT ?");
+    sql.push_str(&(params.len() + 1).to_string());
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(CalleeRow {
+            callee_name: row.get(0)?,
+            call_sites: row.get(1)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,5 +1726,78 @@ mod refs_tests {
             .query_row("SELECT package FROM symbol_refs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining_pkg, "pkg2");
+    }
+
+    #[test]
+    fn test_query_symbol_references_filters() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("r.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
+             VALUES ('foo', 'call', 'a.rs', 10, 'pkg1', 'bar'), \
+                    ('foo', 'type', 'a.rs', 20, 'pkg1', 'bar'), \
+                    ('foo', 'call', 'b.rs', 5, 'pkg2', 'quux'), \
+                    ('other', 'call', 'a.rs', 30, 'pkg1', NULL)",
+            [],
+        ).unwrap();
+
+        let all = query_symbol_references(&conn, "foo", None, None, 100).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let calls = query_symbol_references(&conn, "foo", Some("call"), None, 100).unwrap();
+        assert_eq!(calls.len(), 2);
+
+        let p1 = query_symbol_references(&conn, "foo", None, Some("pkg1"), 100).unwrap();
+        assert_eq!(p1.len(), 2);
+
+        let p1_calls = query_symbol_references(&conn, "foo", Some("call"), Some("pkg1"), 100).unwrap();
+        assert_eq!(p1_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_query_symbol_callers_groups_and_counts() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("c.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
+             VALUES ('foo', 'call', 'a.rs', 10, 'p', 'bar'), \
+                    ('foo', 'call', 'a.rs', 11, 'p', 'bar'), \
+                    ('foo', 'call', 'b.rs', 5, 'p', 'quux'), \
+                    ('foo', 'type', 'a.rs', 20, 'p', 'bar'), \
+                    ('foo', 'call', 'c.rs', 1, 'p', NULL)",
+            [],
+        ).unwrap();
+
+        let callers = query_symbol_callers(&conn, "foo", None, 100).unwrap();
+        assert_eq!(callers.len(), 2);
+        let bar = callers.iter().find(|c| c.caller_name == "bar").unwrap();
+        assert_eq!(bar.call_sites, 2);
+        assert_eq!(bar.caller_file, "a.rs");
+        assert_eq!(bar.caller_line, 10);
+    }
+
+    #[test]
+    fn test_query_symbol_callees_groups() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cee.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
+             VALUES ('foo', 'call', 'a.rs', 1, 'p', 'handler'), \
+                    ('bar', 'call', 'a.rs', 2, 'p', 'handler'), \
+                    ('foo', 'call', 'a.rs', 3, 'p', 'handler'), \
+                    ('baz', 'call', 'a.rs', 4, 'p', 'other')",
+            [],
+        ).unwrap();
+
+        let callees = query_symbol_callees(&conn, "handler", None, 100).unwrap();
+        assert_eq!(callees.len(), 2);
+        let foo = callees.iter().find(|c| c.callee_name == "foo").unwrap();
+        assert_eq!(foo.call_sites, 2);
     }
 }

@@ -75,6 +75,13 @@ Same loop as Phase 1, but:
 - Target modules: `db/`, `mcp/`
 - Compare aggregate query median instead of build median
 
+The query phase now covers both symbol/file/package FTS queries and the
+cross-reference queries (`query_symbol_references`, `query_symbol_callers`,
+`query_symbol_callees`). Reference queries hit `symbol_refs` via B-tree
+indexes on `name`/`enclosing_symbol`, so optimization ideas in this area
+include adding composite indexes, tuning the covering columns, and reducing
+row materialization.
+
 ## Module Targets
 
 Each experiment targets ONE module:
@@ -106,6 +113,9 @@ Work through these categories systematically, highest impact first:
 3. **Connection** — reuse, mutex contention, pooling
 4. **Results** — reduce allocations, lazy fields
 5. **Caching** — LRU for frequent queries, statement warmup
+6. **Reference queries** — composite indexes on `symbol_refs(name, kind)` or
+   `symbol_refs(enclosing_symbol, kind)`, covering indexes that let callers/
+   callees GROUP BY without a table scan
 
 ## Off-Limits
 

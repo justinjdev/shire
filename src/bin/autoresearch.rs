@@ -142,6 +142,9 @@ fn run_build_benchmark(repos: &[PathBuf]) {
         let symbol_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap_or(0);
+        let reference_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap_or(0);
         let file_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap_or(0);
@@ -164,6 +167,7 @@ fn run_build_benchmark(repos: &[PathBuf]) {
             "stddev_ms": round1(stats.stddev),
             "package_count": package_count,
             "symbol_count": symbol_count,
+            "reference_count": reference_count,
             "file_count": file_count,
             "db_size_bytes": db_size_bytes,
         }));
@@ -234,6 +238,7 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
         let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
         let package_count: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0)).unwrap_or(0);
         let symbol_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let reference_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0)).unwrap_or(0);
         let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
         drop(conn);
 
@@ -252,6 +257,7 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
             "stddev_ms": round1(stats.stddev),
             "package_count": package_count,
             "symbol_count": symbol_count,
+            "reference_count": reference_count,
             "file_count": file_count,
             "db_size_bytes": db_size_bytes,
         }));
@@ -327,6 +333,34 @@ fn run_query_benchmark(repos: &[PathBuf]) {
                 name: "list_packages(None)",
                 run: Box::new(|c| {
                     let _ = shire::db::queries::list_packages(c, None);
+                }),
+            },
+            QueryBench {
+                name: "query_symbol_references(\"Config\")",
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_references(
+                        c, "Config", None, None, 50,
+                    );
+                }),
+            },
+            QueryBench {
+                name: "query_symbol_references(\"Config\", kind=type)",
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_references(
+                        c, "Config", Some("type"), None, 50,
+                    );
+                }),
+            },
+            QueryBench {
+                name: "query_symbol_callers(\"New\")",
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_callers(c, "New", None, 50);
+                }),
+            },
+            QueryBench {
+                name: "query_symbol_callees(\"main\")",
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_callees(c, "main", None, 50);
                 }),
             },
         ];
@@ -517,6 +551,9 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
             let _ = shire::db::queries::search_files(&conn, "test", None, None);
             let _ = shire::db::queries::search_packages(&conn, "api", 20);
+            let _ =
+                shire::db::queries::query_symbol_references(&conn, "Config", None, None, 50);
+            let _ = shire::db::queries::query_symbol_callers(&conn, "New", None, 50);
             let query_ms = start.elapsed().as_secs_f64() * 1000.0;
             query_times.push(query_ms);
             drop(conn);
@@ -690,6 +727,64 @@ fn run_quality_checks(repos: &[PathBuf]) {
             "no orphan symbols",
             orphan_syms == 0,
             format!("{} orphans", orphan_syms),
+        ));
+
+        // 4b. Cross-reference index is populated
+        let ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap_or(0);
+        checks.push((
+            "references exist",
+            ref_count > 0,
+            format!("{} refs", ref_count),
+        ));
+
+        // 4c. Non-null ref packages all resolve to packages table
+        let orphan_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs r WHERE r.package IS NOT NULL AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = r.package)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        checks.push((
+            "no orphan references",
+            orphan_refs == 0,
+            format!("{} orphans", orphan_refs),
+        ));
+
+        // 4d. No self-reference at a definition's own line — covers type/impl
+        // self-ref bugs we recently hit for TS non-exported interfaces. The
+        // JOIN key is (name, file_path, line, kind) and we exclude Call kind
+        // because a method named `foo` calling itself at its own line is
+        // structurally possible (e.g. recursive one-liners).
+        let self_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs r \
+                 JOIN symbols s ON s.name = r.name AND s.file_path = r.file_path AND s.line = r.line \
+                 WHERE r.kind IN ('type', 'impl')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        checks.push((
+            "no self-references at definition",
+            self_refs == 0,
+            format!("{} self-refs", self_refs),
+        ));
+
+        // 4e. Reference queries return results for a common name
+        let config_refs = shire::db::queries::query_symbol_references(
+            &conn, "Config", None, None, 10,
+        )
+        .map(|r| r.len())
+        .unwrap_or(0);
+        checks.push((
+            "reference query returns results",
+            // Allow zero for repos that happen to have no "Config" symbol
+            // but flag if the overall index has refs and we still get zero
+            config_refs > 0 || ref_count == 0,
+            format!("{} refs for 'Config'", config_refs),
         ));
 
         // 5. FTS integrity (needs read-write connection)

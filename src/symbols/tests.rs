@@ -67,6 +67,74 @@ fn test_python_function_no_hints() {
     assert!(symbols[0].return_type.is_none());
 }
 
+// Python reference tests
+
+#[test]
+fn test_python_call_references() {
+    let source = r#"import json
+
+def load(path: str) -> dict:
+    raw = open(path).read()
+    return json.loads(raw)
+
+def save(path: str, data: dict):
+    with open(path, 'w') as f:
+        f.write(json.dumps(data))
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("io.py"));
+    let call_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Call).collect();
+    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"loads"), "got {:?}", names);
+    assert!(names.contains(&"dumps"));
+    assert!(names.contains(&"read"));
+
+    // open() is in the stoplist (builtin), should not appear
+    assert!(!names.contains(&"open"), "open() is builtin, should be in stoplist");
+
+    let loads_ref = call_refs.iter().find(|r| r.name == "loads").unwrap();
+    assert_eq!(loads_ref.enclosing_symbol.as_deref(), Some("load"));
+}
+
+#[test]
+fn test_python_import_references() {
+    let source = r#"import json
+from typing import List, Dict
+from os.path import join
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("imports.py"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"json"), "got {:?}", names);
+    assert!(names.contains(&"List"));
+    assert!(names.contains(&"Dict"));
+    assert!(names.contains(&"join"));
+}
+
+#[test]
+fn test_python_impl_references() {
+    let source = r#"class Base:
+    pass
+
+class Derived(Base):
+    pass
+
+class Multi(Base, Mixin):
+    pass
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("cls.py"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"Base"), "got {:?}", names);
+    assert!(names.contains(&"Mixin"));
+}
+
 // ============================================================
 // Go tests (ported from go.rs)
 // ============================================================

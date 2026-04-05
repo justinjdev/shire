@@ -55,3 +55,33 @@
   "default"
   (class_declaration
     name: (type_identifier) @name) @definition.class)
+
+; Reference: calls
+(call_expression
+  function: (identifier) @name) @reference.call
+
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)) @reference.call
+
+; Reference: type usages
+(type_identifier) @name @reference.type
+
+; Reference: imports (named imports)
+(import_statement
+  (import_clause
+    (named_imports
+      (import_specifier
+        name: (identifier) @name @reference.import))))
+
+; Reference: superclass (extends on class)
+(class_declaration
+  (class_heritage
+    (extends_clause
+      value: (identifier) @name @reference.impl)))
+
+; Reference: implemented interfaces
+(class_declaration
+  (class_heritage
+    (implements_clause
+      (type_identifier) @name @reference.impl)))

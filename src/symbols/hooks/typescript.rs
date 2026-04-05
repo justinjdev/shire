@@ -207,7 +207,20 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        enclosing_ancestors: &[
+            "function_declaration",
+            "method_definition",
+            "class_declaration",
+            "interface_declaration",
+            "function_expression",
+            "method_signature",
+        ],
+        reference_stoplist: &[
+            "true", "false", "null", "undefined", "this", "super",
+            "console", "window", "document",
+            "string", "number", "boolean", "any", "unknown", "never", "void",
+            "String", "Number", "Boolean", "Object", "Array",
+            "Promise", "Error",
+        ],
     }
 }

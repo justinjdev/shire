@@ -483,6 +483,85 @@ fn test_js_function() {
     assert_eq!(symbols[0].name, "greet");
 }
 
+#[test]
+fn test_typescript_call_references() {
+    let source = r#"import { parseConfig } from './config';
+
+export function handle(req: Request): Response {
+    const cfg = parseConfig(req.body);
+    return buildResponse(cfg);
+}
+
+function buildResponse(cfg: Config): Response {
+    return new Response();
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("handler.ts"));
+    let call_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(call_names.contains(&"parseConfig"), "got {:?}", call_names);
+    assert!(call_names.contains(&"buildResponse"));
+}
+
+#[test]
+fn test_typescript_type_references() {
+    let source = r#"interface Config {
+    key: string;
+}
+
+function handle(req: Request): Response {
+    return new Response();
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("h.ts"));
+    let type_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(type_names.contains(&"Request"), "got {:?}", type_names);
+    assert!(type_names.contains(&"Response"));
+}
+
+#[test]
+fn test_typescript_impl_references() {
+    let source = r#"interface Service {}
+interface Auditable {}
+class Base {}
+
+class MyService extends Base implements Service, Auditable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("svc.ts"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Service"));
+    assert!(impl_names.contains(&"Auditable"));
+}
+
+#[test]
+fn test_typescript_import_references() {
+    let source = r#"import { parseConfig, Config } from './config';
+import { handler } from './handler';
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("i.ts"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.contains(&"parseConfig"), "got {:?}", imp_names);
+    assert!(imp_names.contains(&"Config"));
+    assert!(imp_names.contains(&"handler"));
+}
+
 // ============================================================
 // Java tests (ported from java.rs)
 // ============================================================

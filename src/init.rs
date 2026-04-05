@@ -1117,6 +1117,32 @@ mod tests {
     }
 
     #[test]
+    fn test_write_rules_file_includes_refs_guidance_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+
+        let content = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(content.contains("symbol_references"));
+        assert!(content.contains("symbol_callers"));
+        assert!(content.contains("symbol_callees"));
+        assert!(content.contains("reference_audit"));
+    }
+
+    #[test]
+    fn test_write_rules_file_omits_refs_guidance_when_disabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+
+        let content = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(!content.contains("symbol_references"));
+        assert!(!content.contains("symbol_callers"));
+        assert!(!content.contains("symbol_callees"));
+        assert!(!content.contains("reference_audit"));
+    }
+
+    #[test]
     fn test_init_rules_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
         run_init(dir.path(), false, true).unwrap();

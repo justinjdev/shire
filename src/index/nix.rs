@@ -1,6 +1,5 @@
 use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
-use regex::Regex;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -15,12 +14,12 @@ impl ManifestParser for FlakeNixParser {
         let content = std::fs::read_to_string(manifest_path)?;
         let dependencies = parse_flake_nix(&content);
 
-        let name = if relative_dir.is_empty() {
+        let path = relative_dir.to_string();
+        let name = if path.is_empty() {
             ".".to_string()
         } else {
-            relative_dir.to_string()
+            path.clone()
         };
-        let path = name.clone();
 
         Ok(PackageInfo {
             name,
@@ -49,36 +48,16 @@ fn parse_flake_nix(content: &str) -> Vec<DepInfo> {
     let mut order: Vec<(String, Option<String>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    // Step 1: Find every `inputs = { ... }` block and parse its body.
-    for (open, close) in find_inputs_blocks(&text) {
-        let body = &text[open + 1..close];
-        parse_inputs_body(body, &mut order, &mut seen);
-    }
+    // A flake.nix is an attrset `{ ... }` at the top of the file. Only
+    // assignments at depth 0 of that outer attrset are real flake attributes;
+    // any `inputs = { ... }` or `inputs.X` occurrences inside an individual
+    // input's override body are transitive-input overrides, not new direct
+    // inputs. Scan only the outer body to avoid false edges.
+    let Some(outer_body) = outer_attrset_body(&text) else {
+        return Vec::new();
+    };
 
-    // Step 2: Find every `inputs.NAME...` pattern not already captured.
-    //
-    // Matches two shapes anchored at `inputs.NAME`:
-    //   - `inputs.NAME.url = "VALUE"`                → record (NAME, VALUE)
-    //   - `inputs.NAME = { ... url = "VALUE"; ... }` → record (NAME, VALUE)
-    //   - `inputs.NAME.<anything_else>`              → ensure NAME registered
-    let dotted_re =
-        Regex::new(r#"(?m)\binputs\.([A-Za-z_][A-Za-z0-9_'-]*)"#).unwrap();
-    for caps in dotted_re.captures_iter(&text) {
-        let name = caps[1].to_string();
-        let after = caps.get(0).unwrap().end();
-        let url = extract_url_for_dotted(&text, after);
-        if seen.insert(name.clone()) {
-            order.push((name, url));
-        } else if url.is_some() {
-            // Later occurrences may carry the URL for an input first seen in
-            // a nested `.follows` override with no URL.
-            if let Some(entry) = order.iter_mut().find(|(n, _)| n == &name) {
-                if entry.1.is_none() {
-                    entry.1 = url;
-                }
-            }
-        }
-    }
+    scan_top_level_inputs(outer_body, &mut order, &mut seen);
 
     order
         .into_iter()
@@ -90,14 +69,131 @@ fn parse_flake_nix(content: &str) -> Vec<DepInfo> {
         .collect()
 }
 
+/// Return the slice inside the outermost `{ ... }` of the flake file, or None
+/// if the file has no top-level attrset.
+fn outer_attrset_body(text: &str) -> Option<&str> {
+    let open = text.find('{')?;
+    let close = find_matching_brace(text, open)?;
+    Some(&text[open + 1..close])
+}
+
+/// Walk a flake's outer attrset body at depth 0, dispatching `inputs = { ... }`
+/// and `inputs.NAME ...` occurrences. Nested `{ ... }`, `[ ... ]`, `( ... )`,
+/// and string literals are skipped by depth tracking, so overrides inside
+/// individual input attrsets are ignored.
+fn scan_top_level_inputs(
+    body: &str,
+    order: &mut Vec<(String, Option<String>)>,
+    seen: &mut HashSet<String>,
+) {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            b'{' | b'[' | b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b'}' | b']' | b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if depth != 0 {
+            i += 1;
+            continue;
+        }
+
+        // At depth 0 of the outer flake body: look for the word `inputs`
+        // followed (after whitespace) by either `=` or `.`.
+        if c == b'i'
+            && body[i..].starts_with("inputs")
+            && is_word_boundary_before(body, i)
+            && is_word_boundary_at(body, i + 6)
+        {
+            let mut j = i + 6;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                // `inputs = ...`
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'{'
+                    && let Some(close) = find_matching_brace(body, k) {
+                        parse_inputs_body(&body[k + 1..close], order, seen);
+                        i = close + 1;
+                        continue;
+                    }
+                i = j;
+                continue;
+            } else if j < bytes.len() && bytes[j] == b'.' {
+                // `inputs.NAME...`
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let name_start = k;
+                while k < bytes.len() && is_ident_byte(bytes[k]) {
+                    k += 1;
+                }
+                if k > name_start {
+                    let name = body[name_start..k].to_string();
+                    let url = extract_url_for_dotted(body, k);
+                    if seen.insert(name.clone()) {
+                        order.push((name, url));
+                    } else if url.is_some()
+                        && let Some(entry) = order.iter_mut().find(|(n, _)| n == &name)
+                            && entry.1.is_none() {
+                                entry.1 = url;
+                            }
+                    // Advance just past NAME; depth tracking will walk over
+                    // any `= { ... }` attrset or `.key = value` tail.
+                    i = k;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+}
+
 /// Extract URL for a top-level `inputs.NAME...` occurrence, where `pos` is the
 /// byte offset immediately after `inputs.NAME`.
 fn extract_url_for_dotted(text: &str, pos: usize) -> Option<String> {
     let rest = text.get(pos..)?;
     let rest = rest.trim_start();
-    if rest.starts_with('.') {
+    if let Some(after_dot) = rest.strip_prefix('.') {
         // inputs.NAME.<key> = ...
-        let after_dot = rest[1..].trim_start();
+        let after_dot = after_dot.trim_start();
         // Read identifier
         let key_end = after_dot
             .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '\''))
@@ -106,13 +202,13 @@ fn extract_url_for_dotted(text: &str, pos: usize) -> Option<String> {
         if key == "url" {
             let after_key = after_dot[key_end..].trim_start();
             if let Some(eq_rest) = after_key.strip_prefix('=') {
-                return extract_quoted_string(eq_rest.trim_start());
+                return extract_url_value(eq_rest.trim_start());
             }
         }
         None
-    } else if rest.starts_with('=') {
+    } else if let Some(after_eq) = rest.strip_prefix('=') {
         // inputs.NAME = { ... }
-        let after_eq = rest[1..].trim_start();
+        let after_eq = after_eq.trim_start();
         if after_eq.starts_with('{') {
             // Find position of '{' in original text
             let brace_offset = pos + (text[pos..].len() - rest.len()) + (rest.len() - after_eq.len());
@@ -174,11 +270,10 @@ fn find_url_in_attrset(body: &str) -> Option<String> {
                     let after_url = i + 3;
                     if after_url <= body.len() && is_word_boundary_at(body, after_url) {
                         let rest = body[after_url..].trim_start();
-                        if let Some(after_eq) = rest.strip_prefix('=') {
-                            if let Some(val) = extract_quoted_string(after_eq.trim_start()) {
+                        if let Some(after_eq) = rest.strip_prefix('=')
+                            && let Some(val) = extract_url_value(after_eq.trim_start()) {
                                 return Some(val);
                             }
-                        }
                     }
                 }
                 i += 1;
@@ -249,7 +344,7 @@ fn parse_inputs_body(
                     i += 1;
                 }
                 if key == "url" {
-                    url = extract_quoted_string(&body[i..]);
+                    url = extract_url_value(&body[i..]);
                 }
             }
             // Skip to next `;` at depth 0.
@@ -281,27 +376,12 @@ fn parse_inputs_body(
             order.push((name, url));
         } else if url.is_some() {
             // If we already saw this input but didn't have a URL, update it.
-            if let Some(entry) = order.iter_mut().find(|(n, _)| n == &name) {
-                if entry.1.is_none() {
+            if let Some(entry) = order.iter_mut().find(|(n, _)| n == &name)
+                && entry.1.is_none() {
                     entry.1 = url;
                 }
-            }
         }
     }
-}
-
-/// Find all `inputs = { ... }` blocks in text. Returns (open_brace_pos, close_brace_pos) pairs.
-fn find_inputs_blocks(text: &str) -> Vec<(usize, usize)> {
-    let re = Regex::new(r#"(?m)(^|[^A-Za-z0-9_'])inputs\s*=\s*\{"#).unwrap();
-    let mut out = Vec::new();
-    for mat in re.find_iter(text) {
-        // The brace is the last char of the match.
-        let brace_pos = mat.end() - 1;
-        if let Some(close) = find_matching_brace(text, brace_pos) {
-            out.push((brace_pos, close));
-        }
-    }
-    out
 }
 
 /// Find the matching `}` for a `{` at `open`. Returns the byte index of the `}`.
@@ -378,6 +458,74 @@ fn skip_to_statement_end(s: &str, start: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Extract a URL value, accepting either a double-quoted string literal or an
+/// unquoted Nix URI literal (e.g. `github:NixOS/nixpkgs/nixos-unstable`).
+/// Nix supports both forms for flake input URLs.
+fn extract_url_value(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    if s.as_bytes().first() == Some(&b'"') {
+        extract_quoted_string(s)
+    } else {
+        extract_uri_literal(s)
+    }
+}
+
+/// Parse an unquoted Nix URI literal per the Nix lexer grammar:
+/// `[A-Za-z][A-Za-z0-9+\-.]*:[A-Za-z0-9%/?:@&=+$,\-_.!~*']+`
+fn extract_uri_literal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    // Scheme: one or more of [A-Za-z0-9+-.] after the first letter.
+    let mut i = 1;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphanumeric() || c == b'+' || c == b'-' || c == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1; // consume ':'
+    let body_start = i;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let ok = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'%' | b'/'
+                    | b'?'
+                    | b':'
+                    | b'@'
+                    | b'&'
+                    | b'='
+                    | b'+'
+                    | b'$'
+                    | b','
+                    | b'-'
+                    | b'_'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+            );
+        if ok {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == body_start {
+        return None;
+    }
+    Some(s[..i].to_string())
 }
 
 /// Extract a double-quoted string starting at `s[0..]`, returning the unquoted value.
@@ -724,6 +872,171 @@ mod tests {
             info.dependencies[0].version_req.as_deref(),
             Some("path:./vendor")
         );
+    }
+
+    #[test]
+    fn test_nested_inputs_overrides_not_treated_as_direct_deps() {
+        // Nested transitive-input overrides must not be registered as direct
+        // flake inputs. Here `inputs.bar.follows` lives inside rust-overlay
+        // and should not produce a top-level `bar` edge.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.bar.follows = "nixpkgs";
+  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "proj").unwrap();
+
+        let names: Vec<&str> = info.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            info.dependencies.len(),
+            2,
+            "expected only top-level inputs, got {names:?}"
+        );
+        assert!(names.contains(&"rust-overlay"));
+        assert!(names.contains(&"nixpkgs"));
+        assert!(
+            !names.contains(&"bar"),
+            "nested inputs.bar.follows override was incorrectly registered as a direct dep"
+        );
+    }
+
+    #[test]
+    fn test_nested_inputs_block_not_treated_as_direct_deps() {
+        // Nested `inputs = { ... }` attrsets (inside another input) must not
+        // leak their entries as top-level flake inputs.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  inputs.foo = {
+    url = "github:x/foo";
+    inputs = {
+      bar.follows = "nixpkgs";
+    };
+  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "proj").unwrap();
+
+        let names: Vec<&str> = info.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"bar"), "got {names:?}");
+    }
+
+    #[test]
+    fn test_root_flake_uses_empty_path() {
+        // A root flake.nix (relative_dir == "") must be keyed by "" to match
+        // how the rest of the indexer keys repo-root packages. `name` may be
+        // "." for display, but `path` must mirror relative_dir or file
+        // association, delete, and stale-hash cleanup flows will silently skip
+        // the root package.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "").unwrap();
+
+        assert_eq!(info.path, "");
+        assert_eq!(info.name, ".");
+    }
+
+    #[test]
+    fn test_parse_unquoted_uri_literal_dotted() {
+        // Nix allows unquoted URI literals for flake URLs.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  inputs.nixpkgs.url = github:NixOS/nixpkgs/nixos-unstable;
+  inputs.flake-utils.url = github:numtide/flake-utils;
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "proj").unwrap();
+
+        assert_eq!(info.dependencies.len(), 2);
+        let nixpkgs = info.dependencies.iter().find(|d| d.name == "nixpkgs").unwrap();
+        assert_eq!(
+            nixpkgs.version_req.as_deref(),
+            Some("github:NixOS/nixpkgs/nixos-unstable")
+        );
+        let utils = info.dependencies.iter().find(|d| d.name == "flake-utils").unwrap();
+        assert_eq!(utils.version_req.as_deref(), Some("github:numtide/flake-utils"));
+    }
+
+    #[test]
+    fn test_parse_unquoted_uri_literal_block() {
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  inputs = {
+    nixpkgs.url = github:NixOS/nixpkgs/nixos-unstable;
+    rust-overlay = {
+      url = github:oxalica/rust-overlay;
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "proj").unwrap();
+
+        assert_eq!(info.dependencies.len(), 2);
+        let nixpkgs = info.dependencies.iter().find(|d| d.name == "nixpkgs").unwrap();
+        assert_eq!(
+            nixpkgs.version_req.as_deref(),
+            Some("github:NixOS/nixpkgs/nixos-unstable")
+        );
+        let rust = info.dependencies.iter().find(|d| d.name == "rust-overlay").unwrap();
+        assert_eq!(rust.version_req.as_deref(), Some("github:oxalica/rust-overlay"));
+    }
+
+    #[test]
+    fn test_extract_uri_literal_accepts_common_schemes() {
+        assert_eq!(
+            extract_uri_literal("github:NixOS/nixpkgs"),
+            Some("github:NixOS/nixpkgs".to_string())
+        );
+        assert_eq!(
+            extract_uri_literal("https://example.com/foo.tar.gz"),
+            Some("https://example.com/foo.tar.gz".to_string())
+        );
+        assert_eq!(
+            extract_uri_literal("path:./vendor"),
+            Some("path:./vendor".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_uri_literal_rejects_non_uri() {
+        // Plain identifiers or numbers are not URIs.
+        assert_eq!(extract_uri_literal("nixpkgs"), None);
+        assert_eq!(extract_uri_literal("1github:foo"), None);
+        // A colon with no body is not a URI.
+        assert_eq!(extract_uri_literal("github:"), None);
     }
 
     #[test]

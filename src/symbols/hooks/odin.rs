@@ -179,7 +179,7 @@ mod tests {
         let hooks = hooks();
         let mut parser = Parser::new();
         parser.set_language(&lang).unwrap();
-        query_extract::extract(&mut parser, &query, source, Arc::from(file_path), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from(file_path), &hooks).0
     }
 
     #[test]

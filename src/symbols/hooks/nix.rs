@@ -211,7 +211,7 @@ mod tests {
         let query_source = include_str!("../queries/nix.scm");
         let query = Query::new(&language, query_source).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nix"), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.nix"), &hooks).0
     }
 
     #[test]

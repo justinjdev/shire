@@ -114,9 +114,18 @@ impl ReferenceKind {
     }
 }
 
-/// Extract symbols from a single file by extension.
-pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
+/// Extract both symbols and references from a single file by extension.
+pub fn extract_file_full(
+    ext: &str,
+    source: &str,
+    file_path: Arc<str>,
+) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     registry::extract_file(ext, source, file_path)
+}
+
+/// Extract only symbols (backward-compatible convenience wrapper).
+pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
+    registry::extract_file(ext, source, file_path).0
 }
 
 #[cfg(test)]

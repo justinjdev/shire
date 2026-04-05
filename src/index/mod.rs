@@ -7,6 +7,7 @@ pub mod gradle_settings;
 pub mod hash;
 pub mod manifest;
 pub mod maven;
+pub mod nix;
 pub mod npm;
 pub mod perl;
 pub mod python;
@@ -2171,6 +2172,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         Box::new(gradle::GradleKtsParser),
         Box::new(perl::CpanfileParser),
         Box::new(ruby::RubyParser),
+        Box::new(nix::FlakeNixParser),
     ];
 
     // Phase 1: Walk manifests

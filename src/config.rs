@@ -249,6 +249,7 @@ fn default_manifests() -> Vec<String> {
         "settings.gradle.kts".into(),
         "cpanfile".into(),
         "Gemfile".into(),
+        "flake.nix".into(),
     ]
 }
 
@@ -403,7 +404,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.discovery.manifests.len(), 12);
+        assert_eq!(config.discovery.manifests.len(), 13);
         assert!(config.discovery.exclude.contains(&"node_modules".to_string()));
         assert!(config.discovery.exclude.contains(&".gradle".to_string()));
         assert!(config.discovery.exclude.contains(&"build".to_string()));
@@ -660,7 +661,7 @@ exclude_extensions = [".proto", ".pl"]
     fn test_load_missing_config_returns_default() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = load_config(dir.path()).unwrap();
-        assert_eq!(config.discovery.manifests.len(), 12);
+        assert_eq!(config.discovery.manifests.len(), 13);
     }
 
     #[test]

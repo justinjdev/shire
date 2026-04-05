@@ -235,6 +235,46 @@ fn create_schema(conn: &Connection) -> Result<()> {
             INSERT INTO docs_fts(rowid, title, body, path)
             VALUES (new.rowid, new.title, new.body, new.path);
         END;
+
+        CREATE TABLE IF NOT EXISTS symbol_refs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            file_path        TEXT NOT NULL,
+            line             INTEGER NOT NULL,
+            package          TEXT,
+            enclosing_symbol TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+        CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_refs(file_path);
+        CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
+        CREATE INDEX IF NOT EXISTS idx_refs_package ON symbol_refs(package);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS symbol_refs_fts USING fts5(
+            name, kind, enclosing_symbol,
+            content='symbol_refs',
+            content_rowid='rowid',
+            tokenize=\"unicode61 tokenchars '_'\",
+            prefix='2,3'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS symbol_refs_ai AFTER INSERT ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(rowid, name, kind, enclosing_symbol)
+            VALUES (new.rowid, new.name, new.kind, new.enclosing_symbol);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS symbol_refs_ad AFTER DELETE ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(symbol_refs_fts, rowid, name, kind, enclosing_symbol)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.enclosing_symbol);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS symbol_refs_au AFTER UPDATE ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(symbol_refs_fts, rowid, name, kind, enclosing_symbol)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.enclosing_symbol);
+            INSERT INTO symbol_refs_fts(rowid, name, kind, enclosing_symbol)
+            VALUES (new.rowid, new.name, new.kind, new.enclosing_symbol);
+        END;
         ",
     )?;
     Ok(())
@@ -298,7 +338,36 @@ pub fn recreate_docs_fts_triggers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const FTS_SCHEMA_VERSION: &str = "3";
+pub fn drop_symbol_refs_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS symbol_refs_ai;
+         DROP TRIGGER IF EXISTS symbol_refs_ad;
+         DROP TRIGGER IF EXISTS symbol_refs_au;",
+    )?;
+    Ok(())
+}
+
+pub fn recreate_symbol_refs_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS symbol_refs_ai AFTER INSERT ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(rowid, name, kind, enclosing_symbol)
+            VALUES (new.rowid, new.name, new.kind, new.enclosing_symbol);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbol_refs_ad AFTER DELETE ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(symbol_refs_fts, rowid, name, kind, enclosing_symbol)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.enclosing_symbol);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbol_refs_au AFTER UPDATE ON symbol_refs BEGIN
+            INSERT INTO symbol_refs_fts(symbol_refs_fts, rowid, name, kind, enclosing_symbol)
+            VALUES ('delete', old.rowid, old.name, old.kind, old.enclosing_symbol);
+            INSERT INTO symbol_refs_fts(rowid, name, kind, enclosing_symbol)
+            VALUES (new.rowid, new.name, new.kind, new.enclosing_symbol);
+        END;",
+    )?;
+    Ok(())
+}
+
+const FTS_SCHEMA_VERSION: &str = "4";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     let current: Option<String> = conn
@@ -335,7 +404,11 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS packages_fts;
          DROP TABLE IF EXISTS files_fts;
          DROP TABLE IF EXISTS symbols_fts;
-         DROP TABLE IF EXISTS docs_fts;",
+         DROP TABLE IF EXISTS docs_fts;
+         DROP TRIGGER IF EXISTS symbol_refs_ai;
+         DROP TRIGGER IF EXISTS symbol_refs_ad;
+         DROP TRIGGER IF EXISTS symbol_refs_au;
+         DROP TABLE IF EXISTS symbol_refs_fts;",
     )?;
 
     create_schema(conn)?;
@@ -344,7 +417,8 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
         "INSERT INTO packages_fts(packages_fts) VALUES('rebuild');
          INSERT INTO files_fts(files_fts) VALUES('rebuild');
          INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');
-         INSERT INTO docs_fts(docs_fts) VALUES('rebuild');",
+         INSERT INTO docs_fts(docs_fts) VALUES('rebuild');
+         INSERT INTO symbol_refs_fts(symbol_refs_fts) VALUES('rebuild');",
     )?;
 
     conn.execute(
@@ -534,5 +608,63 @@ mod tests {
             &dir.path().join("dest.db"),
         );
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_symbol_refs_schema_created() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbol_refs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "symbol_refs table must exist");
+
+        let fts_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbol_refs_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 1, "symbol_refs_fts virtual table must exist");
+    }
+
+    #[test]
+    fn test_symbol_refs_insert_and_fts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
+             VALUES ('parseConfig', 'call', 'src/main.rs', 42, NULL, 'handle_request')",
+            [],
+        ).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let fts_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs_fts WHERE name MATCH 'parseConfig'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hit, 1, "FTS index should contain the inserted row");
     }
 }

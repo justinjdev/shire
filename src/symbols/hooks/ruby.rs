@@ -190,7 +190,17 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: None,
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        enclosing_ancestors: &[
+            "method",
+            "singleton_method",
+            "class",
+            "module",
+        ],
+        reference_stoplist: &[
+            "true", "false", "nil", "self",
+            "puts", "print", "p", "pp",
+            "String", "Integer", "Float", "Array", "Hash", "Symbol", "Nil",
+            "Object", "Class", "Module",
+        ],
     }
 }

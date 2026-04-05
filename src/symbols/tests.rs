@@ -2298,6 +2298,71 @@ fn test_ruby_empty_source() {
 }
 
 #[test]
+fn test_ruby_call_references() {
+    let source = r#"require 'json'
+
+class Loader
+  def load(path)
+    raw = File.read(path)
+    JSON.parse(raw)
+  end
+
+  def save(path, data)
+    File.write(path, JSON.dump(data))
+  end
+end
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("loader.rb"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"read"), "got {:?}", names);
+    assert!(names.contains(&"parse"));
+    assert!(names.contains(&"write"));
+    assert!(names.contains(&"dump"));
+
+    let parse_ref = refs.iter().find(|r| r.name == "parse" && r.kind == ReferenceKind::Call).unwrap();
+    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("load"));
+}
+
+#[test]
+fn test_ruby_impl_references() {
+    let source = r#"class Derived < Base
+  include Comparable
+  include Enumerable
+  extend ModuleMethods
+end
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("d.rb"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "expected superclass Base, got {:?}", impl_names);
+    assert!(impl_names.contains(&"Comparable"));
+    assert!(impl_names.contains(&"Enumerable"));
+    assert!(impl_names.contains(&"ModuleMethods"));
+}
+
+#[test]
+fn test_ruby_require_references() {
+    let source = r#"require 'json'
+require_relative './util'
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("m.rb"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.iter().any(|n| n.contains("json")), "got {:?}", imp_names);
+    assert!(imp_names.iter().any(|n| n.contains("util")));
+}
+
+#[test]
 fn test_type_definition_not_double_captured_as_ref() {
     // The type declaration "type Config struct" should NOT produce a self-reference
     // via @reference.type — only the uses in parameters/fields should.

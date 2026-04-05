@@ -247,7 +247,6 @@ fn create_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
-        CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_refs(file_path);
         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
         ",
     )?;
@@ -318,6 +317,9 @@ pub fn recreate_docs_fts_triggers(conn: &Connection) -> Result<()> {
 /// substantially faster for large batches.
 pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
+        // idx_refs_file was removed in schema v6: its per-row maintenance
+        // cost during INSERT exceeded the savings it gave the per-file
+        // DELETE path. Keep the DROP so legacy DBs shed it on next bulk load.
         "DROP INDEX IF EXISTS idx_refs_name;
          DROP INDEX IF EXISTS idx_refs_file;
          DROP INDEX IF EXISTS idx_refs_enclosing;",
@@ -328,13 +330,12 @@ pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
 pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
-         CREATE INDEX IF NOT EXISTS idx_refs_file ON symbol_refs(file_path);
          CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);",
     )?;
     Ok(())
 }
 
-const FTS_SCHEMA_VERSION: &str = "5";
+const FTS_SCHEMA_VERSION: &str = "6";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     let current: Option<String> = conn
@@ -376,7 +377,8 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS symbol_refs_ad;
          DROP TRIGGER IF EXISTS symbol_refs_au;
          DROP TABLE IF EXISTS symbol_refs_fts;
-         DROP INDEX IF EXISTS idx_refs_package;",
+         DROP INDEX IF EXISTS idx_refs_package;
+         DROP INDEX IF EXISTS idx_refs_file;",
     )?;
 
     create_schema(conn)?;

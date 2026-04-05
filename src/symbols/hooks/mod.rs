@@ -11,6 +11,7 @@ pub mod go;
 pub mod haskell;
 pub mod hcl;
 pub mod java;
+pub mod javascript;
 pub mod julia;
 pub mod kotlin;
 pub mod lua;

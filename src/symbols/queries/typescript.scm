@@ -64,6 +64,21 @@
   function: (member_expression
     property: (property_identifier) @name)) @reference.call
 
+; Suppression-only: match the name nodes of non-export-wrapped type-like
+; declarations so they seed def_name_ranges (suppressing a Type self-ref at
+; the declaration site). The main export-wrapped patterns above already match
+; exported variants; these duplicates are deduped by seen_def_ranges and
+; non-exported variants are filtered to None in post_process. Without these,
+; `interface Foo {}` (non-exported) leaks `Foo` as a Type ref on its own line
+; because `(type_identifier) @reference.type` below matches the interface's
+; name node.
+(class_declaration
+  name: (type_identifier) @name) @definition.class
+(interface_declaration
+  name: (type_identifier) @name) @definition.interface
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
 ; Reference: type usages
 (type_identifier) @name @reference.type
 

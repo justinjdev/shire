@@ -35,6 +35,7 @@ pub struct IndexStatus {
     pub git_commit: Option<String>,
     pub package_count: Option<String>,
     pub symbol_count: Option<String>,
+    pub reference_count: Option<String>,
     pub file_count: Option<String>,
     pub doc_count: Option<String>,
     pub total_duration_ms: Option<String>,
@@ -645,6 +646,7 @@ pub fn index_status(conn: &Connection) -> Result<IndexStatus> {
         git_commit: get_meta("git_commit")?,
         package_count: get_meta("package_count")?,
         symbol_count: get_meta("symbol_count")?,
+        reference_count: get_meta("reference_count")?,
         file_count: get_meta("file_count")?,
         doc_count: get_meta("doc_count")?,
         total_duration_ms: get_meta("total_duration_ms")?,
@@ -905,21 +907,18 @@ pub fn query_symbol_references(
 ) -> Result<Vec<ReferenceRow>> {
     let mut sql = String::from(
         "SELECT name, kind, file_path, line, package, enclosing_symbol \
-         FROM symbol_refs WHERE name = ?1",
+         FROM symbol_refs WHERE name = ?",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(k) = kind {
         sql.push_str(" AND kind = ?");
-        sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(k.to_string()));
     }
     if let Some(p) = package {
         sql.push_str(" AND package = ?");
-        sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(p.to_string()));
     }
     sql.push_str(" ORDER BY file_path, line LIMIT ?");
-    sql.push_str(&(params.len() + 1).to_string());
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -955,16 +954,14 @@ pub fn query_symbol_callers(
     let mut sql = String::from(
         "SELECT enclosing_symbol, file_path, MIN(line), package, COUNT(*) \
          FROM symbol_refs \
-         WHERE name = ?1 AND kind = 'call' AND enclosing_symbol IS NOT NULL",
+         WHERE name = ? AND kind = 'call' AND enclosing_symbol IS NOT NULL",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(p) = package {
         sql.push_str(" AND package = ?");
-        sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(p.to_string()));
     }
     sql.push_str(" GROUP BY enclosing_symbol, file_path, package ORDER BY 5 DESC, 1 ASC LIMIT ?");
-    sql.push_str(&(params.len() + 1).to_string());
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -997,16 +994,14 @@ pub fn query_symbol_callees(
 ) -> Result<Vec<CalleeRow>> {
     let mut sql = String::from(
         "SELECT name, file_path, MIN(line), COUNT(*) FROM symbol_refs \
-         WHERE enclosing_symbol = ?1 AND kind = 'call'",
+         WHERE enclosing_symbol = ? AND kind = 'call'",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
     if let Some(p) = package {
         sql.push_str(" AND package = ?");
-        sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(p.to_string()));
     }
     sql.push_str(" GROUP BY name, file_path ORDER BY 4 DESC, 1 ASC LIMIT ?");
-    sql.push_str(&(params.len() + 1).to_string());
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;

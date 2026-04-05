@@ -2488,3 +2488,94 @@ class MyService extends Base with Service
         base_kinds
     );
 }
+
+#[test]
+fn test_no_self_reference_at_definition_site_across_languages() {
+    // Cross-language invariant: for every tier-1 language with reference
+    // extraction, a definition's own name node at its declaration site must
+    // never be emitted as a reference record. Uses elsewhere in the file are
+    // expected — only the definition line should be ref-free for that name.
+    //
+    // This guards against per-language regressions where a new @reference.*
+    // capture accidentally matches the definition's name node.
+    struct Case {
+        ext: &'static str,
+        source: &'static str,
+        def_name: &'static str,
+        def_line: usize,
+    }
+
+    let cases = [
+        // Go: type_identifier at the declaration AND at use sites.
+        Case {
+            ext: "go",
+            source: "package main\ntype Config struct { Key string }\nfunc use(c Config) Config { return c }\n",
+            def_name: "Config",
+            def_line: 2,
+        },
+        // Python: identifier at class_definition name AND in type annotations.
+        Case {
+            ext: "py",
+            source: "class Config:\n    pass\n\ndef use(c: Config) -> Config:\n    return c\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Java: identifier at class_declaration name, type_identifier at use sites.
+        Case {
+            ext: "java",
+            source: "public class Config {}\nclass Svc { public Config use(Config c) { return c; } }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // TypeScript: type_identifier at interface_declaration name AND at
+        // use sites. Non-exported to exercise the suppression-only patterns
+        // that seed def_name_ranges for unexported type-like declarations.
+        Case {
+            ext: "ts",
+            source: "interface Config { key: string }\nfunction use(c: Config): Config { return c }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // JavaScript: identifier at class_declaration name, referenced via extends (impl).
+        Case {
+            ext: "js",
+            source: "export class Config {}\nexport class Sub extends Config {}\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Perl: package declaration name, referenced via `use` later.
+        Case {
+            ext: "pl",
+            source: "package Config;\n\npackage Main;\nuse Config;\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Ruby: constant at class name AND as a type-ref constant in body.
+        Case {
+            ext: "rb",
+            source: "class Config\nend\n\nclass Svc\n  def use\n    Config.new\n  end\nend\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Scala: type_identifier at class name AND at use sites.
+        Case {
+            ext: "scala",
+            source: "class Config\nclass Svc { def use(c: Config): Config = c }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+    ];
+
+    for case in cases {
+        let (_, refs) = extract_file_full(case.ext, case.source, Arc::from("f"));
+        for r in &refs {
+            if r.name == case.def_name {
+                assert_ne!(
+                    r.line, case.def_line,
+                    "[{}] '{}' defined at line {} should not produce a self-reference, got ref {:?}",
+                    case.ext, case.def_name, case.def_line, r
+                );
+            }
+        }
+    }
+}

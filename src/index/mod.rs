@@ -273,24 +273,30 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
+    let orphaned_refs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbol_refs WHERE package IS NOT NULL AND package NOT IN (SELECT name FROM packages)",
+        [],
+        |row| row.get(0),
+    )?;
     let orphaned_deps: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
         [],
         |row| row.get(0),
     )?;
 
-    if orphaned_syms > 0 || orphaned_deps > 0 {
+    if orphaned_syms > 0 || orphaned_refs > 0 || orphaned_deps > 0 {
         tracing::warn!(
             orphaned_symbols = orphaned_syms,
+            orphaned_references = orphaned_refs,
             orphaned_dependencies = orphaned_deps,
-            "cleaning up orphaned symbol(s) and dependency(ies)"
+            "cleaning up orphaned symbol(s), reference(s), and dependency(ies)"
         );
         conn.execute(
             "DELETE FROM symbols WHERE package NOT IN (SELECT name FROM packages)",
             [],
         )?;
         conn.execute(
-            "DELETE FROM symbol_refs WHERE package NOT IN (SELECT name FROM packages)",
+            "DELETE FROM symbol_refs WHERE package IS NOT NULL AND package NOT IN (SELECT name FROM packages)",
             [],
         )?;
         conn.execute(
@@ -365,8 +371,8 @@ fn upsert_symbols_and_refs_for_file(
     batch_insert_symbols(conn, package, syms)?;
 
     conn.execute(
-        "DELETE FROM symbol_refs WHERE file_path = ?1",
-        rusqlite::params![file_path],
+        "DELETE FROM symbol_refs WHERE package = ?1 AND file_path = ?2",
+        rusqlite::params![package, file_path],
     )?;
     crate::db::queries::batch_insert_references(conn, Some(package), refs)?;
     Ok(())
@@ -733,6 +739,7 @@ struct BuildSummary {
     num_docs: usize,
     total_packages: i64,
     total_symbols: i64,
+    total_references: i64,
     failures: Vec<(String, String)>,
 }
 
@@ -1799,6 +1806,10 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
         [summary.total_symbols.to_string()],
     )?;
     conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('reference_count', ?1)",
+        [summary.total_references.to_string()],
+    )?;
+    conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_count', ?1)",
         [summary.num_files.to_string()],
     )?;
@@ -1827,22 +1838,25 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
 
     if is_full_build || force {
         println!(
-            "Indexed {} packages, {} symbols, {} files, {} docs into {}",
-            summary.total_packages, summary.total_symbols, summary.num_files, summary.num_docs,
+            "Indexed {} packages, {} symbols, {} refs, {} files, {} docs into {}",
+            summary.total_packages, summary.total_symbols, summary.total_references,
+            summary.num_files, summary.num_docs,
             db_path.display()
         );
     } else if summary.num_source_reextracted > 0 {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} files, {} docs into {}",
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} refs, {} files, {} docs into {}",
             summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols, summary.num_files, summary.num_docs,
+            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols,
+            summary.total_references, summary.num_files, summary.num_docs,
             db_path.display()
         );
     } else {
         println!(
-            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} files, {} docs into {}",
+            "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} refs, {} files, {} docs into {}",
             summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.total_symbols, summary.num_files, summary.num_docs,
+            summary.num_skipped, summary.total_symbols, summary.total_references,
+            summary.num_files, summary.num_docs,
             db_path.display()
         );
     }
@@ -2422,6 +2436,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     let total_packages: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))?;
     let total_symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+    let total_references: i64 = conn.query_row("SELECT COUNT(*) FROM symbol_refs", [], |row| row.get(0))?;
 
     let summary = BuildSummary {
         num_added,
@@ -2433,6 +2448,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         num_docs,
         total_packages,
         total_symbols,
+        total_references,
         failures,
     };
 

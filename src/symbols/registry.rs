@@ -67,7 +67,7 @@ fn registry() -> &'static [LanguageEntry] {
                 extensions: &["js", "jsx"],
                 ts_language: || tree_sitter_javascript::LANGUAGE.into(),
                 query_source: include_str!("queries/javascript.scm"),
-                hooks: super::hooks::typescript::hooks,
+                hooks: super::hooks::javascript::hooks,
                 compiled_query: OnceLock::new(),
             },
             LanguageEntry {

@@ -384,29 +384,26 @@ fn upsert_symbols_and_refs_for_file(
     // Insert new symbols (triggers handle FTS)
     batch_insert_symbols(conn, package, syms)?;
 
-    // Resolve file_id once for this file; all refs in this call share the path.
-    let file_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            [file_path],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(file_id) = file_id else {
-        tracing::warn!(
-            path = file_path,
-            "file not in files table — skipping symbol_refs upsert"
-        );
-        return Ok(());
-    };
-
-    conn.execute(
-        "DELETE FROM symbol_refs WHERE file_id = ?1",
-        rusqlite::params![file_id],
-    )?;
+    // Resolve file_id; if the path is not yet in `files`, we leave the
+    // lookup map empty and let `batch_insert_references` synthesize a
+    // row (same safety-net path the bulk insert uses). The two walkers
+    // can disagree on hidden/symlinked paths — before this unification,
+    // the incremental path would early-return with a warn and leave the
+    // file without refs, while the bulk path would succeed, so an
+    // off→on transition could commit `references_enabled=true` with
+    // gaps for walker-missed files.
     let mut file_ids = std::collections::HashMap::new();
-    file_ids.insert(file_path.to_string(), file_id);
+    if let Ok(file_id) = conn.query_row(
+        "SELECT id FROM files WHERE path = ?1",
+        [file_path],
+        |row| row.get::<_, i64>(0),
+    ) {
+        conn.execute(
+            "DELETE FROM symbol_refs WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        file_ids.insert(file_path.to_string(), file_id);
+    }
     crate::db::queries::batch_insert_references(conn, Some(package), refs, &mut file_ids)?;
     Ok(())
 }
@@ -1247,6 +1244,7 @@ fn phase_source_incremental(
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
     references_enabled: bool,
+    force_source_reextract: bool,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
@@ -1277,13 +1275,16 @@ fn phase_source_incremental(
         .par_iter()
         .filter_map(|(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
             let result = (|| -> Option<SourceCheckResult> {
-                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely
-                if let Some(ts_str) = hashed_at {
-                    if let Some(since) = parse_hashed_at(ts_str) {
-                        if !hash::has_newer_source_files(repo_root, pkg_path, since) {
-                            return None; // No files changed — skip entirely
-                        }
-                    }
+                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely.
+                // `force_source_reextract` bypasses this fast-path — used during a
+                // references_enabled false→true transition, where refs must populate
+                // even for packages whose source files haven't been touched.
+                if !force_source_reextract
+                    && let Some(ts_str) = hashed_at
+                    && let Some(since) = parse_hashed_at(ts_str)
+                    && !hash::has_newer_source_files(repo_root, pkg_path, since)
+                {
+                    return None; // No files changed — skip entirely
                 }
 
                 // Mtime says check needed — walk files and do per-file comparison
@@ -1317,8 +1318,12 @@ fn phase_source_incremental(
                             .to_string();
 
                         let stored = stored_file_hashes.get(&relative_path);
-                        if stored == Some(&content_hash) {
-                            // File unchanged — include in results for aggregate hash but no symbols
+                        if stored == Some(&content_hash) && !force_source_reextract {
+                            // File unchanged — include in results for aggregate hash but no symbols.
+                            // `force_source_reextract` skips this fast-path so refs
+                            // populate for every file during a refs-enabled transition,
+                            // while leaving `stored_file_hashes` intact so the caller
+                            // can still compute `deleted_files` against it below.
                             Some(FileResult {
                                 file_path: relative_path,
                                 content_hash,
@@ -1958,6 +1963,31 @@ fn git_index_changed_since_build(repo_root: &Path, conn: &Connection) -> bool {
     }
 }
 
+/// True when `references_enabled` flipped off→on since the last build.
+///
+/// `prior` is the value read from `shire_meta.references_enabled`:
+/// - `Some(true)`: last build already populated `symbol_refs`, nothing to do.
+/// - `Some(false)` or `None`: we cannot assume `symbol_refs` is in sync with
+///   the current source tree; treat as a transition if refs are now enabled.
+///
+/// Kept as a pure predicate so the transition logic inside
+/// `build_index_inner` is exercised by `cargo test --lib` without having
+/// to stand up a full build context.
+fn is_refs_transition_enable(current: bool, prior: Option<bool>) -> bool {
+    current && prior != Some(true)
+}
+
+/// True when a refs transition should force re-hashing. A full build
+/// (`is_full_build`) or `--force` run already re-extracts everything, so
+/// the hash wipe is redundant in those cases.
+fn refs_transition_requires_rehash(
+    refs_just_enabled: bool,
+    is_full_build: bool,
+    force: bool,
+) -> bool {
+    refs_just_enabled && !is_full_build && !force
+}
+
 /// Check if the DB has been populated (has manifest hashes).
 fn is_fresh_db(conn: &Connection) -> bool {
     let count: i64 = conn
@@ -2110,6 +2140,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM file_hashes", [])?;
             conn.execute("DELETE FROM docs", [])?;
             conn.execute("DELETE FROM shire_meta WHERE key = 'file_tree_hash'", [])?;
+            // symbol_refs is now empty; mark refs as not-trustworthy
+            // atomically with the wipe. If the build fails before
+            // phase_extract_symbols re-populates refs, MCP tools will
+            // correctly refuse to serve instead of returning silent [].
+            crate::db::write_references_enabled(&conn, false)?;
             Ok(())
         })?;
     }
@@ -2330,6 +2365,27 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
     let pb_sym_clone = pb_sym.clone();
     let refs_enabled = config.symbols.references_enabled;
+    // Detect a false→true transition. In the unchanged case, the per-file
+    // hash matches the stored hash, so `phase_source_incremental`'s
+    // fast-paths skip extraction and leave `symbol_refs` empty for every
+    // unchanged file — the user sees a partial ref index with no
+    // indication it's stale. We repair by passing `force_source_reextract`
+    // into `phase_source_incremental`, which bypasses the mtime and
+    // per-file-hash fast-paths while PRESERVING `file_hashes` — the
+    // stored hashes are still needed to compute `deleted_files` (files
+    // removed since the last build). Wiping the hashes here would break
+    // deleted-file cleanup.
+    let prior_refs_enabled = crate::db::read_references_enabled(&conn);
+    let refs_just_enabled = is_refs_transition_enable(refs_enabled, prior_refs_enabled);
+    let force_source_reextract =
+        refs_transition_requires_rehash(refs_just_enabled, is_full_build, force);
+    if force_source_reextract {
+        tracing::warn!(
+            prior = ?prior_refs_enabled,
+            "references_enabled transitioned to true — forcing source re-extraction \
+             so symbol_refs is populated for every source file"
+        );
+    }
     let num_source_reextracted = with_transaction(&conn, || {
         // Wipe symbol_refs if the user has turned the experimental refs
         // feature off — this keeps the DB from carrying stale refs while
@@ -2339,15 +2395,27 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, refs_enabled)?;
-        if git_index_changed {
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)
+        let count = if git_index_changed || refs_just_enabled {
+            // The refs_just_enabled branch is load-bearing: flipping the
+            // flag in shire.toml does not touch .git/index, so without
+            // this override phase_source_incremental would skip unchanged
+            // packages and leave symbol_refs empty for every file the
+            // user hasn't edited since the last build.
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled, force_source_reextract)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {
                 pb.inc(diff.unchanged.len() as u64);
             }
-            Ok(0)
-        }
+            0
+        };
+        // Commit the refs-trustworthy flag atomically with the extraction
+        // results. If a later phase (docs, rag, meta) fails, the flag's
+        // committed state still matches the committed state of
+        // symbol_refs — so MCP tools cannot return silent [] from a
+        // partially-repopulated table.
+        crate::db::write_references_enabled(&conn, refs_enabled)?;
+        Ok(count)
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");
@@ -2546,6 +2614,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
             [&now],
         )?;
+        // NOTE: `references_enabled` is written inside the
+        // phase_extract_symbols transaction (see build_index_inner), so
+        // the flag commits atomically with the symbol_refs mutation. Not
+        // written here to avoid a later-phase failure desynchronizing
+        // the flag from the committed state of symbol_refs.
         Ok(())
     })?;
 
@@ -2608,6 +2681,112 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn test_is_refs_transition_enable_off_to_on() {
+        // None/false→true is the load-bearing transition: symbol_refs
+        // cannot be trusted without a re-extraction pass.
+        assert!(is_refs_transition_enable(true, None));
+        assert!(is_refs_transition_enable(true, Some(false)));
+    }
+
+    #[test]
+    fn test_is_refs_transition_enable_no_change() {
+        // Already-on or never-enabled: no transition.
+        assert!(!is_refs_transition_enable(true, Some(true)));
+        assert!(!is_refs_transition_enable(false, Some(false)));
+        assert!(!is_refs_transition_enable(false, None));
+    }
+
+    #[test]
+    fn test_is_refs_transition_enable_on_to_off() {
+        // On→off is handled separately (wipe symbol_refs) — not a refs
+        // transition this predicate cares about.
+        assert!(!is_refs_transition_enable(false, Some(true)));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_default_path() {
+        // Incremental build with a genuine transition: must re-hash.
+        assert!(refs_transition_requires_rehash(true, false, false));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_full_build() {
+        // A full build already re-extracts everything; wiping hashes on
+        // top is redundant work.
+        assert!(!refs_transition_requires_rehash(true, true, false));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_forced() {
+        // --force paths already walk every file; same rationale.
+        assert!(!refs_transition_requires_rehash(true, false, true));
+    }
+
+    #[test]
+    fn test_refs_transition_requires_rehash_skips_when_no_transition() {
+        // No transition → nothing to repair.
+        assert!(!refs_transition_requires_rehash(false, false, false));
+        assert!(!refs_transition_requires_rehash(false, true, false));
+        assert!(!refs_transition_requires_rehash(false, false, true));
+    }
+
+    /// Regression test: `upsert_symbols_and_refs_for_file` must not
+    /// early-return when the file_path is missing from the `files`
+    /// table. It should synthesize the row the same way the bulk path
+    /// (`batch_insert_references`) does, otherwise a walker-missed file
+    /// commits with no refs while `references_enabled=true` is also
+    /// committed — the exact silent-[] gap the MCP guard exists to
+    /// prevent.
+    #[test]
+    fn test_upsert_symbols_and_refs_synthesizes_files_row_when_missing() {
+        use crate::symbols::{ReferenceInfo, ReferenceKind};
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = db::open_or_create(&path, false).unwrap();
+
+        // Seed a package row (NOT a files row for the path we're about
+        // to process). This simulates the walker-mismatch scenario.
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('svc', 'svc', 'go')",
+            [],
+        )
+        .unwrap();
+
+        let walker_missed_path = ".hidden/config.go";
+        let refs = vec![ReferenceInfo {
+            name: "Foo".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from(walker_missed_path),
+            line: 10,
+            enclosing_symbol: Some("Bar".into()),
+        }];
+
+        upsert_symbols_and_refs_for_file(&conn, "svc", walker_missed_path, &[], &refs).unwrap();
+
+        // The ref should be present (walker gap did not cause it to
+        // disappear), and the files row should have been synthesized.
+        let ref_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Foo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ref_count, 1, "ref must be inserted even when file_id is missing");
+
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                [walker_missed_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_count, 1, "files row must be synthesized by the bulk path");
+    }
 
     fn create_test_monorepo(dir: &Path) {
         // npm package

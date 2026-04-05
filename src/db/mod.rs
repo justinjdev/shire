@@ -249,6 +249,12 @@ fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
         CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
+        -- (package, name) composite: supports both per-package deletes
+        -- (delete_references_for_package) and name-scoped lookups filtered
+        -- by package (query_symbol_references/callers/callees). Without
+        -- this, those operations full-scan symbol_refs — at monorepo scale
+        -- that is multiple seconds per call.
+        CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);
         ",
     )?;
     Ok(())
@@ -327,7 +333,8 @@ pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
         "DROP INDEX IF EXISTS idx_refs_name;
          DROP INDEX IF EXISTS idx_refs_file;
          DROP INDEX IF EXISTS idx_refs_file_id;
-         DROP INDEX IF EXISTS idx_refs_enclosing;",
+         DROP INDEX IF EXISTS idx_refs_enclosing;
+         DROP INDEX IF EXISTS idx_refs_package_name;",
     )?;
     Ok(())
 }
@@ -336,7 +343,41 @@ pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
          CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
-         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);",
+         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
+         CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);",
+    )?;
+    Ok(())
+}
+
+/// Read the last-persisted `references_enabled` flag from `shire_meta`.
+/// Returns `None` when the key is absent (either a fresh DB or an index
+/// built before this key was introduced). Callers treat `None` as "refs
+/// are not available" so MCP tools can refuse to serve stale empty
+/// `symbol_refs`.
+pub fn read_references_enabled(conn: &Connection) -> Option<bool> {
+    let v: String = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    match v.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Persist the `references_enabled` flag to `shire_meta`. Called at the
+/// end of every build so subsequent opens (including the MCP server) can
+/// tell whether `symbol_refs` is populated and in sync with the current
+/// source tree.
+pub fn write_references_enabled(conn: &Connection, enabled: bool) -> Result<()> {
+    let v = if enabled { "true" } else { "false" };
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('references_enabled', ?1)",
+        [v],
     )?;
     Ok(())
 }
@@ -658,5 +699,45 @@ mod schema_tests {
             )
             .unwrap();
         assert_eq!(hit, 1);
+    }
+
+    #[test]
+    fn test_idx_refs_package_name_exists() {
+        // Package-scoped ref queries (query_symbol_references/callers/callees
+        // with a package filter, delete_references_for_package) must not
+        // full-scan symbol_refs. The (package, name) composite index was
+        // missing for a stretch — verify it's created for fresh DBs.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_refs_package_name'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "idx_refs_package_name must exist");
+    }
+
+    #[test]
+    fn test_references_enabled_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        assert_eq!(
+            read_references_enabled(&conn),
+            None,
+            "fresh DB has no persisted flag"
+        );
+
+        write_references_enabled(&conn, true).unwrap();
+        assert_eq!(read_references_enabled(&conn), Some(true));
+
+        write_references_enabled(&conn, false).unwrap();
+        assert_eq!(read_references_enabled(&conn), Some(false));
     }
 }

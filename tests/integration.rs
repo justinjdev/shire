@@ -2530,3 +2530,401 @@ type Config struct{}
         "expected type-ref to Config, got {config_type_refs}"
     );
 }
+
+/// Exercises the three states the `references_enabled` flag can be in:
+///  1. Disabled (default): symbol_refs stays empty, flag persisted as false.
+///  2. Transition off→on without --force: unchanged files would normally
+///     hash-match and skip extraction, leaving refs empty. The build must
+///     detect the transition and invalidate file_hashes so refs get
+///     populated for every source file.
+///  3. Transition on→off: symbol_refs wiped, flag persisted as false.
+///
+/// This is the load-bearing safety guarantee behind the 3 MCP ref tools —
+/// without it, an LLM calling `symbol_callers` on a partially-populated
+/// index gets a false-negative answer and ships a broken refactor.
+#[test]
+fn test_references_enabled_flag_transitions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // State 1: default (references_enabled omitted = false)
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "disabled-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0, "symbol_refs must be empty when flag is off");
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "false", "flag must be persisted as 'false'");
+    }
+
+    // State 2: flip false→true. Don't touch source files. The build must
+    // detect the transition and invalidate file_hashes so `a.go` gets
+    // re-extracted (otherwise the hash matches and no refs are written).
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "enabled-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let call_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            call_refs, 1,
+            "false→true transition must force refs to populate for unchanged files"
+        );
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "true");
+    }
+
+    // State 3: flip true→false. symbol_refs must be wiped.
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "disable-refs build failed");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0, "symbol_refs must be wiped when flag flips to false");
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "false");
+    }
+}
+
+/// Regression test for CodeRabbit finding on PR #96: when the user flips
+/// `references_enabled` in `shire.toml` without touching source or git
+/// state, `.git/index` mtime is unchanged, so `git_index_changed == false`
+/// and the fast-path in `phase_extract_symbols` would skip
+/// `phase_source_incremental` — leaving `symbol_refs` empty for every
+/// unchanged package despite the `file_hashes` wipe.
+///
+/// This test seeds a `.git/index` file with an old mtime, persists a
+/// `last_build_at` that's *newer* than that mtime (so
+/// `git_index_changed_since_build` returns false), flips the refs flag,
+/// and asserts refs get populated anyway.
+#[test]
+fn test_refs_toggle_forces_extraction_when_git_index_unchanged() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    // Create a .git/index file. Its mtime will become the baseline that
+    // `git_index_changed_since_build` compares against. We set it to an
+    // old time so subsequent `last_build_at` timestamps will be newer.
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/index"), "dummy").unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // First build: refs disabled. Populates the DB, sets last_build_at.
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "first build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Don't touch .git/index. The default `last_build_at` written by the
+    // first build is already newer than the .git/index mtime (both were
+    // created seconds ago, and last_build_at is set at the end of the
+    // build after .git/index was created). To make the test deterministic
+    // anyway, force `last_build_at` forward by 1 hour so
+    // `git_index_changed_since_build` is guaranteed to return false.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE shire_meta SET value = ?1 WHERE key = 'last_build_at'",
+            [&future],
+        )
+        .unwrap();
+    }
+
+    // Second build: flip to enabled. The only delta is shire.toml.
+    // .git/index is untouched, so the `git_index_changed` fast-path is
+    // off — the fix under test must still force re-extraction via the
+    // `refs_just_enabled` branch.
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "enable-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let call_refs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        call_refs, 1,
+        "refs must populate for unchanged packages even when .git/index \
+         is unchanged — otherwise flipping the flag leaves a silent \
+         partial index that breaks refactor-safety queries"
+    );
+}
+
+/// The `references_enabled` flag in shire_meta is the MCP safety gate —
+/// it MUST match the committed state of symbol_refs at every DB-commit
+/// boundary. If symbol_refs is empty (wiped by --force, wiped by the
+/// disabled path) but the flag still reads `true`, MCP tools will return
+/// silent `[]` for refactor-safety queries.
+///
+/// This test exercises the `--force` path specifically, which wipes
+/// symbol_refs in its own transaction at the start of the build — long
+/// before the extraction transaction runs. The fix writes `false` in
+/// the wipe transaction and `true` again in the extraction transaction.
+#[test]
+fn test_force_rebuild_keeps_refs_flag_consistent_with_refs_table() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // Initial build populates symbol_refs and sets flag=true.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Force rebuild: wipes symbol_refs in an early transaction, then
+    // re-populates in the extraction transaction. Both writes must
+    // happen atomically with the matching flag write.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--force", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let refs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+        .unwrap();
+    let flag: String = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(refs > 0, "symbol_refs must be re-populated after --force");
+    assert_eq!(
+        flag, "true",
+        "flag must match the populated state of symbol_refs"
+    );
+
+    // The invariant we care about: flag==true ⇒ symbol_refs is the
+    // ground truth (was populated by a committed extraction). A failed
+    // build would leave the atomic wipe committed (flag=false, refs
+    // empty) — a consistent state MCP can reason about.
+}
+
+/// Regression test for CodeRabbit finding on PR #96: during a refs
+/// off→on transition, deleted-file cleanup in `phase_source_incremental`
+/// depends on the stored `file_hashes` map — it diffs current files
+/// against those hashes to compute `deleted_files`. Wiping
+/// `file_hashes` to force re-extraction would make that diff empty,
+/// leaving stale symbols for files that were removed while refs were
+/// off.
+///
+/// This test: deletes `old.go` while refs are off, flips refs on,
+/// rebuilds, and asserts the deleted file's symbols are gone AND the
+/// surviving file's refs populate.
+#[test]
+fn test_refs_transition_cleans_up_files_deleted_while_refs_off() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc Alive() { Callee() }\nfunc Callee() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("svc/old.go"),
+        "package svc\n\nfunc Doomed() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // Build 1: refs disabled. Both Doomed and Alive get indexed into
+    // symbols (no refs extraction), file_hashes captures both files.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let doomed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE name = 'Doomed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(doomed > 0, "Doomed should be indexed after first build");
+    }
+
+    // Delete old.go while refs are still off.
+    fs::remove_file(root.join("svc/old.go")).unwrap();
+
+    // Build 2: flip refs on. The transition triggers
+    // force_source_reextract, which must still let the deleted-file
+    // diff compute correctly against file_hashes.
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let doomed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'Doomed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        doomed, 0,
+        "Doomed must be removed — old.go was deleted before this build"
+    );
+
+    // Alive should still be indexed and its call-ref to Callee should
+    // now be populated (proves the refs transition actually took effect).
+    let alive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE name = 'Alive'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(alive, 1, "Alive should survive the rebuild");
+    let call_refs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Callee' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        call_refs, 1,
+        "call-ref to Callee must populate — the point of the refs transition"
+    );
+}

@@ -183,6 +183,27 @@ impl ShireService {
         }
     }
 
+    /// Early-return result for the three ref tools when the cross-reference
+    /// index is disabled or was never populated. Without this, a refs-tool
+    /// call against a refs-disabled DB returns `[]` silently — an LLM
+    /// treats "no references" as "safe to delete/rename" and ships a
+    /// broken refactor. We return an explicit actionable message instead.
+    fn refs_disabled_result(conn: &Connection) -> Option<CallToolResult> {
+        match crate::db::read_references_enabled(conn) {
+            Some(true) => None,
+            Some(false) => Some(CallToolResult::success(vec![Content::text(
+                "Cross-reference index is disabled. Set `symbols.references_enabled = true` in \
+                 shire.toml and run `shire build --force`, then retry this tool. \
+                 (Feature is experimental and opt-in; defaults to off.)",
+            )])),
+            None => Some(CallToolResult::success(vec![Content::text(
+                "Cross-reference index was never populated for this DB. Set \
+                 `symbols.references_enabled = true` in shire.toml and run \
+                 `shire build --force`, then retry this tool.",
+            )])),
+        }
+    }
+
     /// Merge FTS5 and vector search results using Reciprocal Rank Fusion (RRF).
     #[cfg(feature = "rag")]
     fn hybrid_search(
@@ -656,6 +677,20 @@ impl ShireService {
         tracing::debug!(tool = "symbol_references", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        if let Some(disabled) = Self::refs_disabled_result(&conn) {
+            return Ok(disabled);
+        }
+        // Validate `kind` up front. Without this, a typo like "CALL" or
+        // "cal" passes through to the SQL `AND r.kind = ?` and returns
+        // zero rows — visually identical to "no matches", which hides the
+        // error from the caller.
+        if let Some(k) = args.kind.as_deref()
+            && !matches!(k, "call" | "type" | "import" | "impl")
+        {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Unknown kind {k:?}. Valid kinds are: call, type, import, impl."
+            ))]));
+        }
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_references(
             &conn,
@@ -678,6 +713,9 @@ impl ShireService {
         tracing::debug!(tool = "symbol_callers", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        if let Some(disabled) = Self::refs_disabled_result(&conn) {
+            return Ok(disabled);
+        }
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callers(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -694,6 +732,9 @@ impl ShireService {
         tracing::debug!(tool = "symbol_callees", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        if let Some(disabled) = Self::refs_disabled_result(&conn) {
+            return Ok(disabled);
+        }
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callees(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -808,5 +849,105 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let result = ShireService::read_indexed_at(&conn);
         assert!(result.is_none(), "should return None when shire_meta doesn't exist");
+    }
+
+    /// When the `references_enabled` flag is absent (e.g. an index built
+    /// before the flag was persisted), the ref tools must refuse to
+    /// serve — otherwise an LLM sees `[]` and assumes "no callers" on a
+    /// DB that never populated `symbol_refs`.
+    #[test]
+    fn test_refs_disabled_result_none_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        crate::db::write_references_enabled(&conn, true).unwrap();
+        assert!(
+            ShireService::refs_disabled_result(&conn).is_none(),
+            "enabled flag allows the tool to proceed"
+        );
+    }
+
+    #[test]
+    fn test_refs_disabled_result_some_when_disabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        crate::db::write_references_enabled(&conn, false).unwrap();
+        let r = ShireService::refs_disabled_result(&conn);
+        assert!(r.is_some(), "disabled flag short-circuits the tool");
+    }
+
+    #[test]
+    fn test_refs_disabled_result_some_when_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        // Flag was never written — simulates an old DB or an index that
+        // predates this guard. Tools must still refuse to serve.
+        let r = ShireService::refs_disabled_result(&conn);
+        assert!(r.is_some(), "missing flag short-circuits the tool");
+    }
+
+    /// End-to-end test of the ref tool against a DB with refs enabled but
+    /// no data — exercises the disabled-guard bypass and verifies the tool
+    /// returns a JSON array (possibly empty) rather than silently
+    /// swallowing a kind-filter typo. Covers D3.
+    #[test]
+    fn test_symbol_references_rejects_unknown_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = crate::db::open_or_create(&path, false).unwrap();
+            crate::db::write_references_enabled(&conn, true).unwrap();
+        }
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+
+        let args = SymbolRefsArgs {
+            name: "foo".into(),
+            kind: Some("CALL".into()), // wrong case — would silently return []
+            package: None,
+            limit: None,
+        };
+        let r = svc.symbol_references(Parameters(args)).unwrap();
+        // The result carries the validation message, not an empty JSON array.
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("Unknown kind"),
+            "expected validation error, got {text}"
+        );
+        assert!(
+            text.contains("call, type, import, impl"),
+            "should list the valid kinds"
+        );
+    }
+
+    #[test]
+    fn test_symbol_references_accepts_known_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = crate::db::open_or_create(&path, false).unwrap();
+            crate::db::write_references_enabled(&conn, true).unwrap();
+        }
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+
+        let args = SymbolRefsArgs {
+            name: "foo".into(),
+            kind: Some("call".into()),
+            package: None,
+            limit: None,
+        };
+        let r = svc.symbol_references(Parameters(args)).unwrap();
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        // Empty DB → empty JSON array, not an error string.
+        assert_eq!(text, "[]", "empty DB returns empty array");
     }
 }

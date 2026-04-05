@@ -826,6 +826,13 @@ pub fn batch_insert_references(
     // Resolve file_id for every ref up front. For paths not already in the
     // map, insert a `files` row (pkg=None, ext derived from suffix) and cache
     // the new id.
+    //
+    // The backfill is a safety net for paths that the file walker skipped
+    // but the symbol extractor reached (e.g. dotfiles, symlinks, walker
+    // config mismatch). Losing refs would be worse than a `files` row with
+    // `package=NULL, size_bytes=0`, so we keep the insert — but we log at
+    // WARN so operators can audit and the two walkers can be brought into
+    // alignment.
     let mut resolved: Vec<(&ReferenceInfo, i64)> = Vec::with_capacity(refs.len());
     for r in refs {
         let path = r.file_path.as_ref();
@@ -836,6 +843,12 @@ pub fn batch_insert_references(
                     .rsplit_once('.')
                     .map(|(_, e)| e.to_lowercase())
                     .unwrap_or_default();
+                tracing::warn!(
+                    path,
+                    package,
+                    "batch_insert_references: file_id missing, synthesizing files row \
+                     (file walker and symbol extractor are not aligned for this path)"
+                );
                 conn.execute(
                     "INSERT OR IGNORE INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, ?2, 0)",
                     rusqlite::params![path, ext],
@@ -870,10 +883,7 @@ pub fn batch_insert_references(
 
     let mut iter = resolved.chunks_exact(ROWS_PER_CHUNK);
     for chunk in &mut iter {
-        let params = bind_refs(chunk, package);
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|b| b.as_ref()).collect();
-        full_stmt.execute(rusqlite::params_from_iter(param_refs.iter().copied()))?;
+        bind_and_execute_chunk(&mut full_stmt, chunk, package)?;
     }
 
     // Handle the tail (rows that didn't fit a full chunk) with a sized statement.
@@ -881,12 +891,34 @@ pub fn batch_insert_references(
     if !remainder.is_empty() {
         let tail_sql = build_multi_row_insert_sql(remainder.len(), COLS_PER_ROW);
         let mut tail_stmt = conn.prepare_cached(&tail_sql)?;
-        let params = bind_refs(remainder, package);
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|b| b.as_ref()).collect();
-        tail_stmt.execute(rusqlite::params_from_iter(param_refs.iter().copied()))?;
+        bind_and_execute_chunk(&mut tail_stmt, remainder, package)?;
     }
 
+    Ok(())
+}
+
+/// Bind and execute one chunk of the multi-row INSERT. Uses
+/// `raw_bind_parameter` to avoid building a `Vec<Box<dyn ToSql>>` for each
+/// chunk — the Box+dyn pair was ~768 heap allocations per 128-row chunk
+/// (6 columns × 128 rows), and the per-row `r.name.clone()` was another
+/// 128. At 5M refs, that was on the order of 40M needless heap allocations
+/// inside the bulk insert path.
+fn bind_and_execute_chunk(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    chunk: &[(&ReferenceInfo, i64)],
+    package: Option<&str>,
+) -> Result<()> {
+    let mut col = 1;
+    for (r, file_id) in chunk {
+        stmt.raw_bind_parameter(col, r.name.as_str())?;
+        stmt.raw_bind_parameter(col + 1, r.kind.as_str())?;
+        stmt.raw_bind_parameter(col + 2, *file_id)?;
+        stmt.raw_bind_parameter(col + 3, r.line as i64)?;
+        stmt.raw_bind_parameter(col + 4, package)?;
+        stmt.raw_bind_parameter(col + 5, r.enclosing_symbol.as_deref())?;
+        col += 6;
+    }
+    stmt.raw_execute()?;
     Ok(())
 }
 
@@ -908,22 +940,6 @@ fn build_multi_row_insert_sql(rows: usize, cols: usize) -> String {
         sql.push(')');
     }
     sql
-}
-
-fn bind_refs<'a>(
-    chunk: &'a [(&'a ReferenceInfo, i64)],
-    package: Option<&'a str>,
-) -> Vec<Box<dyn rusqlite::ToSql + 'a>> {
-    let mut params: Vec<Box<dyn rusqlite::ToSql + 'a>> = Vec::with_capacity(chunk.len() * 6);
-    for (r, file_id) in chunk {
-        params.push(Box::new(r.name.clone()));
-        params.push(Box::new(r.kind.as_str()));
-        params.push(Box::new(*file_id));
-        params.push(Box::new(r.line as i64));
-        params.push(Box::new(package.map(|s| s.to_string())));
-        params.push(Box::new(r.enclosing_symbol.clone()));
-    }
-    params
 }
 
 /// Delete all rows in `symbol_refs` for a given file path. Used during

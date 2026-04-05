@@ -2530,3 +2530,121 @@ type Config struct{}
         "expected type-ref to Config, got {config_type_refs}"
     );
 }
+
+/// Exercises the three states the `references_enabled` flag can be in:
+///  1. Disabled (default): symbol_refs stays empty, flag persisted as false.
+///  2. Transition off→on without --force: unchanged files would normally
+///     hash-match and skip extraction, leaving refs empty. The build must
+///     detect the transition and invalidate file_hashes so refs get
+///     populated for every source file.
+///  3. Transition on→off: symbol_refs wiped, flag persisted as false.
+///
+/// This is the load-bearing safety guarantee behind the 3 MCP ref tools —
+/// without it, an LLM calling `symbol_callers` on a partially-populated
+/// index gets a false-negative answer and ships a broken refactor.
+#[test]
+fn test_references_enabled_flag_transitions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // State 1: default (references_enabled omitted = false)
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "disabled-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0, "symbol_refs must be empty when flag is off");
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "false", "flag must be persisted as 'false'");
+    }
+
+    // State 2: flip false→true. Don't touch source files. The build must
+    // detect the transition and invalidate file_hashes so `a.go` gets
+    // re-extracted (otherwise the hash matches and no refs are written).
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "enabled-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let call_refs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            call_refs, 1,
+            "false→true transition must force refs to populate for unchanged files"
+        );
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "true");
+    }
+
+    // State 3: flip true→false. symbol_refs must be wiped.
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "disable-refs build failed");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs, 0, "symbol_refs must be wiped when flag flips to false");
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "false");
+    }
+}

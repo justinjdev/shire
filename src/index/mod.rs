@@ -2330,6 +2330,26 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     };
     let pb_sym_clone = pb_sym.clone();
     let refs_enabled = config.symbols.references_enabled;
+    // Detect a false→true transition. In the unchanged case, the per-file
+    // hash matches the stored hash, so `phase_source_incremental` skips
+    // extraction and leaves `symbol_refs` empty for every unchanged file —
+    // the user sees a partial ref index with no indication it's stale. To
+    // repair, we wipe `file_hashes`/`source_hashes` on the transition so
+    // the next phase re-extracts every source file.
+    let prior_refs_enabled = crate::db::read_references_enabled(&conn);
+    let refs_just_enabled = refs_enabled && prior_refs_enabled != Some(true);
+    if refs_just_enabled && !is_full_build && !force {
+        tracing::warn!(
+            prior = ?prior_refs_enabled,
+            "references_enabled transitioned to true — invalidating file hashes to force \
+             full re-extraction so symbol_refs is populated for every source file"
+        );
+        with_transaction(&conn, || {
+            conn.execute("DELETE FROM file_hashes", [])?;
+            conn.execute("DELETE FROM source_hashes", [])?;
+            Ok(())
+        })?;
+    }
     let num_source_reextracted = with_transaction(&conn, || {
         // Wipe symbol_refs if the user has turned the experimental refs
         // feature off — this keeps the DB from carrying stale refs while
@@ -2546,6 +2566,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
             [&now],
         )?;
+        // Record whether this build populated symbol_refs. The MCP server
+        // reads this key on every refs-tool call to refuse serving when the
+        // feature is off (otherwise callers see [] and assume "no refs",
+        // which is dangerous for refactor-safety tools).
+        crate::db::write_references_enabled(&conn, config.symbols.references_enabled)?;
         Ok(())
     })?;
 

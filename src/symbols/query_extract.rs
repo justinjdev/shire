@@ -58,13 +58,33 @@ pub fn extract(
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     let tree = match parser.parse(source, None) {
         Some(t) => t,
-        None => return (Vec::new(), Vec::new()),
+        None => {
+            // A parser that returns None for non-empty source means the
+            // grammar hit a resource/recursion limit or the input was not
+            // valid UTF-8 at a byte tree-sitter cares about. Without this
+            // log, the file gets hashed as "processed" with zero symbols
+            // and zero refs — indistinguishable from an empty file.
+            if !source.is_empty() {
+                tracing::warn!(
+                    file = %file_path,
+                    source_bytes = source.len(),
+                    "tree-sitter parse returned None — file yields no symbols or refs"
+                );
+            }
+            return (Vec::new(), Vec::new());
+        }
     };
 
     let capture_names = query.capture_names();
     let name_idx = match capture_names.iter().position(|&n| n == "name") {
         Some(i) => i as u32,
-        None => return (Vec::new(), Vec::new()),
+        None => {
+            tracing::warn!(
+                file = %file_path,
+                "tree-sitter query has no @name capture — skipping extraction"
+            );
+            return (Vec::new(), Vec::new());
+        }
     };
 
     QUERY_CURSOR.with_borrow_mut(|cursor| {

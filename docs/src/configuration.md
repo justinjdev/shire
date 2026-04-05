@@ -10,9 +10,10 @@ db_path = "/path/to/custom/index.db"
 manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile"]
 exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire", ".gradle", "build"]
 
-# Skip symbol extraction for specific file types
+# Symbol extraction
 [symbols]
 exclude_extensions = [".proto", ".pl"]
+references_enabled = true  # EXPERIMENTAL, default true — see below
 
 # Documentation indexing
 [docs]
@@ -44,6 +45,25 @@ max_days = 30           # automatically delete log files older than this
 The `SHIRE_LOG` environment variable overrides the config `level` (e.g., `SHIRE_LOG=debug shire build`). Log files are daily-rotated with filenames like `shire.log.2026-03-26`. Each session includes a unique session ID for correlation across concurrent processes.
 
 All fields are optional. Defaults are shown above. The `--db` CLI flag takes precedence over `db_path` in config.
+
+## Cross-reference index (experimental)
+
+`symbols.references_enabled` (default `true`) populates the `symbol_refs`
+table so the `symbol_references`, `symbol_callers`, and `symbol_callees`
+MCP tools can answer "where is this used?" / "who calls this?" questions.
+Reference extraction is supported for 8 tier-1 languages: Go, Python,
+Java, TypeScript, JavaScript, Perl, Ruby, Scala.
+
+**Cost:** +19-23% DB size and ~5-7% build time on Go-heavy repos. For
+size-sensitive deployments or if the reference tools aren't being used,
+set `references_enabled = false` in `[symbols]`.
+
+Toggling the flag takes effect on the next build. Disabling wipes
+`symbol_refs` at the start of the build; re-enabling repopulates it on
+the next full rebuild (`shire build --force`).
+
+This feature is marked experimental: its schema and coverage may change
+in minor versions as language support broadens and edge cases surface.
 
 ## Custom package discovery
 

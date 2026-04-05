@@ -1072,6 +1072,7 @@ fn phase_extract_symbols(
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
+    references_enabled: bool,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
@@ -1111,17 +1112,27 @@ fn phase_extract_symbols(
     // Build file_path → files.id map once; reused across all package inserts.
     // Mutated in-place when refs reference paths that weren't in `files` —
     // e.g. dotfiles the file walker hides but symbol extraction surfaces.
-    let mut file_ids = crate::db::queries::build_file_id_map(conn)?;
+    // Only built when reference extraction is enabled — skipping refs makes
+    // the map load a dead cost.
+    let mut file_ids = if references_enabled {
+        crate::db::queries::build_file_id_map(conn)?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if skip_deletes {
             // Symbols and refs tables already empty (force/full build) — insert only
             batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
-            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
+            if references_enabled {
+                crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
+            }
         } else {
             upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
-            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
+            if references_enabled {
+                crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
+            }
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -1213,6 +1224,7 @@ fn phase_source_incremental(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
+    references_enabled: bool,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
@@ -1390,8 +1402,12 @@ fn phase_source_incremental(
                     if let Some(syms) = &fr.symbols {
                         // File changed — upsert symbols and references for this file
                         let empty_refs = Vec::new();
-                        let refs = fr.references.as_ref().unwrap_or(&empty_refs);
-                        upsert_symbols_and_refs_for_file(conn, pkg_name, &fr.file_path, syms, refs)?;
+                        let refs_slice = if references_enabled {
+                            fr.references.as_ref().unwrap_or(&empty_refs).as_slice()
+                        } else {
+                            &empty_refs
+                        };
+                        upsert_symbols_and_refs_for_file(conn, pkg_name, &fr.file_path, syms, refs_slice)?;
                         had_changes = true;
                     }
                 }
@@ -2285,10 +2301,18 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         None
     };
     let pb_sym_clone = pb_sym.clone();
+    let refs_enabled = config.symbols.references_enabled;
     let num_source_reextracted = with_transaction(&conn, || {
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force)?;
+        // Wipe symbol_refs if the user has turned the experimental refs
+        // feature off — this keeps the DB from carrying stale refs while
+        // disabled. Cheap: DELETE FROM without a WHERE is O(1) in SQLite
+        // with the table truncated-and-recreated optimization.
+        if !refs_enabled {
+            conn.execute("DELETE FROM symbol_refs", [])?;
+        }
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, refs_enabled)?;
         if git_index_changed {
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone)
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

@@ -2135,6 +2135,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM file_hashes", [])?;
             conn.execute("DELETE FROM docs", [])?;
             conn.execute("DELETE FROM shire_meta WHERE key = 'file_tree_hash'", [])?;
+            // symbol_refs is now empty; mark refs as not-trustworthy
+            // atomically with the wipe. If the build fails before
+            // phase_extract_symbols re-populates refs, MCP tools will
+            // correctly refuse to serve instead of returning silent [].
+            crate::db::write_references_enabled(&conn, false)?;
             Ok(())
         })?;
     }
@@ -2384,20 +2389,27 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, refs_enabled)?;
-        if git_index_changed || refs_just_enabled {
+        let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {
                 pb.inc(diff.unchanged.len() as u64);
             }
-            Ok(0)
-        }
+            0
+        };
+        // Commit the refs-trustworthy flag atomically with the extraction
+        // results. If a later phase (docs, rag, meta) fails, the flag's
+        // committed state still matches the committed state of
+        // symbol_refs — so MCP tools cannot return silent [] from a
+        // partially-repopulated table.
+        crate::db::write_references_enabled(&conn, refs_enabled)?;
+        Ok(count)
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");
@@ -2596,11 +2608,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
             [&now],
         )?;
-        // Record whether this build populated symbol_refs. The MCP server
-        // reads this key on every refs-tool call to refuse serving when the
-        // feature is off (otherwise callers see [] and assume "no refs",
-        // which is dangerous for refactor-safety tools).
-        crate::db::write_references_enabled(&conn, config.symbols.references_enabled)?;
+        // NOTE: `references_enabled` is written inside the
+        // phase_extract_symbols transaction (see build_index_inner), so
+        // the flag commits atomically with the symbol_refs mutation. Not
+        // written here to avoid a later-phase failure desynchronizing
+        // the flag from the committed state of symbol_refs.
         Ok(())
     })?;
 

@@ -2745,3 +2745,77 @@ fn test_refs_toggle_forces_extraction_when_git_index_unchanged() {
          partial index that breaks refactor-safety queries"
     );
 }
+
+/// The `references_enabled` flag in shire_meta is the MCP safety gate —
+/// it MUST match the committed state of symbol_refs at every DB-commit
+/// boundary. If symbol_refs is empty (wiped by --force, wiped by the
+/// disabled path) but the flag still reads `true`, MCP tools will return
+/// silent `[]` for refactor-safety queries.
+///
+/// This test exercises the `--force` path specifically, which wipes
+/// symbol_refs in its own transaction at the start of the build — long
+/// before the extraction transaction runs. The fix writes `false` in
+/// the wipe transaction and `true` again in the extraction transaction.
+#[test]
+fn test_force_rebuild_keeps_refs_flag_consistent_with_refs_table() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // Initial build populates symbol_refs and sets flag=true.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Force rebuild: wipes symbol_refs in an early transaction, then
+    // re-populates in the extraction transaction. Both writes must
+    // happen atomically with the matching flag write.
+    assert!(
+        Command::new(&bin)
+            .args(["build", "--force", "--root", root.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let refs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+        .unwrap();
+    let flag: String = conn
+        .query_row(
+            "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(refs > 0, "symbol_refs must be re-populated after --force");
+    assert_eq!(
+        flag, "true",
+        "flag must match the populated state of symbol_refs"
+    );
+
+    // The invariant we care about: flag==true ⇒ symbol_refs is the
+    // ground truth (was populated by a committed extraction). A failed
+    // build would leave the atomic wipe committed (flag=false, refs
+    // empty) — a consistent state MCP can reason about.
+}

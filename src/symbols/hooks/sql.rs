@@ -71,7 +71,7 @@ mod tests {
     use crate::symbols::SymbolKind;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
-        extract_file("sql", source, Arc::from("test.sql"))
+        extract_file("sql", source, Arc::from("test.sql")).0
     }
 
     #[test]

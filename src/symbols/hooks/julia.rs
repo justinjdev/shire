@@ -195,7 +195,7 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let hooks = super::hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.jl"), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.jl"), &hooks).0
     }
 
     #[test]

@@ -123,7 +123,17 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        enclosing_ancestors: &[
+            "function_declaration",
+            "method_declaration",
+        ],
+        reference_stoplist: &[
+            "true", "false", "nil", "iota",
+            "make", "new", "len", "cap", "append", "copy", "delete",
+            "print", "println", "panic", "recover",
+            "int", "int32", "int64", "uint", "uint32", "uint64",
+            "string", "bool", "byte", "rune", "float32", "float64",
+            "error", "any",
+        ],
     }
 }

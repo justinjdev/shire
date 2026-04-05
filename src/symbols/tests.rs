@@ -146,6 +146,72 @@ type internalType struct {}
     assert!(symbols.is_empty());
 }
 
+// References
+
+#[test]
+fn test_go_call_references() {
+    let source = r#"package main
+
+import "fmt"
+
+func handleRequest(req *Request) error {
+    cfg := parseConfig(req)
+    fmt.Println(cfg)
+    return validate(cfg)
+}
+
+func parseConfig(r *Request) Config { return Config{} }
+func validate(c Config) error { return nil }
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+
+    let call_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Call).collect();
+    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"parseConfig"), "expected call-ref to parseConfig, got {:?}", names);
+    assert!(names.contains(&"validate"), "expected call-ref to validate, got {:?}", names);
+
+    let parse_ref = call_refs.iter().find(|r| r.name == "parseConfig").unwrap();
+    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("handleRequest"));
+}
+
+#[test]
+fn test_go_type_references() {
+    let source = r#"package main
+
+type Config struct { Key string }
+
+func parse(r *Request) Config { return Config{} }
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+    let type_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Type).collect();
+    let names: Vec<&str> = type_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"Request"), "expected type-ref Request, got {:?}", names);
+    assert!(names.contains(&"Config"), "expected type-ref Config, got {:?}", names);
+}
+
+#[test]
+fn test_go_import_references() {
+    let source = r#"package main
+
+import (
+    "fmt"
+    "strings"
+)
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+    let import_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+    let names: Vec<&str> = import_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&"fmt"),
+        "expected fmt import (quotes stripped by query_extract), got {:?}",
+        names
+    );
+    assert!(names.contains(&"strings"), "got {:?}", names);
+}
+
 // ============================================================
 // Rust tests (ported from rust_lang.rs)
 // ============================================================

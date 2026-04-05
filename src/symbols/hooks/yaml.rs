@@ -62,7 +62,7 @@ mod tests {
     use crate::symbols::registry::extract_file;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
-        extract_file("yaml", source, Arc::from("test.yaml"))
+        extract_file("yaml", source, Arc::from("test.yaml")).0
     }
 
     #[test]
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn test_yml_extension() {
         let source = "key: value\n";
-        let symbols = extract_file("yml", source, Arc::from("test.yml"));
+        let symbols = extract_file("yml", source, Arc::from("test.yml")).0;
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "key");
     }

@@ -39,6 +39,15 @@ fn capture_name_to_ref_kind(name: &str) -> Option<ReferenceKind> {
     }
 }
 
+/// Run a compiled tree-sitter query against `source`, returning both the
+/// definitions (`SymbolInfo`) and references (`ReferenceInfo`) captured.
+///
+/// The `Query` is expected to be compiled once per language (cached upstream)
+/// and the `Parser` must already have its language set. `@definition.*` captures
+/// flow to the symbols vec; `@reference.*` captures flow to references, with
+/// stoplist filtering, enclosing-symbol resolution, and self-reference removal
+/// (references whose byte range coincides with a definition's name node are
+/// dropped — e.g. `type Config struct` does not produce a Config→Config ref).
 pub fn extract(
     parser: &mut Parser,
     query: &Query,
@@ -183,7 +192,12 @@ pub fn extract(
                 if hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
                 }
-                // Trim surrounding quotes for import names (common for Go/Ruby strings)
+                // Trim surrounding quotes for import names. Lives here (not in
+                // per-language hooks) because several grammars expose import
+                // paths as string-literal nodes with the quote characters
+                // included — e.g. Go (`import "fmt"` → `"fmt"`) and Ruby
+                // (`require 'json'` → `'json'`). Centralizing keeps language
+                // `.scm` files simple.
                 let trimmed_name = if matches!(kind, ReferenceKind::Import) {
                     name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
                         .to_string()

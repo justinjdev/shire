@@ -772,6 +772,15 @@ pub fn search_docs(
 
 use crate::symbols::ReferenceInfo;
 
+/// Insert a batch of `ReferenceInfo` rows into `symbol_refs`.
+///
+/// The FTS5 `symbol_refs_ai` trigger fires per row, keeping the FTS index in
+/// sync with the table. For large bulk inserts the caller should drop the
+/// triggers (via `db::drop_symbol_refs_fts_triggers`) and rebuild the FTS
+/// afterward — mirroring the existing pattern used by symbol inserts.
+///
+/// Callers are expected to wrap the surrounding work in a transaction for
+/// throughput; this function does not open one itself.
 pub fn batch_insert_references(
     conn: &Connection,
     package: Option<&str>,
@@ -797,6 +806,8 @@ pub fn batch_insert_references(
     Ok(())
 }
 
+/// Delete all rows in `symbol_refs` for a given file path. Used during
+/// file-granularity incremental rebuild before inserting fresh references.
 pub fn delete_references_for_file(conn: &Connection, file_path: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM symbol_refs WHERE file_path = ?1",
@@ -805,6 +816,8 @@ pub fn delete_references_for_file(conn: &Connection, file_path: &str) -> Result<
     Ok(())
 }
 
+/// Delete all rows in `symbol_refs` for a given package. Used during
+/// package-level rebuilds. Relies on the `idx_refs_package` index.
 pub fn delete_references_for_package(conn: &Connection, package: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM symbol_refs WHERE package = ?1",

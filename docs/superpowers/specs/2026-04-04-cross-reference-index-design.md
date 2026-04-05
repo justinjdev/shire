@@ -97,9 +97,14 @@ CREATE TABLE symbol_refs (
 CREATE INDEX idx_refs_name ON symbol_refs(name);
 CREATE INDEX idx_refs_file ON symbol_refs(file_path);
 CREATE INDEX idx_refs_enclosing ON symbol_refs(enclosing_symbol);
+CREATE INDEX idx_refs_package ON symbol_refs(package);
 ```
 
+`idx_refs_package` supports bulk package-scoped deletes (no `name` or `enclosing_symbol` predicate to use the higher-selectivity indexes).
+
 Plus an FTS5 virtual table over `name` (same tokenizer as `symbols_fts`, triggers dropped/recreated during bulk writes).
+
+**Import-name normalization**: several grammars expose import paths as string-literal nodes that include the quote characters (e.g. Go `import "fmt"` captures as `"fmt"`, Ruby `require 'json'` captures as `'json'`). The extractor strips surrounding `"`/`'`/`` ` `` quotes when emitting a reference with `kind = Import`. This normalization lives in the shared `query_extract` layer so per-language `.scm` files can capture the whole string-literal node without needing inner-content captures.
 
 Schema version bump in `shire_meta` triggers automatic migration — existing databases build the new table and FTS index at next `shire build`.
 

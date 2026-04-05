@@ -417,7 +417,7 @@ const X = 1
 "#;
         let syms = extract(source);
         for sym in &syms {
-            assert_eq!(sym.visibility, "public", "all Julia symbols should be public");
+            assert_eq!(sym.visibility, crate::symbols::Visibility::Public, "all Julia symbols should be public");
         }
     }
 }

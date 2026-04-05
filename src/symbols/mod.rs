@@ -14,10 +14,38 @@ pub struct SymbolInfo {
     pub signature: Option<String>,
     pub file_path: Arc<str>,
     pub line: usize,
-    pub visibility: String,
+    pub visibility: Visibility,
     pub parent_symbol: Option<String>,
     pub return_type: Option<String>,
     pub parameters: Option<Vec<Parameter>>,
+}
+
+/// Symbol visibility. Most symbols are `Public`; other values come from
+/// language-specific post_process hooks (e.g., PHP, C#, Java).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+    Internal,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Protected => "protected",
+            Visibility::Private => "private",
+            Visibility::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

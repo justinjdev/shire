@@ -1,9 +1,17 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 use super::hooks::LanguageHooks;
-use super::{SymbolInfo, SymbolKind};
+use super::{SymbolInfo, SymbolKind, Visibility};
+
+thread_local! {
+    /// Per-thread pooled QueryCursor to avoid repeated allocation.
+    /// Tree-sitter's QueryCursor holds internal buffers that can be reused
+    /// across queries on the same thread.
+    static QUERY_CURSOR: RefCell<QueryCursor> = RefCell::new(QueryCursor::new());
+}
 
 /// Map query capture names to SymbolKind.
 fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
@@ -45,7 +53,7 @@ pub fn extract(
         None => return Vec::new(),
     };
 
-    let mut cursor = QueryCursor::new();
+    QUERY_CURSOR.with_borrow_mut(|cursor| {
     let mut symbols = Vec::new();
     let mut seen_def_ranges = std::collections::HashSet::new();
     let source_bytes = source.as_bytes();
@@ -124,7 +132,7 @@ pub fn extract(
             signature: Some(signature),
             file_path: file_path.clone(),
             line,
-            visibility: "public".to_string(),
+            visibility: Visibility::Public,
             parent_symbol: parent,
             return_type,
             parameters,
@@ -144,6 +152,7 @@ pub fn extract(
     }
 
     symbols
+    })
 }
 
 fn default_signature(name: &str, kind: SymbolKind) -> String {

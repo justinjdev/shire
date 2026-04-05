@@ -12,6 +12,8 @@ REPOS=(
     "grafana|https://github.com/grafana/grafana.git|v11.0.0"
     # Large (~2.5GB, Go/Python/Protobuf)
     "kubernetes|https://github.com/kubernetes/kubernetes.git|v1.30.0"
+    # Extra-large (Rust monorepo with many crates)
+    "rust|https://github.com/rust-lang/rust.git|1.78.0"
 )
 
 setup_repo() {
@@ -45,7 +47,7 @@ setup_repo() {
     echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
 }
 
-# Parse optional filter: setup-bench-repo.sh [small|medium|large|all]
+# Parse optional filter: setup-bench-repo.sh [small|medium|large|xlarge|all]
 FILTER="${1:-all}"
 
 for entry in "${REPOS[@]}"; do
@@ -55,7 +57,8 @@ for entry in "${REPOS[@]}"; do
         small)  [[ "${name}" == "turborepo" ]] && setup_repo "${entry}" ;;
         medium) [[ "${name}" == "grafana" ]] && setup_repo "${entry}" ;;
         large)  [[ "${name}" == "kubernetes" ]] && setup_repo "${entry}" ;;
-        *)      echo "Usage: $0 [small|medium|large|all]"; exit 1 ;;
+        xlarge) [[ "${name}" == "rust" ]] && setup_repo "${entry}" ;;
+        *)      echo "Usage: $0 [small|medium|large|xlarge|all]"; exit 1 ;;
     esac
 done
 

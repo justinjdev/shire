@@ -317,7 +317,7 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
             &sym.signature,
             sym.file_path.as_ref(),
             sym.line as i64,
-            &sym.visibility,
+            sym.visibility.as_str(),
             &sym.parent_symbol,
             &sym.return_type,
             &params_json,
@@ -1991,6 +1991,13 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // up any orphaned rows.
     conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
 
+    // Try MEMORY journal mode to eliminate WAL checkpoint overhead on COMMIT.
+    // Falls back silently to WAL if another connection holds a lock.
+    let switched_journal: String = conn
+        .query_row("PRAGMA journal_mode=MEMORY", [], |row| row.get(0))
+        .unwrap_or_else(|_| "wal".to_string());
+    let restore_wal = switched_journal == "memory";
+
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
         Box::new(go::GoParser),
@@ -2428,8 +2435,10 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
-    // Wait for RAG embedding to complete before printing summary.
-    // Spinner is already hidden in quiet mode, so joining has no visual cost.
+    // Wait for RAG embedding to complete before restoring journal mode.
+    // The background RAG thread opened its own connection to this DB; switching
+    // back to WAL requires an exclusive lock, which can fail with SQLITE_BUSY
+    // if the RAG thread's connection is still active.
     if let Some(handle) = rag_handle {
         if let Err(panic_payload) = handle.join() {
             let msg = panic_payload
@@ -2439,6 +2448,11 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                 .unwrap_or("unknown panic");
             tracing::error!(panic = %msg, "RAG embedding thread panicked");
         }
+    }
+
+    // Restore WAL mode for read-heavy query workloads after the build.
+    if restore_wal {
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     }
 
     print_summary(&summary, &db_path, is_full_build, force);

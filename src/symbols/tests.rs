@@ -527,6 +527,37 @@ function handle(req: Request): Response {
 }
 
 #[test]
+fn test_typescript_default_and_namespace_imports() {
+    let source = r#"import Foo from './foo';
+import * as Bar from './bar';
+import { Baz } from './baz';
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("i.ts"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.contains(&"Foo"), "default import missing — got {:?}", imp_names);
+    assert!(imp_names.contains(&"Bar"), "namespace import missing — got {:?}", imp_names);
+    assert!(imp_names.contains(&"Baz"), "named import missing — got {:?}", imp_names);
+}
+
+#[test]
+fn test_typescript_interface_extends() {
+    let source = r#"interface A {}
+interface B extends A {}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("h.ts"));
+    let impl_refs: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_refs.contains(&"A"), "interface extends not captured — got {:?}", impl_refs);
+}
+
+#[test]
 fn test_typescript_impl_references() {
     let source = r#"interface Service {}
 interface Auditable {}
@@ -809,8 +840,10 @@ import java.util.Map;
         .filter(|r| r.kind == ReferenceKind::Import)
         .map(|r| r.name.as_str())
         .collect();
-    assert!(imp_names.iter().any(|n| n.contains("List")), "got {:?}", imp_names);
-    assert!(imp_names.iter().any(|n| n.contains("Map")), "got {:?}", imp_names);
+    // Lookup by `symbol_references(name="List")` must match — capture the
+    // simple name from `java.util.List`, not the full qualified path.
+    assert!(imp_names.contains(&"List"), "got {:?}", imp_names);
+    assert!(imp_names.contains(&"Map"), "got {:?}", imp_names);
 }
 
 // ============================================================

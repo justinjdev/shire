@@ -432,7 +432,7 @@ mod tests {
     use std::sync::Arc;
 
     fn extract(source: &str) -> Vec<SymbolInfo> {
-        extract_file("dart", source, Arc::from("test.dart")).0
+        extract_file("dart", source, Arc::from("test.dart"), true).0
     }
 
     #[test]

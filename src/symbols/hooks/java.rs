@@ -253,13 +253,15 @@ pub fn hooks() -> LanguageHooks {
             "interface_declaration",
             "enum_declaration",
         ],
+        // Keep only literals/keywords and primitive type names — things that
+        // cannot be user-defined. JDK class names like `List`, `Map`,
+        // `Optional`, `String`, `Exception` are ORDINARY identifiers in Java
+        // and stoplisting them turns any repo-defined type with one of those
+        // names into a permanent false negative for reference lookup. Push
+        // JDK-noise handling to query/ranking time instead.
         reference_stoplist: &[
             "true", "false", "null", "this", "super",
-            "String", "Integer", "Long", "Boolean", "Double", "Float", "Object",
             "void", "int", "long", "boolean", "double", "float", "byte", "char", "short",
-            "System", "Math", "Override", "Exception", "RuntimeException",
-            "List", "Map", "Set", "Collection", "ArrayList", "HashMap", "HashSet",
-            "Optional", "Iterable", "Iterator", "Stream",
         ],
     }
 }

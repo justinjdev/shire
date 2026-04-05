@@ -391,6 +391,18 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
 
     create_schema(conn)?;
 
+    // `symbol_refs` is a regular table with no FTS 'rebuild' hook — it is
+    // only populated during symbol extraction. If we just dropped+recreated
+    // it (e.g. v7 schema change) but leave `source_hashes`/`file_hashes`
+    // intact, the next incremental `shire build` will hash-match every
+    // unchanged file, skip extraction, and leave `symbol_refs` empty until
+    // the user runs `--force` or edits files. Clear the hash tables so the
+    // next build re-extracts.
+    conn.execute_batch(
+        "DELETE FROM source_hashes;
+         DELETE FROM file_hashes;",
+    )?;
+
     conn.execute_batch(
         "INSERT INTO packages_fts(packages_fts) VALUES('rebuild');
          INSERT INTO files_fts(files_fts) VALUES('rebuild');

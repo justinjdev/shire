@@ -198,7 +198,7 @@ mod tests {
         let query_source = include_str!("../queries/clojure.scm");
         let query = Query::new(&language, query_source).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.clj"), &hooks).0
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.clj"), &hooks, true).0
     }
 
     #[test]

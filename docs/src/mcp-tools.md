@@ -17,9 +17,9 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
 | `explore` | Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
-| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. Note: matching is name-based — same-name symbols across different packages are merged. |
-| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, call_sites}]`. Accepts optional `package` filter. |
-| `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, call_sites}]`. Accepts optional `package` filter. |
+| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based — same-name symbols across different packages are merged. |
+| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, call_sites}]`. Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
+| `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, call_sites}]`. Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 
 ### When to use Shire vs Grep/Glob
 
@@ -41,4 +41,4 @@ Prompts are pre-built templates that compose multiple queries into structured co
 | Prompt | Args | Description |
 |---|---|---|
 | `explore` | `query` | Search packages, symbols, files, and documentation for a concept — returns a structured context map organized by package |
-| `reference_audit` | `name` | Guides refactor-safety analysis for a symbol: classifies refs by kind, traces the call graph via `symbol_callers`, identifies cross-package impact, and assesses rename/change risk |
+| `reference_audit` | `name` | Guides refactor-safety analysis for a symbol: classifies refs by kind, traces the call graph via `symbol_callers`, identifies cross-package impact, and assesses rename/change risk. **Requires `symbols.references_enabled = true` (experimental).** |

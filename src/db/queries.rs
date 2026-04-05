@@ -959,6 +959,21 @@ pub struct ReferenceRow {
     pub enclosing_symbol: Option<String>,
 }
 
+/// Collect a rusqlite row iterator into a Vec, tracing deserialization
+/// failures at debug level rather than silently dropping them. Schema
+/// mismatches or malformed rows would otherwise disappear behind
+/// `filter_map(Result::ok)` and surface only as mysterious empty results.
+fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>) -> Vec<T> {
+    let mut out = Vec::new();
+    for row in rows {
+        match row {
+            Ok(r) => out.push(r),
+            Err(e) => tracing::debug!(error = %e, "skipping malformed row"),
+        }
+    }
+    out
+}
+
 pub fn query_symbol_references(
     conn: &Connection,
     name: &str,
@@ -994,7 +1009,7 @@ pub fn query_symbol_references(
             enclosing_symbol: row.get(5)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(collect_rows(rows))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1036,7 +1051,7 @@ pub fn query_symbol_callers(
             call_sites: row.get(4)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(collect_rows(rows))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1076,7 +1091,7 @@ pub fn query_symbol_callees(
             call_sites: row.get(3)?,
         })
     })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(collect_rows(rows))
 }
 
 #[cfg(test)]

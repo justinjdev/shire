@@ -231,13 +231,17 @@ pub fn hooks() -> LanguageHooks {
             "interface_declaration",
             "function_expression",
             "method_signature",
+            // arrow_function is a distinct callable kind in TS — without
+            // it refs captured inside arrow bodies get no enclosing_symbol.
+            "arrow_function",
         ],
+        // Keep only literals/keywords and TS-reserved type keywords. Global
+        // classes like String/Number/Array/Promise/Error ARE user-definable
+        // (you can write `class Array { ... }`), so stoplisting them turns
+        // any repo type with those names into a permanent false negative.
         reference_stoplist: &[
             "true", "false", "null", "undefined", "this", "super",
-            "console", "window", "document",
             "string", "number", "boolean", "any", "unknown", "never", "void",
-            "String", "Number", "Boolean", "Object", "Array",
-            "Promise", "Error",
         ],
     }
 }

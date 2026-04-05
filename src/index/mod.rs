@@ -278,16 +278,26 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
+    // file_id FK is declared ON DELETE CASCADE, but FK enforcement is off
+    // during the build pipeline — so file-row deletions during
+    // incremental_upsert_files can leave ref rows pointing at a missing
+    // files.id. Sweep them up here.
+    let orphaned_ref_file_ids: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbol_refs WHERE file_id NOT IN (SELECT id FROM files)",
+        [],
+        |row| row.get(0),
+    )?;
     let orphaned_deps: i64 = conn.query_row(
         "SELECT COUNT(*) FROM dependencies WHERE package NOT IN (SELECT name FROM packages)",
         [],
         |row| row.get(0),
     )?;
 
-    if orphaned_syms > 0 || orphaned_refs > 0 || orphaned_deps > 0 {
+    if orphaned_syms > 0 || orphaned_refs > 0 || orphaned_ref_file_ids > 0 || orphaned_deps > 0 {
         tracing::warn!(
             orphaned_symbols = orphaned_syms,
             orphaned_references = orphaned_refs,
+            orphaned_ref_file_ids = orphaned_ref_file_ids,
             orphaned_dependencies = orphaned_deps,
             "cleaning up orphaned symbol(s), reference(s), and dependency(ies)"
         );
@@ -297,6 +307,10 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
         )?;
         conn.execute(
             "DELETE FROM symbol_refs WHERE package IS NOT NULL AND package NOT IN (SELECT name FROM packages)",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM symbol_refs WHERE file_id NOT IN (SELECT id FROM files)",
             [],
         )?;
         conn.execute(
@@ -984,6 +998,7 @@ fn single_pass_extract(
     _pkg_kind: &str,
     exclude_extensions: &[String],
     exclude_patterns: &[String],
+    references_enabled: bool,
 ) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1028,7 +1043,14 @@ fn single_pass_extract(
             let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file_full(ext, &source, file_path_arc)
+                    if references_enabled {
+                        symbols::extract_file_full(ext, &source, file_path_arc)
+                    } else {
+                        // Skip ref extraction entirely when refs are off so
+                        // disabled builds don't pay the allocation cost for
+                        // ReferenceInfo values that are never written.
+                        (symbols::extract_file(ext, &source, file_path_arc), Vec::new())
+                    }
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1079,7 +1101,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, references_enabled);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1313,7 +1335,11 @@ fn phase_source_incremental(
                             let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file_full(ext, &source, file_path_arc)
+                                    if references_enabled {
+                                        symbols::extract_file_full(ext, &source, file_path_arc)
+                                    } else {
+                                        (symbols::extract_file(ext, &source, file_path_arc), Vec::new())
+                                    }
                                 })
                                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {
@@ -1374,14 +1400,16 @@ fn phase_source_incremental(
     for result in &results {
         match result {
             SourceCheckResult::NeedsUpdate { pkg_name, file_results: all_files, deleted_files, aggregate_hash } => {
-                // Delete symbols and references for deleted files
+                // Delete symbols and references for deleted files. symbol_refs
+                // keys by file_id, so resolve via the `files` table. Must
+                // happen BEFORE `files` rows are removed downstream.
                 for del_path in deleted_files {
                     conn.execute(
                         "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
                         rusqlite::params![pkg_name, del_path],
                     )?;
                     conn.execute(
-                        "DELETE FROM symbol_refs WHERE file_path = ?1",
+                        "DELETE FROM symbol_refs WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
                         rusqlite::params![del_path],
                     )?;
                 }

@@ -112,7 +112,7 @@ Index creation is deferred to after bulk insert — indexes are dropped before i
 
 **Import-name normalization**: several grammars expose import paths as string-literal nodes that include the quote characters (e.g. Go `import "fmt"` captures as `"fmt"`, Ruby `require 'json'` captures as `'json'`). The extractor strips surrounding `"`/`'`/`` ` `` quotes when emitting a reference with `kind = Import`. This normalization lives in the shared `query_extract` layer so per-language `.scm` files can capture the whole string-literal node without needing inner-content captures.
 
-Schema version bump in `shire_meta` triggers automatic migration — existing databases build the new table and FTS index at next `shire build`.
+Schema version bump in `shire_meta` triggers automatic migration — existing databases build the new table and B-tree indexes at next `shire build`.
 
 Expected size: references outnumber definitions roughly 5–10x in typical code. A 100k-symbol codebase produces ~500k–1M ref rows. Storage is cheap; the `name` index is what makes lookup fast.
 

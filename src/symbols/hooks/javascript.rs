@@ -25,12 +25,13 @@ pub fn hooks() -> LanguageHooks {
             "method_definition",
             "class_declaration",
             "function_expression",
+            // arrow_function is a distinct callable kind in JS — without it
+            // refs captured inside arrow bodies get no enclosing_symbol,
+            // degrading caller/callee attribution.
+            "arrow_function",
         ],
         reference_stoplist: &[
             "true", "false", "null", "undefined", "this", "super",
-            "console", "window", "document",
-            "String", "Number", "Boolean", "Object", "Array",
-            "Promise", "Error",
         ],
         ..base
     }

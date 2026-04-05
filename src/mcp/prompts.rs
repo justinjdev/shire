@@ -81,6 +81,20 @@ r#"# Reference audit: `{name}`
 
 Perform a refactor safety analysis for the symbol `{name}` by following these steps.
 
+## Prerequisite
+
+This prompt relies on the cross-reference index, which is **experimental and
+opt-in**. If `symbol_references` returns an empty list on a symbol you know
+is used, the index is disabled — add this to `shire.toml` and run
+`shire build --force`:
+
+```toml
+[symbols]
+references_enabled = true
+```
+
+Then retry the audit.
+
 ## Step 1 — Gather all references
 
 Call `symbol_references` with `name={name}` to retrieve every location where this symbol

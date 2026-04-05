@@ -42,7 +42,8 @@ pub struct SymbolsConfig {
     /// can answer refactor-safety questions ("where is this used?", "who
     /// calls this?").
     ///
-    /// Cost: adds +19-23% DB size on Go-heavy repos and ~5-7% build time.
+    /// Cost: DB grows substantially — roughly +30% on TS/JS repos and up to
+    /// +150% on Go-heavy repos. Build time grows ~5-7%.
     /// Coverage: 8 tier-1 languages (Go, Python, Java, TypeScript, JavaScript,
     /// Perl, Ruby, Scala). `shire init` prompts for this option and marks
     /// it as experimental.

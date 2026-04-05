@@ -162,9 +162,8 @@ Prompts are pre-built templates for semantic codebase exploration. They compose 
 
 | Prompt | Args | Description |
 |---|---|---|
-| `explore` | `query` | Search packages, symbols, and files for a concept — returns a structured context map organized by package |
-| `explore-package` | `name` | Deep dive into a specific package — metadata, internal deps, dependents, public API surface, file tree |
-| `impact-analysis` | `name` | Blast radius analysis — direct dependents, transitive dependents, full dependency chain |
+| `explore` | `query` | Search packages, symbols, files, and docs for a concept — returns a structured context map organized by package |
+| `reference_audit` | `name` | Refactor-safety analysis using references, callers, and callees for change-impact review (requires cross-reference index — experimental, opt-in) |
 
 ### Claude Code
 

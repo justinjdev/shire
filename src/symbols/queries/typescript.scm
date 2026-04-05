@@ -82,12 +82,23 @@
 ; Reference: type usages
 (type_identifier) @name @reference.type
 
-; Reference: imports (named imports)
+; Reference: imports (named imports) — `import { Foo } from "./m"`
 (import_statement
   (import_clause
     (named_imports
       (import_specifier
         name: (identifier) @name @reference.import))))
+
+; Reference: imports (default import) — `import Foo from "./m"`
+(import_statement
+  (import_clause
+    (identifier) @name @reference.import))
+
+; Reference: imports (namespace import) — `import * as Foo from "./m"`
+(import_statement
+  (import_clause
+    (namespace_import
+      (identifier) @name @reference.import)))
 
 ; Reference: superclass (extends on class)
 (class_declaration
@@ -100,3 +111,8 @@
   (class_heritage
     (implements_clause
       (type_identifier) @name @reference.impl)))
+
+; Reference: interface extends (`interface Foo extends Bar, Baz {}`)
+(interface_declaration
+  (extends_type_clause
+    (type_identifier) @name @reference.impl))

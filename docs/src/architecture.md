@@ -38,6 +38,8 @@ src/
 │                    # for 8 tier-1 languages: Go, Python, Java, TypeScript, JavaScript,
 │                    # Perl, Ruby, Scala. References are captured via @reference.* captures
 │                    # in the language's .scm query and written to the symbol_refs table.
+│                    # Coverage is asymmetric per language: JavaScript omits Type refs
+│                    # (no type system), and Go/Perl omit Impl refs (no extends/implements).
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
 │   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding (64 files/batch)

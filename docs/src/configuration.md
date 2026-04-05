@@ -63,7 +63,9 @@ when you say yes. You can also add it manually:
 references_enabled = true
 ```
 
-**Cost:** +19-23% DB size and ~5-7% build time on Go-heavy repos.
+**Cost:** DB grows substantially — roughly +30% on TS/JS repos to +150% on
+Go-heavy repos (benchmarks on shire-bench: turborepo +29%, grafana +152%,
+kubernetes +104% vs main baseline). Build time grows ~5-7%.
 
 Toggling the flag takes effect on the next build. Disabling wipes
 `symbol_refs` at the start of the build; re-enabling repopulates it on

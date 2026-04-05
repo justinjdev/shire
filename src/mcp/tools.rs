@@ -358,9 +358,9 @@ pub struct SymbolRefsArgs {
     /// Optional package filter
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100)
+    /// Max results (default 100, clamped to 1..=1000)
     #[serde(default)]
-    pub limit: Option<i64>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -370,9 +370,9 @@ pub struct SymbolCallersArgs {
     /// Optional: restrict callers to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100)
+    /// Max results (default 100, clamped to 1..=1000)
     #[serde(default)]
-    pub limit: Option<i64>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -382,9 +382,9 @@ pub struct SymbolCalleesArgs {
     /// Optional: restrict to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100)
+    /// Max results (default 100, clamped to 1..=1000)
     #[serde(default)]
-    pub limit: Option<i64>,
+    pub limit: Option<u32>,
 }
 
 #[tool_router]
@@ -656,7 +656,7 @@ impl ShireService {
         tracing::debug!(tool = "symbol_references", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let limit = args.limit.unwrap_or(100);
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_references(
             &conn,
             &args.name,
@@ -678,7 +678,7 @@ impl ShireService {
         tracing::debug!(tool = "symbol_callers", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let limit = args.limit.unwrap_or(100);
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callers(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string(&rows)
@@ -694,7 +694,7 @@ impl ShireService {
         tracing::debug!(tool = "symbol_callees", name = %args.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let limit = args.limit.unwrap_or(100);
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callees(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         let json = serde_json::to_string(&rows)

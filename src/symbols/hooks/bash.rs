@@ -40,7 +40,7 @@ mod tests {
     use crate::symbols::registry::extract_file;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
-        extract_file("sh", source, Arc::from("test.sh")).0
+        extract_file("sh", source, Arc::from("test.sh"), true).0
     }
 
     #[test]
@@ -124,7 +124,7 @@ function run {
         let source = r#"function hello() {
     echo "world"
 }"#;
-        let symbols = extract_file("bash", source, Arc::from("test.bash")).0;
+        let symbols = extract_file("bash", source, Arc::from("test.bash"), true).0;
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "hello");
     }

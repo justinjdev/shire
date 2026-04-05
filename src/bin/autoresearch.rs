@@ -299,71 +299,117 @@ fn run_query_benchmark(repos: &[PathBuf]) {
 
         eprintln!("\n=== {} ({}) ===", repo_name, size);
 
+        // Sample actual names from symbol_refs so benchmarks measure real
+        // index hits, not empty-table lookups against a hard-coded probe.
+        // Falls back to "Config" / "main" when the index is empty (refs
+        // disabled or repo with no refs yet).
+        let ref_name: String = conn
+            .query_row(
+                "SELECT name FROM symbol_refs WHERE kind = 'type' ORDER BY RANDOM() LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "Config".into());
+        let caller_target: String = conn
+            .query_row(
+                "SELECT name FROM symbol_refs WHERE kind = 'call' ORDER BY RANDOM() LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "New".into());
+        let callee_enclosing: String = conn
+            .query_row(
+                "SELECT enclosing_symbol FROM symbol_refs WHERE kind = 'call' AND enclosing_symbol IS NOT NULL ORDER BY RANDOM() LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "main".into());
+        // Leak sampled names into 'static so they can live inside Fn closures.
+        let ref_name_static: &'static str = Box::leak(ref_name.into_boxed_str());
+        let caller_target_static: &'static str = Box::leak(caller_target.into_boxed_str());
+        let callee_enclosing_static: &'static str = Box::leak(callee_enclosing.into_boxed_str());
+
         struct QueryBench {
-            name: &'static str,
+            name: String,
             run: Box<dyn Fn(&rusqlite::Connection)>,
         }
 
-        let queries: Vec<QueryBench> = vec![
+        let mut queries: Vec<QueryBench> = vec![
             QueryBench {
-                name: "search_symbols(\"parse\")",
+                name: "search_symbols(\"parse\")".into(),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::search_symbols(c, "parse", None, None, 50);
                 }),
             },
             QueryBench {
-                name: "search_symbols(\"Config\")",
+                name: "search_symbols(\"Config\")".into(),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::search_symbols(c, "Config", None, None, 50);
                 }),
             },
             QueryBench {
-                name: "search_files(\"mod\")",
+                name: "search_files(\"mod\")".into(),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::search_files(c, "mod", None, None);
                 }),
             },
             QueryBench {
-                name: "search_files(\"test\")",
+                name: "search_files(\"test\")".into(),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::search_files(c, "test", None, None);
                 }),
             },
             QueryBench {
-                name: "list_packages(None)",
+                name: "list_packages(None)".into(),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::list_packages(c, None);
                 }),
             },
-            QueryBench {
-                name: "query_symbol_references(\"Config\")",
-                run: Box::new(|c| {
-                    let _ = shire::db::queries::query_symbol_references(
-                        c, "Config", None, None, 50,
-                    );
-                }),
-            },
-            QueryBench {
-                name: "query_symbol_references(\"Config\", kind=type)",
-                run: Box::new(|c| {
-                    let _ = shire::db::queries::query_symbol_references(
-                        c, "Config", Some("type"), None, 50,
-                    );
-                }),
-            },
-            QueryBench {
-                name: "query_symbol_callers(\"New\")",
-                run: Box::new(|c| {
-                    let _ = shire::db::queries::query_symbol_callers(c, "New", None, 50);
-                }),
-            },
-            QueryBench {
-                name: "query_symbol_callees(\"main\")",
-                run: Box::new(|c| {
-                    let _ = shire::db::queries::query_symbol_callees(c, "main", None, 50);
-                }),
-            },
         ];
+
+        // Only run reference-query benchmarks if the index has refs. When the
+        // user has disabled references_enabled these tables are empty and the
+        // benchmark numbers would all be "DB lookup on empty table", which
+        // isn't useful and pollutes the aggregate.
+        let ref_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap_or(0);
+        if ref_count > 0 {
+            queries.push(QueryBench {
+                name: format!("query_symbol_references({:?})", ref_name_static),
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_references(
+                        c, ref_name_static, None, None, 50,
+                    );
+                }),
+            });
+            queries.push(QueryBench {
+                name: format!("query_symbol_references({:?}, kind=type)", ref_name_static),
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_references(
+                        c, ref_name_static, Some("type"), None, 50,
+                    );
+                }),
+            });
+            queries.push(QueryBench {
+                name: format!("query_symbol_callers({:?})", caller_target_static),
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_callers(
+                        c, caller_target_static, None, 50,
+                    );
+                }),
+            });
+            queries.push(QueryBench {
+                name: format!("query_symbol_callees({:?})", callee_enclosing_static),
+                run: Box::new(|c| {
+                    let _ = shire::db::queries::query_symbol_callees(
+                        c, callee_enclosing_static, None, 50,
+                    );
+                }),
+            });
+        } else {
+            eprintln!("[query] symbol_refs empty — skipping reference-query benchmarks");
+        }
 
         let mut query_results = Vec::new();
 
@@ -551,9 +597,14 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
             let _ = shire::db::queries::search_files(&conn, "test", None, None);
             let _ = shire::db::queries::search_packages(&conn, "api", 20);
-            let _ =
-                shire::db::queries::query_symbol_references(&conn, "Config", None, None, 50);
-            let _ = shire::db::queries::query_symbol_callers(&conn, "New", None, 50);
+            // Only benchmark ref-queries when the index actually has refs —
+            // otherwise we're just measuring an empty-table lookup, which
+            // pollutes the aggregate.
+            if config.symbols.references_enabled {
+                let _ =
+                    shire::db::queries::query_symbol_references(&conn, "Config", None, None, 50);
+                let _ = shire::db::queries::query_symbol_callers(&conn, "New", None, 50);
+            }
             let query_ms = start.elapsed().as_secs_f64() * 1000.0;
             query_times.push(query_ms);
             drop(conn);
@@ -729,64 +780,77 @@ fn run_quality_checks(repos: &[PathBuf]) {
             format!("{} orphans", orphan_syms),
         ));
 
-        // 4b. Cross-reference index is populated
-        let ref_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
-            .unwrap_or(0);
-        checks.push((
-            "references exist",
-            ref_count > 0,
-            format!("{} refs", ref_count),
-        ));
+        // 4b-4e: cross-reference index checks. Only run when the user has
+        // opted into refs — otherwise the table is expected empty and
+        // asserting "references exist" would be a false-positive failure.
+        if config.symbols.references_enabled {
+            let ref_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+                .unwrap_or(0);
+            checks.push((
+                "references exist",
+                ref_count > 0,
+                format!("{} refs", ref_count),
+            ));
 
-        // 4c. Non-null ref packages all resolve to packages table
-        let orphan_refs: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM symbol_refs r WHERE r.package IS NOT NULL AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = r.package)",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(-1);
-        checks.push((
-            "no orphan references",
-            orphan_refs == 0,
-            format!("{} orphans", orphan_refs),
-        ));
+            // 4c. Non-null ref packages all resolve to packages table
+            let orphan_refs: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbol_refs r WHERE r.package IS NOT NULL AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = r.package)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            checks.push((
+                "no orphan references",
+                orphan_refs == 0,
+                format!("{} orphans", orphan_refs),
+            ));
 
-        // 4d. No self-reference at a definition's own line — covers type/impl
-        // self-ref bugs we recently hit for TS non-exported interfaces. The
-        // JOIN key is (name, file_path, line, kind) and we exclude Call kind
-        // because a method named `foo` calling itself at its own line is
-        // structurally possible (e.g. recursive one-liners).
-        let self_refs: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM symbol_refs r \
-                 JOIN files f ON f.id = r.file_id \
-                 JOIN symbols s ON s.name = r.name AND s.file_path = f.path AND s.line = r.line \
-                 WHERE r.kind IN ('type', 'impl')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(-1);
-        checks.push((
-            "no self-references at definition",
-            self_refs == 0,
-            format!("{} self-refs", self_refs),
-        ));
+            // 4d. No self-reference at a definition's own line — covers type/impl
+            // self-ref bugs we recently hit for TS non-exported interfaces. The
+            // JOIN key is (name, file_path, line, kind) and we exclude Call kind
+            // because a method named `foo` calling itself at its own line is
+            // structurally possible (e.g. recursive one-liners).
+            let self_refs: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbol_refs r \
+                     JOIN files f ON f.id = r.file_id \
+                     JOIN symbols s ON s.name = r.name AND s.file_path = f.path AND s.line = r.line \
+                     WHERE r.kind IN ('type', 'impl')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1);
+            checks.push((
+                "no self-references at definition",
+                self_refs == 0,
+                format!("{} self-refs", self_refs),
+            ));
 
-        // 4e. Reference queries return results for a common name
-        let config_refs = shire::db::queries::query_symbol_references(
-            &conn, "Config", None, None, 10,
-        )
-        .map(|r| r.len())
-        .unwrap_or(0);
-        checks.push((
-            "reference query returns results",
-            // Allow zero for repos that happen to have no "Config" symbol
-            // but flag if the overall index has refs and we still get zero
-            config_refs > 0 || ref_count == 0,
-            format!("{} refs for 'Config'", config_refs),
-        ));
+            // 4e. Reference query round-trips for an actual name in the index.
+            // Sample a random ref name instead of hard-coding "Config" — some
+            // repos don't have that symbol and we'd false-fail.
+            if ref_count > 0 {
+                let probe: String = conn
+                    .query_row(
+                        "SELECT name FROM symbol_refs ORDER BY RANDOM() LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let probe_hits = shire::db::queries::query_symbol_references(
+                    &conn, &probe, None, None, 10,
+                )
+                .map(|r| r.len())
+                .unwrap_or(0);
+                checks.push((
+                    "reference query returns results",
+                    probe_hits > 0,
+                    format!("{} refs for {:?}", probe_hits, probe),
+                ));
+            }
+        }
 
         // 5. FTS integrity (needs read-write connection)
         drop(conn);

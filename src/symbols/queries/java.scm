@@ -31,9 +31,15 @@
 (type_identifier) @name @reference.type
 
 ; Reference: imports
+; Capture the terminal identifier of a scoped_identifier so
+; `import java.util.List;` records as `List` (simple name), not
+; `java.util.List`. symbol_refs lookup is exact-name, so the full
+; qualified path would never match a user's search for `List`.
 (import_declaration
-  (scoped_identifier) @name) @reference.import
+  (scoped_identifier
+    name: (identifier) @name)) @reference.import
 
+; Bare identifier imports (rare) — record as-is.
 (import_declaration
   (identifier) @name) @reference.import
 

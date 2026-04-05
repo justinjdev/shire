@@ -217,7 +217,7 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nim"), &hooks).0
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.nim"), &hooks, true).0
     }
 
     #[test]

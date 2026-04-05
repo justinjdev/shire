@@ -120,12 +120,14 @@ pub fn extract_file_full(
     source: &str,
     file_path: Arc<str>,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
-    registry::extract_file(ext, source, file_path)
+    registry::extract_file(ext, source, file_path, false)
 }
 
-/// Extract only symbols (backward-compatible convenience wrapper).
+/// Extract only symbols (backward-compatible convenience wrapper). Skips
+/// reference-capture processing entirely so callers that don't need refs
+/// don't pay the per-match `resolve_enclosing_symbol` + allocation cost.
 pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
-    registry::extract_file(ext, source, file_path).0
+    registry::extract_file(ext, source, file_path, true).0
 }
 
 #[cfg(test)]

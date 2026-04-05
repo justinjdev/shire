@@ -1,5 +1,14 @@
 # Cross-Reference Index Implementation Plan
 
+> **NOTE (historical):** This plan was written before implementation. The final
+> shipped design dropped the FTS5 virtual table for `symbol_refs` in favor of
+> B-tree indexes only — MCP query tools use exact-name lookups, which don't
+> benefit from FTS5 ranking. The FTS5 schema, triggers, and helpers described
+> in Task 4 were never merged. Schema changes also landed differently: refs
+> store `file_id INTEGER` (FK to `files`), not the original `file_path TEXT`.
+> Use this document for historical context only; see
+> `docs/src/architecture.md` for the shipped design.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Index symbol references (call sites, type refs, imports, impl clauses) alongside symbol definitions, exposing three new MCP tools (`symbol_references`, `symbol_callers`, `symbol_callees`) for tier 1 languages: Go, Python, Java, TypeScript, JavaScript, Perl, Ruby, Scala.

@@ -54,6 +54,7 @@ pub fn extract(
     source: &str,
     file_path: Arc<str>,
     hooks: &LanguageHooks,
+    skip_references: bool,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     let tree = match parser.parse(source, None) {
         Some(t) => t,
@@ -188,6 +189,9 @@ pub fn extract(
             }
 
             // Reference path — buffer for post-pass filtering
+            if skip_references {
+                continue;
+            }
             if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
                 if hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
@@ -221,13 +225,17 @@ pub fn extract(
             }
         }
 
-        // Build the set of byte ranges captured as Impl. A node captured as
-        // Impl is ALWAYS the right classification for that node — e.g. the
-        // `BaseService` identifier inside `extends BaseService` should be an
-        // Impl ref, not a Type ref. But the generic `(type_identifier) @name
-        // @reference.type` pattern also matches it, producing a duplicate
-        // Type row. We suppress Type refs at node ranges already claimed by
-        // Impl.
+        // Build sets of byte ranges captured as Impl or Call. A node
+        // captured as Impl or Call is ALWAYS the right classification for
+        // that node — e.g. `BaseService` in `extends BaseService` is an
+        // Impl, and a `Constant` in method-call position (Ruby: the bare
+        // `(constant) @reference.type` pattern also matches method-name
+        // constants captured as `@reference.call` via
+        // `(call method: (constant))`) is a Call. But the generic
+        // `(type_identifier) @reference.type` / `(constant)
+        // @reference.type` patterns also match these nodes, producing
+        // duplicate Type rows. Suppress Type refs at node ranges already
+        // claimed by Impl or Call.
         let impl_ranges: std::collections::HashSet<(usize, usize)> = pending_references
             .iter()
             .filter_map(|(r, range)| {
@@ -238,15 +246,28 @@ pub fn extract(
                 }
             })
             .collect();
+        let call_ranges: std::collections::HashSet<(usize, usize)> = pending_references
+            .iter()
+            .filter_map(|(r, range)| {
+                if r.kind == ReferenceKind::Call {
+                    Some(*range)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Emit references, skipping:
-        //   (a) self-references at a definition's own name node, and
-        //   (b) Type refs that duplicate an Impl ref at the same node
+        //   (a) self-references at a definition's own name node,
+        //   (b) Type refs that duplicate an Impl ref at the same node, and
+        //   (c) Type refs that duplicate a Call ref at the same node.
         for (reference, node_range) in pending_references {
             if def_name_ranges.contains(&node_range) {
                 continue;
             }
-            if reference.kind == ReferenceKind::Type && impl_ranges.contains(&node_range) {
+            if reference.kind == ReferenceKind::Type
+                && (impl_ranges.contains(&node_range) || call_ranges.contains(&node_range))
+            {
                 continue;
             }
             references.push(reference);

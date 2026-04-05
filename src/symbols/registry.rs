@@ -301,6 +301,7 @@ pub fn extract_file(
     ext: &str,
     source: &str,
     file_path: Arc<str>,
+    skip_references: bool,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     // Regex-based extractors (no tree-sitter)
     match ext {
@@ -320,7 +321,7 @@ pub fn extract_file(
             if parser.set_language(&language).is_err() {
                 return (Vec::new(), Vec::new());
             }
-            return query_extract::extract(&mut parser, query, source, file_path, &hooks);
+            return query_extract::extract(&mut parser, query, source, file_path, &hooks, skip_references);
         }
     }
 

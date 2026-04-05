@@ -407,6 +407,24 @@ pub struct SymbolCalleesArgs {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChangeImpactArgs {
+    /// The symbol name whose change impact to analyze
+    pub name: String,
+    /// Optional "home" package — the package that defines the symbol. When
+    /// omitted, Shire looks it up from the symbols table. Provide this to
+    /// disambiguate same-name symbols defined in multiple packages.
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Reverse-dependency BFS depth for transitive impact. Default 2, clamped
+    /// 0..=10. Use 0 to skip transitive analysis entirely.
+    #[serde(default)]
+    pub transitive_depth: Option<u32>,
+    /// Max results per bucket (default 100, clamped 1..=1000)
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description. Use instead of Grep for finding packages.")]
@@ -741,6 +759,32 @@ impl ShireService {
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols.")]
+    fn change_impact(
+        &self,
+        Parameters(args): Parameters<ChangeImpactArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "change_impact", name = %args.name, package = ?args.package);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        if let Some(disabled) = Self::refs_disabled_result(&conn) {
+            return Ok(disabled);
+        }
+        let depth = args.transitive_depth.unwrap_or(2).min(10);
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
+        let impact = queries::change_impact(
+            &conn,
+            &args.name,
+            args.package.as_deref(),
+            depth,
+            limit,
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&impact)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[cfg(test)]
@@ -948,5 +992,99 @@ mod tests {
         };
         // Empty DB → empty JSON array, not an error string.
         assert_eq!(text, "[]", "empty DB returns empty array");
+    }
+
+    #[test]
+    fn test_change_impact_refs_disabled_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = crate::db::open_or_create(&path, false).unwrap();
+            crate::db::write_references_enabled(&conn, false).unwrap();
+        }
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+
+        let args = ChangeImpactArgs {
+            name: "foo".into(),
+            package: None,
+            transitive_depth: None,
+            limit: None,
+        };
+        let r = svc.change_impact(Parameters(args)).unwrap();
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("Cross-reference index is disabled"));
+    }
+
+    /// End-to-end: wire a minimal symbol + refs + dep graph through the
+    /// tool and verify the JSON carries the partitioning and summary fields.
+    #[test]
+    fn test_change_impact_happy_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = crate::db::open_or_create(&path, false).unwrap();
+            crate::db::write_references_enabled(&conn, true).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('core','core','rust'),('dep','dep','rust'),('grand','grand','rust')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dependencies (package, dependency, dep_kind, is_internal) VALUES ('dep','core','runtime',1),('grand','dep','runtime',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line) VALUES ('core','foo','function','core/f.rs',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes) VALUES ('core/x.rs','core','rs',0),('dep/y.rs','dep','rs',0)",
+                [],
+            )
+            .unwrap();
+            let core_id: i64 = conn.query_row("SELECT id FROM files WHERE path='core/x.rs'", [], |r| r.get(0)).unwrap();
+            let dep_id: i64 = conn.query_row("SELECT id FROM files WHERE path='dep/y.rs'", [], |r| r.get(0)).unwrap();
+            conn.execute(
+                &format!(
+                    "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES \
+                     ('foo','call',{core_id},10,'core','bar'), \
+                     ('foo','call',{dep_id},5,'dep','baz')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+
+        let args = ChangeImpactArgs {
+            name: "foo".into(),
+            package: None,
+            transitive_depth: Some(2),
+            limit: None,
+        };
+        let r = svc.change_impact(Parameters(args)).unwrap();
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v["symbol"], "foo");
+        assert_eq!(v["home_package"], "core");
+        assert_eq!(v["direct_impact"].as_array().unwrap().len(), 1);
+        assert_eq!(v["cross_package_impact"].as_array().unwrap().len(), 1);
+        assert_eq!(v["summary"]["direct_count"], 1);
+        assert_eq!(v["summary"]["cross_package_count"], 1);
+        // dep is directly affected; grand depends on dep → transitive.
+        let trans = v["transitive_impact"].as_array().unwrap();
+        assert_eq!(trans.len(), 1);
+        assert_eq!(trans[0]["package"], "grand");
+        assert_eq!(trans[0]["via"], "dep");
     }
 }

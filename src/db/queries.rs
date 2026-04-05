@@ -1110,6 +1110,187 @@ pub fn query_symbol_callees(
     Ok(collect_rows(rows))
 }
 
+// ── Change impact analysis ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitiveImpact {
+    /// The package affected transitively.
+    pub package: String,
+    /// A directly-affected package that `package` depends on (the edge's
+    /// downstream end). When multiple paths exist, the shortest is reported.
+    pub via: String,
+    pub dep_kind: String,
+    /// Hops from an affected package. 1 = direct reverse-dep of an affected
+    /// package; 2 = depends on a reverse-dep; etc.
+    pub distance: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeImpactSummary {
+    /// Total same-package refs (may exceed `direct_impact.len()` when the
+    /// returned rows were truncated to `per_bucket_limit`).
+    pub direct_count: usize,
+    /// Total cross-package refs (may exceed `cross_package_impact.len()`
+    /// when the returned rows were truncated to `per_bucket_limit`).
+    pub cross_package_count: usize,
+    /// Unique packages that contain cross-package references. Computed from
+    /// the full ref set before truncation — this is the authoritative list
+    /// of directly affected packages.
+    pub affected_packages: Vec<String>,
+    pub transitive_package_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeImpact {
+    pub symbol: String,
+    /// The package where the symbol is defined. `None` when the symbol is not
+    /// in the `symbols` table and no `package` hint was given — in that case
+    /// every ref falls into `cross_package_impact`.
+    pub home_package: Option<String>,
+    pub direct_impact: Vec<ReferenceRow>,
+    pub cross_package_impact: Vec<ReferenceRow>,
+    pub transitive_impact: Vec<TransitiveImpact>,
+    pub summary: ChangeImpactSummary,
+}
+
+/// Resolve the "home package" of a symbol — the package that defines it.
+/// Used by `change_impact` to decide which refs are in-package (direct) vs
+/// cross-package. Picks the first match when multiple same-name symbols exist
+/// across packages (callers can disambiguate by passing `package` explicitly).
+fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Compute the transitive impact of changing a symbol by combining the
+/// cross-reference index with the dependency graph.
+///
+/// - Partitions refs into same-package (`direct_impact`) vs other-package
+///   (`cross_package_impact`) using `home_package` (caller-supplied or looked
+///   up from `symbols`).
+/// - BFS the reverse-dep graph starting from packages with cross-package refs,
+///   up to `transitive_depth`. Packages already in `affected_packages` are
+///   excluded — they would overstate impact.
+pub fn change_impact(
+    conn: &Connection,
+    name: &str,
+    package_hint: Option<&str>,
+    transitive_depth: u32,
+    per_bucket_limit: i64,
+) -> Result<ChangeImpact> {
+    // Fetch all refs with a high safety cap, then partition. Using
+    // per_bucket_limit at fetch time would starve a bucket: refs are
+    // ordered by (file_path, line), so if one side's paths sort first,
+    // the other bucket gets zero rows — affected_packages is incomplete
+    // and BFS under-reports blast radius. The safety cap keeps memory
+    // bounded for pathologically-called symbols.
+    const MAX_REFS_SCANNED: i64 = 10_000;
+    let all_refs = query_symbol_references(conn, name, None, None, MAX_REFS_SCANNED)?;
+
+    let home_package = match package_hint {
+        Some(p) => Some(p.to_string()),
+        None => resolve_home_package(conn, name)?,
+    };
+
+    let mut direct_impact: Vec<ReferenceRow> = Vec::new();
+    let mut cross_package_impact: Vec<ReferenceRow> = Vec::new();
+    let mut affected_packages_set: HashSet<String> = HashSet::new();
+
+    for r in all_refs {
+        match (&home_package, &r.package) {
+            (Some(home), Some(pkg)) if pkg == home => direct_impact.push(r),
+            (_, Some(pkg)) => {
+                affected_packages_set.insert(pkg.clone());
+                cross_package_impact.push(r);
+            }
+            // Refs with NULL package (ref was extracted but package couldn't
+            // be attributed — rare, usually means file wasn't mapped to a
+            // package). Treat as cross-package since we can't prove same-pkg.
+            (_, None) => cross_package_impact.push(r),
+        }
+    }
+
+    // Capture true counts before truncation — users need to see the real
+    // blast radius even when we cap the returned rows for display.
+    let direct_count = direct_impact.len();
+    let cross_package_count = cross_package_impact.len();
+
+    direct_impact.truncate(per_bucket_limit as usize);
+    cross_package_impact.truncate(per_bucket_limit as usize);
+
+    // BFS reverse-dep graph from each affected package. `via` records the
+    // first affected package we reached this transitive package through.
+    // `is_internal = 1` matches reverse_dependency_graph() — external deps
+    // that share a name with an internal package must not appear here.
+    let transitive_cap = per_bucket_limit as usize;
+    let mut transitive_impact: Vec<TransitiveImpact> = Vec::new();
+    if transitive_depth > 0 && !affected_packages_set.is_empty() {
+        let mut visited: HashSet<String> = affected_packages_set.clone();
+        // Also don't recurse back into the home package.
+        if let Some(ref home) = home_package {
+            visited.insert(home.clone());
+        }
+        let mut queue: VecDeque<(String, String, u32)> = VecDeque::new();
+        for pkg in &affected_packages_set {
+            queue.push_back((pkg.clone(), pkg.clone(), 0));
+        }
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1",
+        )?;
+
+        while let Some((current, origin, depth)) = queue.pop_front() {
+            if depth >= transitive_depth || transitive_impact.len() >= transitive_cap {
+                continue;
+            }
+            let rows = stmt.query_map([&current], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (dependent, dep_kind) = row?;
+                if !visited.insert(dependent.clone()) {
+                    continue;
+                }
+                transitive_impact.push(TransitiveImpact {
+                    package: dependent.clone(),
+                    via: origin.clone(),
+                    dep_kind,
+                    distance: depth + 1,
+                });
+                if transitive_impact.len() >= transitive_cap {
+                    break;
+                }
+                queue.push_back((dependent, origin.clone(), depth + 1));
+            }
+        }
+    }
+
+    let mut affected_packages: Vec<String> = affected_packages_set.into_iter().collect();
+    affected_packages.sort();
+
+    let summary = ChangeImpactSummary {
+        direct_count,
+        cross_package_count,
+        affected_packages,
+        transitive_package_count: transitive_impact.len(),
+    };
+
+    Ok(ChangeImpact {
+        symbol: name.to_string(),
+        home_package,
+        direct_impact,
+        cross_package_impact,
+        transitive_impact,
+        summary,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1998,5 +2179,331 @@ mod refs_tests {
         assert_eq!(callees.len(), 2);
         let foo = callees.iter().find(|c| c.callee_name == "foo").unwrap();
         assert_eq!(foo.call_sites, 2);
+    }
+
+    /// Seed a package row for dependency graph tests. Each package needs a
+    /// row in `packages` for the FK on `dependencies.package` to hold.
+    fn seed_package(conn: &Connection, name: &str) {
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES (?1, ?2, 'rust')",
+            [name, name],
+        )
+        .unwrap();
+    }
+
+    fn seed_dependency(conn: &Connection, pkg: &str, dep: &str) {
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal) VALUES (?1, ?2, 'runtime', 1)",
+            [pkg, dep],
+        )
+        .unwrap();
+    }
+
+    /// Full-stack test of change_impact: home-package identification from
+    /// `symbols`, partitioning refs into direct vs cross-package, and BFS of
+    /// the reverse dep graph for transitive impact.
+    #[test]
+    fn test_change_impact_partitions_and_traverses() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        // Packages + dep graph:
+        //   api-server → config-core
+        //   worker → config-core
+        //   integration-tests → api-server
+        //   deploy-scripts → worker
+        for p in ["config-core", "api-server", "worker", "integration-tests", "deploy-scripts"] {
+            seed_package(&conn, p);
+        }
+        seed_dependency(&conn, "api-server", "config-core");
+        seed_dependency(&conn, "worker", "config-core");
+        seed_dependency(&conn, "integration-tests", "api-server");
+        seed_dependency(&conn, "deploy-scripts", "worker");
+
+        // `parseConfig` defined in config-core
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('config-core', 'parseConfig', 'function', 'config-core/src/lib.rs', 5)",
+            [],
+        )
+        .unwrap();
+
+        let ids = seed_files(
+            &conn,
+            &[
+                "config-core/src/loader.rs",
+                "config-core/src/validate.rs",
+                "api-server/src/main.rs",
+                "worker/src/init.rs",
+            ],
+        );
+        let loader = ids["config-core/src/loader.rs"];
+        let validate = ids["config-core/src/validate.rs"];
+        let api_main = ids["api-server/src/main.rs"];
+        let worker_init = ids["worker/src/init.rs"];
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES \
+                 ('parseConfig', 'call', {loader}, 42, 'config-core', 'load'), \
+                 ('parseConfig', 'call', {validate}, 18, 'config-core', 'validate'), \
+                 ('parseConfig', 'call', {api_main}, 7, 'api-server', 'main'), \
+                 ('parseConfig', 'call', {worker_init}, 23, 'worker', 'init')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "parseConfig", None, 2, 100).unwrap();
+
+        assert_eq!(impact.home_package.as_deref(), Some("config-core"));
+        assert_eq!(impact.direct_impact.len(), 2);
+        assert_eq!(impact.cross_package_impact.len(), 2);
+        assert_eq!(impact.summary.affected_packages, vec!["api-server", "worker"]);
+
+        // Transitive: integration-tests → api-server, deploy-scripts → worker.
+        // Neither api-server nor worker themselves appear (they're in
+        // affected_packages and excluded from transitive).
+        let trans_pkgs: HashSet<&str> = impact
+            .transitive_impact
+            .iter()
+            .map(|t| t.package.as_str())
+            .collect();
+        assert_eq!(trans_pkgs, HashSet::from(["integration-tests", "deploy-scripts"]));
+        assert_eq!(impact.summary.transitive_package_count, 2);
+        for t in &impact.transitive_impact {
+            assert_eq!(t.distance, 1);
+        }
+    }
+
+    /// When the caller supplies a `package` hint, it overrides lookup from
+    /// the `symbols` table. This disambiguates same-name symbols defined
+    /// in multiple packages.
+    #[test]
+    fn test_change_impact_package_hint_overrides() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci2.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        for p in ["pkgA", "pkgB"] {
+            seed_package(&conn, p);
+        }
+        // Symbol defined in both packages — lookup would return pkgA (alphabetical).
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('pkgA', 'doThing', 'function', 'a.rs', 1), \
+                    ('pkgB', 'doThing', 'function', 'b.rs', 1)",
+            [],
+        )
+        .unwrap();
+
+        let ids = seed_files(&conn, &["a.rs", "b.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES \
+                 ('doThing', 'call', {a}, 5, 'pkgA', NULL), \
+                 ('doThing', 'call', {b}, 5, 'pkgB', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        // Hint pkgB — ref in pkgB is direct, ref in pkgA is cross-package.
+        let impact = change_impact(&conn, "doThing", Some("pkgB"), 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("pkgB"));
+        assert_eq!(impact.direct_impact.len(), 1);
+        assert_eq!(impact.direct_impact[0].package.as_deref(), Some("pkgB"));
+        assert_eq!(impact.cross_package_impact.len(), 1);
+        assert_eq!(impact.cross_package_impact[0].package.as_deref(), Some("pkgA"));
+    }
+
+    /// When the symbol has no definition in `symbols` and no hint is given,
+    /// home_package is None and every ref becomes cross-package. The tool
+    /// still works — impact analysis is useful for undefined/external symbols
+    /// (imports of third-party names, macros, etc.).
+    #[test]
+    fn test_change_impact_no_home_package() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci3.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        for p in ["pkg1", "pkg2"] {
+            seed_package(&conn, p);
+        }
+        let ids = seed_files(&conn, &["a.rs", "b.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES \
+                 ('External', 'type', {a}, 1, 'pkg1', NULL), \
+                 ('External', 'type', {b}, 1, 'pkg2', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "External", None, 0, 100).unwrap();
+        assert!(impact.home_package.is_none());
+        assert_eq!(impact.direct_impact.len(), 0);
+        assert_eq!(impact.cross_package_impact.len(), 2);
+        assert_eq!(impact.summary.affected_packages, vec!["pkg1", "pkg2"]);
+        assert_eq!(impact.transitive_impact.len(), 0);
+    }
+
+    /// Depth=0 disables transitive traversal entirely, even when there are
+    /// reverse-dep edges to follow.
+    #[test]
+    fn test_change_impact_transitive_depth_zero() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci4.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        for p in ["core", "consumer", "grandchild"] {
+            seed_package(&conn, p);
+        }
+        seed_dependency(&conn, "consumer", "core");
+        seed_dependency(&conn, "grandchild", "consumer");
+
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('core', 'foo', 'function', 'core.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["consumer.rs"]);
+        let c = ids["consumer.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {c}, 1, 'consumer', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "foo", None, 0, 100).unwrap();
+        assert_eq!(impact.cross_package_impact.len(), 1);
+        assert_eq!(impact.transitive_impact.len(), 0);
+
+        // Depth=2 should find grandchild (consumer → grandchild).
+        let deep = change_impact(&conn, "foo", None, 2, 100).unwrap();
+        assert_eq!(deep.transitive_impact.len(), 1);
+        assert_eq!(deep.transitive_impact[0].package, "grandchild");
+        assert_eq!(deep.transitive_impact[0].distance, 1);
+        assert_eq!(deep.transitive_impact[0].via, "consumer");
+    }
+
+    /// Regression test: when one bucket would dominate the sorted fetch,
+    /// both buckets must still populate correctly and affected_packages
+    /// must reflect the full cross-package set. Previously the 2*limit
+    /// prefetch could starve a bucket entirely.
+    #[test]
+    fn test_change_impact_does_not_starve_bucket() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci_starve.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        seed_package(&conn, "home");
+        seed_package(&conn, "consumer_z");
+
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'foo', 'function', 'home/src.rs', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Many home refs in alphabetically-early paths (home/a..home/y),
+        // few cross-package refs at the end (zzz/). Sorted by file_path,
+        // home refs come first — with a low prefetch, the cross ref would
+        // never be seen.
+        let mut home_paths: Vec<String> = (0..20).map(|i| format!("home/a{i:02}.rs")).collect();
+        home_paths.push("zzz/x.rs".into());
+        let path_refs: Vec<&str> = home_paths.iter().map(|s| s.as_str()).collect();
+        let ids = seed_files(&conn, &path_refs);
+
+        let mut values = Vec::new();
+        for p in &home_paths[..20] {
+            let id = ids[p];
+            values.push(format!("('foo', 'call', {id}, 1, 'home', NULL)"));
+        }
+        let z_id = ids["zzz/x.rs"];
+        values.push(format!("('foo', 'call', {z_id}, 1, 'consumer_z', NULL)"));
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES {}",
+                values.join(", ")
+            ),
+            [],
+        )
+        .unwrap();
+
+        // Request a small limit — the bug would cause cross_package_impact
+        // to be empty because the 2*5=10 prefetch would only see home refs.
+        let impact = change_impact(&conn, "foo", None, 1, 5).unwrap();
+
+        // Pre-truncation counts must reflect the true partition.
+        assert_eq!(impact.summary.direct_count, 20);
+        assert_eq!(impact.summary.cross_package_count, 1);
+        assert_eq!(impact.summary.affected_packages, vec!["consumer_z"]);
+
+        // Returned buckets are truncated to per_bucket_limit.
+        assert_eq!(impact.direct_impact.len(), 5);
+        assert_eq!(impact.cross_package_impact.len(), 1);
+    }
+
+    /// Regression test: external dependency edges (is_internal = 0) must
+    /// not contribute transitive impact. This matches reverse_dependency_graph.
+    #[test]
+    fn test_change_impact_skips_external_dep_edges() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci_ext.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        for p in ["home", "consumer", "external_collider"] {
+            seed_package(&conn, p);
+        }
+        // `external_collider` declares an external dep named `consumer` —
+        // a third-party library that happens to share a name with our
+        // internal package. Must NOT show up as transitive impact.
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal) VALUES ('external_collider','consumer','runtime',0)",
+            [],
+        )
+        .unwrap();
+        // Also a legitimate internal edge for contrast.
+        seed_package(&conn, "legit_dep");
+        seed_dependency(&conn, "legit_dep", "consumer");
+
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'foo', 'function', 'home.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["consumer/a.rs"]);
+        let c = ids["consumer/a.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {c}, 1, 'consumer', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "foo", None, 3, 100).unwrap();
+        let trans_pkgs: HashSet<&str> = impact
+            .transitive_impact
+            .iter()
+            .map(|t| t.package.as_str())
+            .collect();
+        assert_eq!(trans_pkgs, HashSet::from(["legit_dep"]));
+        assert!(!trans_pkgs.contains("external_collider"));
     }
 }

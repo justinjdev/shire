@@ -562,6 +562,44 @@ import { handler } from './handler';
     assert!(imp_names.contains(&"handler"));
 }
 
+#[test]
+fn test_javascript_call_references() {
+    let source = r#"import { parseConfig } from './config.js';
+
+export function handle(req) {
+    const cfg = parseConfig(req.body);
+    return buildResponse(cfg);
+}
+
+function buildResponse(cfg) {
+    return {};
+}
+"#;
+    let (_syms, refs) = extract_file_full("js", source, Arc::from("h.js"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"parseConfig"), "got {:?}", names);
+    assert!(names.contains(&"buildResponse"), "got {:?}", names);
+}
+
+#[test]
+fn test_javascript_impl_references() {
+    let source = r#"class Base {}
+
+class Derived extends Base {}
+"#;
+    let (_syms, refs) = extract_file_full("js", source, Arc::from("c.js"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+}
+
 // ============================================================
 // Java tests (ported from java.rs)
 // ============================================================

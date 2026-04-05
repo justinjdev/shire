@@ -35,3 +35,23 @@
   "default"
   (class_declaration
     name: (identifier) @name) @definition.class)
+
+; Reference: calls
+(call_expression
+  function: (identifier) @name) @reference.call
+
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @name)) @reference.call
+
+; Reference: imports (named imports)
+(import_statement
+  (import_clause
+    (named_imports
+      (import_specifier
+        name: (identifier) @name @reference.import))))
+
+; Reference: superclass
+(class_declaration
+  (class_heritage
+    (identifier) @name @reference.impl))

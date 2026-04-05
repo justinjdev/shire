@@ -32,8 +32,15 @@ setup_repo() {
         else
             echo "[${name}] Already at ${commit}"
         fi
-        # Always ensure RAG is disabled for benchmarks
-        echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
+        # RAG off, cross-reference index on (so bench exercises the
+        # symbol_refs path even though refs are off by default).
+        cat > "${repo_dir}/shire.toml" <<'TOML'
+[rag]
+enabled = false
+
+[symbols]
+references_enabled = true
+TOML
         return 0
     fi
 
@@ -43,8 +50,15 @@ setup_repo() {
     git checkout "${commit}" 2>/dev/null || git checkout "tags/${commit}" 2>/dev/null
     echo "[${name}] Ready at ${repo_dir}"
 
-    # Ensure RAG is disabled for benchmarks
-    echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
+    # RAG off, cross-reference index on (so bench exercises the
+    # symbol_refs path even though refs are off by default).
+    cat > "${repo_dir}/shire.toml" <<'TOML'
+[rag]
+enabled = false
+
+[symbols]
+references_enabled = true
+TOML
 }
 
 # Parse optional filter: setup-bench-repo.sh [small|medium|large|xlarge|all]

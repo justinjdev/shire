@@ -2351,8 +2351,14 @@ fn test_references_incremental_rebuild() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
 
-    // Write shire.toml to isolate from any global ~/.claude/shire.toml
-    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    // Write shire.toml to isolate from any global ~/.claude/shire.toml and
+    // explicitly enable the experimental cross-reference index (off by
+    // default since it's opt-in).
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
 
     fs::create_dir_all(root.join("svc")).unwrap();
     fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
@@ -2425,8 +2431,13 @@ fn test_cross_reference_index_end_to_end() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
 
-    // Write shire.toml to isolate from any global ~/.claude/shire.toml
-    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    // Write shire.toml to isolate from any global ~/.claude/shire.toml and
+    // explicitly enable the experimental cross-reference index.
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
 
     // Create minimal Go package with call and type references
     fs::create_dir_all(root.join("svc")).unwrap();

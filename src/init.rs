@@ -67,6 +67,9 @@ pub struct InitOptions {
     pub db_path: String,
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
+    /// When true, populate the symbol_refs table for `symbol_references`,
+    /// `symbol_callers`, and `symbol_callees` MCP tools. EXPERIMENTAL.
+    pub refs_enabled: bool,
     pub generate_rules: bool,
     /// When true, append Shire guidance to ~/.claude/CLAUDE.md.
     pub patch_claude_md: bool,
@@ -83,6 +86,7 @@ impl InitOptions {
             db_path: ".shire/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: true,
@@ -96,6 +100,7 @@ impl InitOptions {
             db_path: "~/.claude/shire/{repo}/{worktree}/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
@@ -162,13 +167,21 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(false)
         .interact()?;
 
-    // 6. Generate .claude/rules/shire.md
+    // 6. Enable cross-reference index (experimental)
+    let refs_enabled = Confirm::new()
+        .with_prompt(
+            "Enable cross-reference index (experimental)? Adds symbol_references/callers/callees MCP tools at +19-23% DB cost",
+        )
+        .default(false)
+        .interact()?;
+
+    // 7. Generate .claude/rules/shire.md
     let generate_rules = Confirm::new()
         .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
         .default(true)
         .interact()?;
 
-    // 7. Add Shire guidance to ~/.claude/CLAUDE.md
+    // 8. Add Shire guidance to ~/.claude/CLAUDE.md
     let patch_claude_md = Confirm::new()
         .with_prompt("Add Shire search guidance to ~/.claude/CLAUDE.md?")
         .default(true)
@@ -179,6 +192,7 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         db_path,
         extra_excludes,
         rag_enabled,
+        refs_enabled,
         generate_rules,
         patch_claude_md,
         gitignore_db_dir,
@@ -216,6 +230,15 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
     if opts.rag_enabled {
         lines.push("[rag]".into());
         lines.push("enabled = true".into());
+        lines.push(String::new());
+    }
+
+    if opts.refs_enabled {
+        lines.push("[symbols]".into());
+        lines.push("# Cross-reference index (experimental) — powers the symbol_references,".into());
+        lines.push("# symbol_callers, and symbol_callees MCP tools. +19-23% DB size on".into());
+        lines.push("# Go-heavy repos; set to false to opt out.".into());
+        lines.push("references_enabled = true".into());
         lines.push(String::new());
     }
 
@@ -1037,6 +1060,7 @@ mod tests {
             db_path: "/custom/path.db".into(),
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
+            refs_enabled: true,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
@@ -1048,6 +1072,22 @@ mod tests {
         assert!(toml.contains("\"gen\""));
         assert!(toml.contains("[rag]"));
         assert!(toml.contains("enabled = true"));
+        assert!(toml.contains("[symbols]"));
+        assert!(toml.contains("references_enabled = true"));
+    }
+
+    #[test]
+    fn test_generate_config_toml_refs_disabled_no_symbols_section() {
+        let opts = InitOptions {
+            refs_enabled: false,
+            ..InitOptions::default_local()
+        };
+        let toml = generate_config_toml(&opts, false);
+        assert!(
+            !toml.contains("[symbols]"),
+            "opt-out should not emit [symbols] section: {}",
+            toml
+        );
     }
 
     #[test]

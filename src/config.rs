@@ -34,16 +34,18 @@ pub struct SymbolsConfig {
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
     /// Extract cross-references (call sites, type uses, imports, impl
-    /// relationships) alongside symbol definitions. EXPERIMENTAL.
+    /// relationships) alongside symbol definitions. EXPERIMENTAL — off by
+    /// default.
     ///
-    /// When enabled (default), populates the `symbol_refs` table so the
+    /// When enabled, populates the `symbol_refs` table so the
     /// `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools
-    /// can answer refactor-safety questions.
+    /// can answer refactor-safety questions ("where is this used?", "who
+    /// calls this?").
     ///
     /// Cost: adds +19-23% DB size on Go-heavy repos and ~5-7% build time.
     /// Coverage: 8 tier-1 languages (Go, Python, Java, TypeScript, JavaScript,
-    /// Perl, Ruby, Scala). Set to `false` on size-sensitive deployments or
-    /// if the reference tools aren't being used.
+    /// Perl, Ruby, Scala). `shire init` prompts for this option and marks
+    /// it as experimental.
     ///
     /// Toggling this flag takes effect on the next build; changing it
     /// requires no manual migration — disabled builds wipe `symbol_refs`,
@@ -64,7 +66,7 @@ impl Default for SymbolsConfig {
 }
 
 fn default_references_enabled() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Deserialize, Clone)]

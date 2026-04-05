@@ -384,29 +384,26 @@ fn upsert_symbols_and_refs_for_file(
     // Insert new symbols (triggers handle FTS)
     batch_insert_symbols(conn, package, syms)?;
 
-    // Resolve file_id once for this file; all refs in this call share the path.
-    let file_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            [file_path],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(file_id) = file_id else {
-        tracing::warn!(
-            path = file_path,
-            "file not in files table — skipping symbol_refs upsert"
-        );
-        return Ok(());
-    };
-
-    conn.execute(
-        "DELETE FROM symbol_refs WHERE file_id = ?1",
-        rusqlite::params![file_id],
-    )?;
+    // Resolve file_id; if the path is not yet in `files`, we leave the
+    // lookup map empty and let `batch_insert_references` synthesize a
+    // row (same safety-net path the bulk insert uses). The two walkers
+    // can disagree on hidden/symlinked paths — before this unification,
+    // the incremental path would early-return with a warn and leave the
+    // file without refs, while the bulk path would succeed, so an
+    // off→on transition could commit `references_enabled=true` with
+    // gaps for walker-missed files.
     let mut file_ids = std::collections::HashMap::new();
-    file_ids.insert(file_path.to_string(), file_id);
+    if let Ok(file_id) = conn.query_row(
+        "SELECT id FROM files WHERE path = ?1",
+        [file_path],
+        |row| row.get::<_, i64>(0),
+    ) {
+        conn.execute(
+            "DELETE FROM symbol_refs WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        file_ids.insert(file_path.to_string(), file_id);
+    }
     crate::db::queries::batch_insert_references(conn, Some(package), refs, &mut file_ids)?;
     Ok(())
 }
@@ -2733,6 +2730,62 @@ mod tests {
         assert!(!refs_transition_requires_rehash(false, false, false));
         assert!(!refs_transition_requires_rehash(false, true, false));
         assert!(!refs_transition_requires_rehash(false, false, true));
+    }
+
+    /// Regression test: `upsert_symbols_and_refs_for_file` must not
+    /// early-return when the file_path is missing from the `files`
+    /// table. It should synthesize the row the same way the bulk path
+    /// (`batch_insert_references`) does, otherwise a walker-missed file
+    /// commits with no refs while `references_enabled=true` is also
+    /// committed — the exact silent-[] gap the MCP guard exists to
+    /// prevent.
+    #[test]
+    fn test_upsert_symbols_and_refs_synthesizes_files_row_when_missing() {
+        use crate::symbols::{ReferenceInfo, ReferenceKind};
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = db::open_or_create(&path, false).unwrap();
+
+        // Seed a package row (NOT a files row for the path we're about
+        // to process). This simulates the walker-mismatch scenario.
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('svc', 'svc', 'go')",
+            [],
+        )
+        .unwrap();
+
+        let walker_missed_path = ".hidden/config.go";
+        let refs = vec![ReferenceInfo {
+            name: "Foo".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from(walker_missed_path),
+            line: 10,
+            enclosing_symbol: Some("Bar".into()),
+        }];
+
+        upsert_symbols_and_refs_for_file(&conn, "svc", walker_missed_path, &[], &refs).unwrap();
+
+        // The ref should be present (walker gap did not cause it to
+        // disappear), and the files row should have been synthesized.
+        let ref_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Foo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ref_count, 1, "ref must be inserted even when file_id is missing");
+
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                [walker_missed_path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_count, 1, "files row must be synthesized by the bulk path");
     }
 
     fn create_test_monorepo(dir: &Path) {

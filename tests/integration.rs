@@ -2648,3 +2648,100 @@ fn test_references_enabled_flag_transitions() {
         assert_eq!(flag, "false");
     }
 }
+
+/// Regression test for CodeRabbit finding on PR #96: when the user flips
+/// `references_enabled` in `shire.toml` without touching source or git
+/// state, `.git/index` mtime is unchanged, so `git_index_changed == false`
+/// and the fast-path in `phase_extract_symbols` would skip
+/// `phase_source_incremental` — leaving `symbol_refs` empty for every
+/// unchanged package despite the `file_hashes` wipe.
+///
+/// This test seeds a `.git/index` file with an old mtime, persists a
+/// `last_build_at` that's *newer* than that mtime (so
+/// `git_index_changed_since_build` returns false), flips the refs flag,
+/// and asserts refs get populated anyway.
+#[test]
+fn test_refs_toggle_forces_extraction_when_git_index_unchanged() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    // Create a .git/index file. Its mtime will become the baseline that
+    // `git_index_changed_since_build` compares against. We set it to an
+    // old time so subsequent `last_build_at` timestamps will be newer.
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/index"), "dummy").unwrap();
+
+    let bin = cargo_bin();
+    let db_path = root.join(".shire/index.db");
+
+    // First build: refs disabled. Populates the DB, sets last_build_at.
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "first build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Don't touch .git/index. The default `last_build_at` written by the
+    // first build is already newer than the .git/index mtime (both were
+    // created seconds ago, and last_build_at is set at the end of the
+    // build after .git/index was created). To make the test deterministic
+    // anyway, force `last_build_at` forward by 1 hour so
+    // `git_index_changed_since_build` is guaranteed to return false.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE shire_meta SET value = ?1 WHERE key = 'last_build_at'",
+            [&future],
+        )
+        .unwrap();
+    }
+
+    // Second build: flip to enabled. The only delta is shire.toml.
+    // .git/index is untouched, so the `git_index_changed` fast-path is
+    // off — the fix under test must still force re-extraction via the
+    // `refs_just_enabled` branch.
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "enable-refs build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let call_refs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        call_refs, 1,
+        "refs must populate for unchanged packages even when .git/index \
+         is unchanged — otherwise flipping the flag leaves a silent \
+         partial index that breaks refactor-safety queries"
+    );
+}

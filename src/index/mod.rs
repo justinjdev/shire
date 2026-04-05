@@ -2359,7 +2359,12 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, refs_enabled)?;
-        if git_index_changed {
+        if git_index_changed || refs_just_enabled {
+            // The refs_just_enabled branch is load-bearing: flipping the
+            // flag in shire.toml does not touch .git/index, so without
+            // this override phase_source_incremental would skip unchanged
+            // packages and leave symbol_refs empty for every file the
+            // user hasn't edited since the last build.
             phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled)
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks

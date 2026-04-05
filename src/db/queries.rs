@@ -773,12 +773,38 @@ pub fn search_docs(
 }
 
 use crate::symbols::ReferenceInfo;
+use std::collections::HashMap;
+
+/// Build a `file_path → files.id` lookup map from the `files` table. Callers
+/// pass this to `batch_insert_references` so references can be inserted with
+/// their compact `file_id` instead of repeated path strings. Built once per
+/// extraction phase and reused across packages.
+pub fn build_file_id_map(conn: &Connection) -> Result<HashMap<String, i64>> {
+    let mut stmt = conn.prepare("SELECT path, id FROM files")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (path, id) = row?;
+        map.insert(path, id);
+    }
+    Ok(map)
+}
 
 /// Insert a batch of `ReferenceInfo` rows into `symbol_refs`.
 ///
 /// Uses multi-row INSERT batching (128 rows per prepared-statement execution)
 /// to amortize per-call overhead. No FTS triggers fire — `symbol_refs` has no
 /// FTS virtual table; all MCP queries use exact-name B-tree lookups.
+///
+/// `file_ids` should contain an entry for every `r.file_path` that appears in
+/// `refs`. In normal operation `phase_index_files` runs before symbol
+/// extraction, so every source path we extract from is already in `files`.
+/// A handful of paths (e.g. dotfiles like `.eslintrc.js`) can slip past the
+/// file walker but still produce refs — for those, this function inserts a
+/// `files` row on the fly and updates `file_ids` so repeated paths are
+/// resolved from the cache.
 ///
 /// For large bulk inserts, callers should drop the `symbol_refs` B-tree
 /// indexes first (via `db::drop_symbol_refs_indexes`) and recreate them
@@ -791,8 +817,42 @@ pub fn batch_insert_references(
     conn: &Connection,
     package: Option<&str>,
     refs: &[ReferenceInfo],
+    file_ids: &mut HashMap<String, i64>,
 ) -> Result<()> {
     if refs.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve file_id for every ref up front. For paths not already in the
+    // map, insert a `files` row (pkg=None, ext derived from suffix) and cache
+    // the new id.
+    let mut resolved: Vec<(&ReferenceInfo, i64)> = Vec::with_capacity(refs.len());
+    for r in refs {
+        let path = r.file_path.as_ref();
+        let id = match file_ids.get(path) {
+            Some(&id) => id,
+            None => {
+                let ext = path
+                    .rsplit_once('.')
+                    .map(|(_, e)| e.to_lowercase())
+                    .unwrap_or_default();
+                conn.execute(
+                    "INSERT OR IGNORE INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, ?2, 0)",
+                    rusqlite::params![path, ext],
+                )?;
+                let id: i64 = conn.query_row(
+                    "SELECT id FROM files WHERE path = ?1",
+                    [path],
+                    |row| row.get(0),
+                )?;
+                file_ids.insert(path.to_string(), id);
+                id
+            }
+        };
+        resolved.push((r, id));
+    }
+
+    if resolved.is_empty() {
         return Ok(());
     }
 
@@ -808,7 +868,7 @@ pub fn batch_insert_references(
     let full_chunk_sql = build_multi_row_insert_sql(ROWS_PER_CHUNK, COLS_PER_ROW);
     let mut full_stmt = conn.prepare_cached(&full_chunk_sql)?;
 
-    let mut iter = refs.chunks_exact(ROWS_PER_CHUNK);
+    let mut iter = resolved.chunks_exact(ROWS_PER_CHUNK);
     for chunk in &mut iter {
         let params = bind_refs(chunk, package);
         let param_refs: Vec<&dyn rusqlite::ToSql> =
@@ -832,7 +892,7 @@ pub fn batch_insert_references(
 
 fn build_multi_row_insert_sql(rows: usize, cols: usize) -> String {
     let mut sql = String::from(
-        "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) VALUES ",
+        "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES ",
     );
     for r in 0..rows {
         if r > 0 {
@@ -851,14 +911,14 @@ fn build_multi_row_insert_sql(rows: usize, cols: usize) -> String {
 }
 
 fn bind_refs<'a>(
-    chunk: &'a [ReferenceInfo],
+    chunk: &'a [(&'a ReferenceInfo, i64)],
     package: Option<&'a str>,
 ) -> Vec<Box<dyn rusqlite::ToSql + 'a>> {
     let mut params: Vec<Box<dyn rusqlite::ToSql + 'a>> = Vec::with_capacity(chunk.len() * 6);
-    for r in chunk {
+    for (r, file_id) in chunk {
         params.push(Box::new(r.name.clone()));
         params.push(Box::new(r.kind.as_str()));
-        params.push(Box::new(r.file_path.to_string()));
+        params.push(Box::new(*file_id));
         params.push(Box::new(r.line as i64));
         params.push(Box::new(package.map(|s| s.to_string())));
         params.push(Box::new(r.enclosing_symbol.clone()));
@@ -868,9 +928,10 @@ fn bind_refs<'a>(
 
 /// Delete all rows in `symbol_refs` for a given file path. Used during
 /// file-granularity incremental rebuild before inserting fresh references.
+/// Resolves `file_path → file_id` via the `files` table.
 pub fn delete_references_for_file(conn: &Connection, file_path: &str) -> Result<()> {
     conn.execute(
-        "DELETE FROM symbol_refs WHERE file_path = ?1",
+        "DELETE FROM symbol_refs WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
         [file_path],
     )?;
     Ok(())
@@ -906,19 +967,19 @@ pub fn query_symbol_references(
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
     let mut sql = String::from(
-        "SELECT name, kind, file_path, line, package, enclosing_symbol \
-         FROM symbol_refs WHERE name = ?",
+        "SELECT r.name, r.kind, f.path, r.line, r.package, r.enclosing_symbol \
+         FROM symbol_refs r JOIN files f ON f.id = r.file_id WHERE r.name = ?",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(k) = kind {
-        sql.push_str(" AND kind = ?");
+        sql.push_str(" AND r.kind = ?");
         params.push(Box::new(k.to_string()));
     }
     if let Some(p) = package {
-        sql.push_str(" AND package = ?");
+        sql.push_str(" AND r.package = ?");
         params.push(Box::new(p.to_string()));
     }
-    sql.push_str(" ORDER BY file_path, line LIMIT ?");
+    sql.push_str(" ORDER BY f.path, r.line LIMIT ?");
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -952,16 +1013,16 @@ pub fn query_symbol_callers(
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
     let mut sql = String::from(
-        "SELECT enclosing_symbol, file_path, MIN(line), package, COUNT(*) \
-         FROM symbol_refs \
-         WHERE name = ? AND kind = 'call' AND enclosing_symbol IS NOT NULL",
+        "SELECT r.enclosing_symbol, f.path, MIN(r.line), r.package, COUNT(*) \
+         FROM symbol_refs r JOIN files f ON f.id = r.file_id \
+         WHERE r.name = ? AND r.kind = 'call' AND r.enclosing_symbol IS NOT NULL",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(p) = package {
-        sql.push_str(" AND package = ?");
+        sql.push_str(" AND r.package = ?");
         params.push(Box::new(p.to_string()));
     }
-    sql.push_str(" GROUP BY enclosing_symbol, file_path, package ORDER BY 5 DESC, 1 ASC LIMIT ?");
+    sql.push_str(" GROUP BY r.enclosing_symbol, f.path, r.package ORDER BY 5 DESC, 1 ASC LIMIT ?");
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -993,15 +1054,16 @@ pub fn query_symbol_callees(
     limit: i64,
 ) -> Result<Vec<CalleeRow>> {
     let mut sql = String::from(
-        "SELECT name, file_path, MIN(line), COUNT(*) FROM symbol_refs \
-         WHERE enclosing_symbol = ? AND kind = 'call'",
+        "SELECT r.name, f.path, MIN(r.line), COUNT(*) \
+         FROM symbol_refs r JOIN files f ON f.id = r.file_id \
+         WHERE r.enclosing_symbol = ? AND r.kind = 'call'",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
     if let Some(p) = package {
-        sql.push_str(" AND package = ?");
+        sql.push_str(" AND r.package = ?");
         params.push(Box::new(p.to_string()));
     }
-    sql.push_str(" GROUP BY name, file_path ORDER BY 4 DESC, 1 ASC LIMIT ?");
+    sql.push_str(" GROUP BY r.name, f.path ORDER BY 4 DESC, 1 ASC LIMIT ?");
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
@@ -1725,11 +1787,29 @@ mod refs_tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    /// Seed the `files` table with the given paths and return a file_path →
+    /// file_id map — needed because symbol_refs.file_id has a FK to files(id).
+    fn seed_files(conn: &Connection, paths: &[&str]) -> HashMap<String, i64> {
+        let mut map = HashMap::new();
+        for p in paths {
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, '', 0)",
+                [p],
+            ).unwrap();
+            let id: i64 = conn
+                .query_row("SELECT id FROM files WHERE path = ?1", [p], |r| r.get(0))
+                .unwrap();
+            map.insert(p.to_string(), id);
+        }
+        map
+    }
+
     #[test]
     fn test_batch_insert_and_delete_by_file() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t.db");
         let conn = open_or_create(&db_path, false).unwrap();
+        let mut file_ids = seed_files(&conn, &["a.rs", "b.rs"]);
 
         let refs = vec![
             ReferenceInfo {
@@ -1754,7 +1834,7 @@ mod refs_tests {
                 enclosing_symbol: None,
             },
         ];
-        batch_insert_references(&conn, Some("mypkg"), &refs).unwrap();
+        batch_insert_references(&conn, Some("mypkg"), &refs, &mut file_ids).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
@@ -1774,6 +1854,7 @@ mod refs_tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t2.db");
         let conn = open_or_create(&db_path, false).unwrap();
+        let mut file_ids = seed_files(&conn, &["x.rs", "y.rs"]);
 
         let refs_p1 = vec![ReferenceInfo {
             name: "foo".into(),
@@ -1789,8 +1870,8 @@ mod refs_tests {
             line: 1,
             enclosing_symbol: None,
         }];
-        batch_insert_references(&conn, Some("pkg1"), &refs_p1).unwrap();
-        batch_insert_references(&conn, Some("pkg2"), &refs_p2).unwrap();
+        batch_insert_references(&conn, Some("pkg1"), &refs_p1, &mut file_ids).unwrap();
+        batch_insert_references(&conn, Some("pkg2"), &refs_p2, &mut file_ids).unwrap();
 
         delete_references_for_package(&conn, "pkg1").unwrap();
 
@@ -1805,13 +1886,18 @@ mod refs_tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("r.db");
         let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["a.rs", "b.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
 
         conn.execute(
-            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
-             VALUES ('foo', 'call', 'a.rs', 10, 'pkg1', 'bar'), \
-                    ('foo', 'type', 'a.rs', 20, 'pkg1', 'bar'), \
-                    ('foo', 'call', 'b.rs', 5, 'pkg2', 'quux'), \
-                    ('other', 'call', 'a.rs', 30, 'pkg1', NULL)",
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {a}, 10, 'pkg1', 'bar'), \
+                        ('foo', 'type', {a}, 20, 'pkg1', 'bar'), \
+                        ('foo', 'call', {b}, 5, 'pkg2', 'quux'), \
+                        ('other', 'call', {a}, 30, 'pkg1', NULL)"
+            ),
             [],
         ).unwrap();
 
@@ -1833,14 +1919,20 @@ mod refs_tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("c.db");
         let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["a.rs", "b.rs", "c.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
+        let c = ids["c.rs"];
 
         conn.execute(
-            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
-             VALUES ('foo', 'call', 'a.rs', 10, 'p', 'bar'), \
-                    ('foo', 'call', 'a.rs', 11, 'p', 'bar'), \
-                    ('foo', 'call', 'b.rs', 5, 'p', 'quux'), \
-                    ('foo', 'type', 'a.rs', 20, 'p', 'bar'), \
-                    ('foo', 'call', 'c.rs', 1, 'p', NULL)",
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {a}, 10, 'p', 'bar'), \
+                        ('foo', 'call', {a}, 11, 'p', 'bar'), \
+                        ('foo', 'call', {b}, 5, 'p', 'quux'), \
+                        ('foo', 'type', {a}, 20, 'p', 'bar'), \
+                        ('foo', 'call', {c}, 1, 'p', NULL)"
+            ),
             [],
         ).unwrap();
 
@@ -1857,13 +1949,17 @@ mod refs_tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("cee.db");
         let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["a.rs"]);
+        let a = ids["a.rs"];
 
         conn.execute(
-            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
-             VALUES ('foo', 'call', 'a.rs', 1, 'p', 'handler'), \
-                    ('bar', 'call', 'a.rs', 2, 'p', 'handler'), \
-                    ('foo', 'call', 'a.rs', 3, 'p', 'handler'), \
-                    ('baz', 'call', 'a.rs', 4, 'p', 'other')",
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {a}, 1, 'p', 'handler'), \
+                        ('bar', 'call', {a}, 2, 'p', 'handler'), \
+                        ('foo', 'call', {a}, 3, 'p', 'handler'), \
+                        ('baz', 'call', {a}, 4, 'p', 'other')"
+            ),
             [],
         ).unwrap();
 

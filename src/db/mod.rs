@@ -240,13 +240,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             name             TEXT NOT NULL,
             kind             TEXT NOT NULL,
-            file_path        TEXT NOT NULL,
+            file_id          INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
             line             INTEGER NOT NULL,
             package          TEXT,
             enclosing_symbol TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+        CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
         ",
     )?;
@@ -320,8 +321,12 @@ pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
         // idx_refs_file was removed in schema v6: its per-row maintenance
         // cost during INSERT exceeded the savings it gave the per-file
         // DELETE path. Keep the DROP so legacy DBs shed it on next bulk load.
+        // In v7 we reintroduce a file index, but on the INTEGER file_id
+        // column — its B-tree entries are ~10x smaller than the TEXT-path
+        // version, so the INSERT-side cost is proportionally lower.
         "DROP INDEX IF EXISTS idx_refs_name;
          DROP INDEX IF EXISTS idx_refs_file;
+         DROP INDEX IF EXISTS idx_refs_file_id;
          DROP INDEX IF EXISTS idx_refs_enclosing;",
     )?;
     Ok(())
@@ -330,12 +335,13 @@ pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
 pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+         CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
          CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);",
     )?;
     Ok(())
 }
 
-const FTS_SCHEMA_VERSION: &str = "6";
+const FTS_SCHEMA_VERSION: &str = "7";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     let current: Option<String> = conn
@@ -378,7 +384,9 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
          DROP TRIGGER IF EXISTS symbol_refs_au;
          DROP TABLE IF EXISTS symbol_refs_fts;
          DROP INDEX IF EXISTS idx_refs_package;
-         DROP INDEX IF EXISTS idx_refs_file;",
+         DROP INDEX IF EXISTS idx_refs_file;
+         -- v7: symbol_refs.file_path TEXT → file_id INTEGER (FK to files(id))
+         DROP TABLE IF EXISTS symbol_refs;",
     )?;
 
     create_schema(conn)?;
@@ -608,9 +616,20 @@ mod schema_tests {
         let conn = open_or_create(&path, false).unwrap();
 
         conn.execute(
-            "INSERT INTO symbol_refs (name, kind, file_path, line, package, enclosing_symbol) \
-             VALUES ('parseConfig', 'call', 'src/main.rs', 42, NULL, 'handle_request')",
+            "INSERT INTO files (path, package, extension, size_bytes) VALUES ('src/main.rs', NULL, 'rs', 0)",
             [],
+        ).unwrap();
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = 'src/main.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+             VALUES ('parseConfig', 'call', ?1, 42, NULL, 'handle_request')",
+            [file_id],
         ).unwrap();
 
         let count: i64 = conn

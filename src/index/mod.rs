@@ -370,11 +370,30 @@ fn upsert_symbols_and_refs_for_file(
     // Insert new symbols (triggers handle FTS)
     batch_insert_symbols(conn, package, syms)?;
 
+    // Resolve file_id once for this file; all refs in this call share the path.
+    let file_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            [file_path],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(file_id) = file_id else {
+        tracing::warn!(
+            path = file_path,
+            "file not in files table — skipping symbol_refs upsert"
+        );
+        return Ok(());
+    };
+
     conn.execute(
-        "DELETE FROM symbol_refs WHERE package = ?1 AND file_path = ?2",
-        rusqlite::params![package, file_path],
+        "DELETE FROM symbol_refs WHERE file_id = ?1",
+        rusqlite::params![file_id],
     )?;
-    crate::db::queries::batch_insert_references(conn, Some(package), refs)?;
+    let mut file_ids = std::collections::HashMap::new();
+    file_ids.insert(file_path.to_string(), file_id);
+    crate::db::queries::batch_insert_references(conn, Some(package), refs, &mut file_ids)?;
     Ok(())
 }
 
@@ -1089,15 +1108,20 @@ fn phase_extract_symbols(
     db::drop_symbols_fts_triggers(conn)?;
     db::drop_symbol_refs_indexes(conn)?;
 
+    // Build file_path → files.id map once; reused across all package inserts.
+    // Mutated in-place when refs reference paths that weren't in `files` —
+    // e.g. dotfiles the file walker hides but symbol extraction surfaces.
+    let mut file_ids = crate::db::queries::build_file_id_map(conn)?;
+
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if skip_deletes {
             // Symbols and refs tables already empty (force/full build) — insert only
             batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
-            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references)?;
+            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
         } else {
             upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
-            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references)?;
+            crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -2232,11 +2256,25 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     }
     timings.push(("update-hashes", t.elapsed()));
 
-    // Phase 7+8: Extract symbols + source-level re-extraction (transaction-wrapped)
+    // Phase 7: Index files (transaction-wrapped).
+    //
+    // Runs BEFORE symbol+ref extraction so that `files.id` is already assigned
+    // for every source path when we insert rows into `symbol_refs` — those
+    // rows use `file_id INTEGER` as a compact surrogate for the full path.
+    tracing::debug!("phase 7: index files");
+    let sp = make_spinner(&mp, "Indexing files…");
+    let t = Instant::now();
+    let num_files = with_transaction(&conn, || {
+        phase_index_files(&conn, repo_root, config)
+    })?;
+    timings.push(("index-files", t.elapsed()));
+    sp.finish_with_message(format!("Indexed {} files", num_files));
+
+    // Phase 8+9: Extract symbols + source-level re-extraction (transaction-wrapped)
     tracing::debug!(
         new_changed = parsed_packages.len(),
         unchanged = diff.unchanged.len(),
-        "phase 7+8: extract symbols"
+        "phase 8+9: extract symbols"
     );
     let t = Instant::now();
     let pb_sym = if !parsed_packages.is_empty() || !diff.unchanged.is_empty() {
@@ -2263,16 +2301,6 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         pb.finish_with_message("Symbols extracted");
     }
     timings.push(("extract-symbols", t.elapsed()));
-
-    // Phase 9: Index files (transaction-wrapped)
-    tracing::debug!("phase 9: index files");
-    let sp = make_spinner(&mp, "Indexing files…");
-    let t = Instant::now();
-    let num_files = with_transaction(&conn, || {
-        phase_index_files(&conn, repo_root, config)
-    })?;
-    timings.push(("index-files", t.elapsed()));
-    sp.finish_with_message(format!("Indexed {} files", num_files));
 
     // Phase 9.5: Index documentation content
     tracing::debug!("phase 9.5: index docs");

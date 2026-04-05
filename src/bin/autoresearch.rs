@@ -761,7 +761,8 @@ fn run_quality_checks(repos: &[PathBuf]) {
         let self_refs: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM symbol_refs r \
-                 JOIN symbols s ON s.name = r.name AND s.file_path = r.file_path AND s.line = r.line \
+                 JOIN files f ON f.id = r.file_id \
+                 JOIN symbols s ON s.name = r.name AND s.file_path = f.path AND s.line = r.line \
                  WHERE r.kind IN ('type', 'impl')",
                 [],
                 |r| r.get(0),

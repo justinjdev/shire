@@ -1127,9 +1127,15 @@ pub struct TransitiveImpact {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeImpactSummary {
+    /// Total same-package refs (may exceed `direct_impact.len()` when the
+    /// returned rows were truncated to `per_bucket_limit`).
     pub direct_count: usize,
+    /// Total cross-package refs (may exceed `cross_package_impact.len()`
+    /// when the returned rows were truncated to `per_bucket_limit`).
     pub cross_package_count: usize,
-    /// Unique packages that contain cross-package references.
+    /// Unique packages that contain cross-package references. Computed from
+    /// the full ref set before truncation — this is the authoritative list
+    /// of directly affected packages.
     pub affected_packages: Vec<String>,
     pub transitive_package_count: usize,
 }
@@ -1178,19 +1184,22 @@ pub fn change_impact(
     transitive_depth: u32,
     per_bucket_limit: i64,
 ) -> Result<ChangeImpact> {
-    // Fetch all refs (no kind/package filter — impact analysis needs the
-    // full set). We fetch up to 2 * per_bucket_limit to leave headroom for
-    // partitioning; each bucket is truncated afterwards.
-    let fetch_cap = per_bucket_limit.saturating_mul(2).max(per_bucket_limit);
-    let all_refs = query_symbol_references(conn, name, None, None, fetch_cap)?;
+    // Fetch all refs with a high safety cap, then partition. Using
+    // per_bucket_limit at fetch time would starve a bucket: refs are
+    // ordered by (file_path, line), so if one side's paths sort first,
+    // the other bucket gets zero rows — affected_packages is incomplete
+    // and BFS under-reports blast radius. The safety cap keeps memory
+    // bounded for pathologically-called symbols.
+    const MAX_REFS_SCANNED: i64 = 10_000;
+    let all_refs = query_symbol_references(conn, name, None, None, MAX_REFS_SCANNED)?;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
         None => resolve_home_package(conn, name)?,
     };
 
-    let mut direct_impact = Vec::new();
-    let mut cross_package_impact = Vec::new();
+    let mut direct_impact: Vec<ReferenceRow> = Vec::new();
+    let mut cross_package_impact: Vec<ReferenceRow> = Vec::new();
     let mut affected_packages_set: HashSet<String> = HashSet::new();
 
     for r in all_refs {
@@ -1207,11 +1216,19 @@ pub fn change_impact(
         }
     }
 
+    // Capture true counts before truncation — users need to see the real
+    // blast radius even when we cap the returned rows for display.
+    let direct_count = direct_impact.len();
+    let cross_package_count = cross_package_impact.len();
+
     direct_impact.truncate(per_bucket_limit as usize);
     cross_package_impact.truncate(per_bucket_limit as usize);
 
     // BFS reverse-dep graph from each affected package. `via` records the
     // first affected package we reached this transitive package through.
+    // `is_internal = 1` matches reverse_dependency_graph() — external deps
+    // that share a name with an internal package must not appear here.
+    let transitive_cap = per_bucket_limit as usize;
     let mut transitive_impact: Vec<TransitiveImpact> = Vec::new();
     if transitive_depth > 0 && !affected_packages_set.is_empty() {
         let mut visited: HashSet<String> = affected_packages_set.clone();
@@ -1225,12 +1242,11 @@ pub fn change_impact(
         }
 
         let mut stmt = conn.prepare_cached(
-            "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1",
+            "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1",
         )?;
 
-        const MAX_TRANSITIVE: usize = 1_000;
         while let Some((current, origin, depth)) = queue.pop_front() {
-            if depth >= transitive_depth || transitive_impact.len() >= MAX_TRANSITIVE {
+            if depth >= transitive_depth || transitive_impact.len() >= transitive_cap {
                 continue;
             }
             let rows = stmt.query_map([&current], |row| {
@@ -1247,7 +1263,7 @@ pub fn change_impact(
                     dep_kind,
                     distance: depth + 1,
                 });
-                if transitive_impact.len() >= MAX_TRANSITIVE {
+                if transitive_impact.len() >= transitive_cap {
                     break;
                 }
                 queue.push_back((dependent, origin.clone(), depth + 1));
@@ -1259,8 +1275,8 @@ pub fn change_impact(
     affected_packages.sort();
 
     let summary = ChangeImpactSummary {
-        direct_count: direct_impact.len(),
-        cross_package_count: cross_package_impact.len(),
+        direct_count,
+        cross_package_count,
         affected_packages,
         transitive_package_count: transitive_impact.len(),
     };
@@ -2379,5 +2395,115 @@ mod refs_tests {
         assert_eq!(deep.transitive_impact[0].package, "grandchild");
         assert_eq!(deep.transitive_impact[0].distance, 1);
         assert_eq!(deep.transitive_impact[0].via, "consumer");
+    }
+
+    /// Regression test: when one bucket would dominate the sorted fetch,
+    /// both buckets must still populate correctly and affected_packages
+    /// must reflect the full cross-package set. Previously the 2*limit
+    /// prefetch could starve a bucket entirely.
+    #[test]
+    fn test_change_impact_does_not_starve_bucket() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci_starve.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        seed_package(&conn, "home");
+        seed_package(&conn, "consumer_z");
+
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'foo', 'function', 'home/src.rs', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Many home refs in alphabetically-early paths (home/a..home/y),
+        // few cross-package refs at the end (zzz/). Sorted by file_path,
+        // home refs come first — with a low prefetch, the cross ref would
+        // never be seen.
+        let mut home_paths: Vec<String> = (0..20).map(|i| format!("home/a{i:02}.rs")).collect();
+        home_paths.push("zzz/x.rs".into());
+        let path_refs: Vec<&str> = home_paths.iter().map(|s| s.as_str()).collect();
+        let ids = seed_files(&conn, &path_refs);
+
+        let mut values = Vec::new();
+        for p in &home_paths[..20] {
+            let id = ids[p];
+            values.push(format!("('foo', 'call', {id}, 1, 'home', NULL)"));
+        }
+        let z_id = ids["zzz/x.rs"];
+        values.push(format!("('foo', 'call', {z_id}, 1, 'consumer_z', NULL)"));
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES {}",
+                values.join(", ")
+            ),
+            [],
+        )
+        .unwrap();
+
+        // Request a small limit — the bug would cause cross_package_impact
+        // to be empty because the 2*5=10 prefetch would only see home refs.
+        let impact = change_impact(&conn, "foo", None, 1, 5).unwrap();
+
+        // Pre-truncation counts must reflect the true partition.
+        assert_eq!(impact.summary.direct_count, 20);
+        assert_eq!(impact.summary.cross_package_count, 1);
+        assert_eq!(impact.summary.affected_packages, vec!["consumer_z"]);
+
+        // Returned buckets are truncated to per_bucket_limit.
+        assert_eq!(impact.direct_impact.len(), 5);
+        assert_eq!(impact.cross_package_impact.len(), 1);
+    }
+
+    /// Regression test: external dependency edges (is_internal = 0) must
+    /// not contribute transitive impact. This matches reverse_dependency_graph.
+    #[test]
+    fn test_change_impact_skips_external_dep_edges() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ci_ext.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+
+        for p in ["home", "consumer", "external_collider"] {
+            seed_package(&conn, p);
+        }
+        // `external_collider` declares an external dep named `consumer` —
+        // a third-party library that happens to share a name with our
+        // internal package. Must NOT show up as transitive impact.
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal) VALUES ('external_collider','consumer','runtime',0)",
+            [],
+        )
+        .unwrap();
+        // Also a legitimate internal edge for contrast.
+        seed_package(&conn, "legit_dep");
+        seed_dependency(&conn, "legit_dep", "consumer");
+
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'foo', 'function', 'home.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["consumer/a.rs"]);
+        let c = ids["consumer/a.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('foo', 'call', {c}, 1, 'consumer', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "foo", None, 3, 100).unwrap();
+        let trans_pkgs: HashSet<&str> = impact
+            .transitive_impact
+            .iter()
+            .map(|t| t.package.as_str())
+            .collect();
+        assert_eq!(trans_pkgs, HashSet::from(["legit_dep"]));
+        assert!(!trans_pkgs.contains("external_collider"));
     }
 }

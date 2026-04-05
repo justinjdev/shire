@@ -2439,3 +2439,52 @@ func use(c Config) Config { return c }
         );
     }
 }
+
+#[test]
+fn test_impl_refs_dedup_type_refs_at_same_node() {
+    // Java: `extends BaseService implements Cacheable` — the Base/Cacheable
+    // identifiers should each produce ONLY one Impl ref, not a redundant
+    // Type ref at the same node.
+    let source = r#"package com.example;
+public class MyService extends BaseService implements Cacheable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("MS.java"));
+
+    for target in ["BaseService", "Cacheable"] {
+        let hits: Vec<&ReferenceInfo> = refs
+            .iter()
+            .filter(|r| r.name == target)
+            .collect();
+        let kinds: Vec<_> = hits.iter().map(|r| r.kind).collect();
+        assert!(
+            kinds.contains(&ReferenceKind::Impl),
+            "expected Impl ref for {}, got {:?}",
+            target, kinds
+        );
+        assert!(
+            !kinds.contains(&ReferenceKind::Type),
+            "{} should NOT also be recorded as Type (duplicate at impl site), got {:?}",
+            target, kinds
+        );
+    }
+
+    // Scala: extends Base with Trait — same dedup invariant
+    let scala_src = r#"trait Service
+class Base
+class MyService extends Base with Service
+"#;
+    let (_syms, refs) = extract_file_full("scala", scala_src, Arc::from("s.scala"));
+    let base_hits: Vec<_> = refs.iter().filter(|r| r.name == "Base").collect();
+    let base_kinds: Vec<_> = base_hits.iter().map(|r| r.kind).collect();
+    assert!(
+        base_kinds.contains(&ReferenceKind::Impl),
+        "Scala: expected Impl for Base, got {:?}",
+        base_kinds
+    );
+    assert!(
+        !base_kinds.contains(&ReferenceKind::Type),
+        "Scala: Base should NOT also be Type at impl site, got {:?}",
+        base_kinds
+    );
+}

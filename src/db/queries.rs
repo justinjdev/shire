@@ -774,10 +774,14 @@ use crate::symbols::ReferenceInfo;
 
 /// Insert a batch of `ReferenceInfo` rows into `symbol_refs`.
 ///
-/// The FTS5 `symbol_refs_ai` trigger fires per row, keeping the FTS index in
-/// sync with the table. For large bulk inserts the caller should drop the
-/// triggers (via `db::drop_symbol_refs_fts_triggers`) and rebuild the FTS
-/// afterward — mirroring the existing pattern used by symbol inserts.
+/// Uses multi-row INSERT batching (128 rows per prepared-statement execution)
+/// to amortize per-call overhead. No FTS triggers fire — `symbol_refs` has no
+/// FTS virtual table; all MCP queries use exact-name B-tree lookups.
+///
+/// For large bulk inserts, callers should drop the `symbol_refs` B-tree
+/// indexes first (via `db::drop_symbol_refs_indexes`) and recreate them
+/// afterward (`db::recreate_symbol_refs_indexes`) — the per-row B-tree
+/// updates dominate otherwise.
 ///
 /// Callers are expected to wrap the surrounding work in a transaction for
 /// throughput; this function does not open one itself.
@@ -938,6 +942,7 @@ pub struct CallerRow {
     pub caller_name: String,
     pub caller_file: String,
     pub caller_line: i64,
+    pub caller_package: Option<String>,
     pub call_sites: i64,
 }
 
@@ -948,7 +953,7 @@ pub fn query_symbol_callers(
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
     let mut sql = String::from(
-        "SELECT enclosing_symbol, file_path, MIN(line), COUNT(*) \
+        "SELECT enclosing_symbol, file_path, MIN(line), package, COUNT(*) \
          FROM symbol_refs \
          WHERE name = ?1 AND kind = 'call' AND enclosing_symbol IS NOT NULL",
     );
@@ -958,7 +963,7 @@ pub fn query_symbol_callers(
         sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(p.to_string()));
     }
-    sql.push_str(" GROUP BY enclosing_symbol, file_path ORDER BY 4 DESC, 1 ASC LIMIT ?");
+    sql.push_str(" GROUP BY enclosing_symbol, file_path, package ORDER BY 5 DESC, 1 ASC LIMIT ?");
     sql.push_str(&(params.len() + 1).to_string());
     params.push(Box::new(limit));
 
@@ -969,7 +974,8 @@ pub fn query_symbol_callers(
             caller_name: row.get(0)?,
             caller_file: row.get(1)?,
             caller_line: row.get(2)?,
-            call_sites: row.get(3)?,
+            caller_package: row.get(3)?,
+            call_sites: row.get(4)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -978,6 +984,8 @@ pub fn query_symbol_callers(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CalleeRow {
     pub callee_name: String,
+    pub first_file: String,
+    pub first_line: i64,
     pub call_sites: i64,
 }
 
@@ -988,7 +996,7 @@ pub fn query_symbol_callees(
     limit: i64,
 ) -> Result<Vec<CalleeRow>> {
     let mut sql = String::from(
-        "SELECT name, COUNT(*) FROM symbol_refs \
+        "SELECT name, file_path, MIN(line), COUNT(*) FROM symbol_refs \
          WHERE enclosing_symbol = ?1 AND kind = 'call'",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
@@ -997,7 +1005,7 @@ pub fn query_symbol_callees(
         sql.push_str(&(params.len() + 1).to_string());
         params.push(Box::new(p.to_string()));
     }
-    sql.push_str(" GROUP BY name ORDER BY 2 DESC, 1 ASC LIMIT ?");
+    sql.push_str(" GROUP BY name, file_path ORDER BY 4 DESC, 1 ASC LIMIT ?");
     sql.push_str(&(params.len() + 1).to_string());
     params.push(Box::new(limit));
 
@@ -1006,7 +1014,9 @@ pub fn query_symbol_callees(
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(CalleeRow {
             callee_name: row.get(0)?,
-            call_sites: row.get(1)?,
+            first_file: row.get(1)?,
+            first_line: row.get(2)?,
+            call_sites: row.get(3)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())

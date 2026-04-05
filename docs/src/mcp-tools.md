@@ -41,3 +41,4 @@ Prompts are pre-built templates that compose multiple queries into structured co
 | Prompt | Args | Description |
 |---|---|---|
 | `explore` | `query` | Search packages, symbols, files, and documentation for a concept — returns a structured context map organized by package |
+| `reference_audit` | `name` | Guides refactor-safety analysis for a symbol: classifies refs by kind, traces the call graph via `symbol_callers`, identifies cross-package impact, and assesses rename/change risk |

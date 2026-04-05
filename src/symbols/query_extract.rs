@@ -221,13 +221,35 @@ pub fn extract(
             }
         }
 
-        // Emit only references whose name node does NOT coincide with a
-        // definition name node (suppresses self-references from patterns like
-        // `(type_identifier) @name @reference.type`).
+        // Build the set of byte ranges captured as Impl. A node captured as
+        // Impl is ALWAYS the right classification for that node — e.g. the
+        // `BaseService` identifier inside `extends BaseService` should be an
+        // Impl ref, not a Type ref. But the generic `(type_identifier) @name
+        // @reference.type` pattern also matches it, producing a duplicate
+        // Type row. We suppress Type refs at node ranges already claimed by
+        // Impl.
+        let impl_ranges: std::collections::HashSet<(usize, usize)> = pending_references
+            .iter()
+            .filter_map(|(r, range)| {
+                if r.kind == ReferenceKind::Impl {
+                    Some(*range)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Emit references, skipping:
+        //   (a) self-references at a definition's own name node, and
+        //   (b) Type refs that duplicate an Impl ref at the same node
         for (reference, node_range) in pending_references {
-            if !def_name_ranges.contains(&node_range) {
-                references.push(reference);
+            if def_name_ranges.contains(&node_range) {
+                continue;
             }
+            if reference.kind == ReferenceKind::Type && impl_ranges.contains(&node_range) {
+                continue;
+            }
+            references.push(reference);
         }
 
         (symbols, references)

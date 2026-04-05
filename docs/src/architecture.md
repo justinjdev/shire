@@ -58,14 +58,14 @@ The `symbol_refs` table stores cross-reference records extracted alongside symbo
 
 | Column | Type | Description |
 |---|---|---|
-| `ref_name` | TEXT | The name being referenced (function, type, module, etc.) |
-| `ref_kind` | TEXT | One of: `call`, `type`, `import`, `impl` |
+| `name` | TEXT | The name being referenced (function, type, module, etc.) |
+| `kind` | TEXT | One of: `call`, `type`, `import`, `impl` |
 | `file_path` | TEXT | Source file containing the reference |
 | `line` | INTEGER | Line number of the reference |
-| `package` | TEXT | Package the referencing file belongs to |
+| `package` | TEXT | Package the referencing file belongs to (nullable) |
 | `enclosing_symbol` | TEXT | Nearest enclosing function or method (nullable) |
 
-An FTS5 index on `ref_name` enables fast prefix/fulltext lookup by the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools.
+B-tree indexes on `name`, `file_path`, and `enclosing_symbol` support the exact-match lookups used by the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools. No FTS5 table — reference queries are exact-name only.
 
 Incremental behavior mirrors symbol extraction: references for a file are dropped and re-extracted whenever the file's SHA-256 hash changes. No separate pass is needed — references are extracted in the same tree-sitter walk as symbol definitions.
 

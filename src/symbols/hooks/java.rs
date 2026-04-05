@@ -257,7 +257,9 @@ pub fn hooks() -> LanguageHooks {
             "true", "false", "null", "this", "super",
             "String", "Integer", "Long", "Boolean", "Double", "Float", "Object",
             "void", "int", "long", "boolean", "double", "float", "byte", "char", "short",
-            "System", "Math",
+            "System", "Math", "Override", "Exception", "RuntimeException",
+            "List", "Map", "Set", "Collection", "ArrayList", "HashMap", "HashSet",
+            "Optional", "Iterable", "Iterator", "Stream",
         ],
     }
 }

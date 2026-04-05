@@ -406,7 +406,7 @@ src/
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
 │   ├── tools.rs     # 14 tool handlers (+ hybrid search when RAG enabled)
-│   └── prompts.rs   # 3 prompt templates for semantic codebase exploration
+│   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)

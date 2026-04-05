@@ -199,8 +199,12 @@ pub fn hooks() -> LanguageHooks {
         reference_stoplist: &[
             "true", "false", "nil", "self",
             "puts", "print", "p", "pp",
-            "String", "Integer", "Float", "Array", "Hash", "Symbol", "Nil",
+            "String", "Integer", "Float", "Array", "Hash", "Symbol", "NilClass",
             "Object", "Class", "Module",
+            // Mixin/import methods: captured separately as @reference.impl
+            // and @reference.import, so suppress their redundant Call refs.
+            "include", "prepend", "extend",
+            "require", "require_relative", "load",
         ],
     }
 }

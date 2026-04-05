@@ -58,125 +58,125 @@ pub fn extract(
     };
 
     QUERY_CURSOR.with_borrow_mut(|cursor| {
-    let mut symbols = Vec::new();
-    let mut references = Vec::new();
-    let mut seen_def_ranges = std::collections::HashSet::new();
-    let source_bytes = source.as_bytes();
+        let mut symbols = Vec::new();
+        let mut references = Vec::new();
+        let mut seen_def_ranges = std::collections::HashSet::new();
+        let source_bytes = source.as_bytes();
 
-    let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
-    while let Some(m) = matches.next() {
-        let name_capture = m.captures.iter().find(|c| c.index == name_idx);
-        let name = match name_capture {
-            Some(c) => match c.node.utf8_text(source_bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
-            },
-            None => continue,
-        };
+        let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+        while let Some(m) = matches.next() {
+            let name_capture = m.captures.iter().find(|c| c.index == name_idx);
+            let name = match name_capture {
+                Some(c) => match c.node.utf8_text(source_bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                },
+                None => continue,
+            };
 
-        // Determine whether this match is a definition or a reference
-        let mut def_kind = None;
-        let mut def_node = None;
-        let mut ref_kind = None;
-        let mut ref_node = None;
-        for capture in m.captures.iter() {
-            let cname = capture_names[capture.index as usize];
-            if def_kind.is_none() {
-                if let Some(k) = capture_name_to_kind(cname) {
-                    def_kind = Some(k);
-                    def_node = Some(capture.node);
+            // Determine whether this match is a definition or a reference
+            let mut def_kind = None;
+            let mut def_node = None;
+            let mut ref_kind = None;
+            let mut ref_node = None;
+            for capture in m.captures.iter() {
+                let cname = capture_names[capture.index as usize];
+                if def_kind.is_none() {
+                    if let Some(k) = capture_name_to_kind(cname) {
+                        def_kind = Some(k);
+                        def_node = Some(capture.node);
+                        continue;
+                    }
+                }
+                if ref_kind.is_none() {
+                    if let Some(k) = capture_name_to_ref_kind(cname) {
+                        ref_kind = Some(k);
+                        ref_node = Some(capture.node);
+                    }
+                }
+            }
+
+            // Definition path
+            if let (Some(kind), Some(node)) = (def_kind, def_node) {
+                let range_key = (node.start_byte(), node.end_byte());
+                if !seen_def_ranges.insert(range_key) {
                     continue;
                 }
-            }
-            if ref_kind.is_none() {
-                if let Some(k) = capture_name_to_ref_kind(cname) {
-                    ref_kind = Some(k);
-                    ref_node = Some(capture.node);
+                if let Some(is_visible) = hooks.is_visible {
+                    if !is_visible(&node, source) {
+                        continue;
+                    }
                 }
-            }
-        }
-
-        // Definition path (logic unchanged from before)
-        if let (Some(kind), Some(node)) = (def_kind, def_node) {
-            let range_key = (node.start_byte(), node.end_byte());
-            if !seen_def_ranges.insert(range_key) {
+                let line = node.start_position().row + 1;
+                let parent = hooks.resolve_parent.and_then(|f| f(&node, source));
+                let signature = hooks
+                    .build_signature
+                    .map(|f| f(&node, source, &name, kind))
+                    .unwrap_or_else(|| default_signature(&name, kind));
+                let parameters = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+                    Some(
+                        hooks
+                            .extract_parameters
+                            .map(|f| f(&node, source))
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    None
+                };
+                let return_type = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+                    hooks.extract_return_type.and_then(|f| f(&node, source))
+                } else {
+                    None
+                };
+                let sym = SymbolInfo {
+                    name: name.clone(),
+                    kind,
+                    signature: Some(signature),
+                    file_path: file_path.clone(),
+                    line,
+                    visibility: Visibility::Public,
+                    parent_symbol: parent,
+                    return_type,
+                    parameters,
+                };
+                let sym = if let Some(post) = hooks.post_process {
+                    match post(sym, &node, source) {
+                        Some(s) => s,
+                        None => continue,
+                    }
+                } else {
+                    sym
+                };
+                symbols.push(sym);
                 continue;
             }
-            if let Some(is_visible) = hooks.is_visible {
-                if !is_visible(&node, source) {
+
+            // Reference path
+            if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
+                if hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
                 }
+                // Trim surrounding quotes for import names (common for Go/Ruby strings)
+                let trimmed_name = if matches!(kind, ReferenceKind::Import) {
+                    name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+                        .to_string()
+                } else {
+                    name
+                };
+                let line = node.start_position().row + 1;
+                let enclosing =
+                    resolve_enclosing_symbol(&node, source, hooks.enclosing_ancestors);
+                references.push(ReferenceInfo {
+                    name: trimmed_name,
+                    kind,
+                    file_path: file_path.clone(),
+                    line,
+                    enclosing_symbol: enclosing,
+                });
             }
-            let line = node.start_position().row + 1;
-            let parent = hooks.resolve_parent.and_then(|f| f(&node, source));
-            let signature = hooks
-                .build_signature
-                .map(|f| f(&node, source, &name, kind))
-                .unwrap_or_else(|| default_signature(&name, kind));
-            let parameters = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-                Some(
-                    hooks
-                        .extract_parameters
-                        .map(|f| f(&node, source))
-                        .unwrap_or_default(),
-                )
-            } else {
-                None
-            };
-            let return_type = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-                hooks.extract_return_type.and_then(|f| f(&node, source))
-            } else {
-                None
-            };
-            let sym = SymbolInfo {
-                name: name.clone(),
-                kind,
-                signature: Some(signature),
-                file_path: file_path.clone(),
-                line,
-                visibility: Visibility::Public,
-                parent_symbol: parent,
-                return_type,
-                parameters,
-            };
-            let sym = if let Some(post) = hooks.post_process {
-                match post(sym, &node, source) {
-                    Some(s) => s,
-                    None => continue,
-                }
-            } else {
-                sym
-            };
-            symbols.push(sym);
-            continue;
         }
 
-        // Reference path
-        if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
-            if hooks.reference_stoplist.contains(&name.as_str()) {
-                continue;
-            }
-            // Trim surrounding quotes for import names (common for Go/Ruby strings)
-            let trimmed_name = if matches!(kind, ReferenceKind::Import) {
-                name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
-                    .to_string()
-            } else {
-                name
-            };
-            let line = node.start_position().row + 1;
-            let enclosing =
-                resolve_enclosing_symbol(&node, source, hooks.enclosing_ancestors);
-            references.push(ReferenceInfo {
-                name: trimmed_name,
-                kind,
-                file_path: file_path.clone(),
-                line,
-                enclosing_symbol: enclosing,
-            });
-        }
-    }
-
-    (symbols, references)
+        (symbols, references)
     })
 }
 

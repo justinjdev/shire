@@ -1996,3 +1996,39 @@ fn test_ruby_empty_source() {
     let symbols = extract_file("rb", "", Arc::from("empty.rb"));
     assert!(symbols.is_empty());
 }
+
+#[test]
+fn test_type_definition_not_double_captured_as_ref() {
+    // The type declaration "type Config struct" should NOT produce a self-reference
+    // via @reference.type — only the uses in parameters/fields should.
+    let source = r#"package main
+
+type Config struct { Key string }
+
+func use(c Config) Config { return c }
+"#;
+    let (syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+
+    // Config should be a defined struct
+    assert!(syms.iter().any(|s| s.name == "Config" && s.kind == SymbolKind::Struct));
+
+    // Config should appear as type-ref at the parameter and return positions (line 5),
+    // but NOT at the declaration site (line 3).
+    let config_type_refs: Vec<&ReferenceInfo> = refs
+        .iter()
+        .filter(|r| r.name == "Config" && r.kind == ReferenceKind::Type)
+        .collect();
+
+    // At least one type-ref (parameter/return), but none at line 3 (the definition)
+    assert!(
+        !config_type_refs.is_empty(),
+        "Config should have at least one type reference (param/return)"
+    );
+    for r in &config_type_refs {
+        assert_ne!(
+            r.line, 3,
+            "Config's own definition at line 3 should not produce a self-reference, got {:?}",
+            r
+        );
+    }
+}

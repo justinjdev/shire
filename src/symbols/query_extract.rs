@@ -61,11 +61,32 @@ pub fn extract(
         let mut symbols = Vec::new();
         let mut references = Vec::new();
         let mut seen_def_ranges = std::collections::HashSet::new();
+        // Tracks byte ranges of definition NAME nodes so we can suppress
+        // reference captures that coincide with a definition's own name node.
+        // Tree-sitter may emit a reference match for the same identifier node
+        // that was already captured as a definition name, producing spurious
+        // self-references (e.g. `type Config struct` → Config type-ref at
+        // declaration line).  We buffer pending references and filter them
+        // after processing all matches.
+        let mut def_name_ranges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        let mut pending_references: Vec<(ReferenceInfo, (usize, usize))> = Vec::new();
         let source_bytes = source.as_bytes();
 
-        let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
-        while let Some(m) = matches.next() {
-            let name_capture = m.captures.iter().find(|c| c.index == name_idx);
+        // Collect all matches into a Vec so we can do two logical passes
+        // without re-running the query (avoids double-parse overhead).
+        let all_matches: Vec<_> = {
+            let mut buf = Vec::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+            while let Some(m) = matches.next() {
+                // Clone captures so we can store them independent of the cursor.
+                buf.push(m.captures.to_vec());
+            }
+            buf
+        };
+
+        for captures in &all_matches {
+            let name_capture = captures.iter().find(|c| c.index == name_idx);
             let name = match name_capture {
                 Some(c) => match c.node.utf8_text(source_bytes) {
                     Ok(s) => s.to_string(),
@@ -79,7 +100,7 @@ pub fn extract(
             let mut def_node = None;
             let mut ref_kind = None;
             let mut ref_node = None;
-            for capture in m.captures.iter() {
+            for capture in captures.iter() {
                 let cname = capture_names[capture.index as usize];
                 if def_kind.is_none() {
                     if let Some(k) = capture_name_to_kind(cname) {
@@ -101,6 +122,12 @@ pub fn extract(
                 let range_key = (node.start_byte(), node.end_byte());
                 if !seen_def_ranges.insert(range_key) {
                     continue;
+                }
+                // Record the NAME node's byte range so we can suppress any
+                // reference capture that lands on the same identifier.
+                if let Some(nc) = name_capture {
+                    def_name_ranges
+                        .insert((nc.node.start_byte(), nc.node.end_byte()));
                 }
                 if let Some(is_visible) = hooks.is_visible {
                     if !is_visible(&node, source) {
@@ -151,7 +178,7 @@ pub fn extract(
                 continue;
             }
 
-            // Reference path
+            // Reference path — buffer for post-pass filtering
             if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
                 if hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
@@ -166,13 +193,26 @@ pub fn extract(
                 let line = node.start_position().row + 1;
                 let enclosing =
                     resolve_enclosing_symbol(&node, source, hooks.enclosing_ancestors);
-                references.push(ReferenceInfo {
-                    name: trimmed_name,
-                    kind,
-                    file_path: file_path.clone(),
-                    line,
-                    enclosing_symbol: enclosing,
-                });
+                let node_range = (node.start_byte(), node.end_byte());
+                pending_references.push((
+                    ReferenceInfo {
+                        name: trimmed_name,
+                        kind,
+                        file_path: file_path.clone(),
+                        line,
+                        enclosing_symbol: enclosing,
+                    },
+                    node_range,
+                ));
+            }
+        }
+
+        // Emit only references whose name node does NOT coincide with a
+        // definition name node (suppresses self-references from patterns like
+        // `(type_identifier) @name @reference.type`).
+        for (reference, node_range) in pending_references {
+            if !def_name_ranges.contains(&node_range) {
+                references.push(reference);
             }
         }
 

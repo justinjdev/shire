@@ -131,9 +131,12 @@ pub fn hooks() -> LanguageHooks {
             "true", "false", "nil", "iota",
             "make", "new", "len", "cap", "append", "copy", "delete",
             "print", "println", "panic", "recover",
+            "min", "max", "clear",
             "int", "int32", "int64", "uint", "uint32", "uint64",
             "string", "bool", "byte", "rune", "float32", "float64",
             "error", "any",
+            "complex", "real", "imag", "close",
+            "uintptr", "complex64", "complex128", "comparable",
         ],
     }
 }

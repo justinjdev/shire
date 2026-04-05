@@ -198,6 +198,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -215,7 +217,7 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nim"), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.nim"), &hooks, true).0
     }
 
     #[test]

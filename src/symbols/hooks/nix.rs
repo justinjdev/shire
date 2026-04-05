@@ -192,6 +192,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -209,7 +211,7 @@ mod tests {
         let query_source = include_str!("../queries/nix.scm");
         let query = Query::new(&language, query_source).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nix"), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.nix"), &hooks, true).0
     }
 
     #[test]

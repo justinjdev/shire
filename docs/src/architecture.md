@@ -34,6 +34,12 @@ src/
 │   ├── hooks/       # Language-specific hooks (visibility, signatures, params, post-processing)
 │   ├── elixir.rs    # Elixir extractor (regex-based)
 │   └── cobol.rs     # COBOL extractor (regex-based)
+│                    # Cross-reference extraction (call, type, import, impl) is supported
+│                    # for 8 tier-1 languages: Go, Python, Java, TypeScript, JavaScript,
+│                    # Perl, Ruby, Scala. References are captured via @reference.* captures
+│                    # in the language's .scm query and written to the symbol_refs table.
+│                    # Coverage is asymmetric per language: JavaScript omits Type refs
+│                    # (no type system), and Go/Perl omit Impl refs (no extends/implements).
 ├── rag/             # Optional RAG vector search (behind `rag` feature flag)
 │   ├── mod.rs       # Feature-gated module root
 │   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding (64 files/batch)
@@ -47,6 +53,23 @@ src/
     ├── daemon.rs    # Process management (start/stop/is_running via PID)
     └── protocol.rs  # Hook input parsing, Bash read-only denylist
 ```
+
+## symbol_refs table
+
+The `symbol_refs` table stores cross-reference records extracted alongside symbol definitions. Each row captures a reference to a named symbol:
+
+| Column | Type | Description |
+|---|---|---|
+| `name` | TEXT | The name being referenced (function, type, module, etc.) |
+| `kind` | TEXT | One of: `call`, `type`, `import`, `impl` |
+| `file_path` | TEXT | Source file containing the reference |
+| `line` | INTEGER | Line number of the reference |
+| `package` | TEXT | Package the referencing file belongs to (nullable) |
+| `enclosing_symbol` | TEXT | Nearest enclosing function or method (nullable) |
+
+B-tree indexes on `name`, `file_path`, and `enclosing_symbol` support the exact-match lookups used by the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools. No FTS5 table — reference queries are exact-name only.
+
+Incremental behavior mirrors symbol extraction: references for a file are dropped and re-extracted whenever the file's SHA-256 hash changes. No separate pass is needed — references are extracted in the same tree-sitter walk as symbol definitions.
 
 ## File embeddings
 

@@ -246,5 +246,22 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[
+            "method_declaration",
+            "constructor_declaration",
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+        ],
+        // Keep only literals/keywords and primitive type names — things that
+        // cannot be user-defined. JDK class names like `List`, `Map`,
+        // `Optional`, `String`, `Exception` are ORDINARY identifiers in Java
+        // and stoplisting them turns any repo-defined type with one of those
+        // names into a permanent false negative for reference lookup. Push
+        // JDK-noise handling to query/ranking time instead.
+        reference_stoplist: &[
+            "true", "false", "null", "this", "super",
+            "void", "int", "long", "boolean", "double", "float", "byte", "char", "short",
+        ],
     }
 }

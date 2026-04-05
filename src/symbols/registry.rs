@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use super::hooks::LanguageHooks;
-use super::{query_extract, SymbolInfo};
+use super::{query_extract, ReferenceInfo, SymbolInfo};
 use tree_sitter::{Language, Parser, Query};
 
 struct LanguageEntry {
@@ -67,7 +67,7 @@ fn registry() -> &'static [LanguageEntry] {
                 extensions: &["js", "jsx"],
                 ts_language: || tree_sitter_javascript::LANGUAGE.into(),
                 query_source: include_str!("queries/javascript.scm"),
-                hooks: super::hooks::typescript::hooks,
+                hooks: super::hooks::javascript::hooks,
                 compiled_query: OnceLock::new(),
             },
             LanguageEntry {
@@ -292,15 +292,22 @@ fn registry() -> &'static [LanguageEntry] {
     })
 }
 
-/// Extract symbols from a single file by extension.
+/// Extract symbols and references from a single file by extension.
 ///
 /// For tree-sitter languages, the `Query` is compiled once per language (cached via `OnceLock`)
 /// and a `Parser` is created per call. The parser creation is cheap; query compilation is the
 /// expensive operation that we avoid repeating.
-pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
+pub fn extract_file(
+    ext: &str,
+    source: &str,
+    file_path: Arc<str>,
+    skip_references: bool,
+) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     // Regex-based extractors (no tree-sitter)
     match ext {
-        "cob" | "cbl" | "cpy" => return super::cobol::extract(source, file_path),
+        "cob" | "cbl" | "cpy" => {
+            return (super::cobol::extract(source, file_path), Vec::new());
+        }
         _ => {}
     }
 
@@ -312,11 +319,11 @@ pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolI
             let language = (entry.ts_language)();
             let mut parser = Parser::new();
             if parser.set_language(&language).is_err() {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
-            return query_extract::extract(&mut parser, query, source, file_path, &hooks);
+            return query_extract::extract(&mut parser, query, source, file_path, &hooks, skip_references);
         }
     }
 
-    Vec::new()
+    (Vec::new(), Vec::new())
 }

@@ -427,6 +427,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -437,11 +439,11 @@ mod tests {
     use std::sync::Arc;
 
     fn extract_ml(source: &str) -> Vec<SymbolInfo> {
-        extract_file("ml", source, Arc::from("test.ml"))
+        extract_file("ml", source, Arc::from("test.ml"), true).0
     }
 
     fn extract_mli(source: &str) -> Vec<SymbolInfo> {
-        extract_file("mli", source, Arc::from("test.mli"))
+        extract_file("mli", source, Arc::from("test.mli"), true).0
     }
 
     #[test]

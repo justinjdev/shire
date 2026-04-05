@@ -85,9 +85,49 @@ pub struct Parameter {
     pub type_annotation: Option<String>,
 }
 
-/// Extract symbols from a single file by extension.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferenceInfo {
+    pub name: String,
+    pub kind: ReferenceKind,
+    pub file_path: Arc<str>,
+    pub line: usize,
+    pub enclosing_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Call,
+    Type,
+    Import,
+    Impl,
+}
+
+impl ReferenceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReferenceKind::Call => "call",
+            ReferenceKind::Type => "type",
+            ReferenceKind::Import => "import",
+            ReferenceKind::Impl => "impl",
+        }
+    }
+}
+
+/// Extract both symbols and references from a single file by extension.
+pub fn extract_file_full(
+    ext: &str,
+    source: &str,
+    file_path: Arc<str>,
+) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
+    registry::extract_file(ext, source, file_path, false)
+}
+
+/// Extract only symbols (backward-compatible convenience wrapper). Skips
+/// reference-capture processing entirely so callers that don't need refs
+/// don't pay the per-match `resolve_enclosing_symbol` + allocation cost.
 pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
-    registry::extract_file(ext, source, file_path)
+    registry::extract_file(ext, source, file_path, true).0
 }
 
 #[cfg(test)]

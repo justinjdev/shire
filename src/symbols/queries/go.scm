@@ -13,3 +13,18 @@
 (type_declaration
   (type_spec
     name: (type_identifier) @name) @definition.type)
+
+; Reference: function/method calls
+(call_expression
+  function: (identifier) @name) @reference.call
+
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @name)) @reference.call
+
+; Reference: type usage (parameters, return types, struct fields)
+(type_identifier) @name @reference.type
+
+; Reference: imports (the import path string)
+(import_spec
+  path: (interpreted_string_literal) @name) @reference.import

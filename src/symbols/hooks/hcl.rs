@@ -81,7 +81,7 @@ mod tests {
     use crate::symbols::SymbolKind;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
-        extract_file("tf", source, Arc::from("test.tf"))
+        extract_file("tf", source, Arc::from("test.tf"), true).0
     }
 
     #[test]
@@ -203,7 +203,7 @@ terraform {
         let source = r#"variable "name" {
   type = string
 }"#;
-        let symbols = extract_file("hcl", source, Arc::from("test.hcl"));
+        let symbols = extract_file("hcl", source, Arc::from("test.hcl"), true).0;
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "name");
     }

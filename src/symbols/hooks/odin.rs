@@ -158,6 +158,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: None,
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -177,7 +179,7 @@ mod tests {
         let hooks = hooks();
         let mut parser = Parser::new();
         parser.set_language(&lang).unwrap();
-        query_extract::extract(&mut parser, &query, source, Arc::from(file_path), &hooks)
+        query_extract::extract(&mut parser, &query, source, Arc::from(file_path), &hooks, true).0
     }
 
     #[test]

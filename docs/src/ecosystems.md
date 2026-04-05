@@ -53,3 +53,20 @@ Shire extracts public symbols (functions, classes, types, methods, interfaces) f
 | Nix | tree-sitter |
 | Nim | tree-sitter |
 | COBOL | regex-based |
+
+## Reference extraction
+
+Shire extracts cross-references (calls, type references, imports, and interface implementations) for a subset of languages. These are stored in the `symbol_refs` table and exposed via the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools.
+
+| Language | Call | Type | Import | Impl |
+|---|---|---|---|---|
+| Go | yes | yes | yes | — (implicit interfaces) |
+| Python | yes | yes | yes | yes |
+| Java | yes | yes | yes | yes |
+| TypeScript | yes | yes | yes | yes |
+| JavaScript | yes | — | yes | yes |
+| Perl | yes | — | yes | — |
+| Ruby | yes | yes | yes | yes |
+| Scala | yes | yes | yes | yes |
+
+All other languages: symbol definitions only; references are not extracted.

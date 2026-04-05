@@ -11,6 +11,7 @@ pub mod go;
 pub mod haskell;
 pub mod hcl;
 pub mod java;
+pub mod javascript;
 pub mod julia;
 pub mod kotlin;
 pub mod lua;
@@ -65,6 +66,16 @@ pub struct LanguageHooks {
     /// Return None to skip the symbol.
     pub post_process:
         Option<fn(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo>>,
+
+    /// Node kinds that qualify as an enclosing symbol for references.
+    /// The extractor walks up from a reference node through ancestors, stopping
+    /// at the first node whose kind appears in this list. None means the
+    /// language has no references tracked (empty list acceptable too).
+    pub enclosing_ancestors: &'static [&'static str],
+
+    /// Identifiers to skip when emitting references (language built-ins,
+    /// reserved words that parse as identifiers, etc.).
+    pub reference_stoplist: &'static [&'static str],
 }
 
 impl Default for LanguageHooks {
@@ -76,6 +87,8 @@ impl Default for LanguageHooks {
             extract_parameters: None,
             extract_return_type: None,
             post_process: None,
+            enclosing_ancestors: &[],
+            reference_stoplist: &[],
         }
     }
 }
@@ -108,6 +121,41 @@ pub fn find_ancestor<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     while let Some(n) = current {
         if n.kind() == kind {
             return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Walk up from `node` through ancestors looking for the first node whose kind
+/// is listed in `ancestors`. Returns the text of that ancestor's `name` field
+/// (or its first `identifier`/`type_identifier` child) as the enclosing symbol
+/// name. Returns None if no qualifying named ancestor is found.
+pub fn resolve_enclosing_symbol(
+    node: &Node,
+    source: &str,
+    ancestors: &[&str],
+) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if ancestors.contains(&n.kind()) {
+            // Try the `name` field first (most grammars)
+            if let Some(name) = field_text(&n, "name", source) {
+                return Some(name.to_string());
+            }
+            // Fall back to scanning direct children for an identifier-like node
+            for i in 0..n.child_count() {
+                let child = n.child(i).unwrap();
+                match child.kind() {
+                    "identifier" | "type_identifier" | "constant" | "simple_identifier" => {
+                        if let Some(txt) = node_text(&child, source) {
+                            return Some(txt.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Found an ancestor but couldn't name it — continue walking
         }
         current = n.parent();
     }

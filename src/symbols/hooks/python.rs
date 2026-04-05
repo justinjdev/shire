@@ -163,5 +163,13 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &["function_definition", "class_definition"],
+        reference_stoplist: &[
+            "True", "False", "None", "self", "cls",
+            "print", "open", "len", "range", "enumerate", "zip", "map", "filter",
+            "str", "int", "float", "bool", "list", "dict", "tuple", "set",
+            "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr",
+            "Exception", "ValueError", "TypeError", "KeyError",
+        ],
     }
 }

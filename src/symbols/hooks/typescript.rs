@@ -173,12 +173,29 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process symbols.
 ///
-/// For `variable_declarator` nodes (Constant kind): extract name from the
-/// variable_declarator's name field, and set signature from the parent
-/// lexical_declaration's first line.
-///
-/// For `type_alias_declaration` nodes: set signature to first line of node text.
+/// - Filters class/interface/type_alias declarations whose direct parent is
+///   not `export_statement`. These come from supplementary suppression-only
+///   query patterns whose sole purpose is to seed def_name_ranges (run before
+///   post_process) so the bare `(type_identifier) @reference.type` pattern
+///   does not emit a self-ref at the declaration line.
+/// - For `variable_declarator` nodes (Constant kind): extract name from the
+///   variable_declarator's name field, and set signature from the parent
+///   lexical_declaration's first line.
+/// - For `type_alias_declaration` nodes: set signature to first line of node
+///   text.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
+    if matches!(
+        node.kind(),
+        "class_declaration" | "interface_declaration" | "type_alias_declaration"
+    ) {
+        let exported = node
+            .parent()
+            .is_some_and(|p| p.kind() == "export_statement");
+        if !exported {
+            return None;
+        }
+    }
+
     if sym.kind == SymbolKind::Constant && node.kind() == "variable_declarator" {
         // Name is already captured by @name on the variable_declarator's name field.
         // Set signature from the parent lexical_declaration.
@@ -207,5 +224,24 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[
+            "function_declaration",
+            "method_definition",
+            "class_declaration",
+            "interface_declaration",
+            "function_expression",
+            "method_signature",
+            // arrow_function is a distinct callable kind in TS — without
+            // it refs captured inside arrow bodies get no enclosing_symbol.
+            "arrow_function",
+        ],
+        // Keep only literals/keywords and TS-reserved type keywords. Global
+        // classes like String/Number/Array/Promise/Error ARE user-definable
+        // (you can write `class Array { ... }`), so stoplisting them turns
+        // any repo type with those names into a permanent false negative.
+        reference_stoplist: &[
+            "true", "false", "null", "undefined", "this", "super",
+            "string", "number", "boolean", "any", "unknown", "never", "void",
+        ],
     }
 }

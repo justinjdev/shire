@@ -16,6 +16,19 @@ REPOS=(
     "rust|https://github.com/rust-lang/rust.git|1.78.0"
 )
 
+# RAG off, cross-reference index on (so bench exercises the symbol_refs path
+# even though refs are off by default). Shared across new-clone and re-use
+# code paths to avoid config drift.
+write_bench_config() {
+    cat > "$1/shire.toml" <<'TOML'
+[rag]
+enabled = false
+
+[symbols]
+references_enabled = true
+TOML
+}
+
 setup_repo() {
     local name url commit
     IFS='|' read -r name url commit <<< "$1"
@@ -32,8 +45,7 @@ setup_repo() {
         else
             echo "[${name}] Already at ${commit}"
         fi
-        # Always ensure RAG is disabled for benchmarks
-        echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
+        write_bench_config "${repo_dir}"
         return 0
     fi
 
@@ -43,8 +55,7 @@ setup_repo() {
     git checkout "${commit}" 2>/dev/null || git checkout "tags/${commit}" 2>/dev/null
     echo "[${name}] Ready at ${repo_dir}"
 
-    # Ensure RAG is disabled for benchmarks
-    echo -e '[rag]\nenabled = false' > "${repo_dir}/shire.toml"
+    write_bench_config "${repo_dir}"
 }
 
 # Parse optional filter: setup-bench-repo.sh [small|medium|large|xlarge|all]

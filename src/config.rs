@@ -24,7 +24,7 @@ pub struct Config {
     pub log: LogConfig,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SymbolsConfig {
     #[serde(default)]
     pub exclude_extensions: Vec<String>,
@@ -33,6 +33,41 @@ pub struct SymbolsConfig {
     /// (e.g. "zz_generated." — note the trailing dot).
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+    /// Extract cross-references (call sites, type uses, imports, impl
+    /// relationships) alongside symbol definitions. EXPERIMENTAL — off by
+    /// default.
+    ///
+    /// When enabled, populates the `symbol_refs` table so the
+    /// `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools
+    /// can answer refactor-safety questions ("where is this used?", "who
+    /// calls this?").
+    ///
+    /// Cost: DB grows substantially — roughly +30% on TS/JS repos and up to
+    /// +150% on Go-heavy repos. Build time grows ~5-7%.
+    /// Coverage: 8 tier-1 languages (Go, Python, Java, TypeScript, JavaScript,
+    /// Perl, Ruby, Scala). `shire init` prompts for this option and marks
+    /// it as experimental.
+    ///
+    /// Toggling this flag takes effect on the next build; changing it
+    /// requires no manual migration — disabled builds wipe `symbol_refs`,
+    /// re-enabled builds repopulate it on the next full rebuild
+    /// (`shire build --force`).
+    #[serde(default = "default_references_enabled")]
+    pub references_enabled: bool,
+}
+
+impl Default for SymbolsConfig {
+    fn default() -> Self {
+        Self {
+            exclude_extensions: Vec::new(),
+            exclude_patterns: Vec::new(),
+            references_enabled: default_references_enabled(),
+        }
+    }
+}
+
+fn default_references_enabled() -> bool {
+    false
 }
 
 #[derive(Debug, Deserialize, Clone)]

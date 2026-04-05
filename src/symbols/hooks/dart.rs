@@ -420,6 +420,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -430,7 +432,7 @@ mod tests {
     use std::sync::Arc;
 
     fn extract(source: &str) -> Vec<SymbolInfo> {
-        extract_file("dart", source, Arc::from("test.dart"))
+        extract_file("dart", source, Arc::from("test.dart"), true).0
     }
 
     #[test]

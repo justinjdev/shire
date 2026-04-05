@@ -235,6 +235,20 @@ fn create_schema(conn: &Connection) -> Result<()> {
             INSERT INTO docs_fts(rowid, title, body, path)
             VALUES (new.rowid, new.title, new.body, new.path);
         END;
+
+        CREATE TABLE IF NOT EXISTS symbol_refs (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            file_id          INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            line             INTEGER NOT NULL,
+            package          TEXT,
+            enclosing_symbol TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+        CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
+        CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
         ",
     )?;
     Ok(())
@@ -298,7 +312,36 @@ pub fn recreate_docs_fts_triggers(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const FTS_SCHEMA_VERSION: &str = "3";
+/// Drop the non-FTS indexes on `symbol_refs` before bulk insert.
+/// Combined with `recreate_symbol_refs_indexes` after the bulk insert,
+/// this moves per-row B-tree updates into one sorted build per index —
+/// substantially faster for large batches.
+pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        // idx_refs_file was removed in schema v6: its per-row maintenance
+        // cost during INSERT exceeded the savings it gave the per-file
+        // DELETE path. Keep the DROP so legacy DBs shed it on next bulk load.
+        // In v7 we reintroduce a file index, but on the INTEGER file_id
+        // column — its B-tree entries are ~10x smaller than the TEXT-path
+        // version, so the INSERT-side cost is proportionally lower.
+        "DROP INDEX IF EXISTS idx_refs_name;
+         DROP INDEX IF EXISTS idx_refs_file;
+         DROP INDEX IF EXISTS idx_refs_file_id;
+         DROP INDEX IF EXISTS idx_refs_enclosing;",
+    )?;
+    Ok(())
+}
+
+pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
+         CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
+         CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);",
+    )?;
+    Ok(())
+}
+
+const FTS_SCHEMA_VERSION: &str = "7";
 
 fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
     let current: Option<String> = conn
@@ -335,10 +378,30 @@ fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS packages_fts;
          DROP TABLE IF EXISTS files_fts;
          DROP TABLE IF EXISTS symbols_fts;
-         DROP TABLE IF EXISTS docs_fts;",
+         DROP TABLE IF EXISTS docs_fts;
+         DROP TRIGGER IF EXISTS symbol_refs_ai;
+         DROP TRIGGER IF EXISTS symbol_refs_ad;
+         DROP TRIGGER IF EXISTS symbol_refs_au;
+         DROP TABLE IF EXISTS symbol_refs_fts;
+         DROP INDEX IF EXISTS idx_refs_package;
+         DROP INDEX IF EXISTS idx_refs_file;
+         -- v7: symbol_refs.file_path TEXT → file_id INTEGER (FK to files(id))
+         DROP TABLE IF EXISTS symbol_refs;",
     )?;
 
     create_schema(conn)?;
+
+    // `symbol_refs` is a regular table with no FTS 'rebuild' hook — it is
+    // only populated during symbol extraction. If we just dropped+recreated
+    // it (e.g. v7 schema change) but leave `source_hashes`/`file_hashes`
+    // intact, the next incremental `shire build` will hash-match every
+    // unchanged file, skip extraction, and leave `symbol_refs` empty until
+    // the user runs `--force` or edits files. Clear the hash tables so the
+    // next build re-extracts.
+    conn.execute_batch(
+        "DELETE FROM source_hashes;
+         DELETE FROM file_hashes;",
+    )?;
 
     conn.execute_batch(
         "INSERT INTO packages_fts(packages_fts) VALUES('rebuild');
@@ -534,5 +597,66 @@ mod tests {
             &dir.path().join("dest.db"),
         );
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_symbol_refs_schema_created() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbol_refs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "symbol_refs table must exist");
+    }
+
+    #[test]
+    fn test_symbol_refs_insert_and_query() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        conn.execute(
+            "INSERT INTO files (path, package, extension, size_bytes) VALUES ('src/main.rs', NULL, 'rs', 0)",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = 'src/main.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+             VALUES ('parseConfig', 'call', ?1, 42, NULL, 'handle_request')",
+            [file_id],
+        ).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // idx_refs_name should support exact-name lookups used by MCP tools
+        let hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'parseConfig'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hit, 1);
     }
 }

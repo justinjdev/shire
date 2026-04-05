@@ -140,6 +140,8 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
+        enclosing_ancestors: &[],
+        reference_stoplist: &[],
     }
 }
 
@@ -150,7 +152,7 @@ mod tests {
     use std::sync::Arc;
 
     fn extract(source: &str) -> Vec<SymbolInfo> {
-        extract_file("erl", source, Arc::from("test.erl"))
+        extract_file("erl", source, Arc::from("test.erl"), true).0
     }
 
     #[test]
@@ -308,7 +310,7 @@ add(A, B) -> A + B.
         let source = r#"-record(state, {pid :: pid(), name :: atom()}).
 -define(TIMEOUT, 5000).
 "#;
-        let syms = extract_file("hrl", source, Arc::from("test.hrl"));
+        let syms = extract_file("hrl", source, Arc::from("test.hrl"), true).0;
         assert_eq!(syms.len(), 2);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"state"));

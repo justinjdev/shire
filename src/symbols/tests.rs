@@ -67,6 +67,74 @@ fn test_python_function_no_hints() {
     assert!(symbols[0].return_type.is_none());
 }
 
+// Python reference tests
+
+#[test]
+fn test_python_call_references() {
+    let source = r#"import json
+
+def load(path: str) -> dict:
+    raw = open(path).read()
+    return json.loads(raw)
+
+def save(path: str, data: dict):
+    with open(path, 'w') as f:
+        f.write(json.dumps(data))
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("io.py"));
+    let call_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Call).collect();
+    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"loads"), "got {:?}", names);
+    assert!(names.contains(&"dumps"));
+    assert!(names.contains(&"read"));
+
+    // open() is in the stoplist (builtin), should not appear
+    assert!(!names.contains(&"open"), "open() is builtin, should be in stoplist");
+
+    let loads_ref = call_refs.iter().find(|r| r.name == "loads").unwrap();
+    assert_eq!(loads_ref.enclosing_symbol.as_deref(), Some("load"));
+}
+
+#[test]
+fn test_python_import_references() {
+    let source = r#"import json
+from typing import List, Dict
+from os.path import join
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("imports.py"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"json"), "got {:?}", names);
+    assert!(names.contains(&"List"));
+    assert!(names.contains(&"Dict"));
+    assert!(names.contains(&"join"));
+}
+
+#[test]
+fn test_python_impl_references() {
+    let source = r#"class Base:
+    pass
+
+class Derived(Base):
+    pass
+
+class Multi(Base, Mixin):
+    pass
+"#;
+    let (_syms, refs) = extract_file_full("py", source, Arc::from("cls.py"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"Base"), "got {:?}", names);
+    assert!(names.contains(&"Mixin"));
+}
+
 // ============================================================
 // Go tests (ported from go.rs)
 // ============================================================
@@ -144,6 +212,72 @@ type internalType struct {}
 "#;
     let symbols = extract_file("go", source, Arc::from("internal.go"));
     assert!(symbols.is_empty());
+}
+
+// References
+
+#[test]
+fn test_go_call_references() {
+    let source = r#"package main
+
+import "fmt"
+
+func handleRequest(req *Request) error {
+    cfg := parseConfig(req)
+    fmt.Println(cfg)
+    return validate(cfg)
+}
+
+func parseConfig(r *Request) Config { return Config{} }
+func validate(c Config) error { return nil }
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+
+    let call_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Call).collect();
+    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"parseConfig"), "expected call-ref to parseConfig, got {:?}", names);
+    assert!(names.contains(&"validate"), "expected call-ref to validate, got {:?}", names);
+
+    let parse_ref = call_refs.iter().find(|r| r.name == "parseConfig").unwrap();
+    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("handleRequest"));
+}
+
+#[test]
+fn test_go_type_references() {
+    let source = r#"package main
+
+type Config struct { Key string }
+
+func parse(r *Request) Config { return Config{} }
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+    let type_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Type).collect();
+    let names: Vec<&str> = type_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"Request"), "expected type-ref Request, got {:?}", names);
+    assert!(names.contains(&"Config"), "expected type-ref Config, got {:?}", names);
+}
+
+#[test]
+fn test_go_import_references() {
+    let source = r#"package main
+
+import (
+    "fmt"
+    "strings"
+)
+"#;
+    let (_syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+    let import_refs: Vec<&ReferenceInfo> =
+        refs.iter().filter(|r| r.kind == ReferenceKind::Import).collect();
+    let names: Vec<&str> = import_refs.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&"fmt"),
+        "expected fmt import (quotes stripped by query_extract), got {:?}",
+        names
+    );
+    assert!(names.contains(&"strings"), "got {:?}", names);
 }
 
 // ============================================================
@@ -349,6 +483,154 @@ fn test_js_function() {
     assert_eq!(symbols[0].name, "greet");
 }
 
+#[test]
+fn test_typescript_call_references() {
+    let source = r#"import { parseConfig } from './config';
+
+export function handle(req: Request): Response {
+    const cfg = parseConfig(req.body);
+    return buildResponse(cfg);
+}
+
+function buildResponse(cfg: Config): Response {
+    return new Response();
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("handler.ts"));
+    let call_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(call_names.contains(&"parseConfig"), "got {:?}", call_names);
+    assert!(call_names.contains(&"buildResponse"));
+}
+
+#[test]
+fn test_typescript_type_references() {
+    let source = r#"interface Config {
+    key: string;
+}
+
+function handle(req: Request): Response {
+    return new Response();
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("h.ts"));
+    let type_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(type_names.contains(&"Request"), "got {:?}", type_names);
+    assert!(type_names.contains(&"Response"));
+}
+
+#[test]
+fn test_typescript_default_and_namespace_imports() {
+    let source = r#"import Foo from './foo';
+import * as Bar from './bar';
+import { Baz } from './baz';
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("i.ts"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.contains(&"Foo"), "default import missing — got {:?}", imp_names);
+    assert!(imp_names.contains(&"Bar"), "namespace import missing — got {:?}", imp_names);
+    assert!(imp_names.contains(&"Baz"), "named import missing — got {:?}", imp_names);
+}
+
+#[test]
+fn test_typescript_interface_extends() {
+    let source = r#"interface A {}
+interface B extends A {}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("h.ts"));
+    let impl_refs: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_refs.contains(&"A"), "interface extends not captured — got {:?}", impl_refs);
+}
+
+#[test]
+fn test_typescript_impl_references() {
+    let source = r#"interface Service {}
+interface Auditable {}
+class Base {}
+
+class MyService extends Base implements Service, Auditable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("svc.ts"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Service"));
+    assert!(impl_names.contains(&"Auditable"));
+}
+
+#[test]
+fn test_typescript_import_references() {
+    let source = r#"import { parseConfig, Config } from './config';
+import { handler } from './handler';
+"#;
+    let (_syms, refs) = extract_file_full("ts", source, Arc::from("i.ts"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.contains(&"parseConfig"), "got {:?}", imp_names);
+    assert!(imp_names.contains(&"Config"));
+    assert!(imp_names.contains(&"handler"));
+}
+
+#[test]
+fn test_javascript_call_references() {
+    let source = r#"import { parseConfig } from './config.js';
+
+export function handle(req) {
+    const cfg = parseConfig(req.body);
+    return buildResponse(cfg);
+}
+
+function buildResponse(cfg) {
+    return {};
+}
+"#;
+    let (_syms, refs) = extract_file_full("js", source, Arc::from("h.js"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"parseConfig"), "got {:?}", names);
+    assert!(names.contains(&"buildResponse"), "got {:?}", names);
+}
+
+#[test]
+fn test_javascript_impl_references() {
+    let source = r#"class Base {}
+
+class Derived extends Base {}
+"#;
+    let (_syms, refs) = extract_file_full("js", source, Arc::from("c.js"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+}
+
 // ============================================================
 // Java tests (ported from java.rs)
 // ============================================================
@@ -490,6 +772,78 @@ public class Service {
         .collect();
     assert_eq!(methods.len(), 1);
     assert_eq!(methods[0].name, "publicMethod");
+}
+
+#[test]
+fn test_java_call_references() {
+    let source = r#"package com.example;
+
+import java.util.List;
+
+public class UserService {
+    private Database db;
+
+    public User fetchUser(String id) {
+        return db.lookup(id);
+    }
+
+    public void saveUser(User u) {
+        validate(u);
+        db.insert(u);
+    }
+
+    private void validate(User u) {}
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("UserService.java"));
+    let call_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(call_names.contains(&"lookup"), "got {:?}", call_names);
+    assert!(call_names.contains(&"validate"), "got {:?}", call_names);
+    assert!(call_names.contains(&"insert"), "got {:?}", call_names);
+
+    let lookup_ref = refs.iter().find(|r| r.name == "lookup" && r.kind == ReferenceKind::Call).unwrap();
+    assert_eq!(lookup_ref.enclosing_symbol.as_deref(), Some("fetchUser"));
+}
+
+#[test]
+fn test_java_impl_references() {
+    let source = r#"package com.example;
+
+public class ConcreteService extends BaseService implements Cacheable, Auditable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("CS.java"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"BaseService"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Cacheable"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Auditable"), "got {:?}", impl_names);
+}
+
+#[test]
+fn test_java_import_references() {
+    let source = r#"package com.example;
+
+import java.util.List;
+import java.util.Map;
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("X.java"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    // Lookup by `symbol_references(name="List")` must match — capture the
+    // simple name from `java.util.List`, not the full qualified path.
+    assert!(imp_names.contains(&"List"), "got {:?}", imp_names);
+    assert!(imp_names.contains(&"Map"), "got {:?}", imp_names);
 }
 
 // ============================================================
@@ -1198,6 +1552,48 @@ fn test_scala_skip_private() {
     assert!(symbols.is_empty());
 }
 
+#[test]
+fn test_scala_call_references() {
+    let source = r#"package com.example
+
+object Service {
+  def process(req: Request): Response = {
+    val cfg = parseConfig(req.body)
+    buildResponse(cfg)
+  }
+
+  def parseConfig(body: String): Config = Config(body)
+  def buildResponse(cfg: Config): Response = Response(cfg.key)
+}
+"#;
+    let (_syms, refs) = extract_file_full("scala", source, Arc::from("svc.scala"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"parseConfig"), "got {:?}", names);
+    assert!(names.contains(&"buildResponse"));
+}
+
+#[test]
+fn test_scala_impl_references() {
+    let source = r#"trait Service
+trait Cacheable
+class Base
+class MyService extends Base with Service with Cacheable
+"#;
+    let (_syms, refs) = extract_file_full("scala", source, Arc::from("s.scala"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+    assert!(impl_names.contains(&"Service"));
+    assert!(impl_names.contains(&"Cacheable"));
+}
+
 // ============================================================
 // Zig tests
 // ============================================================
@@ -1767,6 +2163,51 @@ sub baz {
     assert_eq!(symbols[2].line, 7); // sub baz
 }
 
+#[test]
+fn test_perl_call_references() {
+    let source = r#"package My::Service;
+
+use strict;
+
+sub load {
+    my ($path) = @_;
+    my $raw = read_file($path);
+    return parse_raw($raw);
+}
+
+sub parse_raw { my ($r) = @_; return {}; }
+
+1;
+"#;
+    let (_syms, refs) = extract_file_full("pm", source, Arc::from("Service.pm"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"read_file"), "got {:?}", names);
+    assert!(names.contains(&"parse_raw"));
+}
+
+#[test]
+fn test_perl_use_references() {
+    let source = r#"package Main;
+use strict;
+use My::Utils;
+use JSON::PP;
+1;
+"#;
+    let (_syms, refs) = extract_file_full("pm", source, Arc::from("Main.pm"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    // Capture module names. `strict` is in stoplist — skip.
+    assert!(imp_names.iter().any(|n| n.contains("Utils")), "got {:?}", imp_names);
+    assert!(imp_names.iter().any(|n| n.contains("JSON")));
+}
+
 // ============================================================
 // Ruby tests
 // ============================================================
@@ -1929,4 +2370,245 @@ end
 fn test_ruby_empty_source() {
     let symbols = extract_file("rb", "", Arc::from("empty.rb"));
     assert!(symbols.is_empty());
+}
+
+#[test]
+fn test_ruby_call_references() {
+    let source = r#"require 'json'
+
+class Loader
+  def load(path)
+    raw = File.read(path)
+    JSON.parse(raw)
+  end
+
+  def save(path, data)
+    File.write(path, JSON.dump(data))
+  end
+end
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("loader.rb"));
+    let names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(names.contains(&"read"), "got {:?}", names);
+    assert!(names.contains(&"parse"));
+    assert!(names.contains(&"write"));
+    assert!(names.contains(&"dump"));
+
+    let parse_ref = refs.iter().find(|r| r.name == "parse" && r.kind == ReferenceKind::Call).unwrap();
+    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("load"));
+}
+
+#[test]
+fn test_ruby_impl_references() {
+    let source = r#"class Derived < Base
+  include Comparable
+  include Enumerable
+  extend ModuleMethods
+end
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("d.rb"));
+    let impl_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Impl)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(impl_names.contains(&"Base"), "expected superclass Base, got {:?}", impl_names);
+    assert!(impl_names.contains(&"Comparable"));
+    assert!(impl_names.contains(&"Enumerable"));
+    assert!(impl_names.contains(&"ModuleMethods"));
+}
+
+#[test]
+fn test_ruby_require_references() {
+    let source = r#"require 'json'
+require_relative './util'
+"#;
+    let (_syms, refs) = extract_file_full("rb", source, Arc::from("m.rb"));
+    let imp_names: Vec<&str> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| r.name.as_str())
+        .collect();
+    assert!(imp_names.iter().any(|n| n.contains("json")), "got {:?}", imp_names);
+    assert!(imp_names.iter().any(|n| n.contains("util")));
+}
+
+#[test]
+fn test_type_definition_not_double_captured_as_ref() {
+    // The type declaration "type Config struct" should NOT produce a self-reference
+    // via @reference.type — only the uses in parameters/fields should.
+    let source = r#"package main
+
+type Config struct { Key string }
+
+func use(c Config) Config { return c }
+"#;
+    let (syms, refs) = extract_file_full("go", source, Arc::from("main.go"));
+
+    // Config should be a defined struct
+    assert!(syms.iter().any(|s| s.name == "Config" && s.kind == SymbolKind::Struct));
+
+    // Config should appear as type-ref at the parameter and return positions (line 5),
+    // but NOT at the declaration site (line 3).
+    let config_type_refs: Vec<&ReferenceInfo> = refs
+        .iter()
+        .filter(|r| r.name == "Config" && r.kind == ReferenceKind::Type)
+        .collect();
+
+    // At least one type-ref (parameter/return), but none at line 3 (the definition)
+    assert!(
+        !config_type_refs.is_empty(),
+        "Config should have at least one type reference (param/return)"
+    );
+    for r in &config_type_refs {
+        assert_ne!(
+            r.line, 3,
+            "Config's own definition at line 3 should not produce a self-reference, got {:?}",
+            r
+        );
+    }
+}
+
+#[test]
+fn test_impl_refs_dedup_type_refs_at_same_node() {
+    // Java: `extends BaseService implements Cacheable` — the Base/Cacheable
+    // identifiers should each produce ONLY one Impl ref, not a redundant
+    // Type ref at the same node.
+    let source = r#"package com.example;
+public class MyService extends BaseService implements Cacheable {
+}
+"#;
+    let (_syms, refs) = extract_file_full("java", source, Arc::from("MS.java"));
+
+    for target in ["BaseService", "Cacheable"] {
+        let hits: Vec<&ReferenceInfo> = refs
+            .iter()
+            .filter(|r| r.name == target)
+            .collect();
+        let kinds: Vec<_> = hits.iter().map(|r| r.kind).collect();
+        assert!(
+            kinds.contains(&ReferenceKind::Impl),
+            "expected Impl ref for {}, got {:?}",
+            target, kinds
+        );
+        assert!(
+            !kinds.contains(&ReferenceKind::Type),
+            "{} should NOT also be recorded as Type (duplicate at impl site), got {:?}",
+            target, kinds
+        );
+    }
+
+    // Scala: extends Base with Trait — same dedup invariant
+    let scala_src = r#"trait Service
+class Base
+class MyService extends Base with Service
+"#;
+    let (_syms, refs) = extract_file_full("scala", scala_src, Arc::from("s.scala"));
+    let base_hits: Vec<_> = refs.iter().filter(|r| r.name == "Base").collect();
+    let base_kinds: Vec<_> = base_hits.iter().map(|r| r.kind).collect();
+    assert!(
+        base_kinds.contains(&ReferenceKind::Impl),
+        "Scala: expected Impl for Base, got {:?}",
+        base_kinds
+    );
+    assert!(
+        !base_kinds.contains(&ReferenceKind::Type),
+        "Scala: Base should NOT also be Type at impl site, got {:?}",
+        base_kinds
+    );
+}
+
+#[test]
+fn test_no_self_reference_at_definition_site_across_languages() {
+    // Cross-language invariant: for every tier-1 language with reference
+    // extraction, a definition's own name node at its declaration site must
+    // never be emitted as a reference record. Uses elsewhere in the file are
+    // expected — only the definition line should be ref-free for that name.
+    //
+    // This guards against per-language regressions where a new @reference.*
+    // capture accidentally matches the definition's name node.
+    struct Case {
+        ext: &'static str,
+        source: &'static str,
+        def_name: &'static str,
+        def_line: usize,
+    }
+
+    let cases = [
+        // Go: type_identifier at the declaration AND at use sites.
+        Case {
+            ext: "go",
+            source: "package main\ntype Config struct { Key string }\nfunc use(c Config) Config { return c }\n",
+            def_name: "Config",
+            def_line: 2,
+        },
+        // Python: identifier at class_definition name AND in type annotations.
+        Case {
+            ext: "py",
+            source: "class Config:\n    pass\n\ndef use(c: Config) -> Config:\n    return c\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Java: identifier at class_declaration name, type_identifier at use sites.
+        Case {
+            ext: "java",
+            source: "public class Config {}\nclass Svc { public Config use(Config c) { return c; } }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // TypeScript: type_identifier at interface_declaration name AND at
+        // use sites. Non-exported to exercise the suppression-only patterns
+        // that seed def_name_ranges for unexported type-like declarations.
+        Case {
+            ext: "ts",
+            source: "interface Config { key: string }\nfunction use(c: Config): Config { return c }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // JavaScript: identifier at class_declaration name, referenced via extends (impl).
+        Case {
+            ext: "js",
+            source: "export class Config {}\nexport class Sub extends Config {}\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Perl: package declaration name, referenced via `use` later.
+        Case {
+            ext: "pl",
+            source: "package Config;\n\npackage Main;\nuse Config;\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Ruby: constant at class name AND as a type-ref constant in body.
+        Case {
+            ext: "rb",
+            source: "class Config\nend\n\nclass Svc\n  def use\n    Config.new\n  end\nend\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+        // Scala: type_identifier at class name AND at use sites.
+        Case {
+            ext: "scala",
+            source: "class Config\nclass Svc { def use(c: Config): Config = c }\n",
+            def_name: "Config",
+            def_line: 1,
+        },
+    ];
+
+    for case in cases {
+        let (_, refs) = extract_file_full(case.ext, case.source, Arc::from("f"));
+        for r in &refs {
+            if r.name == case.def_name {
+                assert_ne!(
+                    r.line, case.def_line,
+                    "[{}] '{}' defined at line {} should not produce a self-reference, got ref {:?}",
+                    case.ext, case.def_name, case.def_line, r
+                );
+            }
+        }
+    }
 }

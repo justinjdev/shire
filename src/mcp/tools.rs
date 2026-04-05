@@ -348,6 +348,45 @@ pub struct ExploreParams {
     pub query: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolRefsArgs {
+    /// The symbol name to find references for
+    pub name: String,
+    /// Optional kind filter: "call", "type", "import", or "impl"
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Optional package filter
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Max results (default 100, clamped to 1..=1000)
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolCallersArgs {
+    /// The symbol being called
+    pub name: String,
+    /// Optional: restrict callers to this package
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Max results (default 100, clamped to 1..=1000)
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolCalleesArgs {
+    /// The caller symbol (function/method name)
+    pub name: String,
+    /// Optional: restrict to this package
+    #[serde(default)]
+    pub package: Option<String>,
+    /// Max results (default 100, clamped to 1..=1000)
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description. Use instead of Grep for finding packages.")]
@@ -607,6 +646,60 @@ impl ShireService {
                 crate::mcp::prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
             })?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished.")]
+    fn symbol_references(
+        &self,
+        Parameters(args): Parameters<SymbolRefsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "symbol_references", name = %args.name);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
+        let rows = queries::query_symbol_references(
+            &conn,
+            &args.name,
+            args.kind.as_deref(),
+            args.package.as_deref(),
+            limit,
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward.")]
+    fn symbol_callers(
+        &self,
+        Parameters(args): Parameters<SymbolCallersArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "symbol_callers", name = %args.name);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
+        let rows = queries::query_symbol_callers(&conn, &args.name, args.package.as_deref(), limit)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Find which symbols are called from inside the named function/method. Navigates the call graph downward.")]
+    fn symbol_callees(
+        &self,
+        Parameters(args): Parameters<SymbolCalleesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "symbol_callees", name = %args.name);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
+        let rows = queries::query_symbol_callees(&conn, &args.name, args.package.as_deref(), limit)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 

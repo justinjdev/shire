@@ -34,6 +34,24 @@ When you need to find code, use Shire MCP tools first:
 Fall back to Grep only for literal strings or content inside function bodies.
 "#;
 
+/// Additional rule-file section surfaced only when the user opts into the
+/// experimental cross-reference index, so the generated guidance actually
+/// mentions the MCP tools it enables.
+const RULES_CONTENT_REFS: &str = r#"
+## Cross-reference index (experimental)
+
+This repo has `symbols.references_enabled = true`, which populates the
+`symbol_refs` table. Use these tools before Grep-ing for usage sites:
+
+- **Find where a symbol is used:** `symbol_references` (not Grep)
+- **Find who calls a function/method:** `symbol_callers`
+- **Find what a function calls:** `symbol_callees`
+- **Audit a rename/refactor:** the `reference_audit` prompt
+
+Ref tools match by exact name — same-name symbols across packages are
+merged. Pass the optional `package` filter when you know the owning package.
+"#;
+
 /// Extract the top-level directory component from a relative db_path.
 /// Returns `None` for absolute paths or paths starting with `~`.
 fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
@@ -67,6 +85,9 @@ pub struct InitOptions {
     pub db_path: String,
     pub extra_excludes: Vec<String>,
     pub rag_enabled: bool,
+    /// When true, populate the symbol_refs table for `symbol_references`,
+    /// `symbol_callers`, and `symbol_callees` MCP tools. EXPERIMENTAL.
+    pub refs_enabled: bool,
     pub generate_rules: bool,
     /// When true, append Shire guidance to ~/.claude/CLAUDE.md.
     pub patch_claude_md: bool,
@@ -83,6 +104,7 @@ impl InitOptions {
             db_path: ".shire/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: true,
@@ -96,6 +118,7 @@ impl InitOptions {
             db_path: "~/.claude/shire/{repo}/{worktree}/index.db".into(),
             extra_excludes: Vec::new(),
             rag_enabled: false,
+            refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
@@ -162,13 +185,21 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(false)
         .interact()?;
 
-    // 6. Generate .claude/rules/shire.md
+    // 6. Enable cross-reference index (experimental)
+    let refs_enabled = Confirm::new()
+        .with_prompt(
+            "Enable cross-reference index (experimental)? Adds symbol_references/callers/callees MCP tools. DB grows substantially (roughly 30%-150% depending on language mix)",
+        )
+        .default(false)
+        .interact()?;
+
+    // 7. Generate .claude/rules/shire.md
     let generate_rules = Confirm::new()
         .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
         .default(true)
         .interact()?;
 
-    // 7. Add Shire guidance to ~/.claude/CLAUDE.md
+    // 8. Add Shire guidance to ~/.claude/CLAUDE.md
     let patch_claude_md = Confirm::new()
         .with_prompt("Add Shire search guidance to ~/.claude/CLAUDE.md?")
         .default(true)
@@ -179,6 +210,7 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         db_path,
         extra_excludes,
         rag_enabled,
+        refs_enabled,
         generate_rules,
         patch_claude_md,
         gitignore_db_dir,
@@ -216,6 +248,16 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
     if opts.rag_enabled {
         lines.push("[rag]".into());
         lines.push("enabled = true".into());
+        lines.push(String::new());
+    }
+
+    if opts.refs_enabled {
+        lines.push("[symbols]".into());
+        lines.push("# Cross-reference index (experimental) — powers the symbol_references,".into());
+        lines.push("# symbol_callers, and symbol_callees MCP tools. DB grows substantially".into());
+        lines.push("# (roughly 30% on TS/JS repos to 150% on Go-heavy repos); set to".into());
+        lines.push("# false to opt out.".into());
+        lines.push("references_enabled = true".into());
         lines.push(String::new());
     }
 
@@ -299,7 +341,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 4. Write .claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = root.join(".claude/rules");
-        write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", opts.refs_enabled)?;
     }
 
     // 5. Append Shire guidance to ~/.claude/CLAUDE.md
@@ -395,7 +437,7 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     // 4. Write ~/.claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = claude_dir.join("rules");
-        write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
+        write_rules_file(&rules_dir, "~/.claude/rules/shire.md", opts.refs_enabled)?;
     }
 
     // 5. Append Shire guidance to ~/.claude/CLAUDE.md
@@ -631,17 +673,41 @@ fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write .claude/rules/shire.md with Shire usage guidance.
-fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
+/// Write .claude/rules/shire.md with Shire usage guidance. When
+/// `refs_enabled` is true, appends the cross-reference tool guidance so
+/// users who opt into the experimental index discover the new tools.
+///
+/// If the file already exists and refs were just enabled for the first
+/// time, upgrades the existing file in place by appending the refs section
+/// — otherwise an early opt-in would leave users without discovery docs
+/// for the new MCP tools.
+fn write_rules_file(rules_dir: &Path, display_path: &str, refs_enabled: bool) -> Result<()> {
     fs::create_dir_all(rules_dir)
         .with_context(|| format!("Failed to create directory {}", rules_dir.display()))?;
     let rules_path = rules_dir.join("shire.md");
     if rules_path.exists() {
+        // Upgrade path: file was created before the user opted into refs,
+        // so the refs guidance section is missing. Append it in place.
+        if refs_enabled {
+            let existing = fs::read_to_string(&rules_path)
+                .with_context(|| format!("Failed to read {}", rules_path.display()))?;
+            if !existing.contains("symbol_references") {
+                let sep = if existing.ends_with('\n') { "" } else { "\n" };
+                let updated = format!("{existing}{sep}{RULES_CONTENT_REFS}");
+                atomic_write(&rules_path, &updated)?;
+                print_created(&format!("Updated {display_path} with cross-reference guidance"));
+                return Ok(());
+            }
+        }
         print_skipped(&format!("{display_path} already exists"));
         return Ok(());
     }
-    fs::write(&rules_path, RULES_CONTENT)
-        .with_context(|| format!("Failed to write {}", rules_path.display()))?;
+    let content = if refs_enabled {
+        format!("{RULES_CONTENT}{RULES_CONTENT_REFS}")
+    } else {
+        RULES_CONTENT.to_string()
+    };
+    atomic_write(&rules_path, &content)?;
     print_created(&format!("Created {display_path}"));
     Ok(())
 }
@@ -1037,6 +1103,7 @@ mod tests {
             db_path: "/custom/path.db".into(),
             extra_excludes: vec!["gen".into()],
             rag_enabled: true,
+            refs_enabled: true,
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
@@ -1048,6 +1115,90 @@ mod tests {
         assert!(toml.contains("\"gen\""));
         assert!(toml.contains("[rag]"));
         assert!(toml.contains("enabled = true"));
+        assert!(toml.contains("[symbols]"));
+        assert!(toml.contains("references_enabled = true"));
+    }
+
+    #[test]
+    fn test_generate_config_toml_refs_disabled_no_symbols_section() {
+        let opts = InitOptions {
+            refs_enabled: false,
+            ..InitOptions::default_local()
+        };
+        let toml = generate_config_toml(&opts, false);
+        assert!(
+            !toml.contains("[symbols]"),
+            "opt-out should not emit [symbols] section: {}",
+            toml
+        );
+    }
+
+    #[test]
+    fn test_write_rules_file_includes_refs_guidance_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+
+        let content = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(content.contains("symbol_references"));
+        assert!(content.contains("symbol_callers"));
+        assert!(content.contains("symbol_callees"));
+        assert!(content.contains("reference_audit"));
+    }
+
+    #[test]
+    fn test_write_rules_file_omits_refs_guidance_when_disabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+
+        let content = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(!content.contains("symbol_references"));
+        assert!(!content.contains("symbol_callers"));
+        assert!(!content.contains("symbol_callees"));
+        assert!(!content.contains("reference_audit"));
+    }
+
+    #[test]
+    fn test_write_rules_file_upgrades_existing_when_refs_enabled() {
+        // Simulates: user ran `shire init` without refs, then re-runs it after
+        // enabling refs. The existing shire.md must get the refs guidance
+        // appended rather than being silently skipped.
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+
+        // First pass: refs off.
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+        let before = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(!before.contains("symbol_references"));
+
+        // Second pass: refs on — should upgrade the existing file.
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let after = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert!(after.contains("symbol_references"));
+        assert!(after.contains("symbol_callers"));
+        assert!(after.contains("reference_audit"));
+        // Original content preserved.
+        assert!(after.contains("search_symbols"));
+    }
+
+    #[test]
+    fn test_write_rules_file_idempotent_upgrade() {
+        // Upgrade must be idempotent: running twice with refs_enabled must
+        // not duplicate the refs section.
+        let dir = tempfile::TempDir::new().unwrap();
+        let rules_dir = dir.path().join(".claude/rules");
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", false).unwrap();
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let first = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", true).unwrap();
+        let second = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
+        assert_eq!(first, second, "second upgrade should be a no-op");
+        assert_eq!(
+            second.matches("## Cross-reference index (experimental)").count(),
+            1,
+            "refs section must appear exactly once"
+        );
     }
 
     #[test]

@@ -2419,3 +2419,103 @@ fn test_references_incremental_rebuild() {
         "call-ref to B should be removed after file modification"
     );
 }
+
+#[test]
+fn test_cross_reference_index_end_to_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Write shire.toml to isolate from any global ~/.claude/shire.toml
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
+    // Create minimal Go package with call and type references
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/main.go"),
+        r#"package svc
+
+func ParseConfig(raw string) Config {
+    return Config{}
+}
+
+func Handle(req string) {
+    cfg := ParseConfig(req)
+    Validate(cfg)
+}
+
+func Validate(c Config) {}
+
+type Config struct{}
+"#,
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "shire build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = root.join(".shire/index.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+
+    // At least one call-ref to ParseConfig
+    let calls_to_parse: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'ParseConfig' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        calls_to_parse >= 1,
+        "expected at least one call-ref to ParseConfig, got {calls_to_parse}"
+    );
+
+    // The call to ParseConfig is enclosed in Handle
+    let enclosing: String = conn
+        .query_row(
+            "SELECT enclosing_symbol FROM symbol_refs \
+             WHERE name = 'ParseConfig' AND kind = 'call' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(enclosing, "Handle", "call to ParseConfig should be inside Handle");
+
+    // At least one call-ref to Validate
+    let calls_to_validate: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Validate' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        calls_to_validate >= 1,
+        "expected call-ref to Validate, got {calls_to_validate}"
+    );
+
+    // At least one type-ref to Config (used as parameter or return type)
+    let config_type_refs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'Config' AND kind = 'type'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        config_type_refs >= 1,
+        "expected type-ref to Config, got {config_type_refs}"
+    );
+}

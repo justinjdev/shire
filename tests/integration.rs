@@ -2345,3 +2345,77 @@ fn test_docs_indexing_and_search() {
         .unwrap();
     assert_eq!(pkg.as_deref(), Some("auth-service"));
 }
+
+#[test]
+fn test_references_incremental_rebuild() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Write shire.toml to isolate from any global ~/.claude/shire.toml
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    let bin = cargo_bin();
+
+    // First build
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "first build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = root.join(".shire/index.db");
+    let count_b_before: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count_b_before, 1, "call-ref to B should exist after first build");
+
+    // Modify file: remove the call to B()
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() {}\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    // Incremental build
+    let output = Command::new(&bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "incremental build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let count_b_after: i64 = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        count_b_after, 0,
+        "call-ref to B should be removed after file modification"
+    );
+}

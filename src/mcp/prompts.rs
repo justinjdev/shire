@@ -27,11 +27,18 @@ pub fn list() -> Vec<Prompt> {
         Prompt::new(
             "reference_audit",
             Some("Refactor safety audit — traces all references to a symbol, classifies them by kind, follows call chains upward, and summarizes rename/change risk"),
-            Some(vec![PromptArgument {
-                name: "name".into(),
-                description: Some("Symbol name to audit (e.g. \"parse_manifest\", \"UserService\", \"MAX_RETRIES\")".into()),
-                required: Some(true),
-            }]),
+            Some(vec![
+                PromptArgument {
+                    name: "name".into(),
+                    description: Some("Symbol name to audit (e.g. \"parse_manifest\", \"UserService\", \"MAX_RETRIES\")".into()),
+                    required: Some(true),
+                },
+                PromptArgument {
+                    name: "package".into(),
+                    description: Some("Optional: restrict analysis to a specific package when the symbol name is common (e.g. \"handle\", \"load\"). If omitted, the audit will attempt to resolve the defining package via `search_symbols`.".into()),
+                    required: Some(false),
+                },
+            ]),
         ),
     ]
 }
@@ -75,11 +82,46 @@ fn require_arg<'a>(args: &'a HashMap<String, String>, key: &str) -> Result<&'a s
 
 fn handle_reference_audit(args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
     let name = require_arg(args, "name")?;
+    let package = args.get("package").map(|s| s.as_str()).unwrap_or("");
+
+    // Build the rendered steps that either carry an explicit package filter
+    // through every ref-tool call or instruct the model to resolve the
+    // defining package first. Common names like `handle`, `load`, `parse`
+    // otherwise mix unrelated packages and overstate blast radius.
+    let (resolve_step, package_arg, package_filter_note) = if package.is_empty() {
+        (
+            format!(
+r#"## Step 0 — Resolve the defining package
+
+Before gathering refs, call `search_symbols` with `query="{name}"` to find where
+`{name}` is DEFINED. Note the `package` of the authoritative definition and use
+it in every ref-tool call below to avoid mixing unrelated packages (common
+names like `handle`, `load`, `parse` can appear across many unrelated types).
+
+If `search_symbols` returns a single result or one clearly-authoritative
+definition, substitute its `package` for `<defining_package>` in Steps 1-3.
+If multiple plausible definitions exist, pick one and explicitly state which
+package the audit targets in the summary.
+
+"#
+            ),
+            "<defining_package>".to_string(),
+            "Caller provided no `package` arg — Step 0 resolves it.".to_string(),
+        )
+    } else {
+        (
+            String::new(),
+            package.to_string(),
+            format!("Caller scoped the audit to package `{package}`."),
+        )
+    };
 
     let text = format!(
 r#"# Reference audit: `{name}`
 
 Perform a refactor safety analysis for the symbol `{name}` by following these steps.
+
+> **Package scope:** {package_filter_note}
 
 ## Prerequisite
 
@@ -95,10 +137,12 @@ references_enabled = true
 
 Then retry the audit.
 
-## Step 1 — Gather all references
+{resolve_step}## Step 1 — Gather all references
 
-Call `symbol_references` with `name={name}` to retrieve every location where this symbol
-is referenced across the codebase.
+Call `symbol_references` with `name="{name}"`, `package="{package_arg}"` to
+retrieve every location where this symbol is referenced WITHIN its defining
+package. Scoping by package is critical — name-only lookups merge unrelated
+same-named symbols from other packages.
 
 ## Step 2 — Classify by kind
 
@@ -116,16 +160,22 @@ Record the counts per kind and the packages that contain them.
 ## Step 3 — Trace call chains upward
 
 For each unique `enclosing_symbol` returned in the `call` results, call
-`symbol_callers` on that enclosing symbol to walk the call chain one level higher.
+`symbol_callers` with `name=<enclosing_symbol>` AND `package="{package_arg}"`
+to walk the call chain one level higher. Keep the package filter on every
+hop — it's what prevents unrelated same-named functions in other packages
+from contaminating the blast radius.
+
 Repeat for any new enclosing symbols if the chain is shallow (≤ 3 hops).
 
 This reveals whether the blast radius is contained within one package or fans out
-across many.
+across many. To surface cross-package callers, run ONE additional unfiltered
+`symbol_callers` call per top-level caller and diff against the filtered
+result.
 
 ## Step 4 — Identify cross-package references
 
-Cross-package references are rows where the `package` field differs from the package
-that defines `{name}`. These are the highest-risk references because they cross module
+Cross-package references are rows where the `package` field differs from
+`{package_arg}`. These are the highest-risk references because they cross module
 boundaries and may not be visible to a local search.
 
 List each cross-package reference with: caller package, file, line, kind.
@@ -284,4 +334,53 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
             content: PromptMessageContent::text(text),
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn extract_text(result: GetPromptResult) -> String {
+        let msg = result.messages.into_iter().next().unwrap();
+        match msg.content {
+            PromptMessageContent::Text { text, .. } => text,
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn test_reference_audit_without_package_includes_resolve_step() {
+        let mut args = HashMap::new();
+        args.insert("name".into(), "handle".into());
+        let text = extract_text(handle_reference_audit(&args).ok().expect("audit failed"));
+        assert!(
+            text.contains("Step 0 — Resolve the defining package"),
+            "unscoped audits must tell the model to resolve the defining package first"
+        );
+        assert!(
+            text.contains("package=\"<defining_package>\""),
+            "calls must be templated with a placeholder the model substitutes"
+        );
+    }
+
+    #[test]
+    fn test_reference_audit_with_package_threads_scope() {
+        let mut args = HashMap::new();
+        args.insert("name".into(), "handle".into());
+        args.insert("package".into(), "auth-service".into());
+        let text = extract_text(handle_reference_audit(&args).ok().expect("audit failed"));
+        assert!(
+            !text.contains("Step 0 — Resolve the defining package"),
+            "an explicit package skips the resolve step"
+        );
+        assert!(
+            text.contains("package=\"auth-service\""),
+            "explicit package must appear in every ref-tool call"
+        );
+        assert!(
+            text.contains("scoped the audit to package `auth-service`"),
+            "summary should note the scoped package"
+        );
+    }
 }

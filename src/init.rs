@@ -34,6 +34,24 @@ When you need to find code, use Shire MCP tools first:
 Fall back to Grep only for literal strings or content inside function bodies.
 "#;
 
+/// Additional rule-file section surfaced only when the user opts into the
+/// experimental cross-reference index, so the generated guidance actually
+/// mentions the MCP tools it enables.
+const RULES_CONTENT_REFS: &str = r#"
+## Cross-reference index (experimental)
+
+This repo has `symbols.references_enabled = true`, which populates the
+`symbol_refs` table. Use these tools before Grep-ing for usage sites:
+
+- **Find where a symbol is used:** `symbol_references` (not Grep)
+- **Find who calls a function/method:** `symbol_callers`
+- **Find what a function calls:** `symbol_callees`
+- **Audit a rename/refactor:** the `reference_audit` prompt
+
+Ref tools match by exact name — same-name symbols across packages are
+merged. Pass the optional `package` filter when you know the owning package.
+"#;
+
 /// Extract the top-level directory component from a relative db_path.
 /// Returns `None` for absolute paths or paths starting with `~`.
 fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
@@ -323,7 +341,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 4. Write .claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = root.join(".claude/rules");
-        write_rules_file(&rules_dir, ".claude/rules/shire.md")?;
+        write_rules_file(&rules_dir, ".claude/rules/shire.md", opts.refs_enabled)?;
     }
 
     // 5. Append Shire guidance to ~/.claude/CLAUDE.md
@@ -419,7 +437,7 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     // 4. Write ~/.claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = claude_dir.join("rules");
-        write_rules_file(&rules_dir, "~/.claude/rules/shire.md")?;
+        write_rules_file(&rules_dir, "~/.claude/rules/shire.md", opts.refs_enabled)?;
     }
 
     // 5. Append Shire guidance to ~/.claude/CLAUDE.md
@@ -655,8 +673,10 @@ fn ensure_gitignore(root: &Path, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write .claude/rules/shire.md with Shire usage guidance.
-fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
+/// Write .claude/rules/shire.md with Shire usage guidance. When
+/// `refs_enabled` is true, appends the cross-reference tool guidance so
+/// users who opt into the experimental index discover the new tools.
+fn write_rules_file(rules_dir: &Path, display_path: &str, refs_enabled: bool) -> Result<()> {
     fs::create_dir_all(rules_dir)
         .with_context(|| format!("Failed to create directory {}", rules_dir.display()))?;
     let rules_path = rules_dir.join("shire.md");
@@ -664,7 +684,12 @@ fn write_rules_file(rules_dir: &Path, display_path: &str) -> Result<()> {
         print_skipped(&format!("{display_path} already exists"));
         return Ok(());
     }
-    fs::write(&rules_path, RULES_CONTENT)
+    let content = if refs_enabled {
+        format!("{RULES_CONTENT}{RULES_CONTENT_REFS}")
+    } else {
+        RULES_CONTENT.to_string()
+    };
+    fs::write(&rules_path, content)
         .with_context(|| format!("Failed to write {}", rules_path.display()))?;
     print_created(&format!("Created {display_path}"));
     Ok(())

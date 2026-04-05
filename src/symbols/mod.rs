@@ -85,6 +85,35 @@ pub struct Parameter {
     pub type_annotation: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferenceInfo {
+    pub name: String,
+    pub kind: ReferenceKind,
+    pub file_path: Arc<str>,
+    pub line: usize,
+    pub enclosing_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Call,
+    Type,
+    Import,
+    Impl,
+}
+
+impl ReferenceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReferenceKind::Call => "call",
+            ReferenceKind::Type => "type",
+            ReferenceKind::Import => "import",
+            ReferenceKind::Impl => "impl",
+        }
+    }
+}
+
 /// Extract symbols from a single file by extension.
 pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
     registry::extract_file(ext, source, file_path)

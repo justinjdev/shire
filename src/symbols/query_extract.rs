@@ -53,6 +53,7 @@ fn normalize_import_name(name: &str, kind: ReferenceKind) -> String {
 
 /// Build a SymbolInfo from a classified definition match.
 /// Returns None if the symbol should be skipped (duplicate range, visibility filter, post-process).
+#[allow(clippy::too_many_arguments)]
 fn emit_definition(
     name: &str,
     kind: SymbolKind,
@@ -70,10 +71,10 @@ fn emit_definition(
     }
     def_name_ranges.insert((name_node.start_byte(), name_node.end_byte()));
 
-    if let Some(is_visible) = hooks.is_visible {
-        if !is_visible(node, source) {
-            return None;
-        }
+    if let Some(is_visible) = hooks.is_visible
+        && !is_visible(node, source)
+    {
+        return None;
     }
     let line = node.start_position().row + 1;
     let parent = hooks.resolve_parent.and_then(|f| f(node, source));

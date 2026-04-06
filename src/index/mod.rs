@@ -1218,6 +1218,7 @@ fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<S
 
 /// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
 /// Uses per-file hashing for granular incremental updates.
+#[allow(clippy::too_many_arguments)]
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,

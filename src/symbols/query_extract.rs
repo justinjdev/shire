@@ -210,7 +210,11 @@ pub fn extract(
                 continue;
             }
             if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
-                if hooks.reference_stoplist.contains(&name.as_str()) {
+                let ref_hooks = match &hooks.reference_hooks {
+                    Some(rh) => rh,
+                    None => continue, // Language has no ref support
+                };
+                if ref_hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
                 }
                 // Trim surrounding quotes for import names. Lives here (not in
@@ -227,7 +231,7 @@ pub fn extract(
                 };
                 let line = node.start_position().row + 1;
                 let enclosing =
-                    resolve_enclosing_symbol(&node, source, hooks.enclosing_ancestors);
+                    resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
                 pending_references.push((
                     ReferenceInfo {

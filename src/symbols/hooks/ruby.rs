@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Resolve the parent class or module for a method.
@@ -184,21 +184,23 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: None,
         post_process: Some(post_process),
-        enclosing_ancestors: &[
-            "method",
-            "singleton_method",
-            "class",
-            "module",
-        ],
-        reference_stoplist: &[
-            "true", "false", "nil", "self",
-            "puts", "print", "p", "pp",
-            "String", "Integer", "Float", "Array", "Hash", "Symbol", "NilClass",
-            "Object", "Class", "Module",
-            // Mixin/import methods: captured separately as @reference.impl
-            // and @reference.import, so suppress their redundant Call refs.
-            "include", "prepend", "extend",
-            "require", "require_relative", "load",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "method",
+                "singleton_method",
+                "class",
+                "module",
+            ],
+            reference_stoplist: &[
+                "true", "false", "nil", "self",
+                "puts", "print", "p", "pp",
+                "String", "Integer", "Float", "Array", "Hash", "Symbol", "NilClass",
+                "Object", "Class", "Module",
+                // Mixin/import methods: captured separately as @reference.impl
+                // and @reference.import, so suppress their redundant Call refs.
+                "include", "prepend", "extend",
+                "require", "require_relative", "load",
+            ],
+        }),
     }
 }

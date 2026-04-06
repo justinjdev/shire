@@ -1,4 +1,4 @@
-use super::{find_ancestor, node_text, LanguageHooks, SymbolInfo, SymbolKind};
+use super::{find_ancestor, node_text, LanguageHooks, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Skip private subs (starting with _).
@@ -84,15 +84,17 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: None,
         extract_return_type: None,
         post_process: Some(post_process),
-        enclosing_ancestors: &[
-            "subroutine_declaration_statement",
-            "package_statement",
-        ],
-        reference_stoplist: &[
-            "strict", "warnings", "utf8", "feature", "parent", "base",
-            "print", "say", "die", "warn", "use", "require",
-            "my", "our", "local", "sub", "return", "if", "unless",
-            "undef", "defined",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "subroutine_declaration_statement",
+                "package_statement",
+            ],
+            reference_stoplist: &[
+                "strict", "warnings", "utf8", "feature", "parent", "base",
+                "print", "say", "die", "warn", "use", "require",
+                "my", "our", "local", "sub", "return", "if", "unless",
+                "undef", "defined",
+            ],
+        }),
     }
 }

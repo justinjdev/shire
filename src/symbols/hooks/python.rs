@@ -1,4 +1,4 @@
-use super::{field_text, find_ancestor, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{field_text, find_ancestor, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Check if a Python symbol should be included.
@@ -160,13 +160,15 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &["function_definition", "class_definition"],
-        reference_stoplist: &[
-            "True", "False", "None", "self", "cls",
-            "print", "open", "len", "range", "enumerate", "zip", "map", "filter",
-            "str", "int", "float", "bool", "list", "dict", "tuple", "set",
-            "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr",
-            "Exception", "ValueError", "TypeError", "KeyError",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &["function_definition", "class_definition"],
+            reference_stoplist: &[
+                "True", "False", "None", "self", "cls",
+                "print", "open", "len", "range", "enumerate", "zip", "map", "filter",
+                "str", "int", "float", "bool", "list", "dict", "tuple", "set",
+                "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr",
+                "Exception", "ValueError", "TypeError", "KeyError",
+            ],
+        }),
     }
 }

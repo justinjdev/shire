@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Scala type-defining node kinds.
@@ -220,17 +220,19 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[
-            "function_definition",
-            "class_definition",
-            "object_definition",
-            "trait_definition",
-        ],
-        reference_stoplist: &[
-            "true", "false", "null", "this", "super",
-            "Int", "Long", "Short", "Byte", "Float", "Double", "Boolean", "Char", "String", "Unit",
-            "Some", "None", "Option", "List", "Seq", "Map", "Set", "Array",
-            "println", "print",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "function_definition",
+                "class_definition",
+                "object_definition",
+                "trait_definition",
+            ],
+            reference_stoplist: &[
+                "true", "false", "null", "this", "super",
+                "Int", "Long", "Short", "Byte", "Float", "Double", "Boolean", "Char", "String", "Unit",
+                "Some", "None", "Option", "List", "Seq", "Map", "Set", "Array",
+                "println", "print",
+            ],
+        }),
     }
 }

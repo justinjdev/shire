@@ -40,11 +40,16 @@ const SKIP_SUFFIXES: &[&str] = &[
 /// (to skip generated files) and the boundary detector (to match proto
 /// sources to their generated outputs). Single source of truth.
 pub const PROTO_GENERATED_SUFFIXES: &[&str] = &[
+    // gRPC suffixes must precede shorter suffixes — the boundary detector
+    // breaks on first match, so _grpc.pb.go must be checked before .pb.go.
+    "_grpc.pb.go",
     ".pb.go",
-    "_pb2.py",
     "_pb2_grpc.py",
-    ".pb.h",
+    "_pb2.py",
+    "_grpc.pb.cc",
     ".pb.cc",
+    "_grpc.pb.h",
+    ".pb.h",
     ".pb.ts",
     ".pb.js",
     "_pb.d.ts",

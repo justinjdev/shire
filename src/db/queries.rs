@@ -1291,6 +1291,74 @@ pub fn change_impact(
     })
 }
 
+// ── Boundary edge queries ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BoundaryEdge {
+    pub source_path: String,
+    pub generated_path: String,
+    pub source_package: Option<String>,
+    pub generated_package: Option<String>,
+    pub kind: String,
+}
+
+pub fn batch_insert_boundary_edges(conn: &Connection, edges: &[BoundaryEdge]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO boundary_edges \
+         (source_path, generated_path, source_package, generated_package, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for e in edges {
+        stmt.execute(rusqlite::params![
+            e.source_path,
+            e.generated_path,
+            e.source_package,
+            e.generated_package,
+            e.kind,
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn clear_boundary_edges(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM boundary_edges", [])?;
+    Ok(())
+}
+
+pub fn query_schema_consumers(conn: &Connection, source_path: &str) -> Result<Vec<BoundaryEdge>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT source_path, generated_path, source_package, generated_package, kind \
+         FROM boundary_edges WHERE source_path = ?1 ORDER BY generated_path",
+    )?;
+    let rows = stmt.query_map([source_path], |row| {
+        Ok(BoundaryEdge {
+            source_path: row.get(0)?,
+            generated_path: row.get(1)?,
+            source_package: row.get(2)?,
+            generated_package: row.get(3)?,
+            kind: row.get(4)?,
+        })
+    })?;
+    Ok(collect_rows(rows))
+}
+
+pub fn query_generated_from(conn: &Connection, generated_path: &str) -> Result<Vec<BoundaryEdge>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT source_path, generated_path, source_package, generated_package, kind \
+         FROM boundary_edges WHERE generated_path = ?1 ORDER BY source_path",
+    )?;
+    let rows = stmt.query_map([generated_path], |row| {
+        Ok(BoundaryEdge {
+            source_path: row.get(0)?,
+            generated_path: row.get(1)?,
+            source_package: row.get(2)?,
+            generated_package: row.get(3)?,
+            kind: row.get(4)?,
+        })
+    })?;
+    Ok(collect_rows(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2505,5 +2573,64 @@ mod refs_tests {
             .collect();
         assert_eq!(trans_pkgs, HashSet::from(["legit_dep"]));
         assert!(!trans_pkgs.contains("external_collider"));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::db::open_or_create;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_insert_and_query_schema_consumers() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("b.db"), false).unwrap();
+
+        let edges = vec![
+            BoundaryEdge {
+                source_path: "proto/user.proto".into(),
+                generated_path: "gen/user.pb.go".into(),
+                source_package: Some("proto-pkg".into()),
+                generated_package: Some("go-pkg".into()),
+                kind: "proto".into(),
+            },
+            BoundaryEdge {
+                source_path: "proto/user.proto".into(),
+                generated_path: "gen/user_pb2.py".into(),
+                source_package: Some("proto-pkg".into()),
+                generated_package: Some("py-pkg".into()),
+                kind: "proto".into(),
+            },
+        ];
+        batch_insert_boundary_edges(&conn, &edges).unwrap();
+
+        let consumers = query_schema_consumers(&conn, "proto/user.proto").unwrap();
+        assert_eq!(consumers.len(), 2);
+
+        let from = query_generated_from(&conn, "gen/user.pb.go").unwrap();
+        assert_eq!(from.len(), 1);
+        assert_eq!(from[0].source_path, "proto/user.proto");
+    }
+
+    #[test]
+    fn test_clear_boundary_edges() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("b2.db"), false).unwrap();
+
+        let edges = vec![BoundaryEdge {
+            source_path: "a.proto".into(),
+            generated_path: "a.pb.go".into(),
+            source_package: None,
+            generated_package: None,
+            kind: "proto".into(),
+        }];
+        batch_insert_boundary_edges(&conn, &edges).unwrap();
+        clear_boundary_edges(&conn).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM boundary_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

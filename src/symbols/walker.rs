@@ -19,6 +19,7 @@ const SKIP_SUFFIXES: &[&str] = &[
     // Go
     ".generated.go",
     "_generated.go",
+    "_grpc.pb.go",
     ".pb.go",
     ".gen.go",
     "_test.go",
@@ -26,14 +27,45 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".generated.ts",
     ".generated.js",
     ".d.ts",
+    ".pb.ts",
+    ".pb.js",
+    "_pb.d.ts",
     // Python (protobuf)
     "_pb2.py",
     "_pb2_grpc.py",
     // C/C++ (protobuf)
-    ".pb.h",
+    "_grpc.pb.cc",
     ".pb.cc",
+    "_grpc.pb.h",
+    ".pb.h",
+    // Dart (protobuf)
+    ".pb.dart",
+    // Ruby (protobuf)
+    "_pb.rb",
     // Java
     "Generated.java",
+];
+
+/// Proto-specific generated file suffixes. Used by the boundary detector
+/// (to match proto sources to their generated outputs). These suffixes
+/// are also present in `SKIP_SUFFIXES` — both lists must be kept in
+/// sync when adding new proto-generated patterns.
+pub const PROTO_GENERATED_SUFFIXES: &[&str] = &[
+    // gRPC suffixes must precede shorter suffixes — the boundary detector
+    // breaks on first match, so _grpc.pb.go must be checked before .pb.go.
+    "_grpc.pb.go",
+    ".pb.go",
+    "_pb2_grpc.py",
+    "_pb2.py",
+    "_grpc.pb.cc",
+    ".pb.cc",
+    "_grpc.pb.h",
+    ".pb.h",
+    ".pb.ts",
+    ".pb.js",
+    "_pb.d.ts",
+    ".pb.dart",
+    "_pb.rb",
 ];
 
 const SKIP_PREFIXES: &[&str] = &["zz_generated."];
@@ -309,5 +341,12 @@ mod tests {
         let patterns = vec!["".to_string()];
         let files = walk_source_files_with_patterns(dir.path(), &["go"], &patterns).unwrap();
         assert_eq!(files.len(), 2, "empty pattern should not filter out files");
+    }
+
+    #[test]
+    fn test_proto_generated_suffixes_non_empty() {
+        assert!(!PROTO_GENERATED_SUFFIXES.is_empty());
+        assert!(PROTO_GENERATED_SUFFIXES.contains(&".pb.go"));
+        assert!(PROTO_GENERATED_SUFFIXES.contains(&"_pb2.py"));
     }
 }

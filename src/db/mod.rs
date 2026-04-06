@@ -261,6 +261,18 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- this, those operations full-scan symbol_refs — at monorepo scale
         -- that is multiple seconds per call.
         CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);
+
+        CREATE TABLE IF NOT EXISTS boundary_edges (
+            source_path       TEXT NOT NULL,
+            generated_path    TEXT NOT NULL,
+            source_package    TEXT,
+            generated_package TEXT,
+            kind              TEXT NOT NULL DEFAULT 'proto',
+            PRIMARY KEY (source_path, generated_path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_boundary_source ON boundary_edges(source_path);
+        CREATE INDEX IF NOT EXISTS idx_boundary_generated ON boundary_edges(generated_path);
         ",
     )?;
     Ok(())
@@ -644,6 +656,21 @@ mod tests {
             &dir.path().join("dest.db"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_boundary_edges_table_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO boundary_edges (source_path, generated_path, source_package, generated_package, kind) \
+             VALUES ('a.proto', 'a.pb.go', 'pkg', 'pkg', 'proto')",
+            [],
+        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM boundary_edges WHERE source_path = 'a.proto'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
 

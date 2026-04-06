@@ -2709,8 +2709,7 @@ fn detect_boundary_edges(
         }
 
         for suffix in PROTO_GENERATED_SUFFIXES {
-            if filename.ends_with(suffix) {
-                let stem = &filename[..filename.len() - suffix.len()];
+            if let Some(stem) = filename.strip_suffix(suffix) {
                 generated_map
                     .entry(stem.to_string())
                     .or_default()
@@ -2811,12 +2810,11 @@ fn is_in_scope(
             if dep_edges.contains(&(gp.to_string(), pp.to_string())) {
                 return true;
             }
-            if let Some(proto_par) = proto_parent {
-                if let Some(gen_par) = gen_pkg_path.and_then(package_parent) {
-                    if *proto_par == gen_par {
-                        return true;
-                    }
-                }
+            if let Some(proto_par) = proto_parent
+                && let Some(gen_par) = gen_pkg_path.and_then(package_parent)
+                && *proto_par == gen_par
+            {
+                return true;
             }
             false
         }

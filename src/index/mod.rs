@@ -1039,14 +1039,7 @@ fn single_pass_extract(
             let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    if references_enabled {
-                        symbols::extract_file_full(ext, &source, file_path_arc)
-                    } else {
-                        // Skip ref extraction entirely when refs are off so
-                        // disabled builds don't pay the allocation cost for
-                        // ReferenceInfo values that are never written.
-                        (symbols::extract_file(ext, &source, file_path_arc), Vec::new())
-                    }
+                    symbols::extract_file(ext, &source, file_path_arc, !references_enabled)
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1342,11 +1335,7 @@ fn phase_source_incremental(
                             let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    if references_enabled {
-                                        symbols::extract_file_full(ext, &source, file_path_arc)
-                                    } else {
-                                        (symbols::extract_file(ext, &source, file_path_arc), Vec::new())
-                                    }
+                                    symbols::extract_file(ext, &source, file_path_arc, !references_enabled)
                                 })
                                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {

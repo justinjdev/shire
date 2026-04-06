@@ -990,6 +990,34 @@ fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>)
     out
 }
 
+/// Builds a parameterized WHERE clause for cross-reference queries.
+/// Avoids the repeated `sql.push_str(" AND col = ?")` + `params.push(Box::new(...))`
+/// pattern duplicated across `query_symbol_{references,callers,callees}`.
+struct RefQueryBuilder {
+    sql: String,
+    params: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl RefQueryBuilder {
+    fn new(base_sql: &str, name: &str) -> Self {
+        Self {
+            sql: base_sql.to_string(),
+            params: vec![Box::new(name.to_string())],
+        }
+    }
+
+    fn filter(&mut self, column: &str, value: &str) {
+        self.sql.push_str(&format!(" AND {} = ?", column));
+        self.params.push(Box::new(value.to_string()));
+    }
+
+    fn build_with_order_and_limit(mut self, order_by: &str, limit: i64) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        self.sql.push_str(&format!(" {order_by} LIMIT ?"));
+        self.params.push(Box::new(limit));
+        (self.sql, self.params)
+    }
+}
+
 pub fn query_symbol_references(
     conn: &Connection,
     name: &str,
@@ -997,24 +1025,20 @@ pub fn query_symbol_references(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
-    let mut sql = String::from(
+    let mut qb = RefQueryBuilder::new(
         "SELECT r.name, r.kind, f.path, r.line, r.package, r.enclosing_symbol \
          FROM symbol_refs r JOIN files f ON f.id = r.file_id WHERE r.name = ?",
+        name,
     );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(k) = kind {
-        sql.push_str(" AND r.kind = ?");
-        params.push(Box::new(k.to_string()));
+        qb.filter("r.kind", k);
     }
     if let Some(p) = package {
-        sql.push_str(" AND r.package = ?");
-        params.push(Box::new(p.to_string()));
+        qb.filter("r.package", p);
     }
-    sql.push_str(" ORDER BY f.path, r.line LIMIT ?");
-    params.push(Box::new(limit));
-
-    let mut stmt = conn.prepare(&sql)?;
+    let (sql, params) = qb.build_with_order_and_limit("ORDER BY f.path, r.line", limit);
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(ReferenceRow {
             name: row.get(0)?,
@@ -1043,21 +1067,21 @@ pub fn query_symbol_callers(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
-    let mut sql = String::from(
+    let mut qb = RefQueryBuilder::new(
         "SELECT r.enclosing_symbol, f.path, MIN(r.line), r.package, COUNT(*) \
          FROM symbol_refs r JOIN files f ON f.id = r.file_id \
          WHERE r.name = ? AND r.kind = 'call' AND r.enclosing_symbol IS NOT NULL",
+        name,
     );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(p) = package {
-        sql.push_str(" AND r.package = ?");
-        params.push(Box::new(p.to_string()));
+        qb.filter("r.package", p);
     }
-    sql.push_str(" GROUP BY r.enclosing_symbol, f.path, r.package ORDER BY 5 DESC, 1 ASC LIMIT ?");
-    params.push(Box::new(limit));
-
-    let mut stmt = conn.prepare(&sql)?;
+    let (sql, params) = qb.build_with_order_and_limit(
+        "GROUP BY r.enclosing_symbol, f.path, r.package ORDER BY 5 DESC, 1 ASC",
+        limit,
+    );
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(CallerRow {
             caller_name: row.get(0)?,
@@ -1084,21 +1108,21 @@ pub fn query_symbol_callees(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<CalleeRow>> {
-    let mut sql = String::from(
+    let mut qb = RefQueryBuilder::new(
         "SELECT r.name, f.path, MIN(r.line), COUNT(*) \
          FROM symbol_refs r JOIN files f ON f.id = r.file_id \
          WHERE r.enclosing_symbol = ? AND r.kind = 'call'",
+        enclosing,
     );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
     if let Some(p) = package {
-        sql.push_str(" AND r.package = ?");
-        params.push(Box::new(p.to_string()));
+        qb.filter("r.package", p);
     }
-    sql.push_str(" GROUP BY r.name, f.path ORDER BY 4 DESC, 1 ASC LIMIT ?");
-    params.push(Box::new(limit));
-
-    let mut stmt = conn.prepare(&sql)?;
+    let (sql, params) = qb.build_with_order_and_limit(
+        "GROUP BY r.name, f.path ORDER BY 4 DESC, 1 ASC",
+        limit,
+    );
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(CalleeRow {
             callee_name: row.get(0)?,

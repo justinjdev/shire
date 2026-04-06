@@ -1477,6 +1477,46 @@ fn phase_source_incremental(
     Ok(num_reextracted)
 }
 
+/// Backfill `boundary_edges` from the `files` table when the table is empty.
+/// Called on fast-path early returns in `phase_index_files` to handle the
+/// case where the DB was upgraded (table created empty) but the file tree
+/// hasn't changed so the full detection path never runs.
+fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM boundary_edges", [], |r| r.get(0))?;
+    if count > 0 {
+        return Ok(());
+    }
+    // Check if there are any proto files at all — skip the query overhead if not
+    let has_protos: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE extension = 'proto')",
+            [],
+            |r| r.get(0),
+        )?;
+    if !has_protos {
+        return Ok(());
+    }
+
+    let files: Vec<(String, Option<String>, String, u64)> = conn
+        .prepare("SELECT path, package, extension, size_bytes FROM files")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let edges = detect_boundary_edges(conn, &files)?;
+    if !edges.is_empty() {
+        tracing::debug!(edges = edges.len(), "backfill: boundary edges detected");
+        crate::db::queries::batch_insert_boundary_edges(conn, &edges)?;
+    }
+    Ok(())
+}
+
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
 /// Uses .git/index mtime as a fast pre-check, then file-tree hash to skip
 /// the full rebuild when no files have changed.
@@ -1502,6 +1542,7 @@ fn phase_index_files(
                 let margin = std::time::Duration::from_secs(1);
                 if git_mtime <= since.checked_add(margin).unwrap_or(since) {
                     tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
+                    backfill_boundary_edges_if_needed(conn)?;
                     let num_files: usize = conn
                         .query_row("SELECT COUNT(*) FROM files", [], |row| {
                             row.get::<_, i64>(0)
@@ -1530,6 +1571,7 @@ fn phase_index_files(
 
     if stored_hash.as_deref() == Some(current_hash.as_str()) {
         tracing::debug!("phase_index_files: file tree hash matched, skipping rebuild");
+        backfill_boundary_edges_if_needed(conn)?;
         // Update timestamp so mtime pre-check works next time
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(

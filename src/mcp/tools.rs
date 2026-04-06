@@ -425,6 +425,18 @@ pub struct ChangeImpactArgs {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SchemaConsumersArgs {
+    /// Path to the schema file (e.g. "proto/user.proto")
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GeneratedFromArgs {
+    /// Path to the generated file (e.g. "gen/user.pb.go")
+    pub path: String,
+}
+
 #[tool_router]
 impl ShireService {
     #[tool(description = "Search packages by name or description. Use instead of Grep for finding packages.")]
@@ -785,6 +797,36 @@ impl ShireService {
             .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = "Find all files generated from a schema file (e.g. .proto). Returns generated file paths and their packages. Use to understand the blast radius of a schema change.")]
+    fn schema_consumers(
+        &self,
+        Parameters(args): Parameters<SchemaConsumersArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "schema_consumers", path = %args.path);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let rows = queries::query_schema_consumers(&conn, &args.path)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Find the source schema file that generated a given file. Use to trace a generated file (e.g. user.pb.go) back to its source proto.")]
+    fn generated_from(
+        &self,
+        Parameters(args): Parameters<GeneratedFromArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tracing::debug!(tool = "generated_from", path = %args.path);
+        self.maybe_rebuild();
+        let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let rows = queries::query_generated_from(&conn, &args.path)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows)
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[cfg(test)]
@@ -1086,5 +1128,33 @@ mod tests {
         assert_eq!(trans.len(), 1);
         assert_eq!(trans[0]["package"], "grand");
         assert_eq!(trans[0]["via"], "dep");
+    }
+
+    #[test]
+    fn test_schema_consumers_empty_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let args = SchemaConsumersArgs { path: "a.proto".into() };
+        let r = svc.schema_consumers(Parameters(args)).unwrap();
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "[]");
+    }
+
+    #[test]
+    fn test_generated_from_empty_db() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
+        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let args = GeneratedFromArgs { path: "a.pb.go".into() };
+        let r = svc.generated_from(Parameters(args)).unwrap();
+        let text = match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(text, "[]");
     }
 }

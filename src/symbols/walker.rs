@@ -46,9 +46,10 @@ const SKIP_SUFFIXES: &[&str] = &[
     "Generated.java",
 ];
 
-/// Proto-specific generated file suffixes. Used by both the symbol walker
-/// (to skip generated files) and the boundary detector (to match proto
-/// sources to their generated outputs). Single source of truth.
+/// Proto-specific generated file suffixes. Used by the boundary detector
+/// (to match proto sources to their generated outputs). These suffixes
+/// are also present in `SKIP_SUFFIXES` — both lists must be kept in
+/// sync when adding new proto-generated patterns.
 pub const PROTO_GENERATED_SUFFIXES: &[&str] = &[
     // gRPC suffixes must precede shorter suffixes — the boundary detector
     // breaks on first match, so _grpc.pb.go must be checked before .pb.go.

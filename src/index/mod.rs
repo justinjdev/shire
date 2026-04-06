@@ -2794,7 +2794,8 @@ fn package_parent(pkg_path: &str) -> Option<String> {
 
 /// Check if a generated file is in scope relative to its proto source.
 /// Accepts the pair if: same package, generated depends on proto's package,
-/// or both packages share a parent directory.
+/// both packages share a parent directory, or either file has no package
+/// association (unpackaged files are always accepted).
 fn is_in_scope(
     proto_pkg: Option<&str>,
     gen_pkg: Option<&str>,

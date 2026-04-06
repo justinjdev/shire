@@ -23,6 +23,7 @@ use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use crate::symbols::walker::PROTO_GENERATED_SUFFIXES;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1570,6 +1571,15 @@ fn phase_index_files(
     let num_files = validated_files.len();
     incremental_upsert_files(conn, &validated_files)?;
 
+    // Detect proto→generated boundary edges from the walked file set.
+    // Runs after file upsert so package associations are current.
+    crate::db::queries::clear_boundary_edges(conn)?;
+    let boundary_edges = detect_boundary_edges(conn, &validated_files)?;
+    if !boundary_edges.is_empty() {
+        tracing::debug!(edges = boundary_edges.len(), "boundary edges detected");
+        crate::db::queries::batch_insert_boundary_edges(conn, &boundary_edges)?;
+    }
+
     // Store the new file-tree hash and timestamp for mtime pre-check
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     conn.execute(
@@ -2669,6 +2679,149 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     print_timings(&timings, total_duration);
 
     Ok(())
+}
+
+/// Detect proto→generated-code boundary edges from walked files.
+///
+/// Scans walked files for `.proto` files and files matching known generated
+/// suffixes. Matches by stem (filename without extension/suffix), then filters
+/// by scope: same package, dependent package (via `dependencies` table), or
+/// sibling package (shared parent directory).
+fn detect_boundary_edges(
+    conn: &Connection,
+    files: &[(String, Option<String>, String, u64)], // (path, package, extension, size)
+) -> Result<Vec<crate::db::queries::BoundaryEdge>> {
+    // Collect proto stems: stem → Vec<(path, package)>
+    let mut proto_map: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    // Collect generated stems: stem → Vec<(path, package)>
+    let mut generated_map: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+
+    for (path, package, extension, _size) in files {
+        let filename = path.rsplit_once('/').map(|(_, f)| f).unwrap_or(path);
+
+        if extension == "proto" {
+            let stem = filename.strip_suffix(".proto").unwrap_or(filename);
+            proto_map
+                .entry(stem.to_string())
+                .or_default()
+                .push((path.clone(), package.clone()));
+            continue;
+        }
+
+        for suffix in PROTO_GENERATED_SUFFIXES {
+            if filename.ends_with(suffix) {
+                let stem = &filename[..filename.len() - suffix.len()];
+                generated_map
+                    .entry(stem.to_string())
+                    .or_default()
+                    .push((path.clone(), package.clone()));
+                break; // a file matches at most one suffix
+            }
+        }
+    }
+
+    if proto_map.is_empty() || generated_map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Load package name→path mapping for sibling-directory comparison
+    let pkg_paths: HashMap<String, String> = {
+        let mut stmt = conn.prepare("SELECT name, path FROM packages")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // Load dependency edges for scope filtering: set of (dependent, dependency)
+    let dep_edges: HashSet<(String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT package, dependency FROM dependencies WHERE is_internal = 1")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut edges = Vec::new();
+
+    for (stem, protos) in &proto_map {
+        let gen_files = match generated_map.get(stem) {
+            Some(g) => g,
+            None => continue,
+        };
+
+        for (proto_path, proto_pkg) in protos {
+            let proto_pkg_path = proto_pkg
+                .as_deref()
+                .and_then(|n| pkg_paths.get(n))
+                .map(|s| s.as_str());
+            let proto_parent = proto_pkg_path.and_then(package_parent);
+
+            for (gen_path, gen_pkg) in gen_files {
+                let gen_pkg_path = gen_pkg
+                    .as_deref()
+                    .and_then(|n| pkg_paths.get(n))
+                    .map(|s| s.as_str());
+                if !is_in_scope(
+                    proto_pkg.as_deref(),
+                    gen_pkg.as_deref(),
+                    gen_pkg_path,
+                    &proto_parent,
+                    &dep_edges,
+                ) {
+                    continue;
+                }
+
+                edges.push(crate::db::queries::BoundaryEdge {
+                    source_path: proto_path.clone(),
+                    generated_path: gen_path.clone(),
+                    source_package: proto_pkg.clone(),
+                    generated_package: gen_pkg.clone(),
+                    kind: "proto".into(),
+                });
+            }
+        }
+    }
+
+    Ok(edges)
+}
+
+/// Extract the parent directory of a package path for sibling-package matching.
+/// "services/auth/proto" → "services/auth", "proto" → None
+fn package_parent(pkg_path: &str) -> Option<String> {
+    pkg_path.rsplit_once('/').map(|(parent, _)| parent.to_string())
+}
+
+/// Check if a generated file is in scope relative to its proto source.
+/// Accepts the pair if: same package, generated depends on proto's package,
+/// or both packages share a parent directory.
+fn is_in_scope(
+    proto_pkg: Option<&str>,
+    gen_pkg: Option<&str>,
+    gen_pkg_path: Option<&str>,
+    proto_parent: &Option<String>,
+    dep_edges: &HashSet<(String, String)>,
+) -> bool {
+    match (proto_pkg, gen_pkg) {
+        (Some(pp), Some(gp)) => {
+            if pp == gp {
+                return true;
+            }
+            if dep_edges.contains(&(gp.to_string(), pp.to_string())) {
+                return true;
+            }
+            if let Some(proto_par) = proto_parent {
+                if let Some(gen_par) = gen_pkg_path.and_then(package_parent) {
+                    if *proto_par == gen_par {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]

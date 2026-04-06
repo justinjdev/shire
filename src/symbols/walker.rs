@@ -36,6 +36,22 @@ const SKIP_SUFFIXES: &[&str] = &[
     "Generated.java",
 ];
 
+/// Proto-specific generated file suffixes. Used by both the symbol walker
+/// (to skip generated files) and the boundary detector (to match proto
+/// sources to their generated outputs). Single source of truth.
+pub const PROTO_GENERATED_SUFFIXES: &[&str] = &[
+    ".pb.go",
+    "_pb2.py",
+    "_pb2_grpc.py",
+    ".pb.h",
+    ".pb.cc",
+    ".pb.ts",
+    ".pb.js",
+    "_pb.d.ts",
+    ".pb.dart",
+    "_pb.rb",
+];
+
 const SKIP_PREFIXES: &[&str] = &["zz_generated."];
 
 const SKIP_FILES: &[&str] = &["build.rs", "deepcopy_generated.go"];
@@ -309,5 +325,12 @@ mod tests {
         let patterns = vec!["".to_string()];
         let files = walk_source_files_with_patterns(dir.path(), &["go"], &patterns).unwrap();
         assert_eq!(files.len(), 2, "empty pattern should not filter out files");
+    }
+
+    #[test]
+    fn test_proto_generated_suffixes_non_empty() {
+        assert!(!PROTO_GENERATED_SUFFIXES.is_empty());
+        assert!(PROTO_GENERATED_SUFFIXES.contains(&".pb.go"));
+        assert!(PROTO_GENERATED_SUFFIXES.contains(&"_pb2.py"));
     }
 }

@@ -11,7 +11,10 @@ pub mod nix;
 pub mod npm;
 pub mod perl;
 pub mod python;
+mod ref_writer;
 pub mod ruby;
+
+pub use ref_writer::RefWriter;
 
 use crate::config::Config;
 use crate::db;
@@ -994,7 +997,7 @@ fn single_pass_extract(
     _pkg_kind: &str,
     exclude_extensions: &[String],
     exclude_patterns: &[String],
-    references_enabled: bool,
+    skip_references: bool,
 ) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1039,7 +1042,7 @@ fn single_pass_extract(
             let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(ext, &source, file_path_arc, !references_enabled)
+                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1084,14 +1087,15 @@ fn phase_extract_symbols(
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
-    references_enabled: bool,
+    ref_writer: &mut RefWriter,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
+    let skip_references = ref_writer.skip_references();
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, references_enabled);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1121,30 +1125,15 @@ fn phase_extract_symbols(
     db::drop_symbols_fts_triggers(conn)?;
     db::drop_symbol_refs_indexes(conn)?;
 
-    // Build file_path → files.id map once; reused across all package inserts.
-    // Mutated in-place when refs reference paths that weren't in `files` —
-    // e.g. dotfiles the file walker hides but symbol extraction surfaces.
-    // Only built when reference extraction is enabled — skipping refs makes
-    // the map load a dead cost.
-    let mut file_ids = if references_enabled {
-        crate::db::queries::build_file_id_map(conn)?
-    } else {
-        std::collections::HashMap::new()
-    };
-
     let mut hash_entries: Vec<(&str, String)> = Vec::new();
     for r in &results {
         if skip_deletes {
             // Symbols and refs tables already empty (force/full build) — insert only
             batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
-            if references_enabled {
-                crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
-            }
+            ref_writer.insert(conn, Some(&r.pkg_name), &r.references)?;
         } else {
             upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
-            if references_enabled {
-                crate::db::queries::batch_insert_references(conn, Some(&r.pkg_name), &r.references, &mut file_ids)?;
-            }
+            ref_writer.insert(conn, Some(&r.pkg_name), &r.references)?;
         }
         if !r.aggregate_hash.is_empty() {
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
@@ -1229,7 +1218,6 @@ fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<S
 
 /// Phase 8: Re-extract symbols for unchanged packages whose source files changed (parallel).
 /// Uses per-file hashing for granular incremental updates.
-#[allow(clippy::too_many_arguments)]
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
@@ -1237,7 +1225,7 @@ fn phase_source_incremental(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     progress: &Option<Arc<ProgressBar>>,
-    references_enabled: bool,
+    ref_writer: &mut RefWriter,
     force_source_reextract: bool,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
@@ -1264,6 +1252,10 @@ fn phase_source_incremental(
             Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash, hashed_at, stored_file_hashes))
         })
         .collect();
+
+    // Capture skip_references before the parallel section — RefWriter
+    // cannot be shared across threads but the bool is Copy.
+    let skip_references = ref_writer.skip_references();
 
     // Parallel: mtime pre-check, then per-file hash comparison and selective extraction
     let results: Vec<SourceCheckResult> = unchanged_pkgs
@@ -1335,7 +1327,7 @@ fn phase_source_incremental(
                             let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file(ext, &source, file_path_arc, !references_enabled)
+                                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
                                 })
                                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {
@@ -1426,10 +1418,10 @@ fn phase_source_incremental(
                     if let Some(syms) = &fr.symbols {
                         // File changed — upsert symbols and references for this file
                         let empty_refs = Vec::new();
-                        let refs_slice = if references_enabled {
-                            fr.references.as_ref().unwrap_or(&empty_refs).as_slice()
+                        let refs_slice = if ref_writer.skip_references() {
+                            &[]
                         } else {
-                            &empty_refs
+                            fr.references.as_ref().unwrap_or(&empty_refs).as_slice()
                         };
                         upsert_symbols_and_refs_for_file(conn, pkg_name, &fr.file_path, syms, refs_slice)?;
                         had_changes = true;
@@ -2431,14 +2423,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
         if !refs_enabled {
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, refs_enabled)?;
+        let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer)?;
         let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, refs_enabled, force_source_reextract)?
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

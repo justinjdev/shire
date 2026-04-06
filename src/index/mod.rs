@@ -3486,4 +3486,108 @@ anyhow = "1"
         assert_eq!(body, "abc");
         assert!(body.len() <= 5);
     }
+
+    #[test]
+    fn test_detect_boundary_edges_matches_by_stem_and_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        // Two packages: proto-pkg and go-pkg in the same parent dir
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('proto-pkg', 'services/auth/proto', 'proto')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('go-pkg', 'services/auth/gen', 'go')",
+            [],
+        )
+        .unwrap();
+        // billing is in a different parent — should NOT match
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('billing-pkg', 'services/billing/gen', 'go')",
+            [],
+        )
+        .unwrap();
+
+        let files: Vec<(String, Option<String>, String, u64)> = vec![
+            (
+                "services/auth/proto/user.proto".into(),
+                Some("proto-pkg".into()),
+                "proto".into(),
+                100,
+            ),
+            (
+                "services/auth/gen/user.pb.go".into(),
+                Some("go-pkg".into()),
+                "go".into(),
+                200,
+            ),
+            (
+                "services/auth/gen/user_pb2.py".into(),
+                Some("go-pkg".into()),
+                "py".into(),
+                150,
+            ),
+            // Out-of-scope: different parent directory, no dependency
+            (
+                "services/billing/gen/user.pb.go".into(),
+                Some("billing-pkg".into()),
+                "go".into(),
+                200,
+            ),
+        ];
+
+        let edges = detect_boundary_edges(&conn, &files).unwrap();
+
+        assert_eq!(
+            edges.len(),
+            2,
+            "should match user.pb.go and user_pb2.py in sibling package"
+        );
+        assert!(edges
+            .iter()
+            .all(|e| e.source_path == "services/auth/proto/user.proto"));
+        let gen_paths: std::collections::HashSet<&str> =
+            edges.iter().map(|e| e.generated_path.as_str()).collect();
+        assert!(gen_paths.contains("services/auth/gen/user.pb.go"));
+        assert!(gen_paths.contains("services/auth/gen/user_pb2.py"));
+        assert!(!gen_paths.contains("services/billing/gen/user.pb.go"));
+    }
+
+    #[test]
+    fn test_detect_boundary_edges_dep_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('proto-pkg', 'proto', 'proto'), ('consumer', 'apps/consumer', 'go')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal) VALUES ('consumer', 'proto-pkg', 'runtime', 1)",
+            [],
+        )
+        .unwrap();
+
+        let files: Vec<(String, Option<String>, String, u64)> = vec![
+            (
+                "proto/api.proto".into(),
+                Some("proto-pkg".into()),
+                "proto".into(),
+                100,
+            ),
+            (
+                "apps/consumer/api.pb.go".into(),
+                Some("consumer".into()),
+                "go".into(),
+                200,
+            ),
+        ];
+
+        let edges = detect_boundary_edges(&conn, &files).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].generated_package.as_deref(), Some("consumer"));
+    }
 }

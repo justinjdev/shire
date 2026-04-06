@@ -1,4 +1,4 @@
-use super::{find_ancestor, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{find_ancestor, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Visibility filter for TypeScript/JavaScript symbols.
@@ -218,24 +218,26 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[
-            "function_declaration",
-            "method_definition",
-            "class_declaration",
-            "interface_declaration",
-            "function_expression",
-            "method_signature",
-            // arrow_function is a distinct callable kind in TS — without
-            // it refs captured inside arrow bodies get no enclosing_symbol.
-            "arrow_function",
-        ],
-        // Keep only literals/keywords and TS-reserved type keywords. Global
-        // classes like String/Number/Array/Promise/Error ARE user-definable
-        // (you can write `class Array { ... }`), so stoplisting them turns
-        // any repo type with those names into a permanent false negative.
-        reference_stoplist: &[
-            "true", "false", "null", "undefined", "this", "super",
-            "string", "number", "boolean", "any", "unknown", "never", "void",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "function_declaration",
+                "method_definition",
+                "class_declaration",
+                "interface_declaration",
+                "function_expression",
+                "method_signature",
+                // arrow_function is a distinct callable kind in TS — without
+                // it refs captured inside arrow bodies get no enclosing_symbol.
+                "arrow_function",
+            ],
+            // Keep only literals/keywords and TS-reserved type keywords. Global
+            // classes like String/Number/Array/Promise/Error ARE user-definable
+            // (you can write `class Array { ... }`), so stoplisting them turns
+            // any repo type with those names into a permanent false negative.
+            reference_stoplist: &[
+                "true", "false", "null", "undefined", "this", "super",
+                "string", "number", "boolean", "any", "unknown", "never", "void",
+            ],
+        }),
     }
 }

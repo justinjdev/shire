@@ -1,4 +1,4 @@
-use super::{field_text, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{field_text, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
 /// Go visibility: only symbols starting with an uppercase letter are exported.
@@ -121,20 +121,22 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
-        enclosing_ancestors: &[
-            "function_declaration",
-            "method_declaration",
-        ],
-        reference_stoplist: &[
-            "true", "false", "nil", "iota",
-            "make", "new", "len", "cap", "append", "copy", "delete",
-            "print", "println", "panic", "recover",
-            "min", "max", "clear",
-            "int", "int32", "int64", "uint", "uint32", "uint64",
-            "string", "bool", "byte", "rune", "float32", "float64",
-            "error", "any",
-            "complex", "real", "imag", "close",
-            "uintptr", "complex64", "complex128", "comparable",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "function_declaration",
+                "method_declaration",
+            ],
+            reference_stoplist: &[
+                "true", "false", "nil", "iota",
+                "make", "new", "len", "cap", "append", "copy", "delete",
+                "print", "println", "panic", "recover",
+                "min", "max", "clear",
+                "int", "int32", "int64", "uint", "uint32", "uint64",
+                "string", "bool", "byte", "rune", "float32", "float64",
+                "error", "any",
+                "complex", "real", "imag", "close",
+                "uintptr", "complex64", "complex128", "comparable",
+            ],
+        }),
     }
 }

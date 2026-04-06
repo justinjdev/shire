@@ -11,7 +11,7 @@
 //!    `void`) and TS primitive type names (`string`, `number`, `boolean`) are
 //!    removed since they are ordinary identifiers in JS.
 
-use super::LanguageHooks;
+use super::{LanguageHooks, ReferenceHooks};
 
 /// Return the language hooks for JavaScript.
 ///
@@ -20,19 +20,21 @@ use super::LanguageHooks;
 pub fn hooks() -> LanguageHooks {
     let base = super::typescript::hooks();
     LanguageHooks {
-        enclosing_ancestors: &[
-            "function_declaration",
-            "method_definition",
-            "class_declaration",
-            "function_expression",
-            // arrow_function is a distinct callable kind in JS — without it
-            // refs captured inside arrow bodies get no enclosing_symbol,
-            // degrading caller/callee attribution.
-            "arrow_function",
-        ],
-        reference_stoplist: &[
-            "true", "false", "null", "undefined", "this", "super",
-        ],
+        reference_hooks: Some(ReferenceHooks {
+            enclosing_ancestors: &[
+                "function_declaration",
+                "method_definition",
+                "class_declaration",
+                "function_expression",
+                // arrow_function is a distinct callable kind in JS — without it
+                // refs captured inside arrow bodies get no enclosing_symbol,
+                // degrading caller/callee attribution.
+                "arrow_function",
+            ],
+            reference_stoplist: &[
+                "true", "false", "null", "undefined", "this", "super",
+            ],
+        }),
         ..base
     }
 }

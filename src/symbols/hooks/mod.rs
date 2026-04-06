@@ -44,6 +44,16 @@ pub type SignatureFn = fn(node: &Node, source: &str, name: &str, kind: SymbolKin
 /// Function pointer type for post-processing a matched symbol; returning None drops it.
 pub type PostProcessFn = fn(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo>;
 
+/// Hooks for reference extraction. Only populated for languages with
+/// cross-reference support (currently: Go, Python, Java, TypeScript,
+/// JavaScript, Perl, Ruby, Scala).
+pub struct ReferenceHooks {
+    /// Node kinds that qualify as an enclosing symbol for references.
+    pub enclosing_ancestors: &'static [&'static str],
+    /// Identifiers to skip when emitting references (language built-ins, etc.).
+    pub reference_stoplist: &'static [&'static str],
+}
+
 /// Hooks for language-specific symbol enrichment.
 /// All fields are optional — None means use the default behavior.
 #[derive(Default)]
@@ -72,15 +82,9 @@ pub struct LanguageHooks {
     /// Return None to skip the symbol.
     pub post_process: Option<PostProcessFn>,
 
-    /// Node kinds that qualify as an enclosing symbol for references.
-    /// The extractor walks up from a reference node through ancestors, stopping
-    /// at the first node whose kind appears in this list. None means the
-    /// language has no references tracked (empty list acceptable too).
-    pub enclosing_ancestors: &'static [&'static str],
-
-    /// Identifiers to skip when emitting references (language built-ins,
-    /// reserved words that parse as identifiers, etc.).
-    pub reference_stoplist: &'static [&'static str],
+    /// Reference extraction hooks. `None` means this language has no
+    /// cross-reference support — the extractor skips ref processing entirely.
+    pub reference_hooks: Option<ReferenceHooks>,
 }
 
 

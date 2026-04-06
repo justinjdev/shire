@@ -19,6 +19,7 @@ const SKIP_SUFFIXES: &[&str] = &[
     // Go
     ".generated.go",
     "_generated.go",
+    "_grpc.pb.go",
     ".pb.go",
     ".gen.go",
     "_test.go",
@@ -26,12 +27,21 @@ const SKIP_SUFFIXES: &[&str] = &[
     ".generated.ts",
     ".generated.js",
     ".d.ts",
+    ".pb.ts",
+    ".pb.js",
+    "_pb.d.ts",
     // Python (protobuf)
     "_pb2.py",
     "_pb2_grpc.py",
     // C/C++ (protobuf)
-    ".pb.h",
+    "_grpc.pb.cc",
     ".pb.cc",
+    "_grpc.pb.h",
+    ".pb.h",
+    // Dart (protobuf)
+    ".pb.dart",
+    // Ruby (protobuf)
+    "_pb.rb",
     // Java
     "Generated.java",
 ];

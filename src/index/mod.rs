@@ -990,7 +990,7 @@ struct FileExtractResult {
 }
 
 /// Single-pass: walk source files, read once, hash + extract symbols.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn single_pass_extract(
     repo_root: &Path,
     pkg_path: &str,
@@ -1028,18 +1028,17 @@ fn single_pass_extract(
     let file_results: Vec<FileExtractResult> = source_files
         .par_iter()
         .filter_map(|file_path| {
-            if max_file_size > 0 {
-                if let Ok(meta) = file_path.metadata() {
-                    if meta.len() > max_file_size {
-                        tracing::warn!(
-                            file = %file_path.display(),
-                            size = meta.len(),
-                            limit = max_file_size,
-                            "skipping oversized source file"
-                        );
-                        return None;
-                    }
-                }
+            if max_file_size > 0
+                && let Ok(meta) = file_path.metadata()
+                && meta.len() > max_file_size
+            {
+                tracing::warn!(
+                    file = %file_path.display(),
+                    size = meta.len(),
+                    limit = max_file_size,
+                    "skipping oversized source file"
+                );
+                return None;
             }
             let content = std::fs::read(file_path).ok()?;
             let digest = Sha256::digest(&content);
@@ -1314,18 +1313,17 @@ fn phase_source_incremental(
                 let file_results: Vec<FileResult> = source_files
                     .par_iter()
                     .filter_map(|file_path| {
-                        if max_file_size > 0 {
-                            if let Ok(meta) = file_path.metadata() {
-                                if meta.len() > max_file_size {
-                                    tracing::warn!(
-                                        file = %file_path.display(),
-                                        size = meta.len(),
-                                        limit = max_file_size,
-                                        "skipping oversized source file"
-                                    );
-                                    return None;
-                                }
-                            }
+                        if max_file_size > 0
+                            && let Ok(meta) = file_path.metadata()
+                            && meta.len() > max_file_size
+                        {
+                            tracing::warn!(
+                                file = %file_path.display(),
+                                size = meta.len(),
+                                limit = max_file_size,
+                                "skipping oversized source file"
+                            );
+                            return None;
                         }
                         let content = std::fs::read(file_path).ok()?;
                         let digest = Sha256::digest(&content);

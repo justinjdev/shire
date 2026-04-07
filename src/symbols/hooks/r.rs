@@ -122,8 +122,7 @@ pub fn hooks() -> LanguageHooks {
         extract_parameters: Some(extract_parameters),
         extract_return_type: None,
         post_process: Some(post_process),
-        enclosing_ancestors: &[],
-        reference_stoplist: &[],
+        reference_hooks: None,
     }
 }
 
@@ -138,7 +137,7 @@ mod tests {
     x + y
 }
 "#;
-        let symbols = extract_file("r", source, Arc::from("math.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("math.r"), true);
         assert_eq!(symbols.len(), 1);
         let sym = &symbols[0];
         assert_eq!(sym.name, "my_func");
@@ -159,7 +158,7 @@ mod tests {
     data
 }
 "#;
-        let symbols = extract_file("r", source, Arc::from("proc.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("proc.r"), true);
         assert_eq!(symbols.len(), 1);
         let sym = &symbols[0];
         assert_eq!(sym.name, "process");
@@ -173,7 +172,7 @@ mod tests {
     paste(greeting, name)
 }
 "#;
-        let symbols = extract_file("r", source, Arc::from("greet.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("greet.r"), true);
         assert_eq!(symbols.len(), 1);
         let params = symbols[0].parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
@@ -190,7 +189,7 @@ mod tests {
   )
 )
 "#;
-        let symbols = extract_file("r", source, Arc::from("person.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("person.r"), true);
         assert_eq!(symbols.len(), 1);
         let sym = &symbols[0];
         assert_eq!(sym.name, "Person");
@@ -209,7 +208,7 @@ mod tests {
   )
 )
 "#;
-        let symbols = extract_file("r", source, Arc::from("animal.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("animal.r"), true);
         // Should capture the R6 class definition (Animal <- R6Class)
         // The inner function assignment (self$name <- name) should not match
         // since self$name is an extract_operator, not an identifier
@@ -227,7 +226,7 @@ mod tests {
         let source = r#"library("dplyr")
 x <- some_function()
 "#;
-        let symbols = extract_file("r", source, Arc::from("load.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("load.r"), true);
         // library("dplyr") should be filtered out (not setClass/setRefClass)
         // x <- some_function() should be filtered out (not R6Class)
         assert!(symbols.is_empty());
@@ -241,7 +240,7 @@ subtract <- function(a, b) a - b
 
 multiply <- function(a, b) a * b
 "#;
-        let symbols = extract_file("r", source, Arc::from("ops.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("ops.r"), true);
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0].name, "add");
         assert_eq!(symbols[1].name, "subtract");
@@ -252,7 +251,7 @@ multiply <- function(a, b) a * b
     fn test_r_no_params_function() {
         let source = r#"get_pi <- function() 3.14159
 "#;
-        let symbols = extract_file("r", source, Arc::from("const.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("const.r"), true);
         assert_eq!(symbols.len(), 1);
         let params = symbols[0].parameters.as_ref().unwrap();
         assert!(params.is_empty());
@@ -266,7 +265,7 @@ multiply <- function(a, b) a * b
     fn test_r_uppercase_extension() {
         let source = r#"analyze <- function(data) data
 "#;
-        let symbols = extract_file("R", source, Arc::from("script.R"));
+        let (symbols, _) = extract_file("R", source, Arc::from("script.R"), true);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "analyze");
         assert_eq!(symbols[0].kind, SymbolKind::Function);
@@ -278,7 +277,7 @@ multiply <- function(a, b) a * b
     inner(x, ...)
 }
 "#;
-        let symbols = extract_file("r", source, Arc::from("wrap.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("wrap.r"), true);
         assert_eq!(symbols.len(), 1);
         let params = symbols[0].parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
@@ -299,7 +298,7 @@ multiply <- function(a, b) a * b
   )
 )
 "#;
-        let symbols = extract_file("r", source, Arc::from("counter.r"));
+        let (symbols, _) = extract_file("r", source, Arc::from("counter.r"), true);
         let class_symbols: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
         assert_eq!(class_symbols.len(), 1);
         assert_eq!(class_symbols[0].name, "Counter");

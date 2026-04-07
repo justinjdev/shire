@@ -114,20 +114,16 @@ impl ReferenceKind {
     }
 }
 
-/// Extract both symbols and references from a single file by extension.
-pub fn extract_file_full(
+/// Extract symbols (and optionally references) from a single file by extension.
+/// When `skip_references` is true, reference-capture processing is skipped entirely
+/// so callers that don't need refs don't pay the per-match allocation cost.
+pub fn extract_file(
     ext: &str,
     source: &str,
     file_path: Arc<str>,
+    skip_references: bool,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
-    registry::extract_file(ext, source, file_path, false)
-}
-
-/// Extract only symbols (backward-compatible convenience wrapper). Skips
-/// reference-capture processing entirely so callers that don't need refs
-/// don't pay the per-match `resolve_enclosing_symbol` + allocation cost.
-pub fn extract_file(ext: &str, source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
-    registry::extract_file(ext, source, file_path, true).0
+    registry::extract_file(ext, source, file_path, skip_references)
 }
 
 #[cfg(test)]

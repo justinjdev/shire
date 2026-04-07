@@ -65,10 +65,9 @@ Rust CLI (edition 2024) with subcommands: `build`, `serve`, `watch`, `rebuild`, 
 Only applicable to languages that already have tree-sitter-based symbol extraction.
 
 1. Add `@reference.call`, `@reference.type`, `@reference.import`, `@reference.impl` captures to the language's `.scm` file alongside existing `@definition.X` captures
-2. In the language's hooks file (`src/symbols/hooks/<lang>.rs`), set `enclosing_ancestors: &[...]` with the grammar's function/method/class node kinds
-3. Set `reference_stoplist: &[...]` with language built-ins that should be skipped
-4. Add unit tests in `src/symbols/tests.rs` asserting each ref kind is extracted
-5. Add a row to the Reference extraction table in `docs/src/ecosystems.md`
+2. In the language's hooks file (`src/symbols/hooks/<lang>.rs`), set `reference_hooks: Some(ReferenceHooks { enclosing_ancestors: &[...], reference_stoplist: &[...] })` with the grammar's function/method/class node kinds and language built-ins to skip
+3. Add unit tests in `src/symbols/tests.rs` asserting each ref kind is extracted
+4. Add a row to the Reference extraction table in `docs/src/ecosystems.md`
 
 ## Platform Notes
 

@@ -39,6 +39,82 @@ fn capture_name_to_ref_kind(name: &str) -> Option<ReferenceKind> {
     }
 }
 
+/// Trim surrounding quotes from import reference names. Several grammars
+/// expose import paths as string-literal nodes with quote characters
+/// included (e.g. Go `"fmt"`, Ruby `'json'`).
+fn normalize_import_name(name: &str, kind: ReferenceKind) -> String {
+    if matches!(kind, ReferenceKind::Import) {
+        name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+            .to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Build a SymbolInfo from a classified definition match.
+/// Returns None if the symbol should be skipped (duplicate range, visibility filter, post-process).
+#[allow(clippy::too_many_arguments)]
+fn emit_definition(
+    name: &str,
+    kind: SymbolKind,
+    node: &tree_sitter::Node,
+    name_node: &tree_sitter::Node,
+    source: &str,
+    file_path: &Arc<str>,
+    hooks: &LanguageHooks,
+    seen_def_ranges: &mut std::collections::HashSet<(usize, usize)>,
+    def_name_ranges: &mut std::collections::HashSet<(usize, usize)>,
+) -> Option<SymbolInfo> {
+    let range_key = (node.start_byte(), node.end_byte());
+    if !seen_def_ranges.insert(range_key) {
+        return None;
+    }
+    def_name_ranges.insert((name_node.start_byte(), name_node.end_byte()));
+
+    if let Some(is_visible) = hooks.is_visible
+        && !is_visible(node, source)
+    {
+        return None;
+    }
+    let line = node.start_position().row + 1;
+    let parent = hooks.resolve_parent.and_then(|f| f(node, source));
+    let signature = hooks
+        .build_signature
+        .map(|f| f(node, source, name, kind))
+        .unwrap_or_else(|| default_signature(name, kind));
+    let parameters = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        Some(
+            hooks
+                .extract_parameters
+                .map(|f| f(node, source))
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    let return_type = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        hooks.extract_return_type.and_then(|f| f(node, source))
+    } else {
+        None
+    };
+    let sym = SymbolInfo {
+        name: name.to_string(),
+        kind,
+        signature: Some(signature),
+        file_path: file_path.clone(),
+        line,
+        visibility: Visibility::Public,
+        parent_symbol: parent,
+        return_type,
+        parameters,
+    };
+    if let Some(post) = hooks.post_process {
+        post(sym, node, source)
+    } else {
+        Some(sym)
+    }
+}
+
 /// Run a compiled tree-sitter query against `source`, returning both the
 /// definitions (`SymbolInfo`) and references (`ReferenceInfo`) captured.
 ///
@@ -89,7 +165,6 @@ pub fn extract(
 
     QUERY_CURSOR.with_borrow_mut(|cursor| {
         let mut symbols = Vec::new();
-        let mut references = Vec::new();
         let mut seen_def_ranges = std::collections::HashSet::new();
         // Tracks byte ranges of definition NAME nodes so we can suppress
         // reference captures that coincide with a definition's own name node.
@@ -147,61 +222,19 @@ pub fn extract(
 
             // Definition path
             if let (Some(kind), Some(node)) = (def_kind, def_node) {
-                let range_key = (node.start_byte(), node.end_byte());
-                if !seen_def_ranges.insert(range_key) {
-                    continue;
-                }
-                // Record the NAME node's byte range so we can suppress any
-                // reference capture that lands on the same identifier.
-                if let Some(nc) = name_capture {
-                    def_name_ranges
-                        .insert((nc.node.start_byte(), nc.node.end_byte()));
-                }
-                if let Some(is_visible) = hooks.is_visible
-                    && !is_visible(&node, source) {
-                        continue;
-                    }
-                let line = node.start_position().row + 1;
-                let parent = hooks.resolve_parent.and_then(|f| f(&node, source));
-                let signature = hooks
-                    .build_signature
-                    .map(|f| f(&node, source, &name, kind))
-                    .unwrap_or_else(|| default_signature(&name, kind));
-                let parameters = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-                    Some(
-                        hooks
-                            .extract_parameters
-                            .map(|f| f(&node, source))
-                            .unwrap_or_default(),
-                    )
-                } else {
-                    None
-                };
-                let return_type = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-                    hooks.extract_return_type.and_then(|f| f(&node, source))
-                } else {
-                    None
-                };
-                let sym = SymbolInfo {
-                    name: name.clone(),
+                if let Some(sym) = emit_definition(
+                    &name,
                     kind,
-                    signature: Some(signature),
-                    file_path: file_path.clone(),
-                    line,
-                    visibility: Visibility::Public,
-                    parent_symbol: parent,
-                    return_type,
-                    parameters,
-                };
-                let sym = if let Some(post) = hooks.post_process {
-                    match post(sym, &node, source) {
-                        Some(s) => s,
-                        None => continue,
-                    }
-                } else {
-                    sym
-                };
-                symbols.push(sym);
+                    &node,
+                    &name_capture.unwrap().node,
+                    source,
+                    &file_path,
+                    hooks,
+                    &mut seen_def_ranges,
+                    &mut def_name_ranges,
+                ) {
+                    symbols.push(sym);
+                }
                 continue;
             }
 
@@ -210,24 +243,17 @@ pub fn extract(
                 continue;
             }
             if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
-                if hooks.reference_stoplist.contains(&name.as_str()) {
+                let ref_hooks = match &hooks.reference_hooks {
+                    Some(rh) => rh,
+                    None => continue, // Language has no ref support
+                };
+                if ref_hooks.reference_stoplist.contains(&name.as_str()) {
                     continue;
                 }
-                // Trim surrounding quotes for import names. Lives here (not in
-                // per-language hooks) because several grammars expose import
-                // paths as string-literal nodes with the quote characters
-                // included — e.g. Go (`import "fmt"` → `"fmt"`) and Ruby
-                // (`require 'json'` → `'json'`). Centralizing keeps language
-                // `.scm` files simple.
-                let trimmed_name = if matches!(kind, ReferenceKind::Import) {
-                    name.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
-                        .to_string()
-                } else {
-                    name
-                };
+                let trimmed_name = normalize_import_name(&name, kind);
                 let line = node.start_position().row + 1;
                 let enclosing =
-                    resolve_enclosing_symbol(&node, source, hooks.enclosing_ancestors);
+                    resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
                 pending_references.push((
                     ReferenceInfo {
@@ -242,56 +268,54 @@ pub fn extract(
             }
         }
 
-        // Build sets of byte ranges captured as Impl or Call. A node
-        // captured as Impl or Call is ALWAYS the right classification for
-        // that node — e.g. `BaseService` in `extends BaseService` is an
-        // Impl, and a `Constant` in method-call position (Ruby: the bare
-        // `(constant) @reference.type` pattern also matches method-name
-        // constants captured as `@reference.call` via
-        // `(call method: (constant))`) is a Call. But the generic
-        // `(type_identifier) @reference.type` / `(constant)
-        // @reference.type` patterns also match these nodes, producing
-        // duplicate Type rows. Suppress Type refs at node ranges already
-        // claimed by Impl or Call.
-        let impl_ranges: std::collections::HashSet<(usize, usize)> = pending_references
-            .iter()
-            .filter_map(|(r, range)| {
-                if r.kind == ReferenceKind::Impl {
-                    Some(*range)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let call_ranges: std::collections::HashSet<(usize, usize)> = pending_references
-            .iter()
-            .filter_map(|(r, range)| {
-                if r.kind == ReferenceKind::Call {
-                    Some(*range)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let references = filter_references(pending_references, &def_name_ranges);
+        (symbols, references)
+    })
+}
 
-        // Emit references, skipping:
-        //   (a) self-references at a definition's own name node,
-        //   (b) Type refs that duplicate an Impl ref at the same node, and
-        //   (c) Type refs that duplicate a Call ref at the same node.
-        for (reference, node_range) in pending_references {
+/// Post-pass filter for buffered references. Suppresses:
+/// (a) self-references at a definition's own name node,
+/// (b) Type refs that duplicate an Impl ref at the same byte range,
+/// (c) Type refs that duplicate a Call ref at the same byte range.
+fn filter_references(
+    pending: Vec<(ReferenceInfo, (usize, usize))>,
+    def_name_ranges: &std::collections::HashSet<(usize, usize)>,
+) -> Vec<ReferenceInfo> {
+    let impl_ranges: std::collections::HashSet<(usize, usize)> = pending
+        .iter()
+        .filter_map(|(r, range)| {
+            if r.kind == ReferenceKind::Impl {
+                Some(*range)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let call_ranges: std::collections::HashSet<(usize, usize)> = pending
+        .iter()
+        .filter_map(|(r, range)| {
+            if r.kind == ReferenceKind::Call {
+                Some(*range)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    pending
+        .into_iter()
+        .filter_map(|(reference, node_range)| {
             if def_name_ranges.contains(&node_range) {
-                continue;
+                return None;
             }
             if reference.kind == ReferenceKind::Type
                 && (impl_ranges.contains(&node_range) || call_ranges.contains(&node_range))
             {
-                continue;
+                return None;
             }
-            references.push(reference);
-        }
-
-        (symbols, references)
-    })
+            Some(reference)
+        })
+        .collect()
 }
 
 fn default_signature(name: &str, kind: SymbolKind) -> String {

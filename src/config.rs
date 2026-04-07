@@ -55,7 +55,7 @@ pub struct SymbolsConfig {
     #[serde(default = "default_references_enabled")]
     pub references_enabled: bool,
     /// Maximum source file size in bytes for symbol extraction.
-    /// Files larger than this are skipped with a warning.
+    /// Files larger than this are skipped with a warning. 0 = disabled (default).
     #[serde(default = "default_symbols_max_file_size")]
     pub max_file_size: u64,
     /// Maximum number of cross-references to collect per file.
@@ -81,7 +81,7 @@ fn default_references_enabled() -> bool {
 }
 
 fn default_symbols_max_file_size() -> u64 {
-    2_097_152 // 2 MiB
+    0 // 0 = disabled (no size limit); set to e.g. 2_097_152 for 2 MiB cap
 }
 
 fn default_max_references_per_file() -> usize {
@@ -860,7 +860,7 @@ manifests = ["package.json"]
     #[test]
     fn test_symbols_max_file_size_default() {
         let config = Config::default();
-        assert_eq!(config.symbols.max_file_size, 2_097_152); // 2 MiB
+        assert_eq!(config.symbols.max_file_size, 0); // disabled by default
         assert_eq!(config.symbols.max_references_per_file, 10_000);
     }
 

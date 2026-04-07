@@ -998,6 +998,7 @@ fn single_pass_extract(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     skip_references: bool,
+    max_file_size: u64,
 ) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1026,6 +1027,19 @@ fn single_pass_extract(
     let file_results: Vec<FileExtractResult> = source_files
         .par_iter()
         .filter_map(|file_path| {
+            if max_file_size > 0 {
+                if let Ok(meta) = file_path.metadata() {
+                    if meta.len() > max_file_size {
+                        tracing::warn!(
+                            file = %file_path.display(),
+                            size = meta.len(),
+                            limit = max_file_size,
+                            "skipping oversized source file"
+                        );
+                        return None;
+                    }
+                }
+            }
             let content = std::fs::read(file_path).ok()?;
             let digest = Sha256::digest(&content);
             let raw_digest: [u8; 32] = digest.into();
@@ -1088,6 +1102,7 @@ fn phase_extract_symbols(
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
     ref_writer: &mut RefWriter,
+    max_file_size: u64,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
@@ -1095,7 +1110,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references, max_file_size);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1228,6 +1243,7 @@ fn phase_source_incremental(
     progress: &Option<Arc<ProgressBar>>,
     ref_writer: &mut RefWriter,
     force_source_reextract: bool,
+    max_file_size: u64,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
@@ -1295,6 +1311,19 @@ fn phase_source_incremental(
                 let file_results: Vec<FileResult> = source_files
                     .par_iter()
                     .filter_map(|file_path| {
+                        if max_file_size > 0 {
+                            if let Ok(meta) = file_path.metadata() {
+                                if meta.len() > max_file_size {
+                                    tracing::warn!(
+                                        file = %file_path.display(),
+                                        size = meta.len(),
+                                        limit = max_file_size,
+                                        "skipping oversized source file"
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
                         let content = std::fs::read(file_path).ok()?;
                         let digest = Sha256::digest(&content);
                         let raw_digest: [u8; 32] = digest.into();
@@ -2425,14 +2454,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer)?;
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer, config.symbols.max_file_size)?;
         let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract)?
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract, config.symbols.max_file_size)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

@@ -54,6 +54,14 @@ pub struct SymbolsConfig {
     /// (`shire build --force`).
     #[serde(default = "default_references_enabled")]
     pub references_enabled: bool,
+    /// Maximum source file size in bytes for symbol extraction.
+    /// Files larger than this are skipped with a warning.
+    #[serde(default = "default_symbols_max_file_size")]
+    pub max_file_size: u64,
+    /// Maximum number of cross-references to collect per file.
+    /// Caps memory for pathological inputs with millions of identifiers.
+    #[serde(default = "default_max_references_per_file")]
+    pub max_references_per_file: usize,
 }
 
 impl Default for SymbolsConfig {
@@ -62,12 +70,22 @@ impl Default for SymbolsConfig {
             exclude_extensions: Vec::new(),
             exclude_patterns: Vec::new(),
             references_enabled: default_references_enabled(),
+            max_file_size: default_symbols_max_file_size(),
+            max_references_per_file: default_max_references_per_file(),
         }
     }
 }
 
 fn default_references_enabled() -> bool {
     false
+}
+
+fn default_symbols_max_file_size() -> u64 {
+    2_097_152 // 2 MiB
+}
+
+fn default_max_references_per_file() -> usize {
+    10_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -837,6 +855,25 @@ manifests = ["package.json"]
         let config = Config::default();
         assert_eq!(config.docs.extensions, vec![".md", ".rst", ".txt", ".adoc"]);
         assert_eq!(config.docs.max_file_size, 262_144);
+    }
+
+    #[test]
+    fn test_symbols_max_file_size_default() {
+        let config = Config::default();
+        assert_eq!(config.symbols.max_file_size, 2_097_152); // 2 MiB
+        assert_eq!(config.symbols.max_references_per_file, 10_000);
+    }
+
+    #[test]
+    fn test_parse_symbols_max_file_size() {
+        let toml_str = r#"
+[symbols]
+max_file_size = 4194304
+max_references_per_file = 5000
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.symbols.max_file_size, 4_194_304);
+        assert_eq!(config.symbols.max_references_per_file, 5_000);
     }
 
     #[test]

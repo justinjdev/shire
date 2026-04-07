@@ -15,7 +15,7 @@ exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", 
 exclude_extensions = [".proto", ".pl"]
 references_enabled = false  # EXPERIMENTAL, default false — see below
 max_file_size = 2097152     # 0 = disabled (default); set to e.g. 2097152 for 2 MiB cap
-max_references_per_file = 10000  # cap cross-references per file to bound memory
+max_references_per_file = 10000  # 0 = unlimited; default 10000 — caps cross-references per file
 
 # Documentation indexing
 [docs]

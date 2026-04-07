@@ -1152,6 +1152,7 @@ mod tests {
         assert!(!err.message.contains("SQLITE_ERROR"));
         assert!(!err.message.contains("/home/user"));
         assert!(!err.message.contains("foo"));
+        assert_eq!(err.message, "Internal error \u{2014} check server logs for details");
     }
 
     #[test]

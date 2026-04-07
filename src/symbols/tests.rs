@@ -2612,3 +2612,41 @@ fn test_no_self_reference_at_definition_site_across_languages() {
         }
     }
 }
+
+#[test]
+fn test_references_capped_at_limit() {
+    // Python source that generates multiple call references
+    let source = r#"
+def main():
+    foo()
+    bar()
+    baz()
+    qux()
+    quux()
+"#;
+    // Uncapped (0) — should get all references
+    let (_, refs_uncapped) = extract_file("py", source, Arc::from("cap.py"), false, 0);
+    let call_count = refs_uncapped.iter().filter(|r| r.kind == ReferenceKind::Call).count();
+    assert!(call_count >= 5, "expected at least 5 call refs uncapped, got {call_count}");
+
+    // Capped at 2 — should get at most 2 references total (before dedup filtering)
+    let (_, refs_capped) = extract_file("py", source, Arc::from("cap.py"), false, 2);
+    assert!(
+        refs_capped.len() <= 2,
+        "expected at most 2 refs with cap=2, got {}",
+        refs_capped.len()
+    );
+}
+
+#[test]
+fn test_references_cap_zero_means_unlimited() {
+    let source = r#"
+def main():
+    foo()
+    bar()
+    baz()
+"#;
+    let (_, refs) = extract_file("py", source, Arc::from("uncap.py"), false, 0);
+    let call_count = refs.iter().filter(|r| r.kind == ReferenceKind::Call).count();
+    assert!(call_count >= 3, "cap=0 should be unlimited, got {call_count} call refs");
+}

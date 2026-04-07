@@ -245,6 +245,9 @@ pub fn extract(
                 continue;
             }
             if let (Some(kind), Some(node)) = (ref_kind, ref_node) {
+                if refs_capped {
+                    continue;
+                }
                 let ref_hooks = match &hooks.reference_hooks {
                     Some(rh) => rh,
                     None => continue, // Language has no ref support

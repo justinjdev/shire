@@ -174,10 +174,11 @@ impl ShireService {
         }
     }
 
-    pub(crate) fn mcp_err(msg: String) -> ErrorData {
+    pub(crate) fn mcp_err(detail: String) -> ErrorData {
+        tracing::warn!(error = %detail, "MCP tool error");
         ErrorData {
             code: ErrorCode(-32603),
-            message: Cow::from(msg),
+            message: Cow::from("Internal error — check server logs for details"),
             data: None,
         }
     }
@@ -1142,6 +1143,15 @@ mod tests {
             _ => panic!("expected text"),
         };
         assert_eq!(text, "[]");
+    }
+
+    #[test]
+    fn test_mcp_err_redacts_details() {
+        let err = ShireService::mcp_err("SQLITE_ERROR: no such table: foo at /home/user/.shire/index.db".to_string());
+        // The message returned to the caller must NOT contain the raw error
+        assert!(!err.message.contains("SQLITE_ERROR"));
+        assert!(!err.message.contains("/home/user"));
+        assert!(!err.message.contains("foo"));
     }
 
     #[test]

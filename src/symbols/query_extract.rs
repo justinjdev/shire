@@ -131,6 +131,7 @@ pub fn extract(
     file_path: Arc<str>,
     hooks: &LanguageHooks,
     skip_references: bool,
+    max_references_per_file: usize,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
     let tree = match parser.parse(source, None) {
         Some(t) => t,
@@ -176,6 +177,7 @@ pub fn extract(
         let mut def_name_ranges: std::collections::HashSet<(usize, usize)> =
             std::collections::HashSet::new();
         let mut pending_references: Vec<(ReferenceInfo, (usize, usize))> = Vec::new();
+        let mut refs_capped = false;
         let source_bytes = source.as_bytes();
 
         // Collect all matches into a Vec so we can do two logical passes
@@ -255,17 +257,29 @@ pub fn extract(
                 let enclosing =
                     resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
-                pending_references.push((
-                    ReferenceInfo {
-                        name: trimmed_name,
-                        kind,
-                        file_path: file_path.clone(),
-                        line,
-                        enclosing_symbol: enclosing,
-                    },
-                    node_range,
-                ));
+                if max_references_per_file > 0 && pending_references.len() >= max_references_per_file {
+                    refs_capped = true;
+                } else {
+                    pending_references.push((
+                        ReferenceInfo {
+                            name: trimmed_name,
+                            kind,
+                            file_path: file_path.clone(),
+                            line,
+                            enclosing_symbol: enclosing,
+                        },
+                        node_range,
+                    ));
+                }
             }
+        }
+
+        if refs_capped {
+            tracing::warn!(
+                file = %file_path,
+                cap = max_references_per_file,
+                "reference count capped — excess references discarded"
+            );
         }
 
         let references = filter_references(pending_references, &def_name_ranges);

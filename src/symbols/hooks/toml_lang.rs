@@ -125,7 +125,7 @@ mod tests {
     use crate::symbols::SymbolKind;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
-        extract_file("toml", source, Arc::from("test.toml"), true).0
+        extract_file("toml", source, Arc::from("test.toml"), true, 0).0
     }
 
     #[test]

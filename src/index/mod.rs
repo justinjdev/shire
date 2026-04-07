@@ -999,6 +999,7 @@ fn single_pass_extract(
     exclude_patterns: &[String],
     skip_references: bool,
     max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1056,7 +1057,7 @@ fn single_pass_extract(
             let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
+                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1103,6 +1104,7 @@ fn phase_extract_symbols(
     skip_deletes: bool,
     ref_writer: &mut RefWriter,
     max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
@@ -1110,7 +1112,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references, max_file_size);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references, max_file_size, max_references_per_file);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1244,6 +1246,7 @@ fn phase_source_incremental(
     ref_writer: &mut RefWriter,
     force_source_reextract: bool,
     max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
@@ -1357,7 +1360,7 @@ fn phase_source_incremental(
                             let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
+                                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
                                 })
                                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {
@@ -2454,14 +2457,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer, config.symbols.max_file_size)?;
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer, config.symbols.max_file_size, config.symbols.max_references_per_file)?;
         let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract, config.symbols.max_file_size)?
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract, config.symbols.max_file_size, config.symbols.max_references_per_file)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

@@ -122,8 +122,9 @@ pub fn extract_file(
     source: &str,
     file_path: Arc<str>,
     skip_references: bool,
+    max_references_per_file: usize,
 ) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
-    registry::extract_file(ext, source, file_path, skip_references)
+    registry::extract_file(ext, source, file_path, skip_references, max_references_per_file)
 }
 
 #[cfg(test)]

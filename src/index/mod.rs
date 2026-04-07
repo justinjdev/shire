@@ -1317,13 +1317,28 @@ fn phase_source_incremental(
                             && let Ok(meta) = file_path.metadata()
                             && meta.len() > max_file_size
                         {
+                            let relative_path = file_path
+                                .strip_prefix(repo_root)
+                                .unwrap_or(file_path)
+                                .to_string_lossy()
+                                .to_string();
                             tracing::warn!(
-                                file = %file_path.display(),
+                                file = %relative_path,
                                 size = meta.len(),
                                 limit = max_file_size,
                                 "skipping oversized source file"
                             );
-                            return None;
+                            // Preserve the file's entry so it is not treated as
+                            // deleted by the deleted-file detection below. Use a
+                            // sentinel hash — this avoids reading the file just to
+                            // hash it, while keeping the path in current_paths.
+                            return Some(FileResult {
+                                file_path: relative_path,
+                                content_hash: "oversized".to_string(),
+                                raw_digest: [0u8; 32],
+                                symbols: None,
+                                references: None,
+                            });
                         }
                         let content = std::fs::read(file_path).ok()?;
                         let digest = Sha256::digest(&content);

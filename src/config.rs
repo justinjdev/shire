@@ -60,6 +60,7 @@ pub struct SymbolsConfig {
     pub max_file_size: u64,
     /// Maximum number of cross-references to collect per file.
     /// Caps memory for pathological inputs with millions of identifiers.
+    /// 0 = no cap (unlimited).
     #[serde(default = "default_max_references_per_file")]
     pub max_references_per_file: usize,
 }

@@ -434,11 +434,11 @@ mod tests {
     use std::sync::Arc;
 
     fn extract_ml(source: &str) -> Vec<SymbolInfo> {
-        extract_file("ml", source, Arc::from("test.ml"), true).0
+        extract_file("ml", source, Arc::from("test.ml"), true, 0).0
     }
 
     fn extract_mli(source: &str) -> Vec<SymbolInfo> {
-        extract_file("mli", source, Arc::from("test.mli"), true).0
+        extract_file("mli", source, Arc::from("test.mli"), true, 0).0
     }
 
     #[test]

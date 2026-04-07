@@ -138,7 +138,7 @@ mod tests {
         let hooks = hooks();
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.gleam"), &hooks, true).0
+        query_extract::extract(&mut parser, &query, source, Arc::from("test.gleam"), &hooks, true, 0).0
     }
 
     #[test]

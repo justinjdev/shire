@@ -990,7 +990,7 @@ struct FileExtractResult {
 }
 
 /// Single-pass: walk source files, read once, hash + extract symbols.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn single_pass_extract(
     repo_root: &Path,
     pkg_path: &str,
@@ -998,6 +998,8 @@ fn single_pass_extract(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     skip_references: bool,
+    max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1026,15 +1028,35 @@ fn single_pass_extract(
     let file_results: Vec<FileExtractResult> = source_files
         .par_iter()
         .filter_map(|file_path| {
-            let content = std::fs::read(file_path).ok()?;
-            let digest = Sha256::digest(&content);
-            let raw_digest: [u8; 32] = digest.into();
-            let content_hash_hex = format!("{:x}", digest);
             let relative_path = file_path
                 .strip_prefix(repo_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .to_string();
+            if max_file_size > 0
+                && let Ok(meta) = file_path.metadata()
+                && meta.len() > max_file_size
+            {
+                tracing::warn!(
+                    file = %relative_path,
+                    size = meta.len(),
+                    limit = max_file_size,
+                    "skipping oversized source file"
+                );
+                // Return a sentinel result matching the incremental path so
+                // aggregate hashes are consistent across build modes.
+                return Some(FileExtractResult {
+                    relative_path,
+                    content_hash_hex: "oversized".to_string(),
+                    raw_digest: [0u8; 32],
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                });
+            }
+            let content = std::fs::read(file_path).ok()?;
+            let digest = Sha256::digest(&content);
+            let raw_digest: [u8; 32] = digest.into();
+            let content_hash_hex = format!("{:x}", digest);
             let ext = file_path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -1042,7 +1064,7 @@ fn single_pass_extract(
             let (syms, refs) = String::from_utf8(content).ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
+                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1088,6 +1110,8 @@ fn phase_extract_symbols(
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
     ref_writer: &mut RefWriter,
+    max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<()> {
     tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
 
@@ -1095,7 +1119,7 @@ fn phase_extract_symbols(
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references);
+            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references, max_file_size, max_references_per_file);
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1228,6 +1252,8 @@ fn phase_source_incremental(
     progress: &Option<Arc<ProgressBar>>,
     ref_writer: &mut RefWriter,
     force_source_reextract: bool,
+    max_file_size: u64,
+    max_references_per_file: usize,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
@@ -1295,6 +1321,33 @@ fn phase_source_incremental(
                 let file_results: Vec<FileResult> = source_files
                     .par_iter()
                     .filter_map(|file_path| {
+                        if max_file_size > 0
+                            && let Ok(meta) = file_path.metadata()
+                            && meta.len() > max_file_size
+                        {
+                            let relative_path = file_path
+                                .strip_prefix(repo_root)
+                                .unwrap_or(file_path)
+                                .to_string_lossy()
+                                .to_string();
+                            tracing::warn!(
+                                file = %relative_path,
+                                size = meta.len(),
+                                limit = max_file_size,
+                                "skipping oversized source file"
+                            );
+                            // Preserve the file's entry so it is not treated as
+                            // deleted by the deleted-file detection below. Use a
+                            // sentinel hash — this avoids reading the file just to
+                            // hash it, while keeping the path in current_paths.
+                            return Some(FileResult {
+                                file_path: relative_path,
+                                content_hash: "oversized".to_string(),
+                                raw_digest: [0u8; 32],
+                                symbols: None,
+                                references: None,
+                            });
+                        }
                         let content = std::fs::read(file_path).ok()?;
                         let digest = Sha256::digest(&content);
                         let raw_digest: [u8; 32] = digest.into();
@@ -1328,7 +1381,7 @@ fn phase_source_incremental(
                             let (syms, refs) = String::from_utf8(content).ok()
                                 .map(|source| {
                                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file(ext, &source, file_path_arc, skip_references)
+                                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
                                 })
                                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
                             Some(FileResult {
@@ -2425,14 +2478,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer)?;
+        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer, config.symbols.max_file_size, config.symbols.max_references_per_file)?;
         let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract)?
+            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract, config.symbols.max_file_size, config.symbols.max_references_per_file)?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {

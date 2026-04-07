@@ -1028,27 +1028,35 @@ fn single_pass_extract(
     let file_results: Vec<FileExtractResult> = source_files
         .par_iter()
         .filter_map(|file_path| {
-            if max_file_size > 0
-                && let Ok(meta) = file_path.metadata()
-                && meta.len() > max_file_size
-            {
-                tracing::warn!(
-                    file = %file_path.display(),
-                    size = meta.len(),
-                    limit = max_file_size,
-                    "skipping oversized source file"
-                );
-                return None;
-            }
-            let content = std::fs::read(file_path).ok()?;
-            let digest = Sha256::digest(&content);
-            let raw_digest: [u8; 32] = digest.into();
-            let content_hash_hex = format!("{:x}", digest);
             let relative_path = file_path
                 .strip_prefix(repo_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
                 .to_string();
+            if max_file_size > 0
+                && let Ok(meta) = file_path.metadata()
+                && meta.len() > max_file_size
+            {
+                tracing::warn!(
+                    file = %relative_path,
+                    size = meta.len(),
+                    limit = max_file_size,
+                    "skipping oversized source file"
+                );
+                // Return a sentinel result matching the incremental path so
+                // aggregate hashes are consistent across build modes.
+                return Some(FileExtractResult {
+                    relative_path,
+                    content_hash_hex: "oversized".to_string(),
+                    raw_digest: [0u8; 32],
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                });
+            }
+            let content = std::fs::read(file_path).ok()?;
+            let digest = Sha256::digest(&content);
+            let raw_digest: [u8; 32] = digest.into();
+            let content_hash_hex = format!("{:x}", digest);
             let ext = file_path
                 .extension()
                 .and_then(|e| e.to_str())

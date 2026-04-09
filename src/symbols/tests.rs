@@ -82,23 +82,21 @@ def save(path: str, data: dict):
         f.write(json.dumps(data))
 "#;
     let (_syms, refs) = extract_file("py", source, Arc::from("io.py"), false, 0);
-    let call_refs: Vec<&ReferenceInfo> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
-    assert!(names.contains(&"loads"), "got {:?}", names);
-    assert!(names.contains(&"dumps"));
-    assert!(names.contains(&"read"));
-
-    // open() is in the stoplist (builtin), should not appear
-    assert!(
-        !names.contains(&"open"),
-        "open() is builtin, should be in stoplist"
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("dumps".into(), 9, Some("save".into())),
+            ("loads".into(), 5, Some("load".into())),
+            ("read".into(), 4, Some("load".into())),
+            ("write".into(), 9, Some("save".into())),
+        ]
     );
-
-    let loads_ref = call_refs.iter().find(|r| r.name == "loads").unwrap();
-    assert_eq!(loads_ref.enclosing_symbol.as_deref(), Some("load"));
 }
 
 #[test]
@@ -120,6 +118,24 @@ from os.path import join
 }
 
 #[test]
+fn test_python_type_references() {
+    let source = r#"class Config:
+    pass
+
+def build(req: Request) -> Config:
+    return Config()
+"#;
+    let (_syms, refs) = extract_file("py", source, Arc::from("types.py"), false, 0);
+    let mut type_refs: Vec<(String, usize)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    type_refs.sort();
+    assert_eq!(type_refs, vec![("Config".into(), 4), ("Request".into(), 4)]);
+}
+
+#[test]
 fn test_python_impl_references() {
     let source = r#"class Base:
     pass
@@ -138,6 +154,23 @@ class Multi(Base, Mixin):
         .collect();
     assert!(names.contains(&"Base"), "got {:?}", names);
     assert!(names.contains(&"Mixin"));
+}
+
+#[test]
+fn test_python_lambda_call_uses_outer_function_as_enclosing() {
+    let source = r#"def transform(items):
+    return list(map(lambda x: normalize(x), items))
+"#;
+    let (_syms, refs) = extract_file("py", source, Arc::from("lambda.py"), false, 0);
+    let normalize_call = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "normalize")
+        .unwrap();
+    assert_eq!(normalize_call.line, 2);
+    assert_eq!(
+        normalize_call.enclosing_symbol.as_deref(),
+        Some("transform")
+    );
 }
 
 // ============================================================
@@ -238,24 +271,20 @@ func validate(c Config) error { return nil }
 "#;
     let (_syms, refs) = extract_file("go", source, Arc::from("main.go"), false, 0);
 
-    let call_refs: Vec<&ReferenceInfo> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    let names: Vec<&str> = call_refs.iter().map(|r| r.name.as_str()).collect();
-    assert!(
-        names.contains(&"parseConfig"),
-        "expected call-ref to parseConfig, got {:?}",
-        names
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("Println".into(), 7, Some("handleRequest".into())),
+            ("parseConfig".into(), 6, Some("handleRequest".into())),
+            ("validate".into(), 8, Some("handleRequest".into())),
+        ]
     );
-    assert!(
-        names.contains(&"validate"),
-        "expected call-ref to validate, got {:?}",
-        names
-    );
-
-    let parse_ref = call_refs.iter().find(|r| r.name == "parseConfig").unwrap();
-    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("handleRequest"));
 }
 
 #[test]
@@ -529,13 +558,19 @@ function buildResponse(cfg: Config): Response {
 }
 "#;
     let (_syms, refs) = extract_file("ts", source, Arc::from("handler.ts"), false, 0);
-    let call_names: Vec<&str> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
-        .map(|r| r.name.as_str())
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    assert!(call_names.contains(&"parseConfig"), "got {:?}", call_names);
-    assert!(call_names.contains(&"buildResponse"));
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("buildResponse".into(), 5, Some("handle".into())),
+            ("parseConfig".into(), 4, Some("handle".into())),
+        ]
+    );
 }
 
 #[test]
@@ -642,6 +677,23 @@ import { handler } from './handler';
 }
 
 #[test]
+fn test_typescript_arrow_call_references_use_anonymous_enclosing() {
+    let source = r#"class Handler {
+  run() {
+    const f = () => parseConfig();
+  }
+}
+"#;
+    let (_syms, refs) = extract_file("ts", source, Arc::from("arrow.ts"), false, 0);
+    let parse = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
+        .unwrap();
+    assert_eq!(parse.line, 3);
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
+}
+
+#[test]
 fn test_javascript_call_references() {
     let source = r#"import { parseConfig } from './config.js';
 
@@ -655,13 +707,19 @@ function buildResponse(cfg) {
 }
 "#;
     let (_syms, refs) = extract_file("js", source, Arc::from("h.js"), false, 0);
-    let names: Vec<&str> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
-        .map(|r| r.name.as_str())
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    assert!(names.contains(&"parseConfig"), "got {:?}", names);
-    assert!(names.contains(&"buildResponse"), "got {:?}", names);
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("buildResponse".into(), 5, Some("handle".into())),
+            ("parseConfig".into(), 4, Some("handle".into())),
+        ]
+    );
 }
 
 #[test]
@@ -677,6 +735,40 @@ class Derived extends Base {}
         .map(|r| r.name.as_str())
         .collect();
     assert!(impl_names.contains(&"Base"), "got {:?}", impl_names);
+}
+
+#[test]
+fn test_javascript_import_references() {
+    let source = r#"import { parseConfig, buildResponse } from './config.js';
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("imports.js"), false, 0);
+    let mut import_refs: Vec<(String, usize)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    import_refs.sort();
+    assert_eq!(
+        import_refs,
+        vec![("buildResponse".into(), 1), ("parseConfig".into(), 1)]
+    );
+}
+
+#[test]
+fn test_javascript_arrow_call_references_use_anonymous_enclosing() {
+    let source = r#"class Handler {
+  run() {
+    const f = () => parseConfig();
+  }
+}
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("arrow.js"), false, 0);
+    let parse = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
+        .unwrap();
+    assert_eq!(parse.line, 3);
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
 }
 
 // ============================================================
@@ -868,20 +960,37 @@ public class UserService {
 }
 "#;
     let (_syms, refs) = extract_file("java", source, Arc::from("UserService.java"), false, 0);
-    let call_names: Vec<&str> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
-        .map(|r| r.name.as_str())
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    assert!(call_names.contains(&"lookup"), "got {:?}", call_names);
-    assert!(call_names.contains(&"validate"), "got {:?}", call_names);
-    assert!(call_names.contains(&"insert"), "got {:?}", call_names);
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("insert".into(), 14, Some("saveUser".into())),
+            ("lookup".into(), 9, Some("fetchUser".into())),
+            ("validate".into(), 13, Some("saveUser".into())),
+        ]
+    );
+}
 
-    let lookup_ref = refs
+#[test]
+fn test_java_type_references() {
+    let source = r#"class Repo {}
+class Service {
+  Repo load(Repo r) { return r; }
+}
+"#;
+    let (_syms, refs) = extract_file("java", source, Arc::from("types.java"), false, 0);
+    let mut type_refs: Vec<(String, usize)> = refs
         .iter()
-        .find(|r| r.name == "lookup" && r.kind == ReferenceKind::Call)
-        .unwrap();
-    assert_eq!(lookup_ref.enclosing_symbol.as_deref(), Some("fetchUser"));
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    type_refs.sort();
+    assert_eq!(type_refs, vec![("Repo".into(), 3), ("Repo".into(), 3)]);
 }
 
 #[test]
@@ -919,6 +1028,26 @@ import java.util.Map;
     // simple name from `java.util.List`, not the full qualified path.
     assert!(imp_names.contains(&"List"), "got {:?}", imp_names);
     assert!(imp_names.contains(&"Map"), "got {:?}", imp_names);
+}
+
+#[test]
+fn test_java_inner_class_call_enclosing_uses_inner_method() {
+    let source = r#"class Outer {
+  void outer() {
+    class Inner {
+      void run() { helper(); }
+      void helper() {}
+    }
+  }
+}
+"#;
+    let (_syms, refs) = extract_file("java", source, Arc::from("inner.java"), false, 0);
+    let helper_call = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+        .unwrap();
+    assert_eq!(helper_call.line, 4);
+    assert_eq!(helper_call.enclosing_symbol.as_deref(), Some("run"));
 }
 
 // ============================================================
@@ -1791,13 +1920,53 @@ object Service {
 }
 "#;
     let (_syms, refs) = extract_file("scala", source, Arc::from("svc.scala"), false, 0);
-    let names: Vec<&str> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
-        .map(|r| r.name.as_str())
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    assert!(names.contains(&"parseConfig"), "got {:?}", names);
-    assert!(names.contains(&"buildResponse"));
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("Config".into(), 9, Some("parseConfig".into())),
+            ("Response".into(), 10, Some("buildResponse".into())),
+            ("buildResponse".into(), 6, Some("process".into())),
+            ("parseConfig".into(), 5, Some("process".into())),
+        ]
+    );
+}
+
+#[test]
+fn test_scala_type_references() {
+    let source = r#"class Config
+object Service {
+  def load(c: Config): Config = c
+}
+"#;
+    let (_syms, refs) = extract_file("scala", source, Arc::from("types.scala"), false, 0);
+    let mut type_refs: Vec<(String, usize)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    type_refs.sort();
+    assert_eq!(type_refs, vec![("Config".into(), 3), ("Config".into(), 3)]);
+}
+
+#[test]
+fn test_scala_import_references() {
+    let source = r#"import Config
+
+object Service
+"#;
+    let (_syms, refs) = extract_file("scala", source, Arc::from("imports.scala"), false, 0);
+    let import_refs: Vec<(String, usize)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    assert_eq!(import_refs, vec![("Config".into(), 1)]);
 }
 
 #[test]
@@ -2681,21 +2850,38 @@ class Loader
 end
 "#;
     let (_syms, refs) = extract_file("rb", source, Arc::from("loader.rb"), false, 0);
-    let names: Vec<&str> = refs
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Call)
-        .map(|r| r.name.as_str())
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
         .collect();
-    assert!(names.contains(&"read"), "got {:?}", names);
-    assert!(names.contains(&"parse"));
-    assert!(names.contains(&"write"));
-    assert!(names.contains(&"dump"));
+    call_refs.sort();
+    assert_eq!(
+        call_refs,
+        vec![
+            ("dump".into(), 10, Some("save".into())),
+            ("parse".into(), 6, Some("load".into())),
+            ("read".into(), 5, Some("load".into())),
+            ("write".into(), 10, Some("save".into())),
+        ]
+    );
+}
 
-    let parse_ref = refs
+#[test]
+fn test_ruby_type_references() {
+    let source = r#"class Loader
+  def load(raw)
+    JSON.parse(raw)
+  end
+end
+"#;
+    let (_syms, refs) = extract_file("rb", source, Arc::from("types.rb"), false, 0);
+    let type_refs: Vec<(String, usize)> = refs
         .iter()
-        .find(|r| r.name == "parse" && r.kind == ReferenceKind::Call)
-        .unwrap();
-    assert_eq!(parse_ref.enclosing_symbol.as_deref(), Some("load"));
+        .filter(|r| r.kind == ReferenceKind::Type)
+        .map(|r| (r.name.clone(), r.line))
+        .collect();
+    assert_eq!(type_refs, vec![("JSON".into(), 3)]);
 }
 
 #[test]
@@ -2728,17 +2914,59 @@ fn test_ruby_require_references() {
 require_relative './util'
 "#;
     let (_syms, refs) = extract_file("rb", source, Arc::from("m.rb"), false, 0);
-    let imp_names: Vec<&str> = refs
+    let mut imp_names: Vec<String> = refs
         .iter()
         .filter(|r| r.kind == ReferenceKind::Import)
-        .map(|r| r.name.as_str())
+        .map(|r| r.name.clone())
         .collect();
-    assert!(
-        imp_names.iter().any(|n| n.contains("json")),
-        "got {:?}",
-        imp_names
+    imp_names.sort();
+    assert_eq!(imp_names, vec!["./util".to_string(), "json".to_string()]);
+}
+
+#[test]
+fn test_ruby_block_call_uses_outer_method_as_enclosing() {
+    let source = r#"class Job
+  def run(items)
+    items.each do |item|
+      process(item)
+    end
+  end
+end
+"#;
+    let (_syms, refs) = extract_file("rb", source, Arc::from("job.rb"), false, 0);
+    let process_call = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "process")
+        .unwrap();
+    assert_eq!(process_call.line, 4);
+    assert_eq!(process_call.enclosing_symbol.as_deref(), Some("run"));
+}
+
+#[test]
+fn test_ruby_type_call_dedup_for_constant_call() {
+    let source = r#"def load(raw)
+  JSON(raw)
+end
+"#;
+    let (_syms, refs) = extract_file("rb", source, Arc::from("dedup.rb"), false, 0);
+    let json_calls: Vec<&ReferenceInfo> = refs
+        .iter()
+        .filter(|r| r.name == "JSON" && r.kind == ReferenceKind::Call)
+        .collect();
+    let json_types: Vec<&ReferenceInfo> = refs
+        .iter()
+        .filter(|r| r.name == "JSON" && r.kind == ReferenceKind::Type)
+        .collect();
+    assert_eq!(json_calls.len(), 1, "JSON(raw) should emit one call-ref");
+    assert_eq!(
+        json_calls[0].enclosing_symbol.as_deref(),
+        Some("load"),
+        "JSON call should be attributed to load"
     );
-    assert!(imp_names.iter().any(|n| n.contains("util")));
+    assert!(
+        json_types.is_empty(),
+        "type-ref at the same node/line must be deduplicated against call-ref"
+    );
 }
 
 #[test]

@@ -183,6 +183,8 @@ pub fn extract(
             std::collections::HashSet::new();
         let mut call_ranges: std::collections::HashSet<(usize, usize)> =
             std::collections::HashSet::new();
+        let mut call_name_lines: std::collections::HashSet<(String, usize)> =
+            std::collections::HashSet::new();
         let mut refs_capped = false;
         let source_bytes = source.as_bytes();
 
@@ -258,27 +260,28 @@ pub fn extract(
                 let enclosing =
                     resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
-                if kind == ReferenceKind::Impl {
-                    impl_ranges.insert(node_range);
-                } else if kind == ReferenceKind::Call {
-                    call_ranges.insert(node_range);
-                }
                 if max_references_per_file > 0
                     && pending_references.len() >= max_references_per_file
                 {
                     refs_capped = true;
-                } else {
-                    pending_references.push((
-                        ReferenceInfo {
-                            name: trimmed_name,
-                            kind,
-                            file_path: file_path.clone(),
-                            line,
-                            enclosing_symbol: enclosing,
-                        },
-                        node_range,
-                    ));
+                    continue;
                 }
+                if kind == ReferenceKind::Impl {
+                    impl_ranges.insert(node_range);
+                } else if kind == ReferenceKind::Call {
+                    call_ranges.insert(node_range);
+                    call_name_lines.insert((trimmed_name.clone(), line));
+                }
+                pending_references.push((
+                    ReferenceInfo {
+                        name: trimmed_name,
+                        kind,
+                        file_path: file_path.clone(),
+                        line,
+                        enclosing_symbol: enclosing,
+                    },
+                    node_range,
+                ));
             }
         }
 
@@ -295,6 +298,7 @@ pub fn extract(
             &def_name_ranges,
             &impl_ranges,
             &call_ranges,
+            &call_name_lines,
         );
         (symbols, references)
     })
@@ -303,12 +307,15 @@ pub fn extract(
 /// Post-pass filter for buffered references. Suppresses:
 /// (a) self-references at a definition's own name node,
 /// (b) Type refs that duplicate an Impl ref at the same byte range,
-/// (c) Type refs that duplicate a Call ref at the same byte range.
+/// (c) Type refs that duplicate a Call ref at the same byte range,
+/// (d) Type refs that duplicate a Call ref by name+line (covers grammars
+///     where call captures are attached to wrapper nodes, not name nodes).
 fn filter_references(
     pending: Vec<(ReferenceInfo, (usize, usize))>,
     def_name_ranges: &std::collections::HashSet<(usize, usize)>,
     impl_ranges: &std::collections::HashSet<(usize, usize)>,
     call_ranges: &std::collections::HashSet<(usize, usize)>,
+    call_name_lines: &std::collections::HashSet<(String, usize)>,
 ) -> Vec<ReferenceInfo> {
     pending
         .into_iter()
@@ -317,7 +324,9 @@ fn filter_references(
                 return None;
             }
             if reference.kind == ReferenceKind::Type
-                && (impl_ranges.contains(&node_range) || call_ranges.contains(&node_range))
+                && (impl_ranges.contains(&node_range)
+                    || call_ranges.contains(&node_range)
+                    || call_name_lines.contains(&(reference.name.clone(), reference.line)))
             {
                 return None;
             }
@@ -338,4 +347,43 @@ fn default_signature(name: &str, kind: SymbolKind) -> String {
         SymbolKind::Constant => "const",
     };
     format!("{} {}", keyword, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::{Language, Parser, Query};
+
+    #[test]
+    fn test_cap_does_not_let_dropped_call_suppress_kept_type() {
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+
+        // Intentionally capture the same call site as Type first, then Call.
+        // With cap=1, the Type ref is kept and the Call ref is dropped.
+        // Dropped refs must not influence dedup suppression.
+        let query = Query::new(
+            &language,
+            "(call_expression function: (identifier) @name) @reference.type
+             (call_expression function: (identifier) @name) @reference.call",
+        )
+        .unwrap();
+
+        let hooks = crate::symbols::hooks::javascript::hooks();
+        let (_symbols, refs) = extract(
+            &mut parser,
+            &query,
+            "foo();",
+            Arc::from("cap.js"),
+            &hooks,
+            false,
+            1,
+        );
+
+        assert_eq!(refs.len(), 1, "one ref should remain under cap=1");
+        assert_eq!(refs[0].name, "foo");
+        assert_eq!(refs[0].line, 1);
+        assert_eq!(refs[0].kind, ReferenceKind::Type);
+    }
 }

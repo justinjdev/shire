@@ -126,12 +126,24 @@ pub fn find_ancestor<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
 /// (or its first `identifier`/`type_identifier` child) as the enclosing symbol
 /// name. Returns None if no qualifying named ancestor is found.
 pub fn resolve_enclosing_symbol(node: &Node, source: &str, ancestors: &[&str]) -> Option<String> {
+    fn is_anonymous_callable_kind(kind: &str) -> bool {
+        matches!(
+            kind,
+            "arrow_function" | "function_expression" | "lambda" | "lambda_expression"
+        )
+    }
+
     let mut current = node.parent();
     while let Some(n) = current {
         if ancestors.contains(&n.kind()) {
             // Try the `name` field first (most grammars)
             if let Some(name) = field_text(&n, "name", source) {
                 return Some(name.to_string());
+            }
+            // Anonymous callable scopes should still be attributable, but they
+            // don't have a stable identifier node to read as a name.
+            if is_anonymous_callable_kind(n.kind()) {
+                return Some("<anonymous>".to_string());
             }
             // Fall back to scanning direct children for an identifier-like node
             for i in 0..n.child_count() {

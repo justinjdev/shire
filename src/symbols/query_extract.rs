@@ -183,6 +183,8 @@ pub fn extract(
             std::collections::HashSet::new();
         let mut call_ranges: std::collections::HashSet<(usize, usize)> =
             std::collections::HashSet::new();
+        let mut call_name_lines: std::collections::HashSet<(String, usize)> =
+            std::collections::HashSet::new();
         let mut refs_capped = false;
         let source_bytes = source.as_bytes();
 
@@ -262,6 +264,7 @@ pub fn extract(
                     impl_ranges.insert(node_range);
                 } else if kind == ReferenceKind::Call {
                     call_ranges.insert(node_range);
+                    call_name_lines.insert((trimmed_name.clone(), line));
                 }
                 if max_references_per_file > 0
                     && pending_references.len() >= max_references_per_file
@@ -295,6 +298,7 @@ pub fn extract(
             &def_name_ranges,
             &impl_ranges,
             &call_ranges,
+            &call_name_lines,
         );
         (symbols, references)
     })
@@ -303,12 +307,15 @@ pub fn extract(
 /// Post-pass filter for buffered references. Suppresses:
 /// (a) self-references at a definition's own name node,
 /// (b) Type refs that duplicate an Impl ref at the same byte range,
-/// (c) Type refs that duplicate a Call ref at the same byte range.
+/// (c) Type refs that duplicate a Call ref at the same byte range,
+/// (d) Type refs that duplicate a Call ref by name+line (covers grammars
+///     where call captures are attached to wrapper nodes, not name nodes).
 fn filter_references(
     pending: Vec<(ReferenceInfo, (usize, usize))>,
     def_name_ranges: &std::collections::HashSet<(usize, usize)>,
     impl_ranges: &std::collections::HashSet<(usize, usize)>,
     call_ranges: &std::collections::HashSet<(usize, usize)>,
+    call_name_lines: &std::collections::HashSet<(String, usize)>,
 ) -> Vec<ReferenceInfo> {
     pending
         .into_iter()
@@ -317,7 +324,9 @@ fn filter_references(
                 return None;
             }
             if reference.kind == ReferenceKind::Type
-                && (impl_ranges.contains(&node_range) || call_ranges.contains(&node_range))
+                && (impl_ranges.contains(&node_range)
+                    || call_ranges.contains(&node_range)
+                    || call_name_lines.contains(&(reference.name.clone(), reference.line)))
             {
                 return None;
             }

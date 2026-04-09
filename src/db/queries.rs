@@ -2298,6 +2298,33 @@ mod refs_tests {
     }
 
     #[test]
+    fn test_delete_references_for_file_unknown_path_is_noop() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("t_unknown.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        let mut file_ids = seed_files(&conn, &["known.rs"]);
+
+        let refs = vec![ReferenceInfo {
+            name: "foo".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from("known.rs"),
+            line: 10,
+            enclosing_symbol: Some("main".into()),
+        }];
+        batch_insert_references(&conn, Some("pkg"), &refs, &mut file_ids).unwrap();
+
+        delete_references_for_file(&conn, "missing.rs").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "deleting refs for an unknown path should be a no-op"
+        );
+    }
+
+    #[test]
     fn test_delete_references_for_package() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t2.db");
@@ -2397,6 +2424,88 @@ mod refs_tests {
     }
 
     #[test]
+    fn test_query_symbol_references_returns_rows_without_symbol_definition() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("r_unknown_symbol.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["ext.rs"]);
+        let ext = ids["ext.rs"];
+
+        // No row in `symbols` for "ExternalThing" on purpose. `symbol_references`
+        // is name-based over symbol_refs and should still return this row.
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('ExternalThing', 'call', {ext}, 7, 'pkg-ext', 'main')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let rows =
+            query_symbol_references(&conn, "ExternalThing", Some("call"), Some("pkg-ext"), 10)
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "ExternalThing");
+        assert_eq!(rows[0].kind, "call");
+        assert_eq!(rows[0].file_path, "ext.rs");
+        assert_eq!(rows[0].line, 7);
+        assert_eq!(rows[0].package.as_deref(), Some("pkg-ext"));
+        assert_eq!(rows[0].enclosing_symbol.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn test_query_symbol_references_unicode_round_trip_nfc_and_nfd() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("r_unicode.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["unicode.rs"]);
+        let file_id = ids["unicode.rs"];
+
+        let nfc = "Café";
+        let nfd = "Cafe\u{301}";
+        assert_ne!(
+            nfc, nfd,
+            "test requires distinct byte sequences for NFC/NFD forms"
+        );
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('Config', 'type', {file_id}, 10, 'pkg-u', NULL), \
+                        (?1,      'type', {file_id}, 11, 'pkg-u', NULL), \
+                        (?2,      'type', {file_id}, 12, 'pkg-u', NULL), \
+                        ('Ω',     'type', {file_id}, 13, 'pkg-u', NULL)"
+            ),
+            (nfc, nfd),
+        )
+        .unwrap();
+
+        let config =
+            query_symbol_references(&conn, "Config", Some("type"), Some("pkg-u"), 10).unwrap();
+        assert_eq!(config.len(), 1);
+        assert_eq!(config[0].name, "Config");
+        assert_eq!(config[0].line, 10);
+
+        let nfc_rows =
+            query_symbol_references(&conn, nfc, Some("type"), Some("pkg-u"), 10).unwrap();
+        assert_eq!(nfc_rows.len(), 1);
+        assert_eq!(nfc_rows[0].name, nfc);
+        assert_eq!(nfc_rows[0].line, 11);
+
+        let nfd_rows =
+            query_symbol_references(&conn, nfd, Some("type"), Some("pkg-u"), 10).unwrap();
+        assert_eq!(nfd_rows.len(), 1);
+        assert_eq!(nfd_rows[0].name, nfd);
+        assert_eq!(nfd_rows[0].line, 12);
+
+        let omega = query_symbol_references(&conn, "Ω", Some("type"), Some("pkg-u"), 10).unwrap();
+        assert_eq!(omega.len(), 1);
+        assert_eq!(omega[0].name, "Ω");
+        assert_eq!(omega[0].line, 13);
+    }
+
+    #[test]
     fn test_query_symbol_callers_groups_and_counts() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("c.db");
@@ -2413,7 +2522,9 @@ mod refs_tests {
                         ('foo', 'call', {a}, 11, 'p', 'bar'), \
                         ('foo', 'call', {b}, 5, 'p', 'quux'), \
                         ('foo', 'type', {a}, 20, 'p', 'bar'), \
-                        ('foo', 'call', {c}, 1, 'p', NULL)"
+                        ('foo', 'call', {c}, 1, 'p', NULL), \
+                        ('foo', 'call', {c}, 2, 'p', NULL), \
+                        ('foo', 'call', {c}, 3, 'p', NULL)"
             ),
             [],
         )
@@ -2430,6 +2541,15 @@ mod refs_tests {
         assert_eq!(p_only.len(), 2);
         let none = query_symbol_callers(&conn, "foo", Some("other"), 100).unwrap();
         assert!(none.is_empty());
+
+        // Proves `r.enclosing_symbol IS NOT NULL` stays in the SQL.
+        // If the filter were removed, the NULL group has the highest call-site
+        // count (3) and would sort first; with `LIMIT 1` that top row would be
+        // deserialization-dropped and we'd lose the real caller row.
+        let top = query_symbol_callers(&conn, "foo", None, 1).unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].caller_name, "bar");
+        assert_eq!(top[0].call_sites, 2);
     }
 
     #[test]

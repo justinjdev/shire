@@ -2364,7 +2364,7 @@ fn test_references_incremental_rebuild() {
     fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
     fs::write(
         root.join("svc/a.go"),
-        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+        "package svc\n\nfunc A(){ B() }\nfunc B() {}\n",
     )
     .unwrap();
 
@@ -2426,6 +2426,169 @@ fn test_references_incremental_rebuild() {
     assert_eq!(
         count_b_after, 0,
         "call-ref to B should be removed after file modification"
+    );
+}
+
+fn run_build_for_root(bin: &Path, root: &Path) {
+    let output = Command::new(bin)
+        .args(["build", "--root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn count_b_call_refs(root: &Path, path: Option<&str>, package: Option<&str>) -> i64 {
+    let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+    match (path, package) {
+        (Some(path), Some(package)) => conn
+            .query_row(
+                "SELECT COUNT(*) \
+                 FROM symbol_refs r \
+                 JOIN files f ON f.id = r.file_id \
+                 WHERE r.name = 'B' AND r.kind = 'call' \
+                   AND f.path = ?1 AND r.package = ?2",
+                [path, package],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        (Some(path), None) => conn
+            .query_row(
+                "SELECT COUNT(*) \
+                 FROM symbol_refs r \
+                 JOIN files f ON f.id = r.file_id \
+                 WHERE r.name = 'B' AND r.kind = 'call' AND f.path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        (None, Some(package)) => conn
+            .query_row(
+                "SELECT COUNT(*) \
+                 FROM symbol_refs \
+                 WHERE name = 'B' AND kind = 'call' AND package = ?1",
+                [package],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        (None, None) => conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_refs WHERE name = 'B' AND kind = 'call'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+    }
+}
+
+#[test]
+fn test_references_incremental_rebuild_deleted_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let bin = cargo_bin();
+
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    run_build_for_root(&bin, root);
+    assert_eq!(count_b_call_refs(root, Some("svc/a.go"), Some("svc")), 1);
+
+    fs::remove_file(root.join("svc/a.go")).unwrap();
+    run_build_for_root(&bin, root);
+    assert_eq!(
+        count_b_call_refs(root, None, None),
+        0,
+        "call-ref should disappear when the source file is deleted"
+    );
+}
+
+#[test]
+fn test_references_incremental_rebuild_renamed_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let bin = cargo_bin();
+
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    run_build_for_root(&bin, root);
+    assert_eq!(count_b_call_refs(root, Some("svc/a.go"), Some("svc")), 1);
+
+    fs::rename(root.join("svc/a.go"), root.join("svc/renamed.go")).unwrap();
+    // Ensure the moved path is observed as changed by mtime pre-check logic.
+    fs::write(
+        root.join("svc/renamed.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+    run_build_for_root(&bin, root);
+    assert_eq!(count_b_call_refs(root, Some("svc/a.go"), None), 0);
+    assert_eq!(count_b_call_refs(root, Some("svc/renamed.go"), None), 1);
+}
+
+#[test]
+fn test_references_incremental_rebuild_file_moves_between_packages() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let bin = cargo_bin();
+
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module svc\n\ngo 1.22\n").unwrap();
+    fs::write(root.join("other/go.mod"), "module other\n\ngo 1.22\n").unwrap();
+    fs::write(
+        root.join("svc/a.go"),
+        "package svc\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+
+    run_build_for_root(&bin, root);
+    assert_eq!(count_b_call_refs(root, Some("svc/a.go"), Some("svc")), 1);
+
+    fs::rename(root.join("svc/a.go"), root.join("other/renamed.go")).unwrap();
+    fs::write(
+        root.join("other/renamed.go"),
+        "package other\n\nfunc A() { B() }\nfunc B() {}\n",
+    )
+    .unwrap();
+    run_build_for_root(&bin, root);
+    assert_eq!(count_b_call_refs(root, Some("svc/a.go"), None), 0);
+    assert_eq!(
+        count_b_call_refs(root, Some("other/renamed.go"), Some("other")),
+        1
+    );
+    assert_eq!(
+        count_b_call_refs(root, None, Some("svc")),
+        0,
+        "moved refs should no longer be attributed to the old package"
     );
 }
 

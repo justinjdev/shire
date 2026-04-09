@@ -260,28 +260,28 @@ pub fn extract(
                 let enclosing =
                     resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
+                if max_references_per_file > 0
+                    && pending_references.len() >= max_references_per_file
+                {
+                    refs_capped = true;
+                    continue;
+                }
                 if kind == ReferenceKind::Impl {
                     impl_ranges.insert(node_range);
                 } else if kind == ReferenceKind::Call {
                     call_ranges.insert(node_range);
                     call_name_lines.insert((trimmed_name.clone(), line));
                 }
-                if max_references_per_file > 0
-                    && pending_references.len() >= max_references_per_file
-                {
-                    refs_capped = true;
-                } else {
-                    pending_references.push((
-                        ReferenceInfo {
-                            name: trimmed_name,
-                            kind,
-                            file_path: file_path.clone(),
-                            line,
-                            enclosing_symbol: enclosing,
-                        },
-                        node_range,
-                    ));
-                }
+                pending_references.push((
+                    ReferenceInfo {
+                        name: trimmed_name,
+                        kind,
+                        file_path: file_path.clone(),
+                        line,
+                        enclosing_symbol: enclosing,
+                    },
+                    node_range,
+                ));
             }
         }
 
@@ -347,4 +347,43 @@ fn default_signature(name: &str, kind: SymbolKind) -> String {
         SymbolKind::Constant => "const",
     };
     format!("{} {}", keyword, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::{Language, Parser, Query};
+
+    #[test]
+    fn test_cap_does_not_let_dropped_call_suppress_kept_type() {
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+
+        // Intentionally capture the same call site as Type first, then Call.
+        // With cap=1, the Type ref is kept and the Call ref is dropped.
+        // Dropped refs must not influence dedup suppression.
+        let query = Query::new(
+            &language,
+            "(call_expression function: (identifier) @name) @reference.type
+             (call_expression function: (identifier) @name) @reference.call",
+        )
+        .unwrap();
+
+        let hooks = crate::symbols::hooks::javascript::hooks();
+        let (_symbols, refs) = extract(
+            &mut parser,
+            &query,
+            "foo();",
+            Arc::from("cap.js"),
+            &hooks,
+            false,
+            1,
+        );
+
+        assert_eq!(refs.len(), 1, "one ref should remain under cap=1");
+        assert_eq!(refs[0].name, "foo");
+        assert_eq!(refs[0].line, 1);
+        assert_eq!(refs[0].kind, ReferenceKind::Type);
+    }
 }

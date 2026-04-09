@@ -2220,6 +2220,18 @@ fn refs_transition_requires_rehash(
     refs_just_enabled && !is_full_build && !force
 }
 
+/// True when we should run the expensive orphan sweep:
+/// - always for force builds,
+/// - when manifests/packages were removed,
+/// - when file rows were deleted in incremental file indexing.
+fn needs_integrity_validation(
+    force: bool,
+    removed_manifests: usize,
+    deleted_file_rows: usize,
+) -> bool {
+    force || removed_manifests > 0 || deleted_file_rows > 0
+}
+
 /// Check if the DB has been populated (has manifest hashes).
 fn is_fresh_db(conn: &Connection) -> bool {
     let count: i64 = conn
@@ -2585,7 +2597,7 @@ fn build_index_inner(
     let file_index = with_transaction(&conn, || phase_index_files(&conn, repo_root, config))?;
     let num_files = file_index.num_files;
     let needs_integrity_validation =
-        force || !diff.removed.is_empty() || file_index.deleted_file_rows > 0;
+        needs_integrity_validation(force, diff.removed.len(), file_index.deleted_file_rows);
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
 
@@ -3145,6 +3157,26 @@ mod tests {
         assert!(!refs_transition_requires_rehash(false, false, false));
         assert!(!refs_transition_requires_rehash(false, true, false));
         assert!(!refs_transition_requires_rehash(false, false, true));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_when_force() {
+        assert!(needs_integrity_validation(true, 0, 0));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_when_removed_manifests() {
+        assert!(needs_integrity_validation(false, 1, 0));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_when_deleted_file_rows() {
+        assert!(needs_integrity_validation(false, 0, 1));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_skips_when_no_orphan_signals() {
+        assert!(!needs_integrity_validation(false, 0, 0));
     }
 
     /// Regression test: `upsert_symbols_and_refs_for_file` must not

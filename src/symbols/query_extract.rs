@@ -223,7 +223,7 @@ pub fn extract(
             // Definition path
             if let (Some(kind), Some(node)) = (def_kind, def_node) {
                 if let Some(sym) = emit_definition(
-                    &name,
+                    name,
                     kind,
                     &node,
                     &name_capture.unwrap().node,

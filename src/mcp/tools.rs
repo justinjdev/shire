@@ -54,7 +54,7 @@ impl ShireService {
                         }
                         Err(err) => {
                             tracing::warn!(%err,
-                                "RAG enabled but symbol_embeddings table not accessible — \
+                                "RAG enabled but file_embeddings table not accessible — \
                                  run `shire build` with [rag] enabled to generate embeddings");
                             None
                         }

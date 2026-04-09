@@ -71,52 +71,69 @@ pub fn search_symbols(
 
     // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
     // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
-    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, kind_filter) {
-        (Some(pkg), Some(kind)) => {
-            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
-            (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        match (package_filter, kind_filter) {
+            (Some(pkg), Some(kind)) => {
+                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                (
+                    "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
              ORDER BY rank
              LIMIT ?3",
-            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
-        )},
-        (Some(pkg), None) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    vec![
+                        Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(pkg.to_string()),
+                        Box::new(limit),
+                    ],
+                )
+            }
+            (Some(pkg), None) => (
+                "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
              ORDER BY rank
              LIMIT ?3",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
-        ),
-        (None, Some(kind)) => {
-            let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
-            (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(pkg.to_string()),
+                    Box::new(limit),
+                ],
+            ),
+            (None, Some(kind)) => {
+                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                (
+                    "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
              ORDER BY rank
              LIMIT ?2",
-            vec![Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
-        )},
-        (None, None) => (
-            "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                    vec![
+                        Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
+                        Box::new(limit),
+                    ],
+                )
+            }
+            (None, None) => (
+                "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
              ORDER BY rank
              LIMIT ?2",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
-        ),
-    };
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+        };
 
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -247,8 +264,10 @@ pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, Sy
          WHERE id IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> =
-        ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -286,7 +305,12 @@ pub fn rrf_merge(
 
     type SymKey = (String, String, String, i64);
     fn sym_key(s: &SymbolRow) -> SymKey {
-        (s.name.clone(), s.package.clone(), s.file_path.clone(), s.line)
+        (
+            s.name.clone(),
+            s.package.clone(),
+            s.file_path.clone(),
+            s.line,
+        )
     }
 
     let k = 60.0_f64;
@@ -337,44 +361,61 @@ pub fn search_files(
 
     let limit = 20i64;
 
-    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match (package_filter, extension_filter) {
-        (Some(pkg), Some(ext)) => (
-            "SELECT f.path, f.package, f.extension, f.size_bytes
+    let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        match (package_filter, extension_filter) {
+            (Some(pkg), Some(ext)) => (
+                "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2 AND f.extension = ?3
              ORDER BY rank
              LIMIT ?4",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(ext.to_string()), Box::new(limit)],
-        ),
-        (Some(pkg), None) => (
-            "SELECT f.path, f.package, f.extension, f.size_bytes
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(pkg.to_string()),
+                    Box::new(ext.to_string()),
+                    Box::new(limit),
+                ],
+            ),
+            (Some(pkg), None) => (
+                "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.package = ?2
              ORDER BY rank
              LIMIT ?3",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(pkg.to_string()), Box::new(limit)],
-        ),
-        (None, Some(ext)) => (
-            "SELECT f.path, f.package, f.extension, f.size_bytes
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(pkg.to_string()),
+                    Box::new(limit),
+                ],
+            ),
+            (None, Some(ext)) => (
+                "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1 AND f.extension = ?2
              ORDER BY rank
              LIMIT ?3",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(ext.to_string()), Box::new(limit)],
-        ),
-        (None, None) => (
-            "SELECT f.path, f.package, f.extension, f.size_bytes
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(ext.to_string()),
+                    Box::new(limit),
+                ],
+            ),
+            (None, None) => (
+                "SELECT f.path, f.package, f.extension, f.size_bytes
              FROM files_fts fts
              JOIN files f ON f.rowid = fts.rowid
              WHERE files_fts MATCH ?1
              ORDER BY rank
              LIMIT ?2",
-            vec![Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
-        ),
-    };
+                vec![
+                    Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+        };
 
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -664,7 +705,8 @@ pub fn reverse_dependency_graph(
 ) -> Result<Vec<GraphEdge>> {
     const MAX_EDGES: usize = 10_000;
 
-    let sql = "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1";
+    let sql =
+        "SELECT package, dep_kind FROM dependencies WHERE dependency = ?1 AND is_internal = 1";
 
     let mut edges = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -777,19 +819,14 @@ use std::collections::HashMap;
 
 /// Build a `file_path → files.id` lookup map from the `files` table. Callers
 /// pass this to `batch_insert_references` so references can be inserted with
-/// their compact `file_id` instead of repeated path strings. Built once per
-/// extraction phase and reused across packages.
+/// their compact `file_id` instead of repeated path strings.
+///
+/// This is intentionally lazy: we start empty and resolve/cache IDs on demand
+/// in `batch_insert_references`. Preloading the full `files` table can spike
+/// memory on large repos with hundreds of thousands of file rows.
 pub fn build_file_id_map(conn: &Connection) -> Result<HashMap<String, i64>> {
-    let mut stmt = conn.prepare("SELECT path, id FROM files")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (path, id) = row?;
-        map.insert(path, id);
-    }
-    Ok(map)
+    let _ = conn;
+    Ok(HashMap::new())
 }
 
 /// Insert a batch of `ReferenceInfo` rows into `symbol_refs`.
@@ -834,33 +871,37 @@ pub fn batch_insert_references(
     // WARN so operators can audit and the two walkers can be brought into
     // alignment.
     let mut resolved: Vec<(&ReferenceInfo, i64)> = Vec::with_capacity(refs.len());
+    let mut lookup_stmt = conn.prepare_cached("SELECT id FROM files WHERE path = ?1")?;
     for r in refs {
         let path = r.file_path.as_ref();
         let id = match file_ids.get(path) {
             Some(&id) => id,
-            None => {
-                let ext = path
-                    .rsplit_once('.')
-                    .map(|(_, e)| e.to_lowercase())
-                    .unwrap_or_default();
-                tracing::warn!(
-                    path,
-                    package,
-                    "batch_insert_references: file_id missing, synthesizing files row \
-                     (file walker and symbol extractor are not aligned for this path)"
-                );
-                conn.execute(
-                    "INSERT OR IGNORE INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, ?2, 0)",
-                    rusqlite::params![path, ext],
-                )?;
-                let id: i64 = conn.query_row(
-                    "SELECT id FROM files WHERE path = ?1",
-                    [path],
-                    |row| row.get(0),
-                )?;
-                file_ids.insert(path.to_string(), id);
-                id
-            }
+            None => match lookup_stmt.query_row([path], |row| row.get::<_, i64>(0)) {
+                Ok(id) => {
+                    file_ids.insert(path.to_string(), id);
+                    id
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    let ext = path
+                        .rsplit_once('.')
+                        .map(|(_, e)| e.to_lowercase())
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        path,
+                        package,
+                        "batch_insert_references: file_id missing, synthesizing files row \
+                             (file walker and symbol extractor are not aligned for this path)"
+                    );
+                    conn.execute(
+                            "INSERT OR IGNORE INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, ?2, 0)",
+                            rusqlite::params![path, ext],
+                        )?;
+                    let id = lookup_stmt.query_row([path], |row| row.get::<_, i64>(0))?;
+                    file_ids.insert(path.to_string(), id);
+                    id
+                }
+                Err(e) => return Err(e.into()),
+            },
         };
         resolved.push((r, id));
     }
@@ -954,12 +995,10 @@ pub fn delete_references_for_file(conn: &Connection, file_path: &str) -> Result<
 }
 
 /// Delete all rows in `symbol_refs` for a given package. Used during
-/// package-level rebuilds. Relies on the `idx_refs_package` index.
+/// package-level rebuilds. Relies on the `(package, name)` leading-column
+/// index (`idx_refs_package_name`).
 pub fn delete_references_for_package(conn: &Connection, package: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM symbol_refs WHERE package = ?1",
-        [package],
-    )?;
+    conn.execute("DELETE FROM symbol_refs WHERE package = ?1", [package])?;
     Ok(())
 }
 
@@ -979,7 +1018,9 @@ pub struct ReferenceRow {
 /// failures at debug level rather than silently dropping them. Schema
 /// mismatches or malformed rows would otherwise disappear behind
 /// `filter_map(Result::ok)` and surface only as mysterious empty results.
-fn collect_rows<T>(rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>) -> Vec<T> {
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> Vec<T> {
     let mut out = Vec::new();
     for row in rows {
         match row {
@@ -1011,7 +1052,11 @@ impl RefQueryBuilder {
         self.params.push(Box::new(value.to_string()));
     }
 
-    fn build_with_order_and_limit(mut self, order_by: &str, limit: i64) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    fn build_with_order_and_limit(
+        mut self,
+        order_by: &str,
+        limit: i64,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         self.sql.push_str(&format!(" {order_by} LIMIT ?"));
         self.params.push(Box::new(limit));
         (self.sql, self.params)
@@ -1067,19 +1112,29 @@ pub fn query_symbol_callers(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
-    let mut qb = RefQueryBuilder::new(
-        "SELECT r.enclosing_symbol, f.path, MIN(r.line), r.package, COUNT(*) \
-         FROM symbol_refs r JOIN files f ON f.id = r.file_id \
-         WHERE r.name = ? AND r.kind = 'call' AND r.enclosing_symbol IS NOT NULL",
-        name,
+    // Aggregate over `symbol_refs` first (grouping by `file_id`, not joined
+    // path text), then join to `files` for display fields.
+    let mut sql = String::from(
+        "SELECT g.enclosing_symbol, f.path, g.first_line, g.package, g.call_sites \
+         FROM ( \
+             SELECT r.enclosing_symbol, r.file_id, MIN(r.line) AS first_line, r.package, COUNT(*) AS call_sites \
+             FROM symbol_refs r \
+             WHERE r.name = ? AND r.kind = 'call' AND r.enclosing_symbol IS NOT NULL",
     );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
     if let Some(p) = package {
-        qb.filter("r.package", p);
+        sql.push_str(" AND r.package = ?");
+        params.push(Box::new(p.to_string()));
     }
-    let (sql, params) = qb.build_with_order_and_limit(
-        "GROUP BY r.enclosing_symbol, f.path, r.package ORDER BY 5 DESC, 1 ASC",
-        limit,
+    sql.push_str(
+        " GROUP BY r.enclosing_symbol, r.file_id, r.package \
+         ) AS g \
+         JOIN files f ON f.id = g.file_id \
+         ORDER BY g.call_sites DESC, g.enclosing_symbol ASC \
+         LIMIT ?",
     );
+    params.push(Box::new(limit));
+
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -1108,19 +1163,29 @@ pub fn query_symbol_callees(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<CalleeRow>> {
-    let mut qb = RefQueryBuilder::new(
-        "SELECT r.name, f.path, MIN(r.line), COUNT(*) \
-         FROM symbol_refs r JOIN files f ON f.id = r.file_id \
-         WHERE r.enclosing_symbol = ? AND r.kind = 'call'",
-        enclosing,
+    // Same shape as callers: aggregate within `symbol_refs` using `file_id`
+    // so grouping/sorting can ride ref-table indexes before joining `files`.
+    let mut sql = String::from(
+        "SELECT g.name, f.path, g.first_line, g.call_sites \
+         FROM ( \
+             SELECT r.name, r.file_id, MIN(r.line) AS first_line, COUNT(*) AS call_sites \
+             FROM symbol_refs r \
+             WHERE r.enclosing_symbol = ? AND r.kind = 'call'",
     );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
     if let Some(p) = package {
-        qb.filter("r.package", p);
+        sql.push_str(" AND r.package = ?");
+        params.push(Box::new(p.to_string()));
     }
-    let (sql, params) = qb.build_with_order_and_limit(
-        "GROUP BY r.name, f.path ORDER BY 4 DESC, 1 ASC",
-        limit,
+    sql.push_str(
+        " GROUP BY r.name, r.file_id \
+         ) AS g \
+         JOIN files f ON f.id = g.file_id \
+         ORDER BY g.call_sites DESC, g.name ASC \
+         LIMIT ?",
     );
+    params.push(Box::new(limit));
+
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -1182,9 +1247,8 @@ pub struct ChangeImpact {
 /// cross-package. Picks the first match when multiple same-name symbols exist
 /// across packages (callers can disambiguate by passing `package` explicitly).
 fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1",
-    )?;
+    let mut stmt = conn
+        .prepare_cached("SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1")?;
     let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
@@ -1433,15 +1497,18 @@ mod tests {
         conn.execute(
             "INSERT INTO shire_meta (key, value) VALUES (?1, ?2)",
             ("indexed_at", "2026-02-25T10:00:00Z"),
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO shire_meta (key, value) VALUES (?1, ?2)",
             ("git_commit", "abc123"),
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO shire_meta (key, value) VALUES (?1, ?2)",
             ("package_count", "3"),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1684,16 +1751,19 @@ mod tests {
     fn test_search_symbols_filter_by_package_and_kind() {
         let conn = test_db_with_symbols();
         // Combined filter: package + kind
-        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("method"), 20).unwrap();
+        let results =
+            search_symbols(&conn, "validate", Some("auth-service"), Some("method"), 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
 
         // Wrong package
-        let results = search_symbols(&conn, "validate", Some("nonexistent"), Some("method"), 20).unwrap();
+        let results =
+            search_symbols(&conn, "validate", Some("nonexistent"), Some("method"), 20).unwrap();
         assert!(results.is_empty());
 
         // Wrong kind
-        let results = search_symbols(&conn, "validate", Some("auth-service"), Some("class"), 20).unwrap();
+        let results =
+            search_symbols(&conn, "validate", Some("auth-service"), Some("class"), 20).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1725,12 +1795,37 @@ mod tests {
 
     fn seed_file_data(conn: &Connection) {
         let files = vec![
-            ("services/auth/src/auth.ts", Some("auth-service"), "ts", 1024i64),
-            ("services/auth/src/middleware.ts", Some("auth-service"), "ts", 512),
-            ("services/auth/package.json", Some("auth-service"), "json", 256),
-            ("packages/shared-types/src/types.ts", Some("shared-types"), "ts", 2048),
+            (
+                "services/auth/src/auth.ts",
+                Some("auth-service"),
+                "ts",
+                1024i64,
+            ),
+            (
+                "services/auth/src/middleware.ts",
+                Some("auth-service"),
+                "ts",
+                512,
+            ),
+            (
+                "services/auth/package.json",
+                Some("auth-service"),
+                "json",
+                256,
+            ),
+            (
+                "packages/shared-types/src/types.ts",
+                Some("shared-types"),
+                "ts",
+                2048,
+            ),
             ("services/gateway/main.go", Some("api-gateway"), "go", 4096),
-            ("services/gateway/handler.go", Some("api-gateway"), "go", 3072),
+            (
+                "services/gateway/handler.go",
+                Some("api-gateway"),
+                "go",
+                3072,
+            ),
             ("scripts/deploy.sh", None, "sh", 128),
             ("README.md", None, "md", 64),
         ];
@@ -1738,7 +1833,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, ?2, ?3, ?4)",
                 (path, package, ext, size),
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
 
@@ -1767,7 +1863,11 @@ mod tests {
     fn test_search_files_filter_by_package() {
         let conn = test_db_with_files();
         let results = search_files(&conn, "ts", Some("auth-service"), None).unwrap();
-        assert!(results.iter().all(|f| f.package.as_deref() == Some("auth-service")));
+        assert!(
+            results
+                .iter()
+                .all(|f| f.package.as_deref() == Some("auth-service"))
+        );
     }
 
     #[test]
@@ -1781,7 +1881,11 @@ mod tests {
     fn test_search_files_combined_filters() {
         let conn = test_db_with_files();
         let results = search_files(&conn, "auth", Some("auth-service"), Some("ts")).unwrap();
-        assert!(results.iter().all(|f| f.package.as_deref() == Some("auth-service") && f.extension == "ts"));
+        assert!(
+            results
+                .iter()
+                .all(|f| f.package.as_deref() == Some("auth-service") && f.extension == "ts")
+        );
         assert!(!results.is_empty());
     }
 
@@ -1857,14 +1961,14 @@ mod tests {
     #[test]
     fn test_rrf_merge_overlapping_results() {
         let fts = vec![
-            make_symbol("alpha", "pkg-a", 10),   // rank 0 in FTS
-            make_symbol("beta", "pkg-a", 20),    // rank 1 in FTS
-            make_symbol("gamma", "pkg-b", 30),   // rank 2 in FTS
+            make_symbol("alpha", "pkg-a", 10), // rank 0 in FTS
+            make_symbol("beta", "pkg-a", 20),  // rank 1 in FTS
+            make_symbol("gamma", "pkg-b", 30), // rank 2 in FTS
         ];
         let vec = vec![
-            make_symbol("beta", "pkg-a", 20),    // rank 0 in vec (also in FTS)
-            make_symbol("delta", "pkg-b", 40),   // rank 1 in vec
-            make_symbol("alpha", "pkg-a", 10),   // rank 2 in vec (also in FTS)
+            make_symbol("beta", "pkg-a", 20),  // rank 0 in vec (also in FTS)
+            make_symbol("delta", "pkg-b", 40), // rank 1 in vec
+            make_symbol("alpha", "pkg-a", 10), // rank 2 in vec (also in FTS)
         ];
 
         let merged = rrf_merge(&fts, &vec, 50);
@@ -1874,7 +1978,7 @@ mod tests {
         // alpha appears in both → second highest
         // Overlapping results should rank higher than single-source
         let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names[0], "beta");  // rank 0 in vec + rank 1 in FTS
+        assert_eq!(names[0], "beta"); // rank 0 in vec + rank 1 in FTS
         assert_eq!(names[1], "alpha"); // rank 0 in FTS + rank 2 in vec
         // gamma and delta are single-source, order depends on rank
     }
@@ -1909,10 +2013,7 @@ mod tests {
             make_symbol("b", "pkg", 2),
             make_symbol("c", "pkg", 3),
         ];
-        let vec = vec![
-            make_symbol("d", "pkg", 4),
-            make_symbol("e", "pkg", 5),
-        ];
+        let vec = vec![make_symbol("d", "pkg", 4), make_symbol("e", "pkg", 5)];
 
         let merged = rrf_merge(&fts, &vec, 3);
         assert_eq!(merged.len(), 3);
@@ -2003,12 +2104,26 @@ mod tests {
         let conn = test_db();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("docs/auth.md", Some("auth-service"), "Authentication Guide", "How to configure authentication and set up OAuth providers", 55),
-        ).unwrap();
+            (
+                "docs/auth.md",
+                Some("auth-service"),
+                "Authentication Guide",
+                "How to configure authentication and set up OAuth providers",
+                55,
+            ),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("README.md", Option::<String>::None, "Project Overview", "Welcome to the monorepo project documentation", 48),
-        ).unwrap();
+            (
+                "README.md",
+                Option::<String>::None,
+                "Project Overview",
+                "Welcome to the monorepo project documentation",
+                48,
+            ),
+        )
+        .unwrap();
 
         let results = search_docs(&conn, "authentication", None, 20).unwrap();
         assert_eq!(results.len(), 1);
@@ -2022,12 +2137,26 @@ mod tests {
         let conn = test_db();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("docs/auth.md", Some("auth-service"), "Auth Setup", "How to configure authentication", 30),
-        ).unwrap();
+            (
+                "docs/auth.md",
+                Some("auth-service"),
+                "Auth Setup",
+                "How to configure authentication",
+                30,
+            ),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("docs/gateway.md", Some("api-gateway"), "Gateway Setup", "How to configure the gateway authentication proxy", 50),
-        ).unwrap();
+            (
+                "docs/gateway.md",
+                Some("api-gateway"),
+                "Gateway Setup",
+                "How to configure the gateway authentication proxy",
+                50,
+            ),
+        )
+        .unwrap();
 
         let results = search_docs(&conn, "configure", Some("auth-service"), 20).unwrap();
         assert_eq!(results.len(), 1);
@@ -2046,8 +2175,15 @@ mod tests {
         let conn = test_db();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("docs/oauth.md", Some("auth-service"), "OAuth Setup", r#"Configure "OAuth" providers with client_id and client_secret"#, 60),
-        ).unwrap();
+            (
+                "docs/oauth.md",
+                Some("auth-service"),
+                "OAuth Setup",
+                r#"Configure "OAuth" providers with client_id and client_secret"#,
+                60,
+            ),
+        )
+        .unwrap();
 
         // Query with double quotes should not cause FTS5 syntax error
         let results = search_docs(&conn, r#"configure "OAuth""#, None, 20).unwrap();
@@ -2074,8 +2210,15 @@ mod tests {
         let conn = test_db();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("README.md", Option::<String>::None, "Project Overview", "Welcome to the project documentation", 36),
-        ).unwrap();
+            (
+                "README.md",
+                Option::<String>::None,
+                "Project Overview",
+                "Welcome to the project documentation",
+                36,
+            ),
+        )
+        .unwrap();
 
         let results = search_docs(&conn, "project", None, 20).unwrap();
         assert_eq!(results.len(), 1);
@@ -2099,7 +2242,8 @@ mod refs_tests {
             conn.execute(
                 "INSERT INTO files (path, package, extension, size_bytes) VALUES (?1, NULL, '', 0)",
                 [p],
-            ).unwrap();
+            )
+            .unwrap();
             let id: i64 = conn
                 .query_row("SELECT id FROM files WHERE path = ?1", [p], |r| r.get(0))
                 .unwrap();
@@ -2186,6 +2330,38 @@ mod refs_tests {
     }
 
     #[test]
+    fn test_batch_insert_references_lazy_file_id_lookup() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("lazy.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        seed_files(&conn, &["src/main.rs"]);
+
+        let mut file_ids = build_file_id_map(&conn).unwrap();
+        assert!(
+            file_ids.is_empty(),
+            "file-id cache starts empty and warms lazily"
+        );
+
+        let refs = vec![ReferenceInfo {
+            name: "run".into(),
+            kind: ReferenceKind::Call,
+            file_path: Arc::from("src/main.rs"),
+            line: 8,
+            enclosing_symbol: Some("main".into()),
+        }];
+        batch_insert_references(&conn, Some("app"), &refs, &mut file_ids).unwrap();
+
+        assert!(
+            file_ids.contains_key("src/main.rs"),
+            "cache should warm after first lookup"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_query_symbol_references_filters() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("r.db");
@@ -2203,7 +2379,8 @@ mod refs_tests {
                         ('other', 'call', {a}, 30, 'pkg1', NULL)"
             ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let all = query_symbol_references(&conn, "foo", None, None, 100).unwrap();
         assert_eq!(all.len(), 3);
@@ -2214,7 +2391,8 @@ mod refs_tests {
         let p1 = query_symbol_references(&conn, "foo", None, Some("pkg1"), 100).unwrap();
         assert_eq!(p1.len(), 2);
 
-        let p1_calls = query_symbol_references(&conn, "foo", Some("call"), Some("pkg1"), 100).unwrap();
+        let p1_calls =
+            query_symbol_references(&conn, "foo", Some("call"), Some("pkg1"), 100).unwrap();
         assert_eq!(p1_calls.len(), 1);
     }
 
@@ -2238,7 +2416,8 @@ mod refs_tests {
                         ('foo', 'call', {c}, 1, 'p', NULL)"
             ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let callers = query_symbol_callers(&conn, "foo", None, 100).unwrap();
         assert_eq!(callers.len(), 2);
@@ -2246,6 +2425,11 @@ mod refs_tests {
         assert_eq!(bar.call_sites, 2);
         assert_eq!(bar.caller_file, "a.rs");
         assert_eq!(bar.caller_line, 10);
+
+        let p_only = query_symbol_callers(&conn, "foo", Some("p"), 100).unwrap();
+        assert_eq!(p_only.len(), 2);
+        let none = query_symbol_callers(&conn, "foo", Some("other"), 100).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]
@@ -2265,12 +2449,18 @@ mod refs_tests {
                         ('baz', 'call', {a}, 4, 'p', 'other')"
             ),
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let callees = query_symbol_callees(&conn, "handler", None, 100).unwrap();
         assert_eq!(callees.len(), 2);
         let foo = callees.iter().find(|c| c.callee_name == "foo").unwrap();
         assert_eq!(foo.call_sites, 2);
+
+        let p_only = query_symbol_callees(&conn, "handler", Some("p"), 100).unwrap();
+        assert_eq!(p_only.len(), 2);
+        let none = query_symbol_callees(&conn, "handler", Some("other"), 100).unwrap();
+        assert!(none.is_empty());
     }
 
     /// Seed a package row for dependency graph tests. Each package needs a
@@ -2305,7 +2495,13 @@ mod refs_tests {
         //   worker → config-core
         //   integration-tests → api-server
         //   deploy-scripts → worker
-        for p in ["config-core", "api-server", "worker", "integration-tests", "deploy-scripts"] {
+        for p in [
+            "config-core",
+            "api-server",
+            "worker",
+            "integration-tests",
+            "deploy-scripts",
+        ] {
             seed_package(&conn, p);
         }
         seed_dependency(&conn, "api-server", "config-core");
@@ -2352,7 +2548,10 @@ mod refs_tests {
         assert_eq!(impact.home_package.as_deref(), Some("config-core"));
         assert_eq!(impact.direct_impact.len(), 2);
         assert_eq!(impact.cross_package_impact.len(), 2);
-        assert_eq!(impact.summary.affected_packages, vec!["api-server", "worker"]);
+        assert_eq!(
+            impact.summary.affected_packages,
+            vec!["api-server", "worker"]
+        );
 
         // Transitive: integration-tests → api-server, deploy-scripts → worker.
         // Neither api-server nor worker themselves appear (they're in
@@ -2362,7 +2561,10 @@ mod refs_tests {
             .iter()
             .map(|t| t.package.as_str())
             .collect();
-        assert_eq!(trans_pkgs, HashSet::from(["integration-tests", "deploy-scripts"]));
+        assert_eq!(
+            trans_pkgs,
+            HashSet::from(["integration-tests", "deploy-scripts"])
+        );
         assert_eq!(impact.summary.transitive_package_count, 2);
         for t in &impact.transitive_impact {
             assert_eq!(t.distance, 1);
@@ -2409,7 +2611,10 @@ mod refs_tests {
         assert_eq!(impact.direct_impact.len(), 1);
         assert_eq!(impact.direct_impact[0].package.as_deref(), Some("pkgB"));
         assert_eq!(impact.cross_package_impact.len(), 1);
-        assert_eq!(impact.cross_package_impact[0].package.as_deref(), Some("pkgA"));
+        assert_eq!(
+            impact.cross_package_impact[0].package.as_deref(),
+            Some("pkgA")
+        );
     }
 
     /// When the symbol has no definition in `symbols` and no hint is given,

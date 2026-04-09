@@ -89,8 +89,8 @@ fn resolve_log_dir(dir: &str, repo_root: &Path) -> PathBuf {
 
 /// Remove log files older than `max_days` from the log directory.
 fn evict_old_logs(log_dir: &Path, max_days: u32) {
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(max_days as u64 * 86400);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(max_days as u64 * 86400);
 
     let entries = match std::fs::read_dir(log_dir) {
         Ok(e) => e,
@@ -111,8 +111,9 @@ fn evict_old_logs(log_dir: &Path, max_days: u32) {
         }
         if let Ok(meta) = path.metadata()
             && let Ok(modified) = meta.modified()
-                && modified < cutoff {
-                    let _ = std::fs::remove_file(&path);
-                }
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

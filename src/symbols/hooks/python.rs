@@ -1,4 +1,7 @@
-use super::{field_text, find_ancestor, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, field_text, find_ancestor,
+    node_text,
+};
 use tree_sitter::Node;
 
 /// Check if a Python symbol should be included.
@@ -16,17 +19,19 @@ fn is_visible(node: &Node, source: &str) -> bool {
 
     // Only apply underscore filtering to methods (functions inside a class body)
     if node.kind() == "function_definition"
-        && let Some(parent) = node.parent() {
-            // parent is the `block` node; its parent is the `class_definition`
-            if parent.kind() == "block"
-                && let Some(grandparent) = parent.parent()
-                    && grandparent.kind() == "class_definition" {
-                        // Inside a class: skip _private except __init__
-                        if name.starts_with('_') && name != "__init__" {
-                            return false;
-                        }
-                    }
+        && let Some(parent) = node.parent()
+    {
+        // parent is the `block` node; its parent is the `class_definition`
+        if parent.kind() == "block"
+            && let Some(grandparent) = parent.parent()
+            && grandparent.kind() == "class_definition"
+        {
+            // Inside a class: skip _private except __init__
+            if name.starts_with('_') && name != "__init__" {
+                return false;
+            }
         }
+    }
 
     true
 }
@@ -77,10 +82,7 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
         let child = params_node.child(i).unwrap();
         match child.kind() {
             "identifier" => {
-                let name = child
-                    .utf8_text(source.as_bytes())
-                    .unwrap_or("")
-                    .to_string();
+                let name = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                 if !name.is_empty() {
                     params.push(Parameter {
                         name,
@@ -141,12 +143,9 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 /// Post-process: filter `self` from method parameters.
 fn post_process(mut sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolInfo> {
     if sym.kind == SymbolKind::Method {
-        sym.parameters = sym.parameters.map(|params| {
-            params
-                .into_iter()
-                .filter(|p| p.name != "self")
-                .collect()
-        });
+        sym.parameters = sym
+            .parameters
+            .map(|params| params.into_iter().filter(|p| p.name != "self").collect());
     }
     Some(sym)
 }
@@ -163,11 +162,37 @@ pub fn hooks() -> LanguageHooks {
         reference_hooks: Some(ReferenceHooks {
             enclosing_ancestors: &["function_definition", "class_definition"],
             reference_stoplist: &[
-                "True", "False", "None", "self", "cls",
-                "print", "open", "len", "range", "enumerate", "zip", "map", "filter",
-                "str", "int", "float", "bool", "list", "dict", "tuple", "set",
-                "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr",
-                "Exception", "ValueError", "TypeError", "KeyError",
+                "True",
+                "False",
+                "None",
+                "self",
+                "cls",
+                "print",
+                "open",
+                "len",
+                "range",
+                "enumerate",
+                "zip",
+                "map",
+                "filter",
+                "str",
+                "int",
+                "float",
+                "bool",
+                "list",
+                "dict",
+                "tuple",
+                "set",
+                "type",
+                "isinstance",
+                "issubclass",
+                "hasattr",
+                "getattr",
+                "setattr",
+                "Exception",
+                "ValueError",
+                "TypeError",
+                "KeyError",
             ],
         }),
     }

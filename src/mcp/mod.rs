@@ -3,7 +3,9 @@ pub mod tools;
 
 use crate::db;
 use anyhow::Result;
-use rmcp::{model::*, service::RequestContext, tool_handler, RoleServer, ServiceExt, ServerHandler};
+use rmcp::{
+    RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext, tool_handler,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +59,8 @@ impl ServerHandler for tools::ShireService {
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = std::result::Result<ListPromptsResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = std::result::Result<ListPromptsResult, ErrorData>> + Send + '_
+    {
         std::future::ready(Ok(ListPromptsResult {
             prompts: prompts::list(),
             next_cursor: None,
@@ -68,9 +71,13 @@ impl ServerHandler for tools::ShireService {
         &self,
         request: GetPromptRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = std::result::Result<GetPromptResult, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = std::result::Result<GetPromptResult, ErrorData>> + Send + '_
+    {
         let result = (|| {
-            let conn = self.conn.lock().map_err(|e| tools::ShireService::mcp_err(e.to_string()))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| tools::ShireService::mcp_err(e.to_string()))?;
             let args: HashMap<String, String> = request
                 .arguments
                 .unwrap_or_default()
@@ -83,19 +90,22 @@ impl ServerHandler for tools::ShireService {
                     (k, s)
                 })
                 .collect();
-            prompts::handle(&conn, &request.name, &args)
-                .map_err(|e| match e {
-                    prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
-                    prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
-                    prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
-                })
+            prompts::handle(&conn, &request.name, &args).map_err(|e| match e {
+                prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
+                prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
+                prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
+            })
         })();
 
         std::future::ready(result)
     }
 }
 
-pub async fn run_server(db_path: &Path, rag_config: &crate::config::RagConfig, build_ctx: Option<BuildContext>) -> Result<()> {
+pub async fn run_server(
+    db_path: &Path,
+    rag_config: &crate::config::RagConfig,
+    build_ctx: Option<BuildContext>,
+) -> Result<()> {
     let conn = if db_path.exists() {
         db::open_readonly(db_path)?
     } else {

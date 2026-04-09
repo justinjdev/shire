@@ -5,14 +5,13 @@ use regex::Regex;
 
 static PROGRAM_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*PROGRAM-ID\.\s+([\w-]+)").unwrap());
-static DIVISION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION").unwrap());
+static DIVISION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION").unwrap()
+});
 static SECTION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*([\w][\w-]*)\s+SECTION\s*\.").unwrap());
-static COPY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*COPY\s+([\w-]+)").unwrap());
-static FD_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*FD\s+([\w-]+)").unwrap());
+static COPY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*COPY\s+([\w-]+)").unwrap());
+static FD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*FD\s+([\w-]+)").unwrap());
 static LEVEL_01_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*01\s+([\w-]+)").unwrap());
 static PARAGRAPH_RE: LazyLock<Regex> =
@@ -175,14 +174,49 @@ pub fn extract(source: &str, file_path: Arc<str>) -> Vec<SymbolInfo> {
                 let upper = name.to_uppercase();
                 if matches!(
                     upper.as_str(),
-                    "STOP" | "EXIT" | "PERFORM" | "CALL" | "GO" | "IF" | "ELSE"
-                    | "END" | "MOVE" | "ADD" | "SUBTRACT" | "MULTIPLY" | "DIVIDE"
-                    | "COMPUTE" | "DISPLAY" | "ACCEPT" | "READ" | "WRITE" | "OPEN"
-                    | "CLOSE" | "RETURN" | "EVALUATE" | "WHEN" | "NOT" | "SET"
-                    | "INITIALIZE" | "STRING" | "UNSTRING" | "INSPECT" | "SEARCH"
-                    | "ALTER" | "CONTINUE" | "GOBACK" | "DELETE" | "SORT" | "MERGE"
-                    | "REWRITE" | "START" | "GENERATE" | "TERMINATE" | "RELEASE"
-                    | "REPLACE" | "EXEC"
+                    "STOP"
+                        | "EXIT"
+                        | "PERFORM"
+                        | "CALL"
+                        | "GO"
+                        | "IF"
+                        | "ELSE"
+                        | "END"
+                        | "MOVE"
+                        | "ADD"
+                        | "SUBTRACT"
+                        | "MULTIPLY"
+                        | "DIVIDE"
+                        | "COMPUTE"
+                        | "DISPLAY"
+                        | "ACCEPT"
+                        | "READ"
+                        | "WRITE"
+                        | "OPEN"
+                        | "CLOSE"
+                        | "RETURN"
+                        | "EVALUATE"
+                        | "WHEN"
+                        | "NOT"
+                        | "SET"
+                        | "INITIALIZE"
+                        | "STRING"
+                        | "UNSTRING"
+                        | "INSPECT"
+                        | "SEARCH"
+                        | "ALTER"
+                        | "CONTINUE"
+                        | "GOBACK"
+                        | "DELETE"
+                        | "SORT"
+                        | "MERGE"
+                        | "REWRITE"
+                        | "START"
+                        | "GENERATE"
+                        | "TERMINATE"
+                        | "RELEASE"
+                        | "REPLACE"
+                        | "EXEC"
                 ) {
                     continue;
                 }
@@ -273,15 +307,9 @@ mod tests {
             .collect();
         assert_eq!(paragraphs.len(), 2);
         assert_eq!(paragraphs[0].name, "INIT-PARA");
-        assert_eq!(
-            paragraphs[0].parent_symbol.as_deref(),
-            Some("MAIN-SECTION")
-        );
+        assert_eq!(paragraphs[0].parent_symbol.as_deref(), Some("MAIN-SECTION"));
         assert_eq!(paragraphs[1].name, "PROCESS-PARA");
-        assert_eq!(
-            paragraphs[1].parent_symbol.as_deref(),
-            Some("MAIN-SECTION")
-        );
+        assert_eq!(paragraphs[1].parent_symbol.as_deref(), Some("MAIN-SECTION"));
     }
 
     #[test]
@@ -346,7 +374,10 @@ mod tests {
         // FILLER should be skipped
         assert_eq!(data_items.len(), 2);
         assert_eq!(data_items[0].name, "WS-CUSTOMER-NAME");
-        assert_eq!(data_items[0].signature.as_deref(), Some("01 WS-CUSTOMER-NAME"));
+        assert_eq!(
+            data_items[0].signature.as_deref(),
+            Some("01 WS-CUSTOMER-NAME")
+        );
         assert_eq!(data_items[1].name, "WS-ACCOUNT-BALANCE");
     }
 
@@ -366,11 +397,31 @@ mod tests {
        ";
         let symbols = extract(source, Arc::from("test.cbl"));
 
-        assert!(symbols.iter().any(|s| s.name == "my-program" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "my-copybook" && s.kind == SymbolKind::Type));
-        assert!(symbols.iter().any(|s| s.name == "ws-field" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "main-section" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "main-para" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "my-program" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "my-copybook" && s.kind == SymbolKind::Type)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ws-field" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "main-section" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "main-para" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -475,21 +526,61 @@ mod tests {
         let symbols = extract(source, Arc::from("PAYROLL.cob"));
 
         // PROGRAM-ID
-        assert!(symbols.iter().any(|s| s.name == "PAYROLL-CALC" && s.kind == SymbolKind::Class));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PAYROLL-CALC" && s.kind == SymbolKind::Class)
+        );
         // FD
-        assert!(symbols.iter().any(|s| s.name == "EMPLOYEE-FILE" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "EMPLOYEE-FILE" && s.kind == SymbolKind::Struct)
+        );
         // 01-level
-        assert!(symbols.iter().any(|s| s.name == "EMPLOYEE-RECORD" && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name == "WS-TOTAL-PAY" && s.kind == SymbolKind::Constant));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "EMPLOYEE-RECORD" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "WS-TOTAL-PAY" && s.kind == SymbolKind::Constant)
+        );
         // COPY
-        assert!(symbols.iter().any(|s| s.name == "PAYROLL-CONSTANTS" && s.kind == SymbolKind::Type));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PAYROLL-CONSTANTS" && s.kind == SymbolKind::Type)
+        );
         // Sections
-        assert!(symbols.iter().any(|s| s.name == "MAIN-SECTION" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "CALC-SECTION" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "MAIN-SECTION" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "CALC-SECTION" && s.kind == SymbolKind::Function)
+        );
         // Paragraphs
-        assert!(symbols.iter().any(|s| s.name == "START-PARA" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "INIT-PARA" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "CALC-PARA" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "START-PARA" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "INIT-PARA" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "CALC-PARA" && s.kind == SymbolKind::Method)
+        );
 
         // Verify parent_symbol for paragraphs
         let start = symbols.iter().find(|s| s.name == "START-PARA").unwrap();

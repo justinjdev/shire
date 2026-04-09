@@ -27,20 +27,26 @@ impl std::fmt::Debug for ShireService {
         d.field("tool_router", &self.tool_router);
         d.field("build_ctx", &self.build_ctx.as_ref().map(|c| &c.repo_root));
         #[cfg(feature = "rag")]
-        d.field("rag_embedder", &self.rag_embedder.as_ref().map(|_| "Embedder(...)"));
+        d.field(
+            "rag_embedder",
+            &self.rag_embedder.as_ref().map(|_| "Embedder(...)"),
+        );
         d.finish()
     }
 }
 
 impl ShireService {
-    pub fn new(conn: Connection, rag_config: &crate::config::RagConfig, build_ctx: Option<BuildContext>) -> Self {
+    pub fn new(
+        conn: Connection,
+        rag_config: &crate::config::RagConfig,
+        build_ctx: Option<BuildContext>,
+    ) -> Self {
         #[cfg(feature = "rag")]
         let rag_embedder = if rag_config.enabled {
             match crate::rag::embedder::Embedder::new(rag_config) {
                 Ok(e) => {
                     // Verify vector table exists before enabling hybrid search
-                    let table_check = conn
-                        .prepare("SELECT 1 FROM file_embeddings LIMIT 0");
+                    let table_check = conn.prepare("SELECT 1 FROM file_embeddings LIMIT 0");
                     match &table_check {
                         Ok(_) => {
                             tracing::info!("RAG hybrid search enabled");
@@ -115,9 +121,10 @@ impl ShireService {
         // reads current file state.
         let debounce_s = ctx.config.serve.debounce_s;
         if let Ok(elapsed) = last.elapsed()
-            && elapsed < std::time::Duration::from_secs(debounce_s) {
-                return false;
-            }
+            && elapsed < std::time::Duration::from_secs(debounce_s)
+        {
+            return false;
+        }
 
         // Check .git/index mtime
         let git_index = ctx.repo_root.join(".git/index");
@@ -143,24 +150,27 @@ impl ShireService {
 
         tracing::info!("rebuilding index (stale)");
 
-        match crate::index::build_index_quiet(&ctx.repo_root, &ctx.config, false, Some(&ctx.db_path)) {
+        match crate::index::build_index_quiet(
+            &ctx.repo_root,
+            &ctx.config,
+            false,
+            Some(&ctx.db_path),
+        ) {
             Ok(()) => {
                 // Reopen connection read-only
                 match crate::db::open_readonly(&ctx.db_path) {
-                    Ok(new_conn) => {
-                        match self.conn.lock() {
-                            Ok(mut conn) => {
-                                let now = Self::read_indexed_at(&new_conn)
-                                    .or_else(|| Some(SystemTime::now()));
-                                *conn = new_conn;
-                                if let Ok(mut li) = self.last_indexed.lock() {
-                                    *li = now;
-                                }
-                                tracing::info!("index rebuilt");
+                    Ok(new_conn) => match self.conn.lock() {
+                        Ok(mut conn) => {
+                            let now = Self::read_indexed_at(&new_conn)
+                                .or_else(|| Some(SystemTime::now()));
+                            *conn = new_conn;
+                            if let Ok(mut li) = self.last_indexed.lock() {
+                                *li = now;
                             }
-                            Err(e) => tracing::warn!(%e, "index rebuilt but failed to swap connection"),
+                            tracing::info!("index rebuilt");
                         }
-                    }
+                        Err(e) => tracing::warn!(%e, "index rebuilt but failed to swap connection"),
+                    },
                     Err(e) => {
                         // Prevent infinite rebuild loop: mark as indexed even if reopen fails
                         if let Ok(mut li) = self.last_indexed.lock() {
@@ -242,14 +252,13 @@ impl ShireService {
         ).map_err(|e| Self::mcp_err(e.to_string()))?;
 
         for (file_id, _distance) in &file_vec_results {
-            let file_path: String = match conn.query_row(
-                "SELECT path FROM files WHERE id = ?1",
-                [file_id],
-                |row| row.get(0),
-            ) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+            let file_path: String =
+                match conn.query_row("SELECT path FROM files WHERE id = ?1", [file_id], |row| {
+                    row.get(0)
+                }) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
 
             if let Ok(rows) = sym_stmt.query_map([&file_path], |row| {
                 Ok(queries::SymbolRow {
@@ -440,7 +449,9 @@ pub struct GeneratedFromArgs {
 
 #[tool_router]
 impl ShireService {
-    #[tool(description = "Search packages by name or description. Use instead of Grep for finding packages.")]
+    #[tool(
+        description = "Search packages by name or description. Use instead of Grep for finding packages."
+    )]
     fn search_packages(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -456,12 +467,13 @@ impl ShireService {
         let limit = params.limit.unwrap_or(20);
         let results = queries::search_packages(&conn, &params.query, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List a package's dependencies. Set depth>1 for transitive graph (returns edge list with different schema).")]
+    #[tool(
+        description = "List a package's dependencies. Set depth>1 for transitive graph (returns edge list with different schema)."
+    )]
     fn package_dependencies(
         &self,
         Parameters(params): Parameters<DepsParams>,
@@ -472,17 +484,19 @@ impl ShireService {
         match params.depth {
             Some(n) if n > 1 => {
                 let depth = n.min(20);
-                let edges = queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
-                    .map_err(|e| Self::mcp_err(e.to_string()))?;
-                let json = serde_json::to_string(&edges)
-                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let edges =
+                    queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
+                        .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let json =
+                    serde_json::to_string(&edges).map_err(|e| Self::mcp_err(e.to_string()))?;
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
             _ => {
-                let results = queries::package_dependencies(&conn, &params.name, params.internal_only)
-                    .map_err(|e| Self::mcp_err(e.to_string()))?;
-                let json = serde_json::to_string(&results)
-                    .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let results =
+                    queries::package_dependencies(&conn, &params.name, params.internal_only)
+                        .map_err(|e| Self::mcp_err(e.to_string()))?;
+                let json =
+                    serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
         }
@@ -498,8 +512,7 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::package_dependents(&conn, &params.name)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -513,12 +526,13 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let results = queries::list_packages(&conn, params.kind.as_deref())
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find functions, classes, types, methods by name or signature. Use instead of Grep for 'where is function X?' or 'what matches pattern Y?'. Omit query with a package filter to list all symbols in that package.")]
+    #[tool(
+        description = "Find functions, classes, types, methods by name or signature. Use instead of Grep for 'where is function X?' or 'what matches pattern Y?'. Omit query with a package filter to list all symbols in that package."
+    )]
     fn search_symbols(
         &self,
         Parameters(params): Parameters<SearchSymbolsParams>,
@@ -531,15 +545,16 @@ impl ShireService {
             // No query: list all symbols in a package
             let pkg = match &params.package {
                 Some(p) => p,
-                None => return Ok(CallToolResult::success(vec![Content::text(
-                    "Provide a query or a package filter",
-                )])),
+                None => {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "Provide a query or a package filter",
+                    )]));
+                }
             };
             let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
             let results = queries::get_package_symbols(&conn, pkg, params.kind.as_deref())
                 .map_err(|e| Self::mcp_err(e.to_string()))?;
-            let json = serde_json::to_string(&results)
-                .map_err(|e| Self::mcp_err(e.to_string()))?;
+            let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
             return Ok(CallToolResult::success(vec![Content::text(json)]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -569,12 +584,13 @@ impl ShireService {
         #[cfg(not(feature = "rag"))]
         let results = fts_results;
 
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List all symbols defined in a specific file. Use instead of reading the file to understand its exports.")]
+    #[tool(
+        description = "List all symbols defined in a specific file. Use instead of reading the file to understand its exports."
+    )]
     fn get_file_symbols(
         &self,
         Parameters(params): Parameters<GetFileSymbolsParams>,
@@ -582,18 +598,15 @@ impl ShireService {
         tracing::debug!(tool = "get_file_symbols", file_path = %params.file_path, kind = ?params.kind);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::get_file_symbols(
-            &conn,
-            &params.file_path,
-            params.kind.as_deref(),
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
+        let results = queries::get_file_symbols(&conn, &params.file_path, params.kind.as_deref())
             .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents.")]
+    #[tool(
+        description = "List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents."
+    )]
     fn list_package_files(
         &self,
         Parameters(params): Parameters<ListPackageFilesParams>,
@@ -601,14 +614,10 @@ impl ShireService {
         tracing::debug!(tool = "list_package_files", package = %params.package, extension = ?params.extension);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::list_package_files(
-            &conn,
-            &params.package,
-            params.extension.as_deref(),
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let results =
+            queries::list_package_files(&conn, &params.package, params.extension.as_deref())
+                .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -617,14 +626,14 @@ impl ShireService {
         tracing::debug!(tool = "index_status");
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let status = queries::index_status(&conn)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&status)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let status = queries::index_status(&conn).map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&status).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find files by path or name. Use instead of Glob/find for locating files. Useful for 'middleware', 'proto files', or files in a specific directory.")]
+    #[tool(
+        description = "Find files by path or name. Use instead of Glob/find for locating files. Useful for 'middleware', 'proto files', or files in a specific directory."
+    )]
     fn search_files(
         &self,
         Parameters(params): Parameters<SearchFilesParams>,
@@ -644,12 +653,13 @@ impl ShireService {
             params.extension.as_deref(),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Search documentation files by content, title, or path. Returns matching docs with relevant text snippets. Use for finding guides, READMEs, and written documentation.")]
+    #[tool(
+        description = "Search documentation files by content, title, or path. Returns matching docs with relevant text snippets. Use for finding guides, READMEs, and written documentation."
+    )]
     fn search_docs(
         &self,
         Parameters(params): Parameters<SearchDocsParams>,
@@ -663,19 +673,15 @@ impl ShireService {
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = params.limit.unwrap_or(20);
-        let results = queries::search_docs(
-            &conn,
-            &params.query,
-            params.package.as_deref(),
-            limit,
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results)
+        let results = queries::search_docs(&conn, &params.query, params.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like 'authentication' or 'error handling'. Returns a structured context map organized by package.")]
+    #[tool(
+        description = "Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like 'authentication' or 'error handling'. Returns a structured context map organized by package."
+    )]
     fn explore(
         &self,
         Parameters(params): Parameters<ExploreParams>,
@@ -690,16 +696,24 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let mut args = std::collections::HashMap::new();
         args.insert("query".into(), params.query);
-        let text = crate::mcp::prompts::call_prompt(&conn, "explore", &args)
-            .map_err(|e| match e {
-                crate::mcp::prompts::PromptError::InvalidParams(msg) => ErrorData::invalid_params(msg, None),
-                crate::mcp::prompts::PromptError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
-                crate::mcp::prompts::PromptError::Internal(msg) => ErrorData::internal_error(msg, None),
+        let text =
+            crate::mcp::prompts::call_prompt(&conn, "explore", &args).map_err(|e| match e {
+                crate::mcp::prompts::PromptError::InvalidParams(msg) => {
+                    ErrorData::invalid_params(msg, None)
+                }
+                crate::mcp::prompts::PromptError::NotFound(msg) => {
+                    ErrorData::resource_not_found(msg, None)
+                }
+                crate::mcp::prompts::PromptError::Internal(msg) => {
+                    ErrorData::internal_error(msg, None)
+                }
             })?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished.")]
+    #[tool(
+        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
+    )]
     fn symbol_references(
         &self,
         Parameters(args): Parameters<SymbolRefsArgs>,
@@ -730,12 +744,13 @@ impl ShireService {
             limit,
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward.")]
+    #[tool(
+        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward."
+    )]
     fn symbol_callers(
         &self,
         Parameters(args): Parameters<SymbolCallersArgs>,
@@ -749,12 +764,13 @@ impl ShireService {
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callers(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find which symbols are called from inside the named function/method. Navigates the call graph downward.")]
+    #[tool(
+        description = "Find which symbols are called from inside the named function/method. Navigates the call graph downward."
+    )]
     fn symbol_callees(
         &self,
         Parameters(args): Parameters<SymbolCalleesArgs>,
@@ -768,12 +784,13 @@ impl ShireService {
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
         let rows = queries::query_symbol_callees(&conn, &args.name, args.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols.")]
+    #[tool(
+        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
+    )]
     fn change_impact(
         &self,
         Parameters(args): Parameters<ChangeImpactArgs>,
@@ -786,20 +803,16 @@ impl ShireService {
         }
         let depth = args.transitive_depth.unwrap_or(2).min(10);
         let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
-        let impact = queries::change_impact(
-            &conn,
-            &args.name,
-            args.package.as_deref(),
-            depth,
-            limit,
-        )
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&impact)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let impact =
+            queries::change_impact(&conn, &args.name, args.package.as_deref(), depth, limit)
+                .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find all files generated from a schema file (e.g. .proto). Returns generated file paths and their packages. Use to understand the blast radius of a schema change.")]
+    #[tool(
+        description = "Find all files generated from a schema file (e.g. .proto). Returns generated file paths and their packages. Use to understand the blast radius of a schema change."
+    )]
     fn schema_consumers(
         &self,
         Parameters(args): Parameters<SchemaConsumersArgs>,
@@ -809,12 +822,13 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let rows = queries::query_schema_consumers(&conn, &args.path)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Find the source schema file that generated a given file. Use to trace a generated file (e.g. user.pb.go) back to its source proto.")]
+    #[tool(
+        description = "Find the source schema file that generated a given file. Use to trace a generated file (e.g. user.pb.go) back to its source proto."
+    )]
     fn generated_from(
         &self,
         Parameters(args): Parameters<GeneratedFromArgs>,
@@ -824,8 +838,7 @@ impl ShireService {
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let rows = queries::query_generated_from(&conn, &args.path)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
@@ -890,7 +903,10 @@ mod tests {
         // Set last_indexed to future so git index is "older"
         let svc = make_service_with_ctx(dir.path().to_path_buf());
         *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() + Duration::from_secs(60));
-        assert!(!svc.is_stale(), "should not be stale when .git/index is older than last_indexed");
+        assert!(
+            !svc.is_stale(),
+            "should not be stale when .git/index is older than last_indexed"
+        );
     }
 
     #[test]
@@ -903,7 +919,10 @@ mod tests {
         // Set last_indexed to past so git index is "newer"
         let svc = make_service_with_ctx(dir.path().to_path_buf());
         *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
-        assert!(svc.is_stale(), "should be stale when .git/index is newer than last_indexed");
+        assert!(
+            svc.is_stale(),
+            "should be stale when .git/index is newer than last_indexed"
+        );
     }
 
     #[test]
@@ -916,10 +935,8 @@ mod tests {
     #[test]
     fn test_read_indexed_at_parses_db_timestamp() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
         let ts = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
@@ -934,7 +951,10 @@ mod tests {
     fn test_read_indexed_at_none_when_no_table() {
         let conn = Connection::open_in_memory().unwrap();
         let result = ShireService::read_indexed_at(&conn);
-        assert!(result.is_none(), "should return None when shire_meta doesn't exist");
+        assert!(
+            result.is_none(),
+            "should return None when shire_meta doesn't exist"
+        );
     }
 
     /// When the `references_enabled` flag is absent (e.g. an index built
@@ -1091,8 +1111,16 @@ mod tests {
                 [],
             )
             .unwrap();
-            let core_id: i64 = conn.query_row("SELECT id FROM files WHERE path='core/x.rs'", [], |r| r.get(0)).unwrap();
-            let dep_id: i64 = conn.query_row("SELECT id FROM files WHERE path='dep/y.rs'", [], |r| r.get(0)).unwrap();
+            let core_id: i64 = conn
+                .query_row("SELECT id FROM files WHERE path='core/x.rs'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let dep_id: i64 = conn
+                .query_row("SELECT id FROM files WHERE path='dep/y.rs'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
             conn.execute(
                 &format!(
                     "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) VALUES \
@@ -1136,7 +1164,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
         let svc = ShireService::new(conn, &default_rag_config(), None);
-        let args = SchemaConsumersArgs { path: "a.proto".into() };
+        let args = SchemaConsumersArgs {
+            path: "a.proto".into(),
+        };
         let r = svc.schema_consumers(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {
             RawContent::Text(t) => t.text.clone(),
@@ -1160,7 +1190,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
         let svc = ShireService::new(conn, &default_rag_config(), None);
-        let args = GeneratedFromArgs { path: "a.pb.go".into() };
+        let args = GeneratedFromArgs {
+            path: "a.pb.go".into(),
+        };
         let r = svc.generated_from(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {
             RawContent::Text(t) => t.text.clone(),

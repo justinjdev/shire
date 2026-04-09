@@ -9,7 +9,9 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
     }
     let conn = Connection::open(path)?;
     // Set auto_vacuum before schema creation (must be set on empty DB)
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap_or(0);
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(0);
     if page_count <= 1 {
         conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
     }
@@ -261,6 +263,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
         -- this, those operations full-scan symbol_refs — at monorepo scale
         -- that is multiple seconds per call.
         CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);
+        -- Covering call-ref indexes used by query_symbol_callers/callees.
+        -- Keep them partial (kind='call') so insert/build costs stay bounded.
+        CREATE INDEX IF NOT EXISTS idx_refs_callers_cover
+            ON symbol_refs(name, enclosing_symbol, package, file_id, line)
+            WHERE kind = 'call' AND enclosing_symbol IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_refs_callees_cover
+            ON symbol_refs(enclosing_symbol, name, package, file_id, line)
+            WHERE kind = 'call';
 
         CREATE TABLE IF NOT EXISTS boundary_edges (
             source_path       TEXT NOT NULL,
@@ -352,7 +362,9 @@ pub fn drop_symbol_refs_indexes(conn: &Connection) -> Result<()> {
          DROP INDEX IF EXISTS idx_refs_file;
          DROP INDEX IF EXISTS idx_refs_file_id;
          DROP INDEX IF EXISTS idx_refs_enclosing;
-         DROP INDEX IF EXISTS idx_refs_package_name;",
+         DROP INDEX IF EXISTS idx_refs_package_name;
+         DROP INDEX IF EXISTS idx_refs_callers_cover;
+         DROP INDEX IF EXISTS idx_refs_callees_cover;",
     )?;
     Ok(())
 }
@@ -362,7 +374,13 @@ pub fn recreate_symbol_refs_indexes(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_refs_name ON symbol_refs(name);
          CREATE INDEX IF NOT EXISTS idx_refs_file_id ON symbol_refs(file_id);
          CREATE INDEX IF NOT EXISTS idx_refs_enclosing ON symbol_refs(enclosing_symbol);
-         CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);",
+         CREATE INDEX IF NOT EXISTS idx_refs_package_name ON symbol_refs(package, name);
+         CREATE INDEX IF NOT EXISTS idx_refs_callers_cover
+             ON symbol_refs(name, enclosing_symbol, package, file_id, line)
+             WHERE kind = 'call' AND enclosing_symbol IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_refs_callees_cover
+             ON symbol_refs(enclosing_symbol, name, package, file_id, line)
+             WHERE kind = 'call';",
     )?;
     Ok(())
 }
@@ -499,8 +517,8 @@ pub fn seed_db(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
         .with_context(|| format!("Failed to open seed DB '{}'", source.display()))?;
         let mut dst_conn = Connection::open(&tmp_dest)
             .with_context(|| format!("Failed to create DB '{}'", tmp_dest.display()))?;
-        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
-            .with_context(|| {
+        let backup =
+            rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).with_context(|| {
                 format!(
                     "Failed to init backup '{}' -> '{}'",
                     source.display(),
@@ -524,8 +542,13 @@ pub fn seed_db(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
         return Err(anyhow::anyhow!("{e:#}"));
     }
 
-    std::fs::rename(&tmp_dest, dest)
-        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_dest.display(), dest.display()))?;
+    std::fs::rename(&tmp_dest, dest).with_context(|| {
+        format!(
+            "Failed to rename '{}' to '{}'",
+            tmp_dest.display(),
+            dest.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -572,7 +595,12 @@ mod tests {
         let conn = in_memory_db();
         conn.execute(
             "INSERT INTO packages (name, path, kind, description) VALUES (?1, ?2, ?3, ?4)",
-            ("auth-service", "services/auth", "npm", "Authentication and authorization"),
+            (
+                "auth-service",
+                "services/auth",
+                "npm",
+                "Authentication and authorization",
+            ),
         )
         .unwrap();
 
@@ -591,7 +619,13 @@ mod tests {
         let conn = in_memory_db();
         conn.execute(
             "INSERT INTO docs (path, package, title, body, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("docs/setup.md", Option::<String>::None, "Getting Started", "How to install and configure the service", 42),
+            (
+                "docs/setup.md",
+                Option::<String>::None,
+                "Getting Started",
+                "How to install and configure the service",
+                42,
+            ),
         )
         .unwrap();
 
@@ -668,7 +702,11 @@ mod tests {
             [],
         ).unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM boundary_edges WHERE source_path = 'a.proto'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM boundary_edges WHERE source_path = 'a.proto'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -706,17 +744,16 @@ mod schema_tests {
             [],
         ).unwrap();
         let file_id: i64 = conn
-            .query_row(
-                "SELECT id FROM files WHERE path = 'src/main.rs'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM files WHERE path = 'src/main.rs'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
              VALUES ('parseConfig', 'call', ?1, 42, NULL, 'handle_request')",
             [file_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
@@ -753,6 +790,33 @@ mod schema_tests {
             )
             .unwrap();
         assert_eq!(count, 1, "idx_refs_package_name must exist");
+    }
+
+    #[test]
+    fn test_call_ref_covering_indexes_exist() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_or_create(&path, false).unwrap();
+
+        let callers_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_refs_callers_cover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let callees_idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='idx_refs_callees_cover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(callers_idx, 1, "idx_refs_callers_cover must exist");
+        assert_eq!(callees_idx, 1, "idx_refs_callees_cover must exist");
     }
 
     #[test]

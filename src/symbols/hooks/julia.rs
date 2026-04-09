@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Julia visibility: all symbols are visible (Julia uses `export` at module level,
@@ -55,10 +55,7 @@ fn collect_params(args_node: &Node, source: &str) -> Vec<Parameter> {
         let child = args_node.child(i).unwrap();
         match child.kind() {
             "identifier" => {
-                let pname = child
-                    .utf8_text(source.as_bytes())
-                    .unwrap_or("")
-                    .to_string();
+                let pname = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                 if !pname.is_empty() {
                     params.push(Parameter {
                         name: pname,
@@ -71,9 +68,16 @@ fn collect_params(args_node: &Node, source: &str) -> Vec<Parameter> {
                 // Type can be identifier, parametrized_type_expression, etc.
                 let first = child.named_child(0);
                 let last_idx = child.named_child_count().saturating_sub(1);
-                let last = if last_idx > 0 { child.named_child(last_idx) } else { None };
+                let last = if last_idx > 0 {
+                    child.named_child(last_idx)
+                } else {
+                    None
+                };
                 if let Some(name_node) = first {
-                    let pname = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    let pname = name_node
+                        .utf8_text(source.as_bytes())
+                        .unwrap_or("")
+                        .to_string();
                     if !pname.is_empty() {
                         let ptype = last.and_then(|t| {
                             t.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
@@ -94,7 +98,8 @@ fn collect_params(args_node: &Node, source: &str) -> Vec<Parameter> {
 /// Find a child by kind without lifetime constraints (uses tree-sitter cursor).
 fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    node.children(&mut cursor).find(|&child| child.kind() == kind)
+    node.children(&mut cursor)
+        .find(|&child| child.kind() == kind)
 }
 
 /// Find the argument_list node for a function-like definition.
@@ -153,7 +158,11 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 }
 
 /// Post-process: reclassify macro_definition symbols.
-fn post_process(mut sym: super::SymbolInfo, node: &Node, _source: &str) -> Option<super::SymbolInfo> {
+fn post_process(
+    mut sym: super::SymbolInfo,
+    node: &Node,
+    _source: &str,
+) -> Option<super::SymbolInfo> {
     // Tag macros by prefixing name with @
     if node.kind() == "macro_definition" {
         sym.name = format!("@{}", sym.name);
@@ -177,8 +186,8 @@ pub fn hooks() -> LanguageHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::symbols::query_extract;
     use crate::symbols::SymbolInfo;
+    use crate::symbols::query_extract;
     use std::sync::Arc;
     use tree_sitter::{Parser, Query};
 
@@ -189,7 +198,15 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let hooks = super::hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.jl"), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from("test.jl"),
+            &hooks,
+            true,
+        )
+        .0
     }
 
     #[test]
@@ -224,22 +241,20 @@ end"#;
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
 
         // Module
-        assert!(names.contains(&"MyModule"), "missing MyModule, got: {:?}", names);
+        assert!(
+            names.contains(&"MyModule"),
+            "missing MyModule, got: {:?}",
+            names
+        );
         let module = syms.iter().find(|s| s.name == "MyModule").unwrap();
         assert_eq!(module.kind, SymbolKind::Class); // @definition.module → Class
-        assert_eq!(
-            module.signature.as_deref(),
-            Some("module MyModule")
-        );
+        assert_eq!(module.signature.as_deref(), Some("module MyModule"));
 
         // Abstract type
         assert!(names.contains(&"Shape"), "missing Shape, got: {:?}", names);
         let shape = syms.iter().find(|s| s.name == "Shape").unwrap();
         assert_eq!(shape.kind, SymbolKind::Interface);
-        assert_eq!(
-            shape.signature.as_deref(),
-            Some("abstract type Shape")
-        );
+        assert_eq!(shape.signature.as_deref(), Some("abstract type Shape"));
 
         // Struct
         assert!(names.contains(&"Point"), "missing Point, got: {:?}", names);
@@ -248,13 +263,14 @@ end"#;
         assert_eq!(point.signature.as_deref(), Some("struct Point"));
 
         // Mutable struct
-        assert!(names.contains(&"Counter"), "missing Counter, got: {:?}", names);
+        assert!(
+            names.contains(&"Counter"),
+            "missing Counter, got: {:?}",
+            names
+        );
         let counter = syms.iter().find(|s| s.name == "Counter").unwrap();
         assert_eq!(counter.kind, SymbolKind::Class);
-        assert_eq!(
-            counter.signature.as_deref(),
-            Some("mutable struct Counter")
-        );
+        assert_eq!(counter.signature.as_deref(), Some("mutable struct Counter"));
 
         // Function with return type
         assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
@@ -274,10 +290,7 @@ end"#;
         assert!(names.contains(&"area"), "missing area, got: {:?}", names);
         let area = syms.iter().find(|s| s.name == "area").unwrap();
         assert_eq!(area.kind, SymbolKind::Function);
-        assert_eq!(
-            area.signature.as_deref(),
-            Some("area(r::Float64) = ...")
-        );
+        assert_eq!(area.signature.as_deref(), Some("area(r::Float64) = ..."));
         let area_params = area.parameters.as_ref().unwrap();
         assert_eq!(area_params.len(), 1);
         assert_eq!(area_params[0].name, "r");
@@ -291,13 +304,14 @@ end"#;
         );
         let mac = syms.iter().find(|s| s.name == "@assert_positive").unwrap();
         assert_eq!(mac.kind, SymbolKind::Function);
-        assert_eq!(
-            mac.signature.as_deref(),
-            Some("macro assert_positive(x)")
-        );
+        assert_eq!(mac.signature.as_deref(), Some("macro assert_positive(x)"));
 
         // Constant
-        assert!(names.contains(&"MAX_SIZE"), "missing MAX_SIZE, got: {:?}", names);
+        assert!(
+            names.contains(&"MAX_SIZE"),
+            "missing MAX_SIZE, got: {:?}",
+            names
+        );
         let constant = syms.iter().find(|s| s.name == "MAX_SIZE").unwrap();
         assert_eq!(constant.kind, SymbolKind::Constant);
         assert_eq!(constant.signature.as_deref(), Some("const MAX_SIZE"));
@@ -309,10 +323,7 @@ end"#;
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "hello");
         assert_eq!(syms[0].kind, SymbolKind::Function);
-        assert_eq!(
-            syms[0].signature.as_deref(),
-            Some("function hello()")
-        );
+        assert_eq!(syms[0].signature.as_deref(), Some("function hello()"));
     }
 
     #[test]
@@ -351,10 +362,7 @@ end"#;
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "Bar");
         assert_eq!(syms[0].kind, SymbolKind::Class);
-        assert_eq!(
-            syms[0].signature.as_deref(),
-            Some("mutable struct Bar")
-        );
+        assert_eq!(syms[0].signature.as_deref(), Some("mutable struct Bar"));
     }
 
     #[test]
@@ -413,7 +421,11 @@ const X = 1
 "#;
         let syms = extract(source);
         for sym in &syms {
-            assert_eq!(sym.visibility, crate::symbols::Visibility::Public, "all Julia symbols should be public");
+            assert_eq!(
+                sym.visibility,
+                crate::symbols::Visibility::Public,
+                "all Julia symbols should be public"
+            );
         }
     }
 }

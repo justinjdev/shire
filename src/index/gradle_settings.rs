@@ -24,10 +24,8 @@ fn parse_settings_content(content: &str) -> GradleSettings {
 
     // Match include statements: include ':app', ':lib:core'
     // Also: include(":app", ":lib:core")
-    let include_re = Regex::new(
-        r#"(?m)^\s*include\s*[\(]?\s*((?:["'][^"']+["']\s*,?\s*)+)\s*[\)]?"#,
-    )
-    .unwrap();
+    let include_re =
+        Regex::new(r#"(?m)^\s*include\s*[\(]?\s*((?:["'][^"']+["']\s*,?\s*)+)\s*[\)]?"#).unwrap();
 
     let project_re = Regex::new(r#"["']([^"']+)["']"#).unwrap();
 
@@ -36,9 +34,7 @@ fn parse_settings_content(content: &str) -> GradleSettings {
         for proj_cap in project_re.captures_iter(args) {
             let project_path = proj_cap.get(1).unwrap().as_str();
             // Convert colon-separated to directory path: `:lib:core` → `lib/core`
-            let dir_path = project_path
-                .trim_start_matches(':')
-                .replace(':', "/");
+            let dir_path = project_path.trim_start_matches(':').replace(':', "/");
             if !dir_path.is_empty() {
                 include_dirs.insert(dir_path);
             }

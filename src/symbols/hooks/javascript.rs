@@ -31,9 +31,7 @@ pub fn hooks() -> LanguageHooks {
                 // degrading caller/callee attribution.
                 "arrow_function",
             ],
-            reference_stoplist: &[
-                "true", "false", "null", "undefined", "this", "super",
-            ],
+            reference_stoplist: &["true", "false", "null", "undefined", "this", "super"],
         }),
         ..base
     }

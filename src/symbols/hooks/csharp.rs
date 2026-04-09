@@ -1,4 +1,7 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// Check modifiers on a declaration node.
@@ -14,18 +17,19 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool, 
 
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i)
-            && child.kind() == "modifier" {
-                let text = child.utf8_text(source.as_bytes()).unwrap_or("");
-                match text {
-                    "public" => public = true,
-                    "protected" => protected = true,
-                    "private" => private = true,
-                    "internal" => internal = true,
-                    "static" => is_static = true,
-                    "readonly" => is_readonly = true,
-                    _ => {}
-                }
+            && child.kind() == "modifier"
+        {
+            let text = child.utf8_text(source.as_bytes()).unwrap_or("");
+            match text {
+                "public" => public = true,
+                "protected" => protected = true,
+                "private" => private = true,
+                "internal" => internal = true,
+                "static" => is_static = true,
+                "readonly" => is_readonly = true,
+                _ => {}
             }
+        }
     }
 
     (public, protected, private, internal, is_static, is_readonly)
@@ -164,10 +168,7 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
 fn extract_return_type(node: &Node, source: &str) -> Option<String> {
     // C# methods have a `returns` field for the return type
     if let Some(ret) = node.child_by_field_name("returns") {
-        return ret
-            .utf8_text(source.as_bytes())
-            .ok()
-            .map(|s| s.to_string());
+        return ret.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
     }
     // Fall back to looking for type child nodes
     find_type_node(node, source)
@@ -242,12 +243,13 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 fn has_modifier(node: &Node, source: &str, modifier: &str) -> bool {
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i)
-            && child.kind() == "modifier" {
-                let text = child.utf8_text(source.as_bytes()).unwrap_or("");
-                if text == modifier {
-                    return true;
-                }
+            && child.kind() == "modifier"
+        {
+            let text = child.utf8_text(source.as_bytes()).unwrap_or("");
+            if text == modifier {
+                return true;
             }
+        }
     }
     false
 }

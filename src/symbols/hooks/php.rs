@@ -1,4 +1,7 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// Check visibility and other modifiers on a PHP declaration node.
@@ -46,19 +49,26 @@ fn is_visible(node: &Node, source: &str) -> bool {
     while let Some(n) = current {
         if matches!(
             n.kind(),
-            "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
+            "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration"
         ) {
             // Walk up through the declaration_list to the type node
             if let Some(type_node) = n.parent()
                 && matches!(
                     type_node.kind(),
-                    "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
-                ) {
-                    let (_, _, p_private, _) = check_modifiers(&type_node, source);
-                    if p_private {
-                        return false;
-                    }
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "trait_declaration"
+                        | "enum_declaration"
+                )
+            {
+                let (_, _, p_private, _) = check_modifiers(&type_node, source);
+                if p_private {
+                    return false;
                 }
+            }
         }
         current = n.parent();
     }
@@ -113,9 +123,13 @@ fn build_type_signature(node: &Node, source: &str, kind: SymbolKind) -> String {
             SymbolKind::Enum => "enum",
             _ => "class",
         };
-        format!("{} {}", kind_str, node.child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            .unwrap_or("?"))
+        format!(
+            "{} {}",
+            kind_str,
+            node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .unwrap_or("?")
+        )
     }
 }
 

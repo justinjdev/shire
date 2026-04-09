@@ -1,7 +1,6 @@
 use crate::db::queries;
 use rmcp::model::{
-    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent,
-    PromptMessageRole,
+    GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
 };
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -51,7 +50,9 @@ pub fn handle(
     match name {
         "explore" => handle_explore(conn, args),
         "reference_audit" => handle_reference_audit(args),
-        _ => Err(PromptError::InvalidParams(format!("Unknown prompt: {name}"))),
+        _ => Err(PromptError::InvalidParams(format!(
+            "Unknown prompt: {name}"
+        ))),
     }
 }
 
@@ -70,7 +71,9 @@ pub fn call_prompt(
         .ok_or_else(|| PromptError::Internal("Prompt returned no messages".into()))?;
     match msg.content {
         PromptMessageContent::Text { text, .. } => Ok(text),
-        _ => Err(PromptError::Internal("Prompt returned non-text content".into())),
+        _ => Err(PromptError::Internal(
+            "Prompt returned non-text content".into(),
+        )),
     }
 }
 
@@ -100,8 +103,7 @@ fn validate_prompt_identifier(value: &str, field: &str) -> Result<(), PromptErro
     // quotes, backticks, control chars — is rejected. Empty strings are OK
     // (empty `package` is the documented unscoped case).
     for c in value.chars() {
-        let ok = c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '-' | '.' | ':' | '/' | '@' | '+');
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '/' | '@' | '+');
         if !ok {
             return Err(PromptError::InvalidParams(format!(
                 "{field} contains disallowed character {c:?}; only identifier characters \
@@ -125,7 +127,7 @@ fn handle_reference_audit(args: &HashMap<String, String>) -> Result<GetPromptRes
     let (resolve_step, package_arg, package_filter_note) = if package.is_empty() {
         (
             format!(
-r#"## Step 0 — Resolve the defining package
+                r#"## Step 0 — Resolve the defining package
 
 Before gathering refs, call `search_symbols` with `query="{name}"` to find where
 `{name}` is DEFINED. Note the `package` of the authoritative definition and use
@@ -151,7 +153,7 @@ package the audit targets in the summary.
     };
 
     let text = format!(
-r#"# Reference audit: `{name}`
+        r#"# Reference audit: `{name}`
 
 Perform a refactor safety analysis for the symbol `{name}` by following these steps.
 
@@ -242,13 +244,20 @@ Produce a concise safety summary covering:
     })
 }
 
-fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<GetPromptResult, PromptError> {
+fn handle_explore(
+    conn: &Connection,
+    args: &HashMap<String, String>,
+) -> Result<GetPromptResult, PromptError> {
     let query = require_arg(args, "query")?;
 
-    let packages = queries::search_packages(conn, query, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let symbols = queries::search_symbols(conn, query, None, None, 20).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let files = queries::search_files(conn, query, None, None).map_err(|e| PromptError::Internal(e.to_string()))?;
-    let docs = queries::search_docs(conn, query, None, 10).map_err(|e| PromptError::Internal(e.to_string()))?;
+    let packages = queries::search_packages(conn, query, 20)
+        .map_err(|e| PromptError::Internal(e.to_string()))?;
+    let symbols = queries::search_symbols(conn, query, None, None, 20)
+        .map_err(|e| PromptError::Internal(e.to_string()))?;
+    let files = queries::search_files(conn, query, None, None)
+        .map_err(|e| PromptError::Internal(e.to_string()))?;
+    let docs = queries::search_docs(conn, query, None, 10)
+        .map_err(|e| PromptError::Internal(e.to_string()))?;
 
     let mut text = format!("# Codebase exploration: \"{query}\"\n\n");
 
@@ -261,13 +270,19 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
     // Organize files by package
     let mut files_by_pkg: HashMap<Option<&str>, Vec<&queries::FileRow>> = HashMap::new();
     for file in &files {
-        files_by_pkg.entry(file.package.as_deref()).or_default().push(file);
+        files_by_pkg
+            .entry(file.package.as_deref())
+            .or_default()
+            .push(file);
     }
 
     // Organize docs by package
     let mut docs_by_pkg: HashMap<Option<&str>, Vec<&queries::DocRow>> = HashMap::new();
     for doc in &docs {
-        docs_by_pkg.entry(doc.package.as_deref()).or_default().push(doc);
+        docs_by_pkg
+            .entry(doc.package.as_deref())
+            .or_default()
+            .push(doc);
     }
 
     if packages.is_empty() && symbols.is_empty() && files.is_empty() && docs.is_empty() {
@@ -291,7 +306,10 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
                     text.push_str(&format!("\n**Matching symbols ({}):**\n", syms.len()));
                     for sym in syms {
                         let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                        text.push_str(&format!("- `{}` ({}) — `{}:{}`\n", sig, sym.kind, sym.file_path, sym.line));
+                        text.push_str(&format!(
+                            "- `{}` ({}) — `{}:{}`\n",
+                            sig, sym.kind, sym.file_path, sym.line
+                        ));
                     }
                 }
 
@@ -308,7 +326,10 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
                     text.push_str(&format!("\n**Matching docs ({}):**\n", ds.len()));
                     for d in ds {
                         let title = d.title.as_deref().unwrap_or("(untitled)");
-                        text.push_str(&format!("- **{}** — `{}`\n  {}\n", title, d.path, d.snippet));
+                        text.push_str(&format!(
+                            "- **{}** — `{}`\n  {}\n",
+                            title, d.path, d.snippet
+                        ));
                     }
                 }
                 text.push('\n');
@@ -317,25 +338,38 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
 
         // Symbols not in matched packages
         let matched_pkg_names: HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
-        let orphan_symbols: Vec<_> = symbols.iter().filter(|s| !matched_pkg_names.contains(s.package.as_str())).collect();
+        let orphan_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| !matched_pkg_names.contains(s.package.as_str()))
+            .collect();
         if !orphan_symbols.is_empty() {
-            text.push_str(&format!("## Additional symbol matches ({})\n\n", orphan_symbols.len()));
+            text.push_str(&format!(
+                "## Additional symbol matches ({})\n\n",
+                orphan_symbols.len()
+            ));
             for sym in &orphan_symbols {
                 let sig = sym.signature.as_deref().unwrap_or(&sym.name);
-                text.push_str(&format!("- `{}` ({}) in **{}** — `{}:{}`\n", sig, sym.kind, sym.package, sym.file_path, sym.line));
+                text.push_str(&format!(
+                    "- `{}` ({}) in **{}** — `{}:{}`\n",
+                    sig, sym.kind, sym.package, sym.file_path, sym.line
+                ));
             }
             text.push('\n');
         }
 
         // Files not in matched packages
-        let orphan_files: Vec<_> = files.iter().filter(|f| {
-            match &f.package {
+        let orphan_files: Vec<_> = files
+            .iter()
+            .filter(|f| match &f.package {
                 Some(pkg) => !matched_pkg_names.contains(pkg.as_str()),
                 None => true,
-            }
-        }).collect();
+            })
+            .collect();
         if !orphan_files.is_empty() {
-            text.push_str(&format!("## Additional file matches ({})\n\n", orphan_files.len()));
+            text.push_str(&format!(
+                "## Additional file matches ({})\n\n",
+                orphan_files.len()
+            ));
             for f in &orphan_files {
                 let pkg_label = f.package.as_deref().unwrap_or("(unowned)");
                 text.push_str(&format!("- `{}` [{}]\n", f.path, pkg_label));
@@ -344,18 +378,25 @@ fn handle_explore(conn: &Connection, args: &HashMap<String, String>) -> Result<G
         }
 
         // Docs not in matched packages
-        let orphan_docs: Vec<_> = docs.iter().filter(|d| {
-            match &d.package {
+        let orphan_docs: Vec<_> = docs
+            .iter()
+            .filter(|d| match &d.package {
                 Some(pkg) => !matched_pkg_names.contains(pkg.as_str()),
                 None => true,
-            }
-        }).collect();
+            })
+            .collect();
         if !orphan_docs.is_empty() {
-            text.push_str(&format!("## Documentation matches ({})\n\n", orphan_docs.len()));
+            text.push_str(&format!(
+                "## Documentation matches ({})\n\n",
+                orphan_docs.len()
+            ));
             for d in &orphan_docs {
                 let title = d.title.as_deref().unwrap_or("(untitled)");
                 let pkg_label = d.package.as_deref().unwrap_or("(unowned)");
-                text.push_str(&format!("- **{}** — `{}` [{}]\n  {}\n", title, d.path, pkg_label, d.snippet));
+                text.push_str(&format!(
+                    "- **{}** — `{}` [{}]\n  {}\n",
+                    title, d.path, pkg_label, d.snippet
+                ));
             }
             text.push('\n');
         }

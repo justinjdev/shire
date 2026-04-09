@@ -67,8 +67,8 @@ pub fn hooks() -> LanguageHooks {
 mod tests {
     use std::sync::Arc;
 
-    use crate::symbols::registry::extract_file;
     use crate::symbols::SymbolKind;
+    use crate::symbols::registry::extract_file;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
         extract_file("sql", source, Arc::from("test.sql"), true, 0).0

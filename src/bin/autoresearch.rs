@@ -28,7 +28,10 @@ fn main() {
         "lifecycle" => run_lifecycle_benchmark(&repos),
         "quality" => run_quality_checks(&repos),
         other => {
-            eprintln!("error: unknown phase '{}', expected build|incremental|query|lifecycle|quality", other);
+            eprintln!(
+                "error: unknown phase '{}', expected build|incremental|query|lifecycle|quality",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -116,8 +119,7 @@ fn run_build_benchmark(repos: &[PathBuf]) {
             );
 
             let start = Instant::now();
-            if let Err(e) =
-                shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
+            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
             {
                 eprintln!(
                     "error: build_index failed on {} iteration {}: {}",
@@ -130,7 +132,11 @@ fn run_build_benchmark(repos: &[PathBuf]) {
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             durations_ms.push(elapsed_ms);
 
-            eprintln!("[build] iteration {} completed in {:.1} ms", i + 1, elapsed_ms);
+            eprintln!(
+                "[build] iteration {} completed in {:.1} ms",
+                i + 1,
+                elapsed_ms
+            );
         }
 
         let measured: Vec<f64> = durations_ms[WARMUP..].to_vec();
@@ -150,9 +156,7 @@ fn run_build_benchmark(repos: &[PathBuf]) {
             .unwrap_or(0);
         drop(conn);
 
-        let db_size_bytes = std::fs::metadata(&db_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         let stats = compute_stats(&measured);
 
@@ -223,23 +227,42 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
             );
 
             let start = Instant::now();
-            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)) {
-                eprintln!("error: incremental build failed on {} iteration {}: {}", repo_name, i + 1, e);
+            if let Err(e) =
+                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path))
+            {
+                eprintln!(
+                    "error: incremental build failed on {} iteration {}: {}",
+                    repo_name,
+                    i + 1,
+                    e
+                );
                 std::process::exit(1);
             }
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             durations_ms.push(elapsed_ms);
 
-            eprintln!("[incremental] iteration {} completed in {:.1} ms", i + 1, elapsed_ms);
+            eprintln!(
+                "[incremental] iteration {} completed in {:.1} ms",
+                i + 1,
+                elapsed_ms
+            );
         }
 
         let measured: Vec<f64> = durations_ms[WARMUP..].to_vec();
 
         let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
-        let package_count: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0)).unwrap_or(0);
-        let symbol_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
-        let reference_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0)).unwrap_or(0);
-        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
+        let package_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap_or(0);
+        let symbol_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap_or(0);
+        let reference_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap_or(0);
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap_or(0);
         drop(conn);
 
         let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -283,10 +306,12 @@ fn run_query_benchmark(repos: &[PathBuf]) {
         let db_path = repo_dir.join(".shire").join("bench.db");
 
         if !db_path.exists() {
-            eprintln!("[query] {} DB not found, building index first...", repo_name);
+            eprintln!(
+                "[query] {} DB not found, building index first...",
+                repo_name
+            );
             let config = shire::config::load_config(repo_dir).unwrap_or_default();
-            if let Err(e) =
-                shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
+            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
             {
                 eprintln!("error: build_index failed for {}: {}", repo_name, e);
                 std::process::exit(1);
@@ -379,7 +404,11 @@ fn run_query_benchmark(repos: &[PathBuf]) {
                 name: format!("query_symbol_references({:?})", ref_name_static),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::query_symbol_references(
-                        c, ref_name_static, None, None, 50,
+                        c,
+                        ref_name_static,
+                        None,
+                        None,
+                        50,
                     );
                 }),
             });
@@ -387,23 +416,29 @@ fn run_query_benchmark(repos: &[PathBuf]) {
                 name: format!("query_symbol_references({:?}, kind=type)", ref_name_static),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::query_symbol_references(
-                        c, ref_name_static, Some("type"), None, 50,
+                        c,
+                        ref_name_static,
+                        Some("type"),
+                        None,
+                        50,
                     );
                 }),
             });
             queries.push(QueryBench {
                 name: format!("query_symbol_callers({:?})", caller_target_static),
                 run: Box::new(|c| {
-                    let _ = shire::db::queries::query_symbol_callers(
-                        c, caller_target_static, None, 50,
-                    );
+                    let _ =
+                        shire::db::queries::query_symbol_callers(c, caller_target_static, None, 50);
                 }),
             });
             queries.push(QueryBench {
                 name: format!("query_symbol_callees({:?})", callee_enclosing_static),
                 run: Box::new(|c| {
                     let _ = shire::db::queries::query_symbol_callees(
-                        c, callee_enclosing_static, None, 50,
+                        c,
+                        callee_enclosing_static,
+                        None,
+                        50,
                     );
                 }),
             });
@@ -485,7 +520,10 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         if let Ok(out) = &git_status {
             let dirty = String::from_utf8_lossy(&out.stdout);
             if !dirty.trim().is_empty() {
-                eprintln!("[lifecycle] skipping {} — worktree has uncommitted changes", repo_name);
+                eprintln!(
+                    "[lifecycle] skipping {} — worktree has uncommitted changes",
+                    repo_name
+                );
                 continue;
             }
         }
@@ -591,8 +629,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             rebuild_times.push(rebuild_ms);
 
             // Run a query (simulates MCP tool call after rebuild)
-            let conn =
-                shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
+            let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
             let start = Instant::now();
             let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
             let _ = shire::db::queries::search_files(&conn, "test", None, None);
@@ -654,10 +691,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         let query_degradation =
             (query_last.median - query_first.median) / query_first.median * 100.0;
 
-        eprintln!(
-            "\n[lifecycle] {} summary:",
-            repo_name
-        );
+        eprintln!("\n[lifecycle] {} summary:", repo_name);
         eprintln!(
             "  rebuild: first10={:.1}ms last10={:.1}ms degradation={:+.1}%",
             rebuild_first.median, rebuild_last.median, rebuild_degradation
@@ -839,11 +873,10 @@ fn run_quality_checks(repos: &[PathBuf]) {
                         |r| r.get(0),
                     )
                     .unwrap_or_default();
-                let probe_hits = shire::db::queries::query_symbol_references(
-                    &conn, &probe, None, None, 10,
-                )
-                .map(|r| r.len())
-                .unwrap_or(0);
+                let probe_hits =
+                    shire::db::queries::query_symbol_references(&conn, &probe, None, None, 10)
+                        .map(|r| r.len())
+                        .unwrap_or(0);
                 checks.push((
                     "reference query returns results",
                     probe_hits > 0,
@@ -903,8 +936,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
 
         // 8. Result relevance: top results should match the query term
         let config_results =
-            shire::db::queries::search_symbols(&conn, "Config", None, None, 5)
-                .unwrap_or_default();
+            shire::db::queries::search_symbols(&conn, "Config", None, None, 5).unwrap_or_default();
         // Check that query term appears somewhere in the result (name, signature, or file_path)
         let top_relevant = config_results
             .iter()
@@ -933,8 +965,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
 
         // 9. File search relevance: results should contain the query in path
         let file_results =
-            shire::db::queries::search_files(&conn, "config", None, None)
-                .unwrap_or_default();
+            shire::db::queries::search_files(&conn, "config", None, None).unwrap_or_default();
         let files_relevant = file_results
             .iter()
             .filter(|f| f.path.to_lowercase().contains("config"))
@@ -1026,7 +1057,8 @@ fn run_quality_checks(repos: &[PathBuf]) {
             let original = fs::read_to_string(&test_file).unwrap_or_default();
             let modified = format!("{}\n// quality check\n", original);
             let _ = fs::write(&test_file, &modified);
-            let incr_ok = shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
+            let incr_ok =
+                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
             let _ = fs::write(&test_file, &original); // restore
 
             let conn3 = shire::db::open_readonly(&db_path).expect("failed to open DB");

@@ -1,4 +1,4 @@
-use super::{field_text, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, field_text, node_text};
 use tree_sitter::Node;
 
 /// R class-definition function names that we recognize.
@@ -128,7 +128,7 @@ pub fn hooks() -> LanguageHooks {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{extract_file, SymbolKind};
+    use super::super::super::{SymbolKind, extract_file};
     use std::sync::Arc;
 
     #[test]
@@ -142,10 +142,7 @@ mod tests {
         let sym = &symbols[0];
         assert_eq!(sym.name, "my_func");
         assert_eq!(sym.kind, SymbolKind::Function);
-        assert_eq!(
-            sym.signature.as_deref(),
-            Some("my_func <- function(x, y)")
-        );
+        assert_eq!(sym.signature.as_deref(), Some("my_func <- function(x, y)"));
         let params = sym.parameters.as_ref().unwrap();
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].name, "x");
@@ -212,7 +209,10 @@ mod tests {
         // Should capture the R6 class definition (Animal <- R6Class)
         // The inner function assignment (self$name <- name) should not match
         // since self$name is an extract_operator, not an identifier
-        let class_symbols: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let class_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(class_symbols.len(), 1);
         assert_eq!(class_symbols[0].name, "Animal");
         assert_eq!(
@@ -298,8 +298,11 @@ multiply <- function(a, b) a * b
   )
 )
 "#;
-        let (symbols, _) = extract_file("r", source, Arc::from("counter.r"), true, 0);
-        let class_symbols: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let (symbols, _) = extract_file("r", source, Arc::from("counter.r"), true);
+        let class_symbols: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(class_symbols.len(), 1);
         assert_eq!(class_symbols[0].name, "Counter");
         assert_eq!(

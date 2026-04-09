@@ -1,4 +1,7 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// Resolve the parent class or module for a method.
@@ -28,9 +31,10 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
             // the constant child inside the superclass node
             if let Some(superclass) = node.child_by_field_name("superclass") {
                 if let Some(sc_const) = find_child_by_kind(&superclass, "constant")
-                    && let Some(sc_name) = node_text(&sc_const, source) {
-                        return format!("class {name} < {sc_name}");
-                    }
+                    && let Some(sc_name) = node_text(&sc_const, source)
+                {
+                    return format!("class {name} < {sc_name}");
+                }
                 // Fallback to scope_resolution for namespaced superclasses
                 if let Some(sc_name) = node_text(&superclass, source) {
                     let sc_name = sc_name.trim_start_matches('<').trim();
@@ -100,52 +104,57 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
             "splat_parameter" => {
                 // *args
                 if let Some(name_node) = child.child_by_field_name("name")
-                    && let Some(name) = node_text(&name_node, source) {
-                        params.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: Some("*".to_string()),
-                        });
-                    }
+                    && let Some(name) = node_text(&name_node, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: Some("*".to_string()),
+                    });
+                }
             }
             "hash_splat_parameter" => {
                 // **opts
                 if let Some(name_node) = child.child_by_field_name("name")
-                    && let Some(name) = node_text(&name_node, source) {
-                        params.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: Some("**".to_string()),
-                        });
-                    }
+                    && let Some(name) = node_text(&name_node, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: Some("**".to_string()),
+                    });
+                }
             }
             "block_parameter" => {
                 // &block
                 if let Some(name_node) = child.child_by_field_name("name")
-                    && let Some(name) = node_text(&name_node, source) {
-                        params.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: Some("&".to_string()),
-                        });
-                    }
+                    && let Some(name) = node_text(&name_node, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: Some("&".to_string()),
+                    });
+                }
             }
             "keyword_parameter" => {
                 // name: or name: default
                 if let Some(name_node) = child.child_by_field_name("name")
-                    && let Some(name) = node_text(&name_node, source) {
-                        params.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: None,
-                        });
-                    }
+                    && let Some(name) = node_text(&name_node, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: None,
+                    });
+                }
             }
             "optional_parameter" => {
                 // name = default
                 if let Some(name_node) = child.child_by_field_name("name")
-                    && let Some(name) = node_text(&name_node, source) {
-                        params.push(Parameter {
-                            name: name.to_string(),
-                            type_annotation: None,
-                        });
-                    }
+                    && let Some(name) = node_text(&name_node, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: None,
+                    });
+                }
             }
             _ => {}
         }
@@ -185,21 +194,34 @@ pub fn hooks() -> LanguageHooks {
         extract_return_type: None,
         post_process: Some(post_process),
         reference_hooks: Some(ReferenceHooks {
-            enclosing_ancestors: &[
-                "method",
-                "singleton_method",
-                "class",
-                "module",
-            ],
+            enclosing_ancestors: &["method", "singleton_method", "class", "module"],
             reference_stoplist: &[
-                "true", "false", "nil", "self",
-                "puts", "print", "p", "pp",
-                "String", "Integer", "Float", "Array", "Hash", "Symbol", "NilClass",
-                "Object", "Class", "Module",
+                "true",
+                "false",
+                "nil",
+                "self",
+                "puts",
+                "print",
+                "p",
+                "pp",
+                "String",
+                "Integer",
+                "Float",
+                "Array",
+                "Hash",
+                "Symbol",
+                "NilClass",
+                "Object",
+                "Class",
+                "Module",
                 // Mixin/import methods: captured separately as @reference.impl
                 // and @reference.import, so suppress their redundant Call refs.
-                "include", "prepend", "extend",
-                "require", "require_relative", "load",
+                "include",
+                "prepend",
+                "extend",
+                "require",
+                "require_relative",
+                "load",
             ],
         }),
     }

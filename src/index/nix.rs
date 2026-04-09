@@ -146,12 +146,14 @@ fn scan_top_level_inputs(
                 while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
-                if k < bytes.len() && bytes[k] == b'{'
-                    && let Some(close) = find_matching_brace(body, k) {
-                        parse_inputs_body(&body[k + 1..close], order, seen);
-                        i = close + 1;
-                        continue;
-                    }
+                if k < bytes.len()
+                    && bytes[k] == b'{'
+                    && let Some(close) = find_matching_brace(body, k)
+                {
+                    parse_inputs_body(&body[k + 1..close], order, seen);
+                    i = close + 1;
+                    continue;
+                }
                 i = j;
                 continue;
             } else if j < bytes.len() && bytes[j] == b'.' {
@@ -171,9 +173,10 @@ fn scan_top_level_inputs(
                         order.push((name, url));
                     } else if url.is_some()
                         && let Some(entry) = order.iter_mut().find(|(n, _)| n == &name)
-                            && entry.1.is_none() {
-                                entry.1 = url;
-                            }
+                        && entry.1.is_none()
+                    {
+                        entry.1 = url;
+                    }
                     // Advance just past NAME; depth tracking will walk over
                     // any `= { ... }` attrset or `.key = value` tail.
                     i = k;
@@ -211,7 +214,8 @@ fn extract_url_for_dotted(text: &str, pos: usize) -> Option<String> {
         let after_eq = after_eq.trim_start();
         if after_eq.starts_with('{') {
             // Find position of '{' in original text
-            let brace_offset = pos + (text[pos..].len() - rest.len()) + (rest.len() - after_eq.len());
+            let brace_offset =
+                pos + (text[pos..].len() - rest.len()) + (rest.len() - after_eq.len());
             if let Some(close) = find_matching_brace(text, brace_offset) {
                 let body = &text[brace_offset + 1..close];
                 return find_url_in_attrset(body);
@@ -271,9 +275,10 @@ fn find_url_in_attrset(body: &str) -> Option<String> {
                     if after_url <= body.len() && is_word_boundary_at(body, after_url) {
                         let rest = body[after_url..].trim_start();
                         if let Some(after_eq) = rest.strip_prefix('=')
-                            && let Some(val) = extract_url_value(after_eq.trim_start()) {
-                                return Some(val);
-                            }
+                            && let Some(val) = extract_url_value(after_eq.trim_start())
+                        {
+                            return Some(val);
+                        }
                     }
                 }
                 i += 1;
@@ -377,9 +382,10 @@ fn parse_inputs_body(
         } else if url.is_some() {
             // If we already saw this input but didn't have a URL, update it.
             if let Some(entry) = order.iter_mut().find(|(n, _)| n == &name)
-                && entry.1.is_none() {
-                    entry.1 = url;
-                }
+                && entry.1.is_none()
+            {
+                entry.1 = url;
+            }
         }
     }
 }
@@ -676,10 +682,7 @@ mod tests {
             info.dependencies[0].version_req.as_deref(),
             Some("github:NixOS/nixpkgs/nixos-unstable")
         );
-        assert!(matches!(
-            info.dependencies[0].dep_kind,
-            DepKind::Runtime
-        ));
+        assert!(matches!(info.dependencies[0].dep_kind, DepKind::Runtime));
 
         assert_eq!(info.dependencies[1].name, "flake-utils");
         assert_eq!(
@@ -975,13 +978,24 @@ mod tests {
         let info = parser.parse(&path, "proj").unwrap();
 
         assert_eq!(info.dependencies.len(), 2);
-        let nixpkgs = info.dependencies.iter().find(|d| d.name == "nixpkgs").unwrap();
+        let nixpkgs = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "nixpkgs")
+            .unwrap();
         assert_eq!(
             nixpkgs.version_req.as_deref(),
             Some("github:NixOS/nixpkgs/nixos-unstable")
         );
-        let utils = info.dependencies.iter().find(|d| d.name == "flake-utils").unwrap();
-        assert_eq!(utils.version_req.as_deref(), Some("github:numtide/flake-utils"));
+        let utils = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "flake-utils")
+            .unwrap();
+        assert_eq!(
+            utils.version_req.as_deref(),
+            Some("github:numtide/flake-utils")
+        );
     }
 
     #[test]
@@ -1005,13 +1019,24 @@ mod tests {
         let info = parser.parse(&path, "proj").unwrap();
 
         assert_eq!(info.dependencies.len(), 2);
-        let nixpkgs = info.dependencies.iter().find(|d| d.name == "nixpkgs").unwrap();
+        let nixpkgs = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "nixpkgs")
+            .unwrap();
         assert_eq!(
             nixpkgs.version_req.as_deref(),
             Some("github:NixOS/nixpkgs/nixos-unstable")
         );
-        let rust = info.dependencies.iter().find(|d| d.name == "rust-overlay").unwrap();
-        assert_eq!(rust.version_req.as_deref(), Some("github:oxalica/rust-overlay"));
+        let rust = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "rust-overlay")
+            .unwrap();
+        assert_eq!(
+            rust.version_req.as_deref(),
+            Some("github:oxalica/rust-overlay")
+        );
     }
 
     #[test]

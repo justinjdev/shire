@@ -1,4 +1,7 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor,
+    find_child_by_kind,
+};
 use tree_sitter::Node;
 
 /// Scala type-defining node kinds.
@@ -37,18 +40,20 @@ fn has_private_modifier(node: &Node, source: &str) -> bool {
         let child = node.child(i).unwrap();
         if child.kind() == "access_modifier"
             && let Ok(text) = child.utf8_text(source.as_bytes())
-                && text.starts_with("private") {
-                    return true;
-                }
+            && text.starts_with("private")
+        {
+            return true;
+        }
         // The grammar wraps access_modifier inside a `modifiers` node
         if child.kind() == "modifiers" {
             for j in 0..child.child_count() {
                 let grandchild = child.child(j).unwrap();
                 if grandchild.kind() == "access_modifier"
                     && let Ok(text) = grandchild.utf8_text(source.as_bytes())
-                        && text.starts_with("private") {
-                            return true;
-                        }
+                    && text.starts_with("private")
+                {
+                    return true;
+                }
             }
         }
     }
@@ -228,10 +233,9 @@ pub fn hooks() -> LanguageHooks {
                 "trait_definition",
             ],
             reference_stoplist: &[
-                "true", "false", "null", "this", "super",
-                "Int", "Long", "Short", "Byte", "Float", "Double", "Boolean", "Char", "String", "Unit",
-                "Some", "None", "Option", "List", "Seq", "Map", "Set", "Array",
-                "println", "print",
+                "true", "false", "null", "this", "super", "Int", "Long", "Short", "Byte", "Float",
+                "Double", "Boolean", "Char", "String", "Unit", "Some", "None", "Option", "List",
+                "Seq", "Map", "Set", "Array", "println", "print",
             ],
         }),
     }

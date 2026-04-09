@@ -1,8 +1,17 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// Valid public definition keywords for call nodes.
-const PUBLIC_DEF_KEYWORDS: &[&str] = &["def", "defmacro", "defguard", "defdelegate", "defmodule", "defprotocol"];
+const PUBLIC_DEF_KEYWORDS: &[&str] = &[
+    "def",
+    "defmacro",
+    "defguard",
+    "defdelegate",
+    "defmodule",
+    "defprotocol",
+];
 
 /// Valid attribute names for unary_operator (@attr) nodes.
 const ATTR_KEYWORDS: &[&str] = &["type", "opaque", "callback"];
@@ -23,10 +32,12 @@ fn attr_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 /// Filter: include only valid public definitions.
 fn is_visible(node: &Node, source: &str) -> bool {
     match node.kind() {
-        "call" => call_target_text(node, source)
-            .is_some_and(|kw| PUBLIC_DEF_KEYWORDS.contains(&kw)),
-        "unary_operator" => attr_name(node, source)
-            .is_some_and(|name| ATTR_KEYWORDS.contains(&name)),
+        "call" => {
+            call_target_text(node, source).is_some_and(|kw| PUBLIC_DEF_KEYWORDS.contains(&kw))
+        }
+        "unary_operator" => {
+            attr_name(node, source).is_some_and(|name| ATTR_KEYWORDS.contains(&name))
+        }
         _ => false,
     }
 }
@@ -70,15 +81,16 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
                     let inner_call = outer_args.as_ref().and_then(find_inner_call);
 
                     if let Some(inner) = inner_call
-                        && let Some(args_node) = find_child_by_kind(&inner, "arguments") {
-                            let args_text = node_text(&args_node, source).unwrap_or("()");
-                            let trimmed = args_text.trim();
-                            if let Some(inner_text) =
-                                trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
-                            {
-                                return format!("{keyword} {name}({})", inner_text.trim());
-                            }
+                        && let Some(args_node) = find_child_by_kind(&inner, "arguments")
+                    {
+                        let args_text = node_text(&args_node, source).unwrap_or("()");
+                        let trimmed = args_text.trim();
+                        if let Some(inner_text) =
+                            trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+                        {
+                            return format!("{keyword} {name}({})", inner_text.trim());
                         }
+                    }
                     format!("{keyword} {name}")
                 }
             }
@@ -86,10 +98,11 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
         "unary_operator" => {
             let attr = attr_name(node, source).unwrap_or("type");
             if let Some(operand) = node.child_by_field_name("operand")
-                && let Some(args) = find_child_by_kind(&operand, "arguments") {
-                    let text = node_text(&args, source).unwrap_or(name);
-                    return format!("@{attr} {}", text.trim());
-                }
+                && let Some(args) = find_child_by_kind(&operand, "arguments")
+            {
+                let text = node_text(&args, source).unwrap_or(name);
+                return format!("@{attr} {}", text.trim());
+            }
             format!("@{attr} {name}")
         }
         _ => name.to_string(),
@@ -129,12 +142,13 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
                 // Default value: name \\ default
                 if let Some(left) = child.child_by_field_name("left")
                     && left.kind() == "identifier"
-                        && let Some(name) = node_text(&left, source) {
-                            params.push(Parameter {
-                                name: name.to_string(),
-                                type_annotation: None,
-                            });
-                        }
+                    && let Some(name) = node_text(&left, source)
+                {
+                    params.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: None,
+                    });
+                }
             }
             _ => {}
         }
@@ -180,21 +194,23 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             let attr = attr_name(node, source)?;
             if let Some(operand) = node.child_by_field_name("operand")
                 && let Some(args) = find_child_by_kind(&operand, "arguments")
-                    && let Some(binop) = find_child_by_kind(&args, "binary_operator") {
-                        let return_type = binop
-                            .child_by_field_name("right")
-                            .and_then(|r| node_text(&r, source))
-                            .map(|s| s.trim().to_string());
-                        sym.return_type = return_type;
+                && let Some(binop) = find_child_by_kind(&args, "binary_operator")
+            {
+                let return_type = binop
+                    .child_by_field_name("right")
+                    .and_then(|r| node_text(&r, source))
+                    .map(|s| s.trim().to_string());
+                sym.return_type = return_type;
 
-                        if attr == "callback" {
-                            sym.kind = SymbolKind::Method;
-                            if let Some(left) = binop.child_by_field_name("left")
-                                && left.kind() == "call" {
-                                    sym.parameters = Some(extract_callback_params(&left, source));
-                                }
-                        }
+                if attr == "callback" {
+                    sym.kind = SymbolKind::Method;
+                    if let Some(left) = binop.child_by_field_name("left")
+                        && left.kind() == "call"
+                    {
+                        sym.parameters = Some(extract_callback_params(&left, source));
                     }
+                }
+            }
         }
         _ => {}
     }

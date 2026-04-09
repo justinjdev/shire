@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 
 use super::hooks::LanguageHooks;
-use super::{query_extract, ReferenceInfo, SymbolInfo};
+use super::{ReferenceInfo, SymbolInfo, query_extract};
 use tree_sitter::{Language, Parser, Query};
 
 struct LanguageEntry {
@@ -322,7 +322,14 @@ pub fn extract_file(
             if parser.set_language(&language).is_err() {
                 return (Vec::new(), Vec::new());
             }
-            return query_extract::extract(&mut parser, query, source, file_path, &hooks, skip_references, max_references_per_file);
+            return query_extract::extract(
+                &mut parser,
+                query,
+                source,
+                file_path,
+                &hooks,
+                skip_references,
+            );
         }
     }
 

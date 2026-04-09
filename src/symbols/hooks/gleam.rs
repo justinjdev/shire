@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Gleam visibility: only `pub` symbols are visible.
@@ -138,7 +138,15 @@ mod tests {
         let hooks = hooks();
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.gleam"), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from("test.gleam"),
+            &hooks,
+            true,
+        )
+        .0
     }
 
     #[test]

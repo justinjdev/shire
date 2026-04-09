@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
 use tree_sitter::Node;
 
 /// For methods, resolve the parent class name.
@@ -175,9 +175,10 @@ fn extract_typed_param(param_node: &Node, source: &str) -> Option<String> {
                     .map(|s| s.to_string());
             }
             if child.kind() == "parenthesized_pattern"
-                && let Some(result) = try_extract_type(&child, source) {
-                    return Some(result);
-                }
+                && let Some(result) = try_extract_type(&child, source)
+            {
+                return Some(result);
+            }
         }
         None
     }
@@ -258,19 +259,20 @@ fn extract_function_type_params(node: &Node, source: &str) -> Vec<Parameter> {
 
     // If codomain is also a function_type, recurse; otherwise it's the return type
     if let Some(c) = codomain
-        && c.kind() == "function_type" {
-            let mut sub_params = extract_function_type_params(&c, source);
-            // Renumber parameters
-            for p in &mut sub_params {
-                let idx = params.len();
-                p.name = format!("_{}", idx);
-                params.push(Parameter {
-                    name: p.name.clone(),
-                    type_annotation: p.type_annotation.clone(),
-                });
-            }
+        && c.kind() == "function_type"
+    {
+        let mut sub_params = extract_function_type_params(&c, source);
+        // Renumber parameters
+        for p in &mut sub_params {
+            let idx = params.len();
+            p.name = format!("_{}", idx);
+            params.push(Parameter {
+                name: p.name.clone(),
+                type_annotation: p.type_annotation.clone(),
+            });
         }
-        // else: it's the return type, not a parameter
+    }
+    // else: it's the return type, not a parameter
 
     params
 }
@@ -358,9 +360,10 @@ fn is_local_let_binding(node: &Node) -> bool {
     // Walk up: let_binding -> value_definition -> let_expression
     if let Some(val_def) = node.parent()
         && val_def.kind() == "value_definition"
-            && let Some(grandparent) = val_def.parent() {
-                return grandparent.kind() == "let_expression";
-            }
+        && let Some(grandparent) = val_def.parent()
+    {
+        return grandparent.kind() == "let_expression";
+    }
     false
 }
 

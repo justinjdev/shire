@@ -262,10 +262,7 @@ requires = ["setuptools"]
         );
         assert_eq!(
             parse_pep508("typing-extensions>=4.0; python_version<\"3.11\""),
-            (
-                "typing-extensions".to_string(),
-                Some(">=4.0".to_string())
-            )
+            ("typing-extensions".to_string(), Some(">=4.0".to_string()))
         );
     }
 }

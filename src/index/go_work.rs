@@ -78,7 +78,10 @@ use (
         );
 
         let dirs = parse_go_work(&path).unwrap();
-        assert_eq!(dirs, vec!["services/auth", "services/gateway", "packages/shared"]);
+        assert_eq!(
+            dirs,
+            vec!["services/auth", "services/gateway", "packages/shared"]
+        );
     }
 
     #[test]

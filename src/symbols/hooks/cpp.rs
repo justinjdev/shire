@@ -1,4 +1,6 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// C++ visibility: include all symbols.
@@ -67,7 +69,8 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
 
     for i in 0..params_node.child_count() {
         let child = params_node.child(i).unwrap();
-        if child.kind() == "parameter_declaration" || child.kind() == "optional_parameter_declaration"
+        if child.kind() == "parameter_declaration"
+            || child.kind() == "optional_parameter_declaration"
         {
             let type_ann = child
                 .child_by_field_name("type")

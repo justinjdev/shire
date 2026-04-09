@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
 use tree_sitter::Node;
 
 /// Dart visibility: names starting with `_` are private.
@@ -13,12 +13,15 @@ fn is_visible(node: &Node, source: &str) -> bool {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
-            "class_declaration" | "mixin_declaration" | "enum_declaration"
+            "class_declaration"
+            | "mixin_declaration"
+            | "enum_declaration"
             | "extension_declaration" => {
                 if let Some(ancestor_name) = extract_name(&n, source)
-                    && ancestor_name.starts_with('_') {
-                        return false;
-                    }
+                    && ancestor_name.starts_with('_')
+                {
+                    return false;
+                }
             }
             _ => {}
         }
@@ -41,7 +44,9 @@ fn extract_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     // For method_signature, dig into the inner signature to find the name
     if node.kind() == "method_signature" {
         let inner_kinds = [
-            "function_signature", "getter_signature", "setter_signature",
+            "function_signature",
+            "getter_signature",
+            "setter_signature",
             "constructor_signature",
         ];
         for i in 0..node.child_count() {
@@ -54,9 +59,7 @@ fn extract_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 
     // For declaration nodes wrapping a signature, dig in
     if node.kind() == "declaration" {
-        let sig_kinds = [
-            "function_signature", "getter_signature", "setter_signature",
-        ];
+        let sig_kinds = ["function_signature", "getter_signature", "setter_signature"];
         for i in 0..node.child_count() {
             let child = node.child(i).unwrap();
             if sig_kinds.contains(&child.kind()) {
@@ -85,8 +88,11 @@ fn extract_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 /// resolve the parent type name.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
-        "method_signature" | "declaration" | "constructor_signature"
-        | "constant_constructor_signature" | "factory_constructor_signature"
+        "method_signature"
+        | "declaration"
+        | "constructor_signature"
+        | "constant_constructor_signature"
+        | "factory_constructor_signature"
         | "redirecting_factory_constructor_signature" => {}
         _ => return None,
     }
@@ -155,7 +161,11 @@ fn build_type_signature(node: &Node, source: &str, name: &str) -> String {
                 });
             let sig = source[start..end.min(source.len())].trim();
             if sig.is_empty() {
-                format!("{} {}", node.kind().split('_').next().unwrap_or("class"), name)
+                format!(
+                    "{} {}",
+                    node.kind().split('_').next().unwrap_or("class"),
+                    name
+                )
             } else {
                 sig.to_string()
             }
@@ -198,9 +208,10 @@ fn collect_parameters(params_node: &Node, source: &str, params: &mut Vec<Paramet
                 for j in 0..child.child_count() {
                     let opt_child = child.child(j).unwrap();
                     if opt_child.kind() == "formal_parameter"
-                        && let Some(param) = extract_single_param(&opt_child, source) {
-                            params.push(param);
-                        }
+                        && let Some(param) = extract_single_param(&opt_child, source)
+                    {
+                        params.push(param);
+                    }
                 }
             }
             _ => {}
@@ -242,7 +253,12 @@ fn extract_single_param(param_node: &Node, source: &str) -> Option<Parameter> {
 
 /// Find the type annotation for a parameter, including generic type arguments.
 fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
-    let type_kinds = ["type_identifier", "void_type", "function_type", "inferred_type"];
+    let type_kinds = [
+        "type_identifier",
+        "void_type",
+        "function_type",
+        "inferred_type",
+    ];
 
     for i in 0..param_node.child_count() {
         let child = param_node.child(i).unwrap();
@@ -251,15 +267,17 @@ fn find_param_type(param_node: &Node, source: &str) -> Option<String> {
             let mut next_idx = i + 1;
             // Append generic type_arguments if present (e.g., List<String>)
             if let Some(next) = param_node.child(next_idx)
-                && next.kind() == "type_arguments" {
-                    type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
-                    next_idx += 1;
-                }
+                && next.kind() == "type_arguments"
+            {
+                type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
+                next_idx += 1;
+            }
             // Check for nullable `?` following the type
             if let Some(next) = param_node.child(next_idx)
-                && next.kind() == "?" {
-                    type_text.push('?');
-                }
+                && next.kind() == "?"
+            {
+                type_text.push('?');
+            }
             return Some(type_text);
         }
         // Handle constructor_param (this.name)
@@ -294,15 +312,17 @@ fn extract_type_with_generics(node: &Node, source: &str) -> Option<String> {
             // Append generic type_arguments if present (e.g., Future<int>)
             let mut next_idx = i + 1;
             if let Some(next) = node.child(next_idx)
-                && next.kind() == "type_arguments" {
-                    type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
-                    next_idx += 1;
-                }
+                && next.kind() == "type_arguments"
+            {
+                type_text.push_str(next.utf8_text(source.as_bytes()).ok()?);
+                next_idx += 1;
+            }
             // Check for nullable `?`
             if let Some(next) = node.child(next_idx)
-                && next.kind() == "?" {
-                    type_text.push('?');
-                }
+                && next.kind() == "?"
+            {
+                type_text.push('?');
+            }
             return Some(type_text);
         }
     }
@@ -358,14 +378,16 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
     // Skip operator methods (they have no useful name capture)
     if node.kind() == "method_signature"
         && let Some(inner) = find_inner_signature(node)
-            && inner.kind() == "operator_signature" {
-                return None;
-            }
+        && inner.kind() == "operator_signature"
+    {
+        return None;
+    }
 
     // Named constructors: collect all identifier parts into a dotted name.
     // e.g., Dog.fromJson — the query captures "Dog" but we want "Dog.fromJson"
     match node.kind() {
-        "constructor_signature" | "factory_constructor_signature"
+        "constructor_signature"
+        | "factory_constructor_signature"
         | "redirecting_factory_constructor_signature" => {
             let names: Vec<&str> = (0..node.child_count())
                 .filter_map(|i| {
@@ -520,7 +542,10 @@ class Dog {
 }
 "#;
         let syms = extract(source);
-        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].name, "bark");
         assert_eq!(methods[0].parent_symbol.as_deref(), Some("Dog"));
@@ -534,7 +559,10 @@ class Foo {
 }
 "#;
         let syms = extract(source);
-        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].name, "name");
     }
@@ -547,7 +575,10 @@ class Foo {
 }
 "#;
         let syms = extract(source);
-        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].name, "value");
     }
@@ -594,7 +625,10 @@ class _Internal {
 }
 "#;
         let syms = extract(source);
-        assert!(syms.is_empty(), "methods in private class should be filtered");
+        assert!(
+            syms.is_empty(),
+            "methods in private class should be filtered"
+        );
     }
 
     #[test]
@@ -652,7 +686,10 @@ class MyClass {
 }
 "#;
         let syms = extract(source);
-        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert_eq!(methods.len(), 1, "private method should be filtered");
         assert_eq!(methods[0].name, "publicMethod");
     }
@@ -666,7 +703,10 @@ abstract class Animal {
 }
 "#;
         let syms = extract(source);
-        let methods: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert!(!methods.is_empty(), "abstract methods should be captured");
         let names: Vec<&str> = methods.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"makeSound"), "abstract method missing");
@@ -707,7 +747,11 @@ class Dog {
         assert_eq!(ctors.len(), 2, "both constructors should be captured");
         let names: Vec<&str> = ctors.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Dog"));
-        assert!(names.contains(&"Dog.fromJson"), "named constructor should have dotted name, got: {:?}", names);
+        assert!(
+            names.contains(&"Dog.fromJson"),
+            "named constructor should have dotted name, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -730,8 +774,15 @@ class Dog {
 }
 "#;
         let syms = extract(source);
-        let ctors: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method).collect();
-        assert!(ctors.iter().any(|s| s.name == "Dog.named"), "const named constructor should have dotted name, got: {:?}", ctors.iter().map(|s| &s.name).collect::<Vec<_>>());
+        let ctors: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            ctors.iter().any(|s| s.name == "Dog.named"),
+            "const named constructor should have dotted name, got: {:?}",
+            ctors.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -743,8 +794,15 @@ class Dog {
 }
 "#;
         let syms = extract(source);
-        let ctors: Vec<_> = syms.iter().filter(|s| s.kind == SymbolKind::Method && !s.name.starts_with('_')).collect();
-        assert!(ctors.iter().any(|s| s.name == "Dog.create"), "factory named constructor should have dotted name, got: {:?}", ctors.iter().map(|s| &s.name).collect::<Vec<_>>());
+        let ctors: Vec<_> = syms
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method && !s.name.starts_with('_'))
+            .collect();
+        assert!(
+            ctors.iter().any(|s| s.name == "Dog.create"),
+            "factory named constructor should have dotted name, got: {:?}",
+            ctors.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

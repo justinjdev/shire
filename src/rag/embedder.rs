@@ -21,8 +21,7 @@ impl Embedder {
             }
         };
 
-        let mut options = InitOptions::new(model_enum)
-            .with_show_download_progress(true);
+        let mut options = InitOptions::new(model_enum).with_show_download_progress(true);
 
         if let Some(ref cache_dir) = config.cache_dir {
             let expanded = shellexpand::full(cache_dir)?.into_owned();
@@ -109,7 +108,11 @@ pub fn file_to_text(file: &FileForEmbedding) -> String {
             Some(sig) if !sig.is_empty() => sig.clone(),
             _ => format!("{} {}", sym.kind, sym.name),
         };
-        let cost = if parts.is_empty() { part.len() } else { part.len() + 2 };
+        let cost = if parts.is_empty() {
+            part.len()
+        } else {
+            part.len() + 2
+        };
         if used + cost > budget {
             break;
         }
@@ -183,29 +186,36 @@ mod tests {
 
     #[test]
     fn test_file_to_text_prefers_signature() {
-        let file = make_file(vec![
-            sym("authenticate", "function", Some("fn authenticate(token: &str) -> Result<User>")),
-        ]);
+        let file = make_file(vec![sym(
+            "authenticate",
+            "function",
+            Some("fn authenticate(token: &str) -> Result<User>"),
+        )]);
         let text = file_to_text(&file);
-        assert_eq!(text, "src/auth/middleware.rs in auth-service — fn authenticate(token: &str) -> Result<User>");
+        assert_eq!(
+            text,
+            "src/auth/middleware.rs in auth-service — fn authenticate(token: &str) -> Result<User>"
+        );
     }
 
     #[test]
     fn test_file_to_text_falls_back_without_signature() {
-        let file = make_file(vec![
-            sym("UserConfig", "struct", None),
-        ]);
+        let file = make_file(vec![sym("UserConfig", "struct", None)]);
         let text = file_to_text(&file);
-        assert_eq!(text, "src/auth/middleware.rs in auth-service — struct UserConfig");
+        assert_eq!(
+            text,
+            "src/auth/middleware.rs in auth-service — struct UserConfig"
+        );
     }
 
     #[test]
     fn test_file_to_text_empty_signature_treated_as_absent() {
-        let file = make_file(vec![
-            sym("process", "function", Some("")),
-        ]);
+        let file = make_file(vec![sym("process", "function", Some(""))]);
         let text = file_to_text(&file);
-        assert_eq!(text, "src/auth/middleware.rs in auth-service — function process");
+        assert_eq!(
+            text,
+            "src/auth/middleware.rs in auth-service — function process"
+        );
     }
 
     #[test]
@@ -218,11 +228,21 @@ mod tests {
     #[test]
     fn test_file_to_text_respects_budget() {
         let symbols: Vec<FileSymbol> = (0..200)
-            .map(|i| sym(&format!("symbol_{i}"), "function", Some(&format!("fn symbol_{i}(x: i32) -> i32"))))
+            .map(|i| {
+                sym(
+                    &format!("symbol_{i}"),
+                    "function",
+                    Some(&format!("fn symbol_{i}(x: i32) -> i32")),
+                )
+            })
             .collect();
         let file = make_file(symbols);
         let text = file_to_text(&file);
-        assert!(text.len() <= 1800, "text length {} exceeds 1800", text.len());
+        assert!(
+            text.len() <= 1800,
+            "text length {} exceeds 1800",
+            text.len()
+        );
     }
 
     #[test]
@@ -233,7 +253,10 @@ mod tests {
             sym("Apple", "struct", None),
         ]);
         let text = file_to_text(&file);
-        assert_eq!(text, "src/auth/middleware.rs in auth-service — function alpha, struct Apple, struct Zebra");
+        assert_eq!(
+            text,
+            "src/auth/middleware.rs in auth-service — function alpha, struct Apple, struct Zebra"
+        );
     }
 
     #[test]

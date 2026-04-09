@@ -1,5 +1,5 @@
 use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -111,7 +111,9 @@ impl MavenParser {
             .unwrap_or(false);
 
         if has_modules && is_pom_packaging {
-            return Err(anyhow!("Parent/aggregator POM (has <modules> with pom packaging)"));
+            return Err(anyhow!(
+                "Parent/aggregator POM (has <modules> with pom packaging)"
+            ));
         }
 
         // Resolve groupId: own > parent in-repo > parent declared > fallback
@@ -122,9 +124,7 @@ impl MavenParser {
                 p.artifact_id.as_deref().unwrap_or("")
             )
         });
-        let resolved_parent = parent_key
-            .as_ref()
-            .and_then(|k| parent_context.get(k));
+        let resolved_parent = parent_key.as_ref().and_then(|k| parent_context.get(k));
 
         let group_id = pom
             .group_id
@@ -206,15 +206,16 @@ fn build_managed_deps(
 
     // Override with this POM's own dependencyManagement
     if let Some(mgmt) = dep_mgmt
-        && let Some(deps) = &mgmt.dependencies {
-            for dep in &deps.dependencies {
-                let group = dep.group_id.as_deref().unwrap_or("");
-                let artifact = dep.artifact_id.as_deref().unwrap_or("");
-                if let Some(ver) = &dep.version {
-                    managed.insert(format!("{}:{}", group, artifact), ver.clone());
-                }
+        && let Some(deps) = &mgmt.dependencies
+    {
+        for dep in &deps.dependencies {
+            let group = dep.group_id.as_deref().unwrap_or("");
+            let artifact = dep.artifact_id.as_deref().unwrap_or("");
+            if let Some(ver) = &dep.version {
+                managed.insert(format!("{}:{}", group, artifact), ver.clone());
             }
         }
+    }
 
     managed
 }
@@ -264,23 +265,20 @@ pub(crate) fn collect_maven_parent_context(
             None => continue,
         };
 
-        let key = format!(
-            "{}:{}",
-            group_id.as_deref().unwrap_or(""),
-            artifact_id
-        );
+        let key = format!("{}:{}", group_id.as_deref().unwrap_or(""), artifact_id);
 
         let mut managed_deps = HashMap::new();
         if let Some(mgmt) = &pom.dependency_management
-            && let Some(deps) = &mgmt.dependencies {
-                for dep in &deps.dependencies {
-                    let g = dep.group_id.as_deref().unwrap_or("");
-                    let a = dep.artifact_id.as_deref().unwrap_or("");
-                    if let Some(ver) = &dep.version {
-                        managed_deps.insert(format!("{}:{}", g, a), ver.clone());
-                    }
+            && let Some(deps) = &mgmt.dependencies
+        {
+            for dep in &deps.dependencies {
+                let g = dep.group_id.as_deref().unwrap_or("");
+                let a = dep.artifact_id.as_deref().unwrap_or("");
+                if let Some(ver) = &dep.version {
+                    managed_deps.insert(format!("{}:{}", g, a), ver.clone());
                 }
             }
+        }
 
         context.insert(
             key,
@@ -352,14 +350,26 @@ mod tests {
 
         assert_eq!(info.dependencies.len(), 3);
 
-        let guava = info.dependencies.iter().find(|d| d.name == "com.google.guava:guava").unwrap();
+        let guava = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "com.google.guava:guava")
+            .unwrap();
         assert_eq!(guava.version_req.as_deref(), Some("32.1"));
         assert!(matches!(guava.dep_kind, DepKind::Runtime));
 
-        let junit = info.dependencies.iter().find(|d| d.name == "junit:junit").unwrap();
+        let junit = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "junit:junit")
+            .unwrap();
         assert!(matches!(junit.dep_kind, DepKind::Dev));
 
-        let servlet = info.dependencies.iter().find(|d| d.name.contains("servlet-api")).unwrap();
+        let servlet = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("servlet-api"))
+            .unwrap();
         assert!(matches!(servlet.dep_kind, DepKind::Peer));
     }
 
@@ -444,7 +454,11 @@ mod tests {
         // version inherited from parent
         assert_eq!(info.version.as_deref(), Some("2.0.0"));
         // dep version from dependencyManagement
-        let guava = info.dependencies.iter().find(|d| d.name.contains("guava")).unwrap();
+        let guava = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("guava"))
+            .unwrap();
         assert_eq!(guava.version_req.as_deref(), Some("32.1"));
     }
 
@@ -469,7 +483,11 @@ mod tests {
 
         let parser = MavenParser;
         let info = parser.parse(&path, "app").unwrap();
-        let mystery = info.dependencies.iter().find(|d| d.name.contains("mystery")).unwrap();
+        let mystery = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("mystery"))
+            .unwrap();
         assert_eq!(mystery.version_req, None);
     }
 

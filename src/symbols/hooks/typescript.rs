@@ -1,4 +1,6 @@
-use super::{find_ancestor, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor, node_text,
+};
 use tree_sitter::Node;
 
 /// Visibility filter for TypeScript/JavaScript symbols.
@@ -11,18 +13,20 @@ fn is_visible(node: &Node, source: &str) -> bool {
         // Check for #private names
         if let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source.as_bytes())
-                && name.starts_with('#') {
-                    return false;
-                }
+            && name.starts_with('#')
+        {
+            return false;
+        }
 
         // Check for private/protected accessibility modifier
         for i in 0..node.child_count() {
             let child = node.child(i).unwrap();
             if child.kind() == "accessibility_modifier"
                 && let Ok(text) = child.utf8_text(source.as_bytes())
-                    && (text == "private" || text == "protected") {
-                        return false;
-                    }
+                && (text == "private" || text == "protected")
+            {
+                return false;
+            }
         }
     }
 
@@ -37,7 +41,10 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
 
     let class_node = find_ancestor(node, "class_declaration")?;
     let name_node = class_node.child_by_field_name("name")?;
-    name_node.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+    name_node
+        .utf8_text(source.as_bytes())
+        .ok()
+        .map(|s| s.to_string())
 }
 
 /// Build signature string for TypeScript/JavaScript symbols.
@@ -57,11 +64,12 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
         SymbolKind::Constant => {
             // For constants, get the lexical_declaration parent text (first line)
             if let Some(parent) = node.parent()
-                && parent.kind() == "lexical_declaration" {
-                    return node_text(&parent, source)
-                        .map(|t| t.lines().next().unwrap_or(t).to_string())
-                        .unwrap_or_else(|| format!("const {}", name));
-                }
+                && parent.kind() == "lexical_declaration"
+            {
+                return node_text(&parent, source)
+                    .map(|t| t.lines().next().unwrap_or(t).to_string())
+                    .unwrap_or_else(|| format!("const {}", name));
+            }
             node_text(node, source)
                 .map(|t| t.lines().next().unwrap_or(t).to_string())
                 .unwrap_or_else(|| format!("const {}", name))
@@ -80,7 +88,11 @@ fn build_function_signature(node: &Node, source: &str) -> String {
         .unwrap_or(node.end_byte());
 
     let text = &source[start..end.min(source.len())];
-    text.lines().collect::<Vec<_>>().join(" ").trim().to_string()
+    text.lines()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 /// Build method signature: `name(params): return_type`.
@@ -195,15 +207,15 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         // Name is already captured by @name on the variable_declarator's name field.
         // Set signature from the parent lexical_declaration.
         if let Some(parent) = node.parent()
-            && parent.kind() == "lexical_declaration" {
-                sym.signature = node_text(&parent, source)
-                    .map(|t| t.lines().next().unwrap_or(t).to_string());
-            }
+            && parent.kind() == "lexical_declaration"
+        {
+            sym.signature =
+                node_text(&parent, source).map(|t| t.lines().next().unwrap_or(t).to_string());
+        }
     }
 
     if sym.kind == SymbolKind::Type && node.kind() == "type_alias_declaration" {
-        sym.signature = node_text(node, source)
-            .map(|t| t.lines().next().unwrap_or(t).to_string());
+        sym.signature = node_text(node, source).map(|t| t.lines().next().unwrap_or(t).to_string());
     }
 
     Some(sym)
@@ -235,8 +247,19 @@ pub fn hooks() -> LanguageHooks {
             // (you can write `class Array { ... }`), so stoplisting them turns
             // any repo type with those names into a permanent false negative.
             reference_stoplist: &[
-                "true", "false", "null", "undefined", "this", "super",
-                "string", "number", "boolean", "any", "unknown", "never", "void",
+                "true",
+                "false",
+                "null",
+                "undefined",
+                "this",
+                "super",
+                "string",
+                "number",
+                "boolean",
+                "any",
+                "unknown",
+                "never",
+                "void",
             ],
         }),
     }

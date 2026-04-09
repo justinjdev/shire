@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// C visibility: skip `static` functions/symbols (file-local linkage).
@@ -8,9 +8,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
         let child = node.child(i).unwrap();
         if child.kind() == "storage_class_specifier"
             && let Some(text) = node_text(&child, source)
-                && text == "static" {
-                    return false;
-                }
+            && text == "static"
+        {
+            return false;
+        }
     }
     true
 }

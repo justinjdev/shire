@@ -1,4 +1,4 @@
-use super::{node_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, node_text};
 use tree_sitter::Node;
 
 /// Odin visibility: all top-level declarations are visible.
@@ -164,8 +164,8 @@ pub fn hooks() -> LanguageHooks {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::query_extract;
     use super::super::super::SymbolKind;
+    use super::super::super::query_extract;
     use super::hooks;
     use std::sync::Arc;
     use tree_sitter::{Parser, Query};
@@ -178,7 +178,15 @@ mod tests {
         let hooks = hooks();
         let mut parser = Parser::new();
         parser.set_language(&lang).unwrap();
-        query_extract::extract(&mut parser, &query, source, Arc::from(file_path), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from(file_path),
+            &hooks,
+            true,
+        )
+        .0
     }
 
     #[test]
@@ -226,10 +234,7 @@ MAX_SIZE :: 1024
 
         let direction = symbols.iter().find(|s| s.name == "Direction").unwrap();
         assert_eq!(direction.kind, SymbolKind::Enum);
-        assert_eq!(
-            direction.signature.as_deref(),
-            Some("Direction :: enum")
-        );
+        assert_eq!(direction.signature.as_deref(), Some("Direction :: enum"));
 
         let add = symbols.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(add.kind, SymbolKind::Function);

@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
 use tree_sitter::Node;
 
 /// Check whether a Swift symbol is visible (not private or fileprivate).
@@ -30,17 +30,19 @@ fn has_private_modifier(node: &Node, source: &str) -> bool {
         let child = node.child(i).unwrap();
         if child.kind() == "visibility_modifier"
             && let Ok(text) = child.utf8_text(source.as_bytes())
-                && (text == "private" || text == "fileprivate") {
-                    return true;
-                }
+            && (text == "private" || text == "fileprivate")
+        {
+            return true;
+        }
         if child.kind() == "modifiers" {
             for j in 0..child.child_count() {
                 let grandchild = child.child(j).unwrap();
                 if grandchild.kind() == "visibility_modifier"
                     && let Ok(text) = grandchild.utf8_text(source.as_bytes())
-                        && (text == "private" || text == "fileprivate") {
-                            return true;
-                        }
+                    && (text == "private" || text == "fileprivate")
+                {
+                    return true;
+                }
             }
         }
     }
@@ -144,9 +146,10 @@ fn find_param_name(source: &str, param_node: &Node) -> Option<String> {
     for i in 0..param_node.child_count() {
         let child = param_node.child(i).unwrap();
         if child.kind() == "simple_identifier"
-            && let Ok(text) = child.utf8_text(source.as_bytes()) {
-                identifiers.push(text.to_string());
-            }
+            && let Ok(text) = child.utf8_text(source.as_bytes())
+        {
+            identifiers.push(text.to_string());
+        }
     }
 
     match identifiers.len() {
@@ -240,7 +243,7 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         match keyword {
             "struct" => sym.kind = SymbolKind::Struct,
             "enum" => sym.kind = SymbolKind::Enum,
-            "extension" => return None, // Skip extensions
+            "extension" => return None,        // Skip extensions
             _ => sym.kind = SymbolKind::Class, // class and actor
         }
     }

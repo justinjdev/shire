@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
 use tree_sitter::Node;
 
 /// Check whether a Kotlin symbol is visible (not private or internal).
@@ -32,9 +32,10 @@ fn has_private_or_internal_modifier(node: &Node, source: &str) -> bool {
                 let modifier = child.child(j).unwrap();
                 if modifier.kind() == "visibility_modifier"
                     && let Ok(text) = modifier.utf8_text(source.as_bytes())
-                        && (text == "private" || text == "internal") {
-                            return true;
-                        }
+                    && (text == "private" || text == "internal")
+                {
+                    return true;
+                }
             }
         }
     }

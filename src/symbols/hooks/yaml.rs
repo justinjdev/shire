@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Strip surrounding quotes from a YAML key name.
@@ -101,7 +101,11 @@ mod tests {
         let symbols = extract(source);
         assert_eq!(symbols.len(), 1);
         let sig = symbols[0].signature.as_ref().unwrap();
-        assert!(sig.contains("{...}"), "signature should hint at mapping: {}", sig);
+        assert!(
+            sig.contains("{...}"),
+            "signature should hint at mapping: {}",
+            sig
+        );
     }
 
     #[test]
@@ -110,7 +114,11 @@ mod tests {
         let symbols = extract(source);
         assert_eq!(symbols.len(), 1);
         let sig = symbols[0].signature.as_ref().unwrap();
-        assert!(sig.contains("[...]"), "signature should hint at sequence: {}", sig);
+        assert!(
+            sig.contains("[...]"),
+            "signature should hint at sequence: {}",
+            sig
+        );
     }
 
     #[test]

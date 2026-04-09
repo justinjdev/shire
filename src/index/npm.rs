@@ -39,15 +39,12 @@ impl ManifestParser for NpmParser {
     }
 }
 
-fn extract_deps(
-    json: &serde_json::Value,
-    section: &str,
-    kind: DepKind,
-    out: &mut Vec<DepInfo>,
-) {
+fn extract_deps(json: &serde_json::Value, section: &str, kind: DepKind, out: &mut Vec<DepInfo>) {
     if let Some(deps) = json[section].as_object() {
         for (name, ver) in deps {
-            let version_req = ver.as_str().map(|s| strip_workspace_protocol(s).to_string());
+            let version_req = ver
+                .as_str()
+                .map(|s| strip_workspace_protocol(s).to_string());
             out.push(DepInfo {
                 name: name.clone(),
                 version_req,

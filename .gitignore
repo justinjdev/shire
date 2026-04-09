@@ -2,4 +2,6 @@
 /result
 .shire/
 /docs/
+/tmp/
+/openspec/changes/
 results.tsv

@@ -298,7 +298,7 @@ multiply <- function(a, b) a * b
   )
 )
 "#;
-        let (symbols, _) = extract_file("r", source, Arc::from("counter.r"), true);
+        let (symbols, _) = extract_file("r", source, Arc::from("counter.r"), true, 0);
         let class_symbols: Vec<_> = symbols
             .iter()
             .filter(|s| s.kind == SymbolKind::Class)

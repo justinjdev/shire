@@ -183,6 +183,7 @@ pub fn extract(
             std::collections::HashSet::new();
         let mut call_ranges: std::collections::HashSet<(usize, usize)> =
             std::collections::HashSet::new();
+        let mut refs_capped = false;
         let source_bytes = source.as_bytes();
 
         let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
@@ -262,17 +263,31 @@ pub fn extract(
                 } else if kind == ReferenceKind::Call {
                     call_ranges.insert(node_range);
                 }
-                pending_references.push((
-                    ReferenceInfo {
-                        name: trimmed_name,
-                        kind,
-                        file_path: file_path.clone(),
-                        line,
-                        enclosing_symbol: enclosing,
-                    },
-                    node_range,
-                ));
+                if max_references_per_file > 0
+                    && pending_references.len() >= max_references_per_file
+                {
+                    refs_capped = true;
+                } else {
+                    pending_references.push((
+                        ReferenceInfo {
+                            name: trimmed_name,
+                            kind,
+                            file_path: file_path.clone(),
+                            line,
+                            enclosing_symbol: enclosing,
+                        },
+                        node_range,
+                    ));
+                }
             }
+        }
+
+        if refs_capped {
+            tracing::warn!(
+                file = %file_path,
+                cap = max_references_per_file,
+                "reference count capped — excess references discarded"
+            );
         }
 
         let references = filter_references(

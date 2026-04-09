@@ -205,6 +205,7 @@ mod tests {
             Arc::from("test.jl"),
             &hooks,
             true,
+            0,
         )
         .0
     }

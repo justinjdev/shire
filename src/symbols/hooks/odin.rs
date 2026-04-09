@@ -185,6 +185,7 @@ mod tests {
             Arc::from(file_path),
             &hooks,
             true,
+            0,
         )
         .0
     }

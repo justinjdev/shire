@@ -203,6 +203,7 @@ mod tests {
             Arc::from("test.clj"),
             &hooks,
             true,
+            0,
         )
         .0
     }

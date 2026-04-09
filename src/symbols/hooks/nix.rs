@@ -216,6 +216,7 @@ mod tests {
             Arc::from("test.nix"),
             &hooks,
             true,
+            0,
         )
         .0
     }

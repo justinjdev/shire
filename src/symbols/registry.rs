@@ -329,6 +329,7 @@ pub fn extract_file(
                 file_path,
                 &hooks,
                 skip_references,
+                max_references_per_file,
             );
         }
     }

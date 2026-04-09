@@ -225,6 +225,7 @@ mod tests {
             Arc::from("test.nim"),
             &hooks,
             true,
+            0,
         )
         .0
     }

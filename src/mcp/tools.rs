@@ -1177,12 +1177,17 @@ mod tests {
 
     #[test]
     fn test_mcp_err_redacts_details() {
-        let err = ShireService::mcp_err("SQLITE_ERROR: no such table: foo at /home/user/.shire/index.db".to_string());
+        let err = ShireService::mcp_err(
+            "SQLITE_ERROR: no such table: foo at /home/user/.shire/index.db".to_string(),
+        );
         // The message returned to the caller must NOT contain the raw error
         assert!(!err.message.contains("SQLITE_ERROR"));
         assert!(!err.message.contains("/home/user"));
         assert!(!err.message.contains("foo"));
-        assert_eq!(err.message, "Internal error \u{2014} check server logs for details");
+        assert_eq!(
+            err.message,
+            "Internal error \u{2014} check server logs for details"
+        );
     }
 
     #[test]

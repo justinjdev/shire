@@ -145,6 +145,7 @@ mod tests {
             Arc::from("test.gleam"),
             &hooks,
             true,
+            0,
         )
         .0
     }

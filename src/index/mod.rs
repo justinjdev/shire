@@ -19,6 +19,7 @@ pub use ref_writer::RefWriter;
 use crate::config::Config;
 use crate::db;
 use crate::symbols;
+use crate::symbols::walker::PROTO_GENERATED_SUFFIXES;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -26,7 +27,6 @@ use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
-use crate::symbols::walker::PROTO_GENERATED_SUFFIXES;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,9 +85,10 @@ fn walk_manifests(
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str()
-                && entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    return !exclude_set.contains(name);
-                }
+                && entry.file_type().is_some_and(|ft| ft.is_dir())
+            {
+                return !exclude_set.contains(name);
+            }
             true
         })
         .build_parallel();
@@ -250,7 +251,12 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
          VALUES (?1, ?2, ?3, ?4, 0)",
     )?;
     for dep in &pkg.dependencies {
-        dep_stmt.execute((&pkg.name, &dep.name, dep.dep_kind.as_str(), &dep.version_req))?;
+        dep_stmt.execute((
+            &pkg.name,
+            &dep.name,
+            dep.dep_kind.as_str(),
+            &dep.version_req,
+        ))?;
     }
     Ok(pkg.name.clone())
 }
@@ -331,7 +337,11 @@ fn validate_referential_integrity(conn: &Connection) -> Result<()> {
 
 /// Batch-insert symbols into the symbols table (no DELETE, no trigger management).
 /// Callers are responsible for deleting old rows and managing FTS triggers.
-fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+fn batch_insert_symbols(
+    conn: &Connection,
+    package: &str,
+    syms: &[symbols::SymbolInfo],
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
@@ -361,7 +371,11 @@ fn batch_insert_symbols(conn: &Connection, package: &str, syms: &[symbols::Symbo
 
 /// Upsert symbols for a package without managing FTS triggers or FTS sync.
 /// Caller is responsible for dropping triggers before, rebuilding FTS after.
-fn upsert_symbols_no_triggers(conn: &Connection, package: &str, syms: &[symbols::SymbolInfo]) -> Result<()> {
+fn upsert_symbols_no_triggers(
+    conn: &Connection,
+    package: &str,
+    syms: &[symbols::SymbolInfo],
+) -> Result<()> {
     // Delete old symbols and references (FTS entries will be rebuilt in bulk later)
     conn.execute("DELETE FROM symbols WHERE package = ?1", [package])?;
     conn.execute("DELETE FROM symbol_refs WHERE package = ?1", [package])?;
@@ -397,11 +411,11 @@ fn upsert_symbols_and_refs_for_file(
     // off→on transition could commit `references_enabled=true` with
     // gaps for walker-missed files.
     let mut file_ids = std::collections::HashMap::new();
-    if let Ok(file_id) = conn.query_row(
-        "SELECT id FROM files WHERE path = ?1",
-        [file_path],
-        |row| row.get::<_, i64>(0),
-    ) {
+    if let Ok(file_id) =
+        conn.query_row("SELECT id FROM files WHERE path = ?1", [file_path], |row| {
+            row.get::<_, i64>(0)
+        })
+    {
         conn.execute(
             "DELETE FROM symbol_refs WHERE file_id = ?1",
             rusqlite::params![file_id],
@@ -413,7 +427,11 @@ fn upsert_symbols_and_refs_for_file(
 }
 
 /// Batch upsert file hashes for a package.
-fn batch_upsert_file_hashes(conn: &Connection, package: &str, file_hashes: &[(&str, &str)]) -> Result<()> {
+fn batch_upsert_file_hashes(
+    conn: &Connection,
+    package: &str,
+    file_hashes: &[(&str, &str)],
+) -> Result<()> {
     if file_hashes.is_empty() {
         return Ok(());
     }
@@ -470,9 +488,10 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str()
-                && entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                    return !exclude_set.contains(name);
-                }
+                && entry.file_type().is_some_and(|ft| ft.is_dir())
+            {
+                return !exclude_set.contains(name);
+            }
             true
         })
         .build_parallel();
@@ -517,7 +536,10 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
             });
 
             if guard.len() >= MAX_FILES {
-                tracing::warn!(max = MAX_FILES, "file tree walk capped at maximum file count");
+                tracing::warn!(
+                    max = MAX_FILES,
+                    "file tree walk capped at maximum file count"
+                );
                 capped.store(true, std::sync::atomic::Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }
@@ -535,7 +557,10 @@ fn associate_files_with_packages(
     packages: &[(String, String)], // (name, path)
 ) -> Vec<(String, Option<String>, String, u64)> {
     // Sort package paths by length descending so longest prefix matches first
-    let mut sorted_pkgs: Vec<(&str, &str)> = packages.iter().map(|(n, p)| (n.as_str(), p.as_str())).collect();
+    let mut sorted_pkgs: Vec<(&str, &str)> = packages
+        .iter()
+        .map(|(n, p)| (n.as_str(), p.as_str()))
+        .collect();
     sorted_pkgs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
     // Pre-allocate prefix strings with trailing slash to avoid per-file allocations
@@ -557,7 +582,9 @@ fn associate_files_with_packages(
                 if prefix == "/" {
                     // Root-level package matches everything
                     Some((*name).to_string())
-                } else if file_dir.starts_with(prefix.as_str()) || file_dir == &prefix[..prefix.len() - 1] {
+                } else if file_dir.starts_with(prefix.as_str())
+                    || file_dir == &prefix[..prefix.len() - 1]
+                {
                     Some((*name).to_string())
                 } else {
                     None
@@ -579,14 +606,18 @@ fn associate_files_with_packages(
 fn incremental_upsert_files(
     conn: &Connection,
     files: &[(String, Option<String>, String, u64)],
-) -> Result<()> {
+) -> Result<usize> {
     // Load existing file paths from DB
     let existing: HashMap<String, (Option<String>, String, i64)> = {
         let mut stmt = conn.prepare("SELECT path, package, extension, size_bytes FROM files")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                (row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?),
+                (
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ),
             ))
         })?;
         let mut map = HashMap::new();
@@ -609,13 +640,19 @@ fn incremental_upsert_files(
         .filter(|p| !new_set.contains_key(p.as_str()))
         .map(|p| p.as_str())
         .collect();
+    let deleted_rows = to_delete.len();
     for chunk in to_delete.chunks(500) {
-        let placeholders: String = chunk.iter().enumerate()
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("DELETE FROM files WHERE path IN ({})", placeholders);
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk.iter().map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk
+            .iter()
+            .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
@@ -640,7 +677,8 @@ fn incremental_upsert_files(
             placeholders.join(", ")
         );
 
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(chunk.len() * COLS);
         for (path, package, ext, size) in chunk.iter() {
             params.push(Box::new(path.clone()));
             params.push(Box::new(package.clone()));
@@ -657,12 +695,13 @@ fn incremental_upsert_files(
     )?;
     for (path, pkg, ext, size) in files {
         if let Some((old_pkg, old_ext, old_size)) = existing.get(path)
-            && (old_pkg != pkg || old_ext != ext || *old_size != *size as i64) {
-                update_stmt.execute(rusqlite::params![pkg, ext, *size as i64, path])?;
-            }
+            && (old_pkg != pkg || old_ext != ext || *old_size != *size as i64)
+        {
+            update_stmt.execute(rusqlite::params![pkg, ext, *size as i64, path])?;
+        }
     }
 
-    Ok(())
+    Ok(deleted_rows)
 }
 
 /// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
@@ -677,9 +716,10 @@ fn collect_cargo_workspace_context(walked: &[WalkedManifest]) -> HashMap<String,
             .unwrap_or("");
 
         if filename == "Cargo.toml"
-            && let Ok(deps) = cargo::collect_cargo_workspace_deps(&manifest.abs_path) {
-                all_ws_deps.extend(deps);
-            }
+            && let Ok(deps) = cargo::collect_cargo_workspace_deps(&manifest.abs_path)
+        {
+            all_ws_deps.extend(deps);
+        }
     }
 
     all_ws_deps
@@ -697,17 +737,18 @@ fn collect_go_workspace_context(walked: &[WalkedManifest]) -> HashSet<String> {
             .unwrap_or("");
 
         if filename == "go.work"
-            && let Ok(use_dirs) = go_work::parse_go_work(&manifest.abs_path) {
-                for d in use_dirs {
-                    // go.work use directives are relative to the go.work location
-                    let full_dir = if manifest.relative_dir.is_empty() {
-                        d
-                    } else {
-                        format!("{}/{}", manifest.relative_dir, d)
-                    };
-                    dirs.insert(full_dir);
-                }
+            && let Ok(use_dirs) = go_work::parse_go_work(&manifest.abs_path)
+        {
+            for d in use_dirs {
+                // go.work use directives are relative to the go.work location
+                let full_dir = if manifest.relative_dir.is_empty() {
+                    d
+                } else {
+                    format!("{}/{}", manifest.relative_dir, d)
+                };
+                dirs.insert(full_dir);
             }
+        }
     }
 
     dirs
@@ -740,10 +781,7 @@ fn collect_gradle_settings_context(
                 };
                 dirs.insert(full_dir);
             }
-            root_names.insert(
-                manifest.relative_dir.clone(),
-                settings.root_project_name,
-            );
+            root_names.insert(manifest.relative_dir.clone(), settings.root_project_name);
         }
     }
 
@@ -810,11 +848,7 @@ fn phase_parse(
             ) {
                 Ok(pkg) => {
                     let winner = upsert_package(conn, &pkg)?;
-                    parsed_packages.push((
-                        winner,
-                        pkg.path.clone(),
-                        pkg.kind.to_string(),
-                    ));
+                    parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -826,11 +860,11 @@ fn phase_parse(
         // Gradle: use settings-context-aware parsing
         if filename == "build.gradle" || filename == "build.gradle.kts" {
             let (ref gradle_dirs, ref gradle_root_names) = ws.gradle_settings;
-            let settings_ctx = gradle_root_names
-                .get(&manifest.relative_dir)
-                .map(|name| gradle::GradleSettingsContext {
+            let settings_ctx = gradle_root_names.get(&manifest.relative_dir).map(|name| {
+                gradle::GradleSettingsContext {
                     root_project_name: name.clone(),
-                });
+                }
+            });
             match gradle::parse_with_settings_context(
                 &manifest.abs_path,
                 &manifest.relative_dir,
@@ -841,11 +875,7 @@ fn phase_parse(
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
                     let winner = upsert_package(conn, &pkg)?;
-                    parsed_packages.push((
-                        winner,
-                        pkg.path.clone(),
-                        pkg.kind.to_string(),
-                    ));
+                    parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
                 Err(e) => {
                     failures.push((manifest.abs_path.display().to_string(), e.to_string()));
@@ -959,7 +989,8 @@ fn phase_store_hashes(conn: &Connection, to_parse: &[&WalkedManifest]) -> Result
             placeholders.join(", ")
         );
 
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(chunk.len() * COLS);
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(chunk.len() * COLS);
         for manifest in chunk {
             params.push(Box::new(manifest.manifest_key.clone()));
             params.push(Box::new(manifest.content_hash.clone()));
@@ -1000,7 +1031,12 @@ fn single_pass_extract(
     skip_references: bool,
     max_file_size: u64,
     max_references_per_file: usize,
-) -> Result<(Vec<symbols::SymbolInfo>, Vec<symbols::ReferenceInfo>, String, Vec<(String, String)>)> {
+) -> Result<(
+    Vec<symbols::SymbolInfo>,
+    Vec<symbols::ReferenceInfo>,
+    String,
+    Vec<(String, String)>,
+)> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
         let empty_hash = hash::hash_bytes_hex(b"");
@@ -1015,7 +1051,11 @@ fn single_pass_extract(
             !exclude_extensions.contains(&with_dot)
         })
         .collect();
-    let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns)?;
+    let source_files = symbols::walker::walk_source_files_with_patterns(
+        &package_dir,
+        &extensions,
+        exclude_patterns,
+    )?;
 
     if source_files.is_empty() {
         let empty_hash = hash::hash_bytes_hex(b"");
@@ -1057,14 +1097,18 @@ fn single_pass_extract(
             let digest = Sha256::digest(&content);
             let raw_digest: [u8; 32] = digest.into();
             let content_hash_hex = format!("{:x}", digest);
-            let ext = file_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let (syms, refs) = String::from_utf8(content).ok()
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let (syms, refs) = String::from_utf8(content)
+                .ok()
                 .map(|source| {
                     let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
+                    symbols::extract_file(
+                        ext,
+                        &source,
+                        file_path_arc,
+                        skip_references,
+                        max_references_per_file,
+                    )
                 })
                 .unwrap_or_else(|| (Vec::new(), Vec::new()));
             Some(FileExtractResult {
@@ -1113,13 +1157,25 @@ fn phase_extract_symbols(
     max_file_size: u64,
     max_references_per_file: usize,
 ) -> Result<()> {
-    tracing::debug!(packages = parsed_packages.len(), "phase_extract_symbols: extracting symbols for new/changed packages");
+    tracing::debug!(
+        packages = parsed_packages.len(),
+        "phase_extract_symbols: extracting symbols for new/changed packages"
+    );
 
     let skip_references = ref_writer.skip_references();
     let results: Vec<_> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
-            let result = single_pass_extract(repo_root, pkg_path, pkg_kind, exclude_extensions, exclude_patterns, skip_references, max_file_size, max_references_per_file);
+            let result = single_pass_extract(
+                repo_root,
+                pkg_path,
+                pkg_kind,
+                exclude_extensions,
+                exclude_patterns,
+                skip_references,
+                max_file_size,
+                max_references_per_file,
+            );
             if let Some(pb) = progress {
                 pb.inc(1);
             }
@@ -1163,9 +1219,16 @@ fn phase_extract_symbols(
             hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
         }
         if r.file_hashes.is_empty() {
-            conn.execute("DELETE FROM file_hashes WHERE package = ?1", [r.pkg_name.as_str()])?;
+            conn.execute(
+                "DELETE FROM file_hashes WHERE package = ?1",
+                [r.pkg_name.as_str()],
+            )?;
         } else {
-            let fh_refs: Vec<(&str, &str)> = r.file_hashes.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
+            let fh_refs: Vec<(&str, &str)> = r
+                .file_hashes
+                .iter()
+                .map(|(p, h)| (p.as_str(), h.as_str()))
+                .collect();
             batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
         }
     }
@@ -1181,10 +1244,7 @@ fn phase_extract_symbols(
                 tokenize='unicode61 tokenchars ''_-'''
             )",
         )?;
-        conn.execute(
-            "INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')",
-            [],
-        )?;
+        conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')", [])?;
     }
 
     // Recreate FTS triggers (needed even if we skipped rebuild)
@@ -1205,7 +1265,7 @@ fn parse_hashed_at(s: &str) -> Option<std::time::SystemTime> {
 
 /// Per-file result from incremental check.
 struct FileResult {
-    file_path: String,        // relative path
+    file_path: String, // relative path
     content_hash: String,
     raw_digest: [u8; 32],
     symbols: Option<Vec<symbols::SymbolInfo>>, // None if unchanged
@@ -1228,7 +1288,8 @@ enum SourceCheckResult {
 
 /// Load stored file hashes for a package from the DB.
 fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare("SELECT file_path, content_hash FROM file_hashes WHERE package = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT file_path, content_hash FROM file_hashes WHERE package = ?1")?;
     let rows = stmt.query_map([package], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -1257,7 +1318,14 @@ fn phase_source_incremental(
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
-    let unchanged_pkgs: Vec<(String, String, String, Option<String>, Option<String>, HashMap<String, String>)> = unchanged
+    let unchanged_pkgs: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        HashMap<String, String>,
+    )> = unchanged
         .iter()
         .filter_map(|manifest| {
             let relative_dir = &manifest.relative_dir;
@@ -1276,7 +1344,14 @@ fn phase_source_incremental(
                 )
                 .unwrap_or((None, None));
             let stored_file_hashes = load_stored_file_hashes(conn, &pkg_name).unwrap_or_default();
-            Some((pkg_name, relative_dir.clone(), pkg_kind, stored_hash, hashed_at, stored_file_hashes))
+            Some((
+                pkg_name,
+                relative_dir.clone(),
+                pkg_kind,
+                stored_hash,
+                hashed_at,
+                stored_file_hashes,
+            ))
         })
         .collect();
 
@@ -1287,153 +1362,171 @@ fn phase_source_incremental(
     // Parallel: mtime pre-check, then per-file hash comparison and selective extraction
     let results: Vec<SourceCheckResult> = unchanged_pkgs
         .par_iter()
-        .filter_map(|(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
-            let result = (|| -> Option<SourceCheckResult> {
-                // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely.
-                // `force_source_reextract` bypasses this fast-path — used during a
-                // references_enabled false→true transition, where refs must populate
-                // even for packages whose source files haven't been touched.
-                if !force_source_reextract
-                    && let Some(ts_str) = hashed_at
-                    && let Some(since) = parse_hashed_at(ts_str)
-                    && !hash::has_newer_source_files(repo_root, pkg_path, since)
-                {
-                    return None; // No files changed — skip entirely
-                }
+        .filter_map(
+            |(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
+                let result = (|| -> Option<SourceCheckResult> {
+                    // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely.
+                    // `force_source_reextract` bypasses this fast-path — used during a
+                    // references_enabled false→true transition, where refs must populate
+                    // even for packages whose source files haven't been touched.
+                    if !force_source_reextract
+                        && let Some(ts_str) = hashed_at
+                        && let Some(since) = parse_hashed_at(ts_str)
+                        && !hash::has_newer_source_files(repo_root, pkg_path, since)
+                    {
+                        return None; // No files changed — skip entirely
+                    }
 
-                // Mtime says check needed — walk files and do per-file comparison
-                let package_dir = repo_root.join(pkg_path);
-                if !package_dir.is_dir() {
-                    return None;
-                }
+                    // Mtime says check needed — walk files and do per-file comparison
+                    let package_dir = repo_root.join(pkg_path);
+                    if !package_dir.is_dir() {
+                        return None;
+                    }
 
-                let all_exts = symbols::walker::all_extensions();
-                let extensions: Vec<&str> = all_exts
-                    .into_iter()
-                    .filter(|ext| {
-                        let with_dot = format!(".{}", ext);
-                        !exclude_extensions.contains(&with_dot)
-                    })
-                    .collect();
-                let source_files = symbols::walker::walk_source_files_with_patterns(&package_dir, &extensions, exclude_patterns).ok()?;
+                    let all_exts = symbols::walker::all_extensions();
+                    let extensions: Vec<&str> = all_exts
+                        .into_iter()
+                        .filter(|ext| {
+                            let with_dot = format!(".{}", ext);
+                            !exclude_extensions.contains(&with_dot)
+                        })
+                        .collect();
+                    let source_files = symbols::walker::walk_source_files_with_patterns(
+                        &package_dir,
+                        &extensions,
+                        exclude_patterns,
+                    )
+                    .ok()?;
 
-                // Process each file: read, hash, compare, extract if changed
-                let file_results: Vec<FileResult> = source_files
-                    .par_iter()
-                    .filter_map(|file_path| {
-                        if max_file_size > 0
-                            && let Ok(meta) = file_path.metadata()
-                            && meta.len() > max_file_size
-                        {
+                    // Process each file: read, hash, compare, extract if changed
+                    let file_results: Vec<FileResult> = source_files
+                        .par_iter()
+                        .filter_map(|file_path| {
+                            if max_file_size > 0
+                                && let Ok(meta) = file_path.metadata()
+                                && meta.len() > max_file_size
+                            {
+                                let relative_path = file_path
+                                    .strip_prefix(repo_root)
+                                    .unwrap_or(file_path)
+                                    .to_string_lossy()
+                                    .to_string();
+                                tracing::warn!(
+                                    file = %relative_path,
+                                    size = meta.len(),
+                                    limit = max_file_size,
+                                    "skipping oversized source file"
+                                );
+                                // Preserve the file's entry so it is not treated as
+                                // deleted by the deleted-file detection below. Use a
+                                // sentinel hash — this avoids reading the file just to
+                                // hash it, while keeping the path in current_paths.
+                                return Some(FileResult {
+                                    file_path: relative_path,
+                                    content_hash: "oversized".to_string(),
+                                    raw_digest: [0u8; 32],
+                                    symbols: None,
+                                    references: None,
+                                });
+                            }
+                            let content = std::fs::read(file_path).ok()?;
+                            let digest = Sha256::digest(&content);
+                            let raw_digest: [u8; 32] = digest.into();
+                            let content_hash = format!("{:x}", digest);
                             let relative_path = file_path
                                 .strip_prefix(repo_root)
                                 .unwrap_or(file_path)
                                 .to_string_lossy()
                                 .to_string();
-                            tracing::warn!(
-                                file = %relative_path,
-                                size = meta.len(),
-                                limit = max_file_size,
-                                "skipping oversized source file"
-                            );
-                            // Preserve the file's entry so it is not treated as
-                            // deleted by the deleted-file detection below. Use a
-                            // sentinel hash — this avoids reading the file just to
-                            // hash it, while keeping the path in current_paths.
-                            return Some(FileResult {
-                                file_path: relative_path,
-                                content_hash: "oversized".to_string(),
-                                raw_digest: [0u8; 32],
-                                symbols: None,
-                                references: None,
-                            });
-                        }
-                        let content = std::fs::read(file_path).ok()?;
-                        let digest = Sha256::digest(&content);
-                        let raw_digest: [u8; 32] = digest.into();
-                        let content_hash = format!("{:x}", digest);
-                        let relative_path = file_path
-                            .strip_prefix(repo_root)
-                            .unwrap_or(file_path)
-                            .to_string_lossy()
-                            .to_string();
 
-                        let stored = stored_file_hashes.get(&relative_path);
-                        if stored == Some(&content_hash) && !force_source_reextract {
-                            // File unchanged — include in results for aggregate hash but no symbols.
-                            // `force_source_reextract` skips this fast-path so refs
-                            // populate for every file during a refs-enabled transition,
-                            // while leaving `stored_file_hashes` intact so the caller
-                            // can still compute `deleted_files` against it below.
-                            Some(FileResult {
-                                file_path: relative_path,
-                                content_hash,
-                                raw_digest,
-                                symbols: None,
-                                references: None,
-                            })
-                        } else {
-                            // File changed or new — extract symbols and references if valid UTF-8
-                            let ext = file_path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("");
-                            let (syms, refs) = String::from_utf8(content).ok()
-                                .map(|source| {
-                                    let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                    symbols::extract_file(ext, &source, file_path_arc, skip_references, max_references_per_file)
+                            let stored = stored_file_hashes.get(&relative_path);
+                            if stored == Some(&content_hash) && !force_source_reextract {
+                                // File unchanged — include in results for aggregate hash but no symbols.
+                                // `force_source_reextract` skips this fast-path so refs
+                                // populate for every file during a refs-enabled transition,
+                                // while leaving `stored_file_hashes` intact so the caller
+                                // can still compute `deleted_files` against it below.
+                                Some(FileResult {
+                                    file_path: relative_path,
+                                    content_hash,
+                                    raw_digest,
+                                    symbols: None,
+                                    references: None,
                                 })
-                                .unwrap_or_else(|| (Vec::new(), Vec::new()));
-                            Some(FileResult {
-                                file_path: relative_path,
-                                content_hash,
-                                raw_digest,
-                                symbols: Some(syms),
-                                references: Some(refs),
-                            })
-                        }
+                            } else {
+                                // File changed or new — extract symbols and references if valid UTF-8
+                                let ext =
+                                    file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                let (syms, refs) = String::from_utf8(content)
+                                    .ok()
+                                    .map(|source| {
+                                        let file_path_arc: Arc<str> =
+                                            Arc::from(relative_path.as_str());
+                                        symbols::extract_file(
+                                            ext,
+                                            &source,
+                                            file_path_arc,
+                                            skip_references,
+                                            max_references_per_file,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                                Some(FileResult {
+                                    file_path: relative_path,
+                                    content_hash,
+                                    raw_digest,
+                                    symbols: Some(syms),
+                                    references: Some(refs),
+                                })
+                            }
+                        })
+                        .collect();
+
+                    // Detect deleted files (in stored hashes but not on disk)
+                    let current_paths: HashSet<&str> =
+                        file_results.iter().map(|r| r.file_path.as_str()).collect();
+                    let deleted_files: Vec<String> = stored_file_hashes
+                        .keys()
+                        .filter(|p| !current_paths.contains(p.as_str()))
+                        .cloned()
+                        .collect();
+
+                    // Compute aggregate hash from per-file hashes (sorted by path)
+                    let mut sorted_for_hash: Vec<(&str, &[u8; 32])> = file_results
+                        .iter()
+                        .map(|r| (r.file_path.as_str(), &r.raw_digest))
+                        .collect();
+                    sorted_for_hash.sort_by(|a, b| a.0.cmp(b.0));
+
+                    let mut hasher = Sha256::new();
+                    for (_, raw_digest) in &sorted_for_hash {
+                        hasher.update(*raw_digest);
+                    }
+                    let aggregate_hash = format!("{:x}", hasher.finalize());
+
+                    // Check if any files actually changed
+                    let has_changes = file_results.iter().any(|r| r.symbols.is_some())
+                        || !deleted_files.is_empty();
+                    if !has_changes {
+                        return Some(SourceCheckResult::Unchanged(
+                            pkg_name.clone(),
+                            aggregate_hash,
+                        ));
+                    }
+
+                    Some(SourceCheckResult::NeedsUpdate {
+                        pkg_name: pkg_name.clone(),
+                        file_results,
+                        deleted_files,
+                        aggregate_hash,
                     })
-                    .collect();
-
-                // Detect deleted files (in stored hashes but not on disk)
-                let current_paths: HashSet<&str> = file_results.iter().map(|r| r.file_path.as_str()).collect();
-                let deleted_files: Vec<String> = stored_file_hashes
-                    .keys()
-                    .filter(|p| !current_paths.contains(p.as_str()))
-                    .cloned()
-                    .collect();
-
-                // Compute aggregate hash from per-file hashes (sorted by path)
-                let mut sorted_for_hash: Vec<(&str, &[u8; 32])> = file_results
-                    .iter()
-                    .map(|r| (r.file_path.as_str(), &r.raw_digest))
-                    .collect();
-                sorted_for_hash.sort_by(|a, b| a.0.cmp(b.0));
-
-                let mut hasher = Sha256::new();
-                for (_, raw_digest) in &sorted_for_hash {
-                    hasher.update(*raw_digest);
+                })();
+                if let Some(pb) = progress {
+                    pb.inc(1);
                 }
-                let aggregate_hash = format!("{:x}", hasher.finalize());
-
-                // Check if any files actually changed
-                let has_changes = file_results.iter().any(|r| r.symbols.is_some()) || !deleted_files.is_empty();
-                if !has_changes {
-                    return Some(SourceCheckResult::Unchanged(pkg_name.clone(), aggregate_hash));
-                }
-
-                Some(SourceCheckResult::NeedsUpdate {
-                    pkg_name: pkg_name.clone(),
-                    file_results,
-                    deleted_files,
-                    aggregate_hash,
-                })
-            })();
-            if let Some(pb) = progress {
-                pb.inc(1);
-            }
-            result
-        })
+                result
+            },
+        )
         .collect();
 
     // Sequential DB writes
@@ -1441,7 +1534,12 @@ fn phase_source_incremental(
     let mut hash_entries: Vec<(&str, &str)> = Vec::new();
     for result in &results {
         match result {
-            SourceCheckResult::NeedsUpdate { pkg_name, file_results: all_files, deleted_files, aggregate_hash } => {
+            SourceCheckResult::NeedsUpdate {
+                pkg_name,
+                file_results: all_files,
+                deleted_files,
+                aggregate_hash,
+            } => {
                 // Delete symbols and references for deleted files. symbol_refs
                 // keys by file_id, so resolve via the `files` table. Must
                 // happen BEFORE `files` rows are removed downstream.
@@ -1477,7 +1575,13 @@ fn phase_source_incremental(
                         } else {
                             fr.references.as_ref().unwrap_or(&empty_refs).as_slice()
                         };
-                        upsert_symbols_and_refs_for_file(conn, pkg_name, &fr.file_path, syms, refs_slice)?;
+                        upsert_symbols_and_refs_for_file(
+                            conn,
+                            pkg_name,
+                            &fr.file_path,
+                            syms,
+                            refs_slice,
+                        )?;
                         had_changes = true;
                     }
                 }
@@ -1522,12 +1626,11 @@ fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     // Check if there are any proto files at all — skip the query overhead if not
-    let has_protos: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE extension = 'proto')",
-            [],
-            |r| r.get(0),
-        )?;
+    let has_protos: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE extension = 'proto')",
+        [],
+        |r| r.get(0),
+    )?;
     if !has_protos {
         return Ok(());
     }
@@ -1552,6 +1655,11 @@ fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+struct FileIndexResult {
+    num_files: usize,
+    deleted_file_rows: usize,
+}
+
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
 /// Uses .git/index mtime as a fast pre-check, then file-tree hash to skip
 /// the full rebuild when no files have changed.
@@ -1559,7 +1667,7 @@ fn phase_index_files(
     conn: &Connection,
     repo_root: &Path,
     config: &Config,
-) -> Result<usize> {
+) -> Result<FileIndexResult> {
     // Fast pre-check: if .git/index mtime hasn't changed since last file index,
     // the file tree can't have changed. Skip the expensive walk entirely.
     let git_index_path = repo_root.join(".git/index");
@@ -1573,18 +1681,21 @@ fn phase_index_files(
     if let (Ok(git_meta), Some(stored_ts)) =
         (std::fs::metadata(&git_index_path), &stored_file_index_at)
         && let Ok(git_mtime) = git_meta.modified()
-            && let Some(since) = parse_hashed_at(stored_ts) {
-                let margin = std::time::Duration::from_secs(1);
-                if git_mtime <= since.checked_add(margin).unwrap_or(since) {
-                    tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
-                    backfill_boundary_edges_if_needed(conn)?;
-                    let num_files: usize = conn
-                        .query_row("SELECT COUNT(*) FROM files", [], |row| {
-                            row.get::<_, i64>(0)
-                        })? as usize;
-                    return Ok(num_files);
-                }
-            }
+        && let Some(since) = parse_hashed_at(stored_ts)
+    {
+        let margin = std::time::Duration::from_secs(1);
+        if git_mtime <= since.checked_add(margin).unwrap_or(since) {
+            tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
+            backfill_boundary_edges_if_needed(conn)?;
+            let num_files: usize = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?
+                as usize;
+            return Ok(FileIndexResult {
+                num_files,
+                deleted_file_rows: 0,
+            });
+        }
+    }
 
     let walked_files = walk_files(repo_root, config)?;
 
@@ -1613,15 +1724,18 @@ fn phase_index_files(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
             [&now],
         )?;
-        let num_files: usize = conn.query_row(
-            "SELECT COUNT(*) FROM files",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? as usize;
-        return Ok(num_files);
+        let num_files: usize =
+            conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))? as usize;
+        return Ok(FileIndexResult {
+            num_files,
+            deleted_file_rows: 0,
+        });
     }
 
-    tracing::debug!(files = walked_files.len(), "phase_index_files: file tree hash changed, rebuilding file index");
+    tracing::debug!(
+        files = walked_files.len(),
+        "phase_index_files: file tree hash changed, rebuilding file index"
+    );
 
     // File tree changed (or first build) — incremental update
     let all_packages: Vec<(String, String)> = conn
@@ -1646,7 +1760,7 @@ fn phase_index_files(
         .collect();
 
     let num_files = validated_files.len();
-    incremental_upsert_files(conn, &validated_files)?;
+    let deleted_file_rows = incremental_upsert_files(conn, &validated_files)?;
 
     // Detect proto→generated boundary edges from the walked file set.
     // Runs after file upsert so package associations are current.
@@ -1668,16 +1782,15 @@ fn phase_index_files(
         [&now],
     )?;
 
-    Ok(num_files)
+    Ok(FileIndexResult {
+        num_files,
+        deleted_file_rows,
+    })
 }
 
 /// Index documentation files: read content from doc files in the files table,
 /// extract a title, and upsert into the docs table for FTS search.
-fn phase_index_docs(
-    conn: &Connection,
-    repo_root: &Path,
-    config: &Config,
-) -> Result<usize> {
+fn phase_index_docs(conn: &Connection, repo_root: &Path, config: &Config) -> Result<usize> {
     let extensions = &config.docs.extensions;
     if extensions.is_empty() {
         // No doc extensions configured — clear any previously indexed docs
@@ -1691,9 +1804,7 @@ fn phase_index_docs(
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "SELECT path, package FROM files WHERE extension IN ({placeholders})"
-    );
+    let sql = format!("SELECT path, package FROM files WHERE extension IN ({placeholders})");
     let ext_params: Vec<String> = extensions
         .iter()
         .map(|e| e.strip_prefix('.').unwrap_or(e).to_string())
@@ -1720,7 +1831,14 @@ fn phase_index_docs(
     let existing_docs: HashMap<String, (String, Option<String>, i64)> = {
         let mut stmt = conn.prepare("SELECT path, content_hash, package, size_bytes FROM docs WHERE content_hash IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)))
+            Ok((
+                row.get::<_, String>(0)?,
+                (
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ),
+            ))
         })?;
         let mut map = HashMap::new();
         for row in rows {
@@ -1739,12 +1857,17 @@ fn phase_index_docs(
         .map(|p| p.as_str())
         .collect();
     for chunk in to_delete.chunks(500) {
-        let placeholders: String = chunk.iter().enumerate()
+        let placeholders: String = chunk
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!("DELETE FROM docs WHERE path IN ({})", placeholders);
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk.iter().map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>).collect();
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk
+            .iter()
+            .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     }
 
@@ -1790,17 +1913,24 @@ fn phase_index_docs(
         // Skip if content, package, and size are all unchanged
         if let Some((existing_hash, existing_package, existing_size)) = existing_docs.get(rel_path)
             && *existing_hash == content_hash
-                && existing_package == package
-                && *existing_size == size_bytes
-            {
-                count += 1;
-                continue;
-            }
+            && existing_package == package
+            && *existing_size == size_bytes
+        {
+            count += 1;
+            continue;
+        }
 
         // Extract title: first markdown heading or first non-empty line
         let title = extract_doc_title(body);
 
-        upsert_stmt.execute(rusqlite::params![rel_path, package, title, body, size_bytes, content_hash])?;
+        upsert_stmt.execute(rusqlite::params![
+            rel_path,
+            package,
+            title,
+            body,
+            size_bytes,
+            content_hash
+        ])?;
         count += 1;
     }
 
@@ -1839,8 +1969,7 @@ fn read_doc_file(path: &Path, limit: usize) -> Result<(String, i64)> {
     let mut reader = file.take(limit as u64);
     let mut buf = Vec::with_capacity(limit.min(file_size as usize));
     reader.read_to_end(&mut buf)?;
-    let content = String::from_utf8(buf)
-        .map_err(|_| anyhow::anyhow!("not valid UTF-8"))?;
+    let content = String::from_utf8(buf).map_err(|_| anyhow::anyhow!("not valid UTF-8"))?;
     Ok((content, file_size))
 }
 
@@ -1916,7 +2045,10 @@ fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
             .map(|(i, _)| format!("?{}", i + 1))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("DELETE FROM manifest_hashes WHERE path IN ({})", placeholders);
+        let sql = format!(
+            "DELETE FROM manifest_hashes WHERE path IN ({})",
+            placeholders
+        );
         let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk
             .iter()
             .map(|p| Box::new(p.to_string()) as Box<dyn rusqlite::types::ToSql>)
@@ -1996,24 +2128,40 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
     if is_full_build || force {
         println!(
             "Indexed {} packages, {} symbols, {} refs, {} files, {} docs into {}",
-            summary.total_packages, summary.total_symbols, summary.total_references,
-            summary.num_files, summary.num_docs,
+            summary.total_packages,
+            summary.total_symbols,
+            summary.total_references,
+            summary.num_files,
+            summary.num_docs,
             db_path.display()
         );
     } else if summary.num_source_reextracted > 0 {
         println!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} refs, {} files, {} docs into {}",
-            summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.num_source_reextracted, summary.total_symbols,
-            summary.total_references, summary.num_files, summary.num_docs,
+            summary.total_packages,
+            summary.num_added,
+            summary.num_changed,
+            summary.num_removed,
+            summary.num_skipped,
+            summary.num_source_reextracted,
+            summary.total_symbols,
+            summary.total_references,
+            summary.num_files,
+            summary.num_docs,
             db_path.display()
         );
     } else {
         println!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} refs, {} files, {} docs into {}",
-            summary.total_packages, summary.num_added, summary.num_changed, summary.num_removed,
-            summary.num_skipped, summary.total_symbols, summary.total_references,
-            summary.num_files, summary.num_docs,
+            summary.total_packages,
+            summary.num_added,
+            summary.num_changed,
+            summary.num_removed,
+            summary.num_skipped,
+            summary.total_symbols,
+            summary.total_references,
+            summary.num_files,
+            summary.num_docs,
             db_path.display()
         );
     }
@@ -2072,6 +2220,18 @@ fn refs_transition_requires_rehash(
     refs_just_enabled && !is_full_build && !force
 }
 
+/// True when we should run the expensive orphan sweep:
+/// - always for force builds,
+/// - when manifests/packages were removed,
+/// - when file rows were deleted in incremental file indexing.
+fn needs_integrity_validation(
+    force: bool,
+    removed_manifests: usize,
+    deleted_file_rows: usize,
+) -> bool {
+    force || removed_manifests > 0 || deleted_file_rows > 0
+}
+
 /// Check if the DB has been populated (has manifest hashes).
 fn is_fresh_db(conn: &Connection) -> bool {
     let count: i64 = conn
@@ -2082,10 +2242,7 @@ fn is_fresh_db(conn: &Connection) -> bool {
 
 /// Try to reconstruct manifest walk from cached DB state.
 /// Returns None if we can't determine the manifest list (forces full walk).
-fn cached_manifest_walk(
-    repo_root: &Path,
-    conn: &Connection,
-) -> Option<Vec<WalkedManifest>> {
+fn cached_manifest_walk(repo_root: &Path, conn: &Connection) -> Option<Vec<WalkedManifest>> {
     // Read stored manifest paths and hashes from DB
     let mut stmt = conn
         .prepare("SELECT path, content_hash FROM manifest_hashes")
@@ -2178,15 +2335,31 @@ fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
     pb
 }
 
-pub fn build_index(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+pub fn build_index(
+    repo_root: &Path,
+    config: &Config,
+    force: bool,
+    db_override: Option<&Path>,
+) -> Result<()> {
     build_index_inner(repo_root, config, force, db_override, true)
 }
 
-pub fn build_index_quiet(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>) -> Result<()> {
+pub fn build_index_quiet(
+    repo_root: &Path,
+    config: &Config,
+    force: bool,
+    db_override: Option<&Path>,
+) -> Result<()> {
     build_index_inner(repo_root, config, force, db_override, false)
 }
 
-fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override: Option<&Path>, progress: bool) -> Result<()> {
+fn build_index_inner(
+    repo_root: &Path,
+    config: &Config,
+    force: bool,
+    db_override: Option<&Path>,
+    progress: bool,
+) -> Result<()> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
     let mp = if progress {
@@ -2205,11 +2378,12 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // Seed from main worktree's DB if this is a new linked-worktree build.
     if !db_path.exists()
         && let Some(seed_path) = crate::config::seed_db_path(config, repo_root, &wt_info)?
-            && seed_path.exists() {
-                crate::db::seed_db(&seed_path, &db_path)?;
-                tracing::info!(seed = %seed_path.display(), "seeded DB from main worktree");
-                eprintln!("Seeded DB from {}", seed_path.display());
-            }
+        && seed_path.exists()
+    {
+        crate::db::seed_db(&seed_path, &db_path)?;
+        tracing::info!(seed = %seed_path.display(), "seeded DB from main worktree");
+        eprintln!("Seeded DB from {}", seed_path.display());
+    }
 
     let conn = db::open_or_create(&db_path, config.rag.enabled)?;
 
@@ -2262,7 +2436,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let git_index_changed = force || is_fresh_db(&conn) || git_index_changed_since_build(repo_root, &conn);
+    let git_index_changed =
+        force || is_fresh_db(&conn) || git_index_changed_since_build(repo_root, &conn);
     let walked = if !git_index_changed {
         // .git/index unchanged — no files added/removed. Use cached manifest paths.
         match cached_manifest_walk(repo_root, &conn) {
@@ -2325,9 +2500,8 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     } else {
         None
     };
-    let (mut parsed_packages, failures) = with_transaction(&conn, || {
-        phase_parse(&to_parse, &conn, &parsers, &ws_ctx)
-    })?;
+    let (mut parsed_packages, failures) =
+        with_transaction(&conn, || phase_parse(&to_parse, &conn, &parsers, &ws_ctx))?;
     if let Some(pb) = pb_parse {
         pb.finish_with_message(format!("Parsed {} manifests", to_parse.len()));
     }
@@ -2350,8 +2524,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             .collect();
         let all_known: HashSet<String> = known_paths.union(&db_paths).cloned().collect();
 
-        let global_excludes: HashSet<String> =
-            config.discovery.exclude.iter().cloned().collect();
+        let global_excludes: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
         let custom_pkgs = custom_discovery::discover_custom_packages(
             repo_root,
@@ -2374,18 +2547,17 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     sp.finish_with_message("Custom discovery done");
 
     // Phase 4: Remove deleted packages (transaction-wrapped)
-    tracing::debug!(removed = diff.removed.len(), "phase 4: remove deleted packages");
+    tracing::debug!(
+        removed = diff.removed.len(),
+        "phase 4: remove deleted packages"
+    );
     let t = Instant::now();
     if !diff.removed.is_empty() {
         let pb = make_progress(&mp, diff.removed.len() as u64, "Removing deleted");
-        with_transaction(&conn, || {
-            phase_remove_deleted(&conn, &diff.removed)
-        })?;
+        with_transaction(&conn, || phase_remove_deleted(&conn, &diff.removed))?;
         pb.finish_with_message(format!("Removed {} packages", diff.removed.len()));
     } else {
-        with_transaction(&conn, || {
-            phase_remove_deleted(&conn, &diff.removed)
-        })?;
+        with_transaction(&conn, || phase_remove_deleted(&conn, &diff.removed))?;
     }
     timings.push(("remove-deleted", t.elapsed()));
 
@@ -2407,14 +2579,10 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     let t = Instant::now();
     if !to_parse.is_empty() {
         let pb = make_progress(&mp, to_parse.len() as u64, "Storing hashes");
-        with_transaction(&conn, || {
-            phase_store_hashes(&conn, &to_parse)
-        })?;
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
         pb.finish_with_message(format!("Stored {} hashes", to_parse.len()));
     } else {
-        with_transaction(&conn, || {
-            phase_store_hashes(&conn, &to_parse)
-        })?;
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
     }
     timings.push(("update-hashes", t.elapsed()));
 
@@ -2426,9 +2594,10 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     tracing::debug!("phase 7: index files");
     let sp = make_spinner(&mp, "Indexing files…");
     let t = Instant::now();
-    let num_files = with_transaction(&conn, || {
-        phase_index_files(&conn, repo_root, config)
-    })?;
+    let file_index = with_transaction(&conn, || phase_index_files(&conn, repo_root, config))?;
+    let num_files = file_index.num_files;
+    let needs_integrity_validation =
+        needs_integrity_validation(force, diff.removed.len(), file_index.deleted_file_rows);
     timings.push(("index-files", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} files", num_files));
 
@@ -2478,14 +2647,36 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
-        phase_extract_symbols(&conn, repo_root, &parsed_packages, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, is_full_build || force, &mut ref_writer, config.symbols.max_file_size, config.symbols.max_references_per_file)?;
+        phase_extract_symbols(
+            &conn,
+            repo_root,
+            &parsed_packages,
+            &config.symbols.exclude_extensions,
+            &config.symbols.exclude_patterns,
+            &pb_sym_clone,
+            is_full_build || force,
+            &mut ref_writer,
+            config.symbols.max_file_size,
+            config.symbols.max_references_per_file,
+        )?;
         let count = if git_index_changed || refs_just_enabled {
             // The refs_just_enabled branch is load-bearing: flipping the
             // flag in shire.toml does not touch .git/index, so without
             // this override phase_source_incremental would skip unchanged
             // packages and leave symbol_refs empty for every file the
             // user hasn't edited since the last build.
-            phase_source_incremental(&conn, repo_root, &diff.unchanged, &config.symbols.exclude_extensions, &config.symbols.exclude_patterns, &pb_sym_clone, &mut ref_writer, force_source_reextract, config.symbols.max_file_size, config.symbols.max_references_per_file)?
+            phase_source_incremental(
+                &conn,
+                repo_root,
+                &diff.unchanged,
+                &config.symbols.exclude_extensions,
+                &config.symbols.exclude_patterns,
+                &pb_sym_clone,
+                &mut ref_writer,
+                force_source_reextract,
+                config.symbols.max_file_size,
+                config.symbols.max_references_per_file,
+            )?
         } else {
             // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
             if let Some(pb) = &pb_sym_clone {
@@ -2510,9 +2701,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     tracing::debug!("phase 9.5: index docs");
     let sp = make_spinner(&mp, "Indexing docs…");
     let t = Instant::now();
-    let num_docs = with_transaction(&conn, || {
-        phase_index_docs(&conn, repo_root, config)
-    })?;
+    let num_docs = with_transaction(&conn, || phase_index_docs(&conn, repo_root, config))?;
     timings.push(("index-docs", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} docs", num_docs));
 
@@ -2522,7 +2711,7 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // returned so callers can optionally wait for it.
     #[cfg(feature = "rag")]
     let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
-        use crate::rag::embedder::{embed_files, Embedder, FileForEmbedding, FileSymbol};
+        use crate::rag::embedder::{Embedder, FileForEmbedding, FileSymbol, embed_files};
 
         let changed_packages: Vec<String> = parsed_packages
             .iter()
@@ -2611,7 +2800,9 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                     }
                     pb.set_style(
                         ProgressStyle::default_bar()
-                            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})")
+                            .template(
+                                "{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})",
+                            )
                             .expect("hardcoded progress template must be valid")
                             .progress_chars("━╸─"),
                     );
@@ -2627,25 +2818,26 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
                         }
                     };
                     match embed_files(&embedder, &file_inputs, |n| pb.inc(n as u64)) {
-                        Ok(embeddings) => {
-                            match db::open_or_create(&db_path_owned, true) {
-                                Ok(bg_conn) => {
-                                    if let Err(e) = crate::rag::storage::insert_file_embeddings(&bg_conn, &embeddings) {
-                                        pb.finish_with_message(format!("Embedding failed: {e}"));
-                                        tracing::warn!(error = %e, "RAG background: insert failed");
-                                    } else {
-                                        pb.finish_with_message(format!(
-                                            "Embedded {num_files} files in {:.1}s",
-                                            t.elapsed().as_secs_f64()
-                                        ));
-                                    }
-                                }
-                                Err(e) => {
+                        Ok(embeddings) => match db::open_or_create(&db_path_owned, true) {
+                            Ok(bg_conn) => {
+                                if let Err(e) = crate::rag::storage::insert_file_embeddings(
+                                    &bg_conn,
+                                    &embeddings,
+                                ) {
                                     pb.finish_with_message(format!("Embedding failed: {e}"));
-                                    tracing::warn!(error = %e, "RAG background: DB open failed");
+                                    tracing::warn!(error = %e, "RAG background: insert failed");
+                                } else {
+                                    pb.finish_with_message(format!(
+                                        "Embedded {num_files} files in {:.1}s",
+                                        t.elapsed().as_secs_f64()
+                                    ));
                                 }
                             }
-                        }
+                            Err(e) => {
+                                pb.finish_with_message(format!("Embedding failed: {e}"));
+                                tracing::warn!(error = %e, "RAG background: DB open failed");
+                            }
+                        },
                         Err(e) => {
                             pb.finish_with_message(format!("Embedding failed: {e}"));
                             tracing::warn!(error = %e, "RAG background: embed failed");
@@ -2662,13 +2854,14 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     let rag_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
-    with_transaction(&conn, || {
-        apply_config_overrides(&conn, config)
-    })?;
+    with_transaction(&conn, || apply_config_overrides(&conn, config))?;
 
-    let total_packages: i64 = conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))?;
-    let total_symbols: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
-    let total_references: i64 = conn.query_row("SELECT COUNT(*) FROM symbol_refs", [], |row| row.get(0))?;
+    let total_packages: i64 =
+        conn.query_row("SELECT COUNT(*) FROM packages", [], |row| row.get(0))?;
+    let total_symbols: i64 =
+        conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+    let total_references: i64 =
+        conn.query_row("SELECT COUNT(*) FROM symbol_refs", [], |row| row.get(0))?;
 
     let summary = BuildSummary {
         num_added,
@@ -2708,9 +2901,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
 
     // Re-enable FK enforcement and validate integrity
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    with_transaction(&conn, || {
-        validate_referential_integrity(&conn)
-    })?;
+    if needs_integrity_validation {
+        with_transaction(&conn, || validate_referential_integrity(&conn))?;
+    } else {
+        tracing::debug!(
+            removed_manifests = diff.removed.len(),
+            deleted_file_rows = file_index.deleted_file_rows,
+            "skipping referential-integrity sweep (no orphan-risk signals)"
+        );
+    }
 
     // Clean up stale hash entries that no longer correspond to any existing package.
     // source_hashes keys on package name, so orphans are easy to detect.
@@ -2739,14 +2938,15 @@ fn build_index_inner(repo_root: &Path, config: &Config, force: bool, db_override
     // back to WAL requires an exclusive lock, which can fail with SQLITE_BUSY
     // if the RAG thread's connection is still active.
     if let Some(handle) = rag_handle
-        && let Err(panic_payload) = handle.join() {
-            let msg = panic_payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
-                .unwrap_or("unknown panic");
-            tracing::error!(panic = %msg, "RAG embedding thread panicked");
-        }
+        && let Err(panic_payload) = handle.join()
+    {
+        let msg = panic_payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("unknown panic");
+        tracing::error!(panic = %msg, "RAG embedding thread panicked");
+    }
 
     // Restore WAL mode for read-heavy query workloads after the build.
     if restore_wal {
@@ -2867,7 +3067,9 @@ fn detect_boundary_edges(
 /// Extract the parent directory of a package path for sibling-package matching.
 /// "services/auth/proto" → "services/auth", "proto" → None
 fn package_parent(pkg_path: &str) -> Option<String> {
-    pkg_path.rsplit_once('/').map(|(parent, _)| parent.to_string())
+    pkg_path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
 }
 
 /// Check if a generated file is in scope relative to its proto source.
@@ -2957,6 +3159,26 @@ mod tests {
         assert!(!refs_transition_requires_rehash(false, false, true));
     }
 
+    #[test]
+    fn test_needs_integrity_validation_when_force() {
+        assert!(needs_integrity_validation(true, 0, 0));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_when_removed_manifests() {
+        assert!(needs_integrity_validation(false, 1, 0));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_when_deleted_file_rows() {
+        assert!(needs_integrity_validation(false, 0, 1));
+    }
+
+    #[test]
+    fn test_needs_integrity_validation_skips_when_no_orphan_signals() {
+        assert!(!needs_integrity_validation(false, 0, 0));
+    }
+
     /// Regression test: `upsert_symbols_and_refs_for_file` must not
     /// early-return when the file_path is missing from the `files`
     /// table. It should synthesize the row the same way the bulk path
@@ -3001,7 +3223,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ref_count, 1, "ref must be inserted even when file_id is missing");
+        assert_eq!(
+            ref_count, 1,
+            "ref must be inserted even when file_id is missing"
+        );
 
         let file_count: i64 = conn
             .query_row(
@@ -3010,7 +3235,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(file_count, 1, "files row must be synthesized by the bulk path");
+        assert_eq!(
+            file_count, 1,
+            "files row must be synthesized by the bulk path"
+        );
     }
 
     fn create_test_monorepo(dir: &Path) {
@@ -3034,7 +3262,8 @@ mod tests {
         let go_dir = dir.join("services/gateway");
         fs::create_dir_all(&go_dir).unwrap();
         let mut f = fs::File::create(go_dir.join("go.mod")).unwrap();
-        f.write_all(b"module github.com/company/gateway\n\ngo 1.22\n").unwrap();
+        f.write_all(b"module github.com/company/gateway\n\ngo 1.22\n")
+            .unwrap();
     }
 
     #[test]
@@ -3179,7 +3408,8 @@ mod tests {
         fs::write(
             new_dir.join("package.json"),
             br#"{"name": "billing", "version": "1.0.0", "description": "Billing service"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         build_index(dir.path(), &config, false, None).unwrap();
         assert_eq!(pkg_count(dir.path()), 4);
@@ -3196,7 +3426,8 @@ mod tests {
         fs::write(
             auth_dir.join("package.json"),
             br#"{"name": "auth-service", "version": "1.0.0", "dependencies": {"billing": "^1.0"}}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let config = Config::default();
         build_index(dir.path(), &config, false, None).unwrap();
@@ -3219,7 +3450,8 @@ mod tests {
         fs::write(
             billing_dir.join("package.json"),
             br#"{"name": "billing", "version": "1.0.0"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         build_index(dir.path(), &config, false, None).unwrap();
 
@@ -3622,9 +3854,11 @@ anyhow = "1"
             2,
             "should match user.pb.go and user_pb2.py in sibling package"
         );
-        assert!(edges
-            .iter()
-            .all(|e| e.source_path == "services/auth/proto/user.proto"));
+        assert!(
+            edges
+                .iter()
+                .all(|e| e.source_path == "services/auth/proto/user.proto")
+        );
         let gen_paths: std::collections::HashSet<&str> =
             edges.iter().map(|e| e.generated_path.as_str()).collect();
         assert!(gen_paths.contains("services/auth/gen/user.pb.go"));

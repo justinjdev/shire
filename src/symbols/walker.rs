@@ -75,40 +75,40 @@ const SKIP_FILES: &[&str] = &["build.rs", "deepcopy_generated.go"];
 /// Return ALL registered source file extensions (the union of all languages).
 pub fn all_extensions() -> Vec<&'static str> {
     vec![
-        "ts", "tsx", "js", "jsx",           // TypeScript/JavaScript
-        "go",                                // Go
-        "rs",                                // Rust
-        "py",                                // Python
-        "java", "kt",                       // Java/Kotlin
-        "dart",                              // Dart
-        "proto",                             // Protobuf
-        "pm", "pl",                          // Perl
-        "rb",                                // Ruby
-        "swift",                             // Swift
-        "c", "h",                            // C
-        "cpp", "cc", "cxx", "hpp", "hxx",   // C++
-        "cs",                                // C#
-        "php",                               // PHP
-        "scala", "sc",                       // Scala
-        "ex", "exs",                         // Elixir
-        "zig",                               // Zig
-        "sh", "bash",                        // Bash/Shell
-        "r", "R",                            // R
-        "cob", "cbl", "cpy",                // COBOL
-        "hs",                                // Haskell
-        "yaml", "yml",                       // YAML
-        "sql",                               // SQL
-        "hcl", "tf",                         // HCL/Terraform
-        "toml",                              // TOML
-        "ml", "mli",                         // OCaml
-        "lua",                               // Lua
-        "clj", "cljs", "cljc", "edn",       // Clojure
-        "erl", "hrl",                        // Erlang
-        "jl",                                // Julia
-        "gleam",                             // Gleam
-        "odin",                              // Odin
-        "nix",                               // Nix
-        "nim", "nims",                       // Nim
+        "ts", "tsx", "js", "jsx", // TypeScript/JavaScript
+        "go",  // Go
+        "rs",  // Rust
+        "py",  // Python
+        "java", "kt",    // Java/Kotlin
+        "dart",  // Dart
+        "proto", // Protobuf
+        "pm", "pl",    // Perl
+        "rb",    // Ruby
+        "swift", // Swift
+        "c", "h", // C
+        "cpp", "cc", "cxx", "hpp", "hxx", // C++
+        "cs",  // C#
+        "php", // PHP
+        "scala", "sc", // Scala
+        "ex", "exs", // Elixir
+        "zig", // Zig
+        "sh", "bash", // Bash/Shell
+        "r", "R", // R
+        "cob", "cbl", "cpy", // COBOL
+        "hs",  // Haskell
+        "yaml", "yml", // YAML
+        "sql", // SQL
+        "hcl", "tf",   // HCL/Terraform
+        "toml", // TOML
+        "ml", "mli", // OCaml
+        "lua", // Lua
+        "clj", "cljs", "cljc", "edn", // Clojure
+        "erl", "hrl",   // Erlang
+        "jl",    // Julia
+        "gleam", // Gleam
+        "odin",  // Odin
+        "nix",   // Nix
+        "nim", "nims", // Nim
     ]
 }
 
@@ -120,62 +120,64 @@ pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>
     walk_source_files_with_patterns(dir, extensions, &[])
 }
 
-pub fn walk_source_files_with_patterns(dir: &Path, extensions: &[&str], extra_skip_patterns: &[String]) -> Result<Vec<PathBuf>> {
+pub fn walk_source_files_with_patterns(
+    dir: &Path,
+    extensions: &[&str],
+    extra_skip_patterns: &[String],
+) -> Result<Vec<PathBuf>> {
     let ext_set: HashSet<&str> = extensions.iter().copied().collect();
     let exclude_set: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
 
     let mut files = Vec::new();
 
-    for entry in WalkDir::new(dir)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_str().unwrap_or("");
-                // Skip hidden dirs (except the root)
-                if name.starts_with('.') && e.depth() > 0 {
-                    return false;
-                }
-                return !exclude_set.contains(name);
+    for entry in WalkDir::new(dir).into_iter().filter_entry(|e| {
+        if e.file_type().is_dir() {
+            let name = e.file_name().to_str().unwrap_or("");
+            // Skip hidden dirs (except the root)
+            if name.starts_with('.') && e.depth() > 0 {
+                return false;
             }
-            true
-        })
-    {
+            return !exclude_set.contains(name);
+        }
+        true
+    }) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
 
         let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if !ext_set.contains(ext) {
             continue;
         }
 
-        let filename = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
 
         // Skip known generated/test file patterns
         if SKIP_FILES.contains(&filename) {
             continue;
         }
 
-        if SKIP_SUFFIXES.iter().any(|suffix| filename.ends_with(suffix)) {
+        if SKIP_SUFFIXES
+            .iter()
+            .any(|suffix| filename.ends_with(suffix))
+        {
             continue;
         }
 
-        if SKIP_PREFIXES.iter().any(|prefix| filename.starts_with(prefix)) {
+        if SKIP_PREFIXES
+            .iter()
+            .any(|prefix| filename.starts_with(prefix))
+        {
             continue;
         }
 
         // User-configured skip patterns (suffix or prefix match, ignore blanks)
         if extra_skip_patterns.iter().any(|pat| {
-            !pat.is_empty() && (filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str()))
+            !pat.is_empty()
+                && (filename.ends_with(pat.as_str()) || filename.starts_with(pat.as_str()))
         }) {
             continue;
         }
@@ -324,9 +326,13 @@ mod tests {
         fs::write(dir.path().join("Real.java"), "class Bar {}").unwrap();
 
         let patterns = vec!["_mock.go".to_string(), "CustomGenerated".to_string()];
-        let files = walk_source_files_with_patterns(dir.path(), &["go", "java"], &patterns).unwrap();
+        let files =
+            walk_source_files_with_patterns(dir.path(), &["go", "java"], &patterns).unwrap();
         assert_eq!(files.len(), 2);
-        let names: Vec<&str> = files.iter().map(|f| f.file_name().unwrap().to_str().unwrap()).collect();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_str().unwrap())
+            .collect();
         assert!(names.contains(&"handler.go"));
         assert!(names.contains(&"Real.java"));
     }

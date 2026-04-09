@@ -38,7 +38,12 @@ impl ManifestParser for CargoParser {
 
         extract_deps(&doc, "dependencies", DepKind::Runtime, &mut dependencies);
         extract_deps(&doc, "dev-dependencies", DepKind::Dev, &mut dependencies);
-        extract_deps(&doc, "build-dependencies", DepKind::Build, &mut dependencies);
+        extract_deps(
+            &doc,
+            "build-dependencies",
+            DepKind::Build,
+            &mut dependencies,
+        );
 
         Ok(PackageInfo {
             name,
@@ -117,9 +122,27 @@ impl CargoParser {
 
         let mut dependencies = Vec::new();
 
-        extract_deps_with_workspace(&doc, "dependencies", DepKind::Runtime, workspace_deps, &mut dependencies);
-        extract_deps_with_workspace(&doc, "dev-dependencies", DepKind::Dev, workspace_deps, &mut dependencies);
-        extract_deps_with_workspace(&doc, "build-dependencies", DepKind::Build, workspace_deps, &mut dependencies);
+        extract_deps_with_workspace(
+            &doc,
+            "dependencies",
+            DepKind::Runtime,
+            workspace_deps,
+            &mut dependencies,
+        );
+        extract_deps_with_workspace(
+            &doc,
+            "dev-dependencies",
+            DepKind::Dev,
+            workspace_deps,
+            &mut dependencies,
+        );
+        extract_deps_with_workspace(
+            &doc,
+            "build-dependencies",
+            DepKind::Build,
+            workspace_deps,
+            &mut dependencies,
+        );
 
         Ok(PackageInfo {
             name,
@@ -305,13 +328,25 @@ anyhow = "1"
 
         assert_eq!(info.name, "member-crate");
 
-        let tokio_dep = info.dependencies.iter().find(|d| d.name == "tokio").unwrap();
+        let tokio_dep = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "tokio")
+            .unwrap();
         assert_eq!(tokio_dep.version_req.as_deref(), Some("1.35"));
 
-        let serde_dep = info.dependencies.iter().find(|d| d.name == "serde").unwrap();
+        let serde_dep = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "serde")
+            .unwrap();
         assert_eq!(serde_dep.version_req.as_deref(), Some("1.0"));
 
-        let anyhow_dep = info.dependencies.iter().find(|d| d.name == "anyhow").unwrap();
+        let anyhow_dep = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "anyhow")
+            .unwrap();
         assert_eq!(anyhow_dep.version_req.as_deref(), Some("1"));
     }
 
@@ -337,7 +372,11 @@ missing-dep = { workspace = true }
             .parse_with_workspace_deps(&path, "crates/orphan", &workspace_deps)
             .unwrap();
 
-        let dep = info.dependencies.iter().find(|d| d.name == "missing-dep").unwrap();
+        let dep = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == "missing-dep")
+            .unwrap();
         assert_eq!(dep.version_req, None);
     }
 

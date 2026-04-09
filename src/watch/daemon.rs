@@ -42,10 +42,7 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let mut cmd = Command::new(exe);
-    cmd.arg("watch")
-        .arg("--root")
-        .arg(root)
-        .arg("--foreground");
+    cmd.arg("watch").arg("--root").arg(root).arg("--foreground");
 
     if let Some(db_path) = db {
         cmd.arg("--db").arg(db_path);
@@ -61,7 +58,10 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
     let stderr_target = match std::fs::File::create(&stderr_log) {
         Ok(file) => std::process::Stdio::from(file),
         Err(e) => {
-            eprintln!("Warning: failed to open {}: {e}; daemon stderr will be discarded", stderr_log.display());
+            eprintln!(
+                "Warning: failed to open {}: {e}; daemon stderr will be discarded",
+                stderr_log.display()
+            );
             std::process::Stdio::null()
         }
     };
@@ -73,8 +73,7 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
     let child = cmd.spawn().context("failed to spawn watch daemon")?;
 
     // Write PID file
-    std::fs::write(pid_path(root), child.id().to_string())
-        .context("failed to write PID file")?;
+    std::fs::write(pid_path(root), child.id().to_string()).context("failed to write PID file")?;
 
     Ok(())
 }

@@ -41,9 +41,10 @@ pub fn worktree_info(repo_root: &Path) -> WorktreeInfo {
     }
 
     if dot_git.is_file()
-        && let Some(info) = parse_linked_worktree(&dot_git, repo_root) {
-            return info;
-        }
+        && let Some(info) = parse_linked_worktree(&dot_git, repo_root)
+    {
+        return info;
+    }
 
     // Not a git repo or unrecognizable structure
     WorktreeInfo {

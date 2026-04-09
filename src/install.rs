@@ -128,12 +128,19 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
 
     let registered = results
         .iter()
-        .filter(|r| matches!(r.status, RegStatus::Registered(_) | RegStatus::Updated(_) | RegStatus::AlreadyRegistered(_)))
+        .filter(|r| {
+            matches!(
+                r.status,
+                RegStatus::Registered(_) | RegStatus::Updated(_) | RegStatus::AlreadyRegistered(_)
+            )
+        })
         .count();
     if registered > 0 {
         println!("\nRestart your editor/CLI to activate.");
     } else {
-        println!("\nNo supported tools detected. Install one of: Claude Code, Cursor, Windsurf, VS Code, Zed, Gemini CLI, Codex CLI");
+        println!(
+            "\nNo supported tools detected. Install one of: Claude Code, Cursor, Windsurf, VS Code, Zed, Gemini CLI, Codex CLI"
+        );
     }
 
     let failures: Vec<_> = results
@@ -352,13 +359,14 @@ fn register_claude_code(binary_path: &Path, dry_run: bool, force: bool) -> Regis
             .args(["mcp", "get", "-s", "user", "shire"])
             .output();
         if let Ok(o) = check
-            && o.status.success() {
-                println!("  MCP server already registered (scope: user)");
-                return Registration {
-                    tool: "Claude Code",
-                    status: RegStatus::AlreadyRegistered("via claude mcp".into()),
-                };
-            }
+            && o.status.success()
+        {
+            println!("  MCP server already registered (scope: user)");
+            return Registration {
+                tool: "Claude Code",
+                status: RegStatus::AlreadyRegistered("via claude mcp".into()),
+            };
+        }
     } else {
         // Force: remove existing entry first
         let _ = Command::new(&claude_path)
@@ -431,7 +439,7 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
             return Registration {
                 tool: "Claude Code",
                 status: RegStatus::NotFound,
-            }
+            };
         }
     };
 
@@ -513,18 +521,18 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
             return Registration {
                 tool: "Codex CLI",
                 status: RegStatus::Failed(e.to_string()),
-            }
+            };
         }
     };
 
     let config_file = home.join(".codex/config.toml");
-    println!(
-        "[Codex CLI] detected ({})",
-        codex_path.unwrap().display()
-    );
+    println!("[Codex CLI] detected ({})", codex_path.unwrap().display());
 
     if dry_run {
-        println!("  [dry-run] Would add MCP server to {}", config_file.display());
+        println!(
+            "  [dry-run] Would add MCP server to {}",
+            config_file.display()
+        );
         return Registration {
             tool: "Codex CLI",
             status: RegStatus::Registered(config_file.display().to_string()),
@@ -549,7 +557,10 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
             }
         }
         Ok(UpsertResult::AlreadyExists) => {
-            println!("  MCP server already configured in {}", config_file.display());
+            println!(
+                "  MCP server already configured in {}",
+                config_file.display()
+            );
             Registration {
                 tool: "Codex CLI",
                 status: RegStatus::AlreadyRegistered(config_file.display().to_string()),
@@ -598,7 +609,10 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
 
     // Ensure mcp_servers table exists
     if !root.contains_key("mcp_servers") {
-        root.insert("mcp_servers".into(), toml::Value::Table(toml::map::Map::new()));
+        root.insert(
+            "mcp_servers".into(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
     }
     let mcp_servers = root
         .get_mut("mcp_servers")
@@ -611,7 +625,10 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
     }
 
     let mut shire_entry = toml::map::Map::new();
-    shire_entry.insert("command".into(), toml::Value::String(binary_path.to_string_lossy().into()));
+    shire_entry.insert(
+        "command".into(),
+        toml::Value::String(binary_path.to_string_lossy().into()),
+    );
     shire_entry.insert(
         "args".into(),
         toml::Value::Array(vec![
@@ -637,7 +654,11 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
     if let Err(e) = fs::rename(&tmp_path, config_file) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
-            format!("Failed to rename {} to {}", tmp_path.display(), config_file.display())
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                config_file.display()
+            )
         });
     }
 
@@ -695,9 +716,10 @@ fn remove_codex_mcp(dry_run: bool) {
     if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
         mcp_servers.remove("shire");
         if mcp_servers.is_empty()
-            && let Some(root) = doc.as_table_mut() {
-                root.remove("mcp_servers");
-            }
+            && let Some(root) = doc.as_table_mut()
+        {
+            root.remove("mcp_servers");
+        }
     }
 
     let output = toml::to_string_pretty(&doc).unwrap_or_default();
@@ -755,7 +777,7 @@ fn register_editor_mcp(
             return Registration {
                 tool: tool_name,
                 status: RegStatus::NotFound,
-            }
+            };
         }
     };
 
@@ -779,7 +801,10 @@ fn register_editor_mcp(
     });
 
     if dry_run {
-        println!("  [dry-run] Would upsert shire in {}", config_path.display());
+        println!(
+            "  [dry-run] Would upsert shire in {}",
+            config_path.display()
+        );
         return Registration {
             tool: tool_name,
             status: RegStatus::Registered(config_path.display().to_string()),
@@ -1046,13 +1071,13 @@ fn upsert_json_mcp(
         Map::new()
     };
 
-    let servers = root
-        .entry(servers_key)
-        .or_insert_with(|| json!({}));
+    let servers = root.entry(servers_key).or_insert_with(|| json!({}));
 
-    let servers_obj = servers
-        .as_object_mut()
-        .context(format!("{} is not an object in {}", servers_key, path.display()))?;
+    let servers_obj = servers.as_object_mut().context(format!(
+        "{} is not an object in {}",
+        servers_key,
+        path.display()
+    ))?;
 
     let is_update = servers_obj.contains_key(entry_name);
     if is_update && !force {
@@ -1067,8 +1092,8 @@ fn upsert_json_mcp(
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
-    let output = serde_json::to_string_pretty(&Value::Object(root))
-        .context("Failed to serialize JSON")?;
+    let output =
+        serde_json::to_string_pretty(&Value::Object(root)).context("Failed to serialize JSON")?;
 
     // Atomic write via temp file
     let tmp_path = path.with_extension("json.tmp");
@@ -1144,10 +1169,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false).unwrap();
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
 
-        let result =
-            upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire2"}), false).unwrap();
+        let result = upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire2"}),
+            false,
+        )
+        .unwrap();
         assert!(matches!(result, UpsertResult::AlreadyExists));
 
         // Original value preserved
@@ -1180,7 +1218,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nested/dir/mcp.json");
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false).unwrap();
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
         assert!(path.exists());
     }
 
@@ -1190,7 +1235,13 @@ mod tests {
         let path = dir.path().join("mcp.json");
         fs::write(&path, json!({"mcpServers": "broken"}).to_string()).unwrap();
 
-        let result = upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "shire"}), false);
+        let result = upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        );
         assert!(result.is_err());
     }
 
@@ -1199,10 +1250,23 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/old/shire"}), false).unwrap();
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "/old/shire"}),
+            false,
+        )
+        .unwrap();
 
-        let result =
-            upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/new/shire"}), true).unwrap();
+        let result = upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "/new/shire"}),
+            true,
+        )
+        .unwrap();
         assert!(matches!(result, UpsertResult::Updated));
 
         let parsed: Map<String, Value> =
@@ -1214,10 +1278,18 @@ mod tests {
     fn test_upsert_force_preserves_other_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
-        let existing = json!({"mcpServers": {"shire": {"command": "/old"}, "other": {"command": "other"}}});
+        let existing =
+            json!({"mcpServers": {"shire": {"command": "/old"}, "other": {"command": "other"}}});
         fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        upsert_json_mcp(&path, "mcpServers", "shire", json!({"command": "/new"}), true).unwrap();
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "/new"}),
+            true,
+        )
+        .unwrap();
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1229,14 +1301,20 @@ mod tests {
     fn test_remove_editor_mcp_removes_entry() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("mcp.json");
-        let existing = json!({"mcpServers": {"shire": {"command": "shire"}, "other": {"command": "other"}}});
+        let existing =
+            json!({"mcpServers": {"shire": {"command": "shire"}, "other": {"command": "other"}}});
         fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
         remove_editor_mcp("Test", &Some(path.clone()), "mcpServers", false);
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(!parsed["mcpServers"].as_object().unwrap().contains_key("shire"));
+        assert!(
+            !parsed["mcpServers"]
+                .as_object()
+                .unwrap()
+                .contains_key("shire")
+        );
         assert!(parsed["mcpServers"]["other"].is_object());
     }
 
@@ -1294,7 +1372,11 @@ mod tests {
     fn test_upsert_codex_toml_preserves_other_config() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n").unwrap();
+        fs::write(
+            &path,
+            "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n",
+        )
+        .unwrap();
 
         upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
 

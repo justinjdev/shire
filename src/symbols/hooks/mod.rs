@@ -87,7 +87,6 @@ pub struct LanguageHooks {
     pub reference_hooks: Option<ReferenceHooks>,
 }
 
-
 /// Helper: find first child node with the given kind.
 pub fn find_child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {
     for i in 0..node.child_count() {
@@ -126,11 +125,7 @@ pub fn find_ancestor<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
 /// is listed in `ancestors`. Returns the text of that ancestor's `name` field
 /// (or its first `identifier`/`type_identifier` child) as the enclosing symbol
 /// name. Returns None if no qualifying named ancestor is found.
-pub fn resolve_enclosing_symbol(
-    node: &Node,
-    source: &str,
-    ancestors: &[&str],
-) -> Option<String> {
+pub fn resolve_enclosing_symbol(node: &Node, source: &str, ancestors: &[&str]) -> Option<String> {
     let mut current = node.parent();
     while let Some(n) = current {
         if ancestors.contains(&n.kind()) {

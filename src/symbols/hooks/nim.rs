@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Nim visibility: only exported symbols (those with `*` suffix, represented as
@@ -6,17 +6,19 @@ use tree_sitter::Node;
 fn is_visible(node: &Node, _source: &str) -> bool {
     match node.kind() {
         // Procedure-like declarations: name field is exported_symbol or identifier
-        "proc_declaration" | "func_declaration" | "method_declaration"
-        | "iterator_declaration" | "template_declaration" | "macro_declaration"
-        | "converter_declaration" => {
-            node.child_by_field_name("name")
-                .is_some_and(|n| n.kind() == "exported_symbol")
-        }
+        "proc_declaration"
+        | "func_declaration"
+        | "method_declaration"
+        | "iterator_declaration"
+        | "template_declaration"
+        | "macro_declaration"
+        | "converter_declaration" => node
+            .child_by_field_name("name")
+            .is_some_and(|n| n.kind() == "exported_symbol"),
         // type_symbol_declaration: name field is exported_symbol or identifier
-        "type_symbol_declaration" => {
-            node.child_by_field_name("name")
-                .is_some_and(|n| n.kind() == "exported_symbol")
-        }
+        "type_symbol_declaration" => node
+            .child_by_field_name("name")
+            .is_some_and(|n| n.kind() == "exported_symbol"),
         // variable_declaration inside const_section: check symbol_declaration's name
         "variable_declaration" => has_exported_symbol(node),
         _ => false,
@@ -40,8 +42,12 @@ fn has_exported_symbol(node: &Node) -> bool {
 /// Build signature string for Nim symbols.
 fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> String {
     match node.kind() {
-        "proc_declaration" | "func_declaration" | "method_declaration"
-        | "iterator_declaration" | "template_declaration" | "macro_declaration"
+        "proc_declaration"
+        | "func_declaration"
+        | "method_declaration"
+        | "iterator_declaration"
+        | "template_declaration"
+        | "macro_declaration"
         | "converter_declaration" => {
             let keyword = declaration_keyword(node.kind());
             let params = node
@@ -60,14 +66,15 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
             // Look at sibling to determine what kind of type it is
             let parent = node.parent();
             if let Some(parent) = parent
-                && parent.kind() == "type_declaration" {
-                    if find_child_by_kind(&parent, "enum_declaration").is_some() {
-                        return format!("type {} = enum", name);
-                    }
-                    if find_child_by_kind(&parent, "object_declaration").is_some() {
-                        return format!("type {} = object", name);
-                    }
+                && parent.kind() == "type_declaration"
+            {
+                if find_child_by_kind(&parent, "enum_declaration").is_some() {
+                    return format!("type {} = enum", name);
                 }
+                if find_child_by_kind(&parent, "object_declaration").is_some() {
+                    return format!("type {} = object", name);
+                }
+            }
             format!("type {}", name)
         }
         "variable_declaration" => {
@@ -125,24 +132,21 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
                 for j in 0..sdl.child_count() {
                     let sd = sdl.child(j).unwrap();
                     if sd.kind() == "symbol_declaration"
-                        && let Some(name_node) = sd.child_by_field_name("name") {
-                            let pname = match name_node.kind() {
-                                "exported_symbol" => {
-                                    find_child_by_kind(&name_node, "identifier")
-                                        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                                        .unwrap_or("")
-                                }
-                                _ => name_node
-                                    .utf8_text(source.as_bytes())
-                                    .unwrap_or(""),
-                            };
-                            if !pname.is_empty() {
-                                params.push(Parameter {
-                                    name: pname.to_string(),
-                                    type_annotation: type_ann.clone(),
-                                });
-                            }
+                        && let Some(name_node) = sd.child_by_field_name("name")
+                    {
+                        let pname = match name_node.kind() {
+                            "exported_symbol" => find_child_by_kind(&name_node, "identifier")
+                                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                                .unwrap_or(""),
+                            _ => name_node.utf8_text(source.as_bytes()).unwrap_or(""),
+                        };
+                        if !pname.is_empty() {
+                            params.push(Parameter {
+                                name: pname.to_string(),
+                                type_annotation: type_ann.clone(),
+                            });
                         }
+                    }
                 }
             }
         }
@@ -166,16 +170,17 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
         "type_symbol_declaration" => {
             // Check sibling nodes in the parent type_declaration to determine the actual kind
             if let Some(parent) = node.parent()
-                && parent.kind() == "type_declaration" {
-                    if find_child_by_kind(&parent, "enum_declaration").is_some() {
-                        sym.kind = SymbolKind::Enum;
-                        return Some(sym);
-                    }
-                    if find_child_by_kind(&parent, "object_declaration").is_some() {
-                        sym.kind = SymbolKind::Class;
-                        return Some(sym);
-                    }
+                && parent.kind() == "type_declaration"
+            {
+                if find_child_by_kind(&parent, "enum_declaration").is_some() {
+                    sym.kind = SymbolKind::Enum;
+                    return Some(sym);
                 }
+                if find_child_by_kind(&parent, "object_declaration").is_some() {
+                    sym.kind = SymbolKind::Class;
+                    return Some(sym);
+                }
+            }
             sym.kind = SymbolKind::Type;
         }
         "variable_declaration" => {
@@ -213,7 +218,16 @@ mod tests {
         let mut parser = Parser::new();
         parser.set_language(&language).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nim"), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from("test.nim"),
+            &hooks,
+            true,
+            0,
+        )
+        .0
     }
 
     #[test]
@@ -393,16 +407,37 @@ const MaxSize* = 100
         let syms = extract(source);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Color"), "missing Color, got: {:?}", names);
-        assert!(names.contains(&"Person"), "missing Person, got: {:?}", names);
+        assert!(
+            names.contains(&"Person"),
+            "missing Person, got: {:?}",
+            names
+        );
         assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
-        assert!(!names.contains(&"privateHelper"), "privateHelper should be filtered");
+        assert!(
+            !names.contains(&"privateHelper"),
+            "privateHelper should be filtered"
+        );
         assert!(names.contains(&"add"), "missing add, got: {:?}", names);
         assert!(names.contains(&"draw"), "missing draw, got: {:?}", names);
         assert!(names.contains(&"items"), "missing items, got: {:?}", names);
         assert!(names.contains(&"log"), "missing log, got: {:?}", names);
-        assert!(names.contains(&"genCode"), "missing genCode, got: {:?}", names);
-        assert!(names.contains(&"MaxSize"), "missing MaxSize, got: {:?}", names);
-        assert_eq!(syms.len(), 9, "expected 9 symbols, got {}: {:?}", syms.len(), names);
+        assert!(
+            names.contains(&"genCode"),
+            "missing genCode, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"MaxSize"),
+            "missing MaxSize, got: {:?}",
+            names
+        );
+        assert_eq!(
+            syms.len(),
+            9,
+            "expected 9 symbols, got {}: {:?}",
+            syms.len(),
+            names
+        );
 
         // Verify kinds
         let color = syms.iter().find(|s| s.name == "Color").unwrap();

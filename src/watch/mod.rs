@@ -42,9 +42,10 @@ fn is_relevant(
 
     // Source file with a tracked extension
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && source_exts.contains(ext) {
-            return true;
-        }
+        && source_exts.contains(ext)
+    {
+        return true;
+    }
 
     false
 }
@@ -74,18 +75,13 @@ pub fn send_rebuild(root: &Path, files: Vec<PathBuf>) -> Result<()> {
 
 /// Run the daemon event loop (called with --foreground).
 /// Binds UDS, accepts rebuild signals, debounces, and runs build_index.
-pub async fn run_daemon(
-    root: PathBuf,
-    config: Config,
-    db_override: Option<PathBuf>,
-) -> Result<()> {
+pub async fn run_daemon(root: PathBuf, config: Config, db_override: Option<PathBuf>) -> Result<()> {
     let sock = daemon::sock_path(&root);
 
     // Remove stale socket file before binding
     let _ = std::fs::remove_file(&sock);
 
-    let listener = UnixListener::bind(&sock)
-        .context("failed to bind Unix socket")?;
+    let listener = UnixListener::bind(&sock).context("failed to bind Unix socket")?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<RebuildMessage>();
 

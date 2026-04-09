@@ -1,12 +1,12 @@
-use super::{field_text, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, field_text, node_text,
+};
 use tree_sitter::Node;
 
 /// Go visibility: only symbols starting with an uppercase letter are exported.
 fn is_visible(node: &Node, source: &str) -> bool {
     let name = field_text(node, "name", source);
-    name.is_some_and(|n| {
-        n.chars().next().is_some_and(|c| c.is_uppercase())
-    })
+    name.is_some_and(|n| n.chars().next().is_some_and(|c| c.is_uppercase()))
 }
 
 /// For method_declaration, extract receiver type (strip leading `*`).
@@ -19,10 +19,11 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     for i in 0..receiver.child_count() {
         let child = receiver.child(i).unwrap();
         if child.kind() == "parameter_declaration"
-            && let Some(type_node) = child.child_by_field_name("type") {
-                let type_text = node_text(&type_node, source)?;
-                return Some(type_text.trim_start_matches('*').to_string());
-            }
+            && let Some(type_node) = child.child_by_field_name("type")
+        {
+            let type_text = node_text(&type_node, source)?;
+            return Some(type_text.trim_start_matches('*').to_string());
+        }
     }
     None
 }
@@ -55,7 +56,9 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
                 .map(|n| n.start_byte())
                 .unwrap_or(end);
 
-            source[start..actual_end.min(source.len())].trim().to_string()
+            source[start..actual_end.min(source.len())]
+                .trim()
+                .to_string()
         }
     }
 }
@@ -101,14 +104,16 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process: reclassify type_spec nodes to Struct/Interface based on their type child.
 fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<SymbolInfo> {
-    if sym.kind == SymbolKind::Type && node.kind() == "type_spec"
-        && let Some(type_node) = node.child_by_field_name("type") {
-            sym.kind = match type_node.kind() {
-                "struct_type" => SymbolKind::Struct,
-                "interface_type" => SymbolKind::Interface,
-                _ => SymbolKind::Type,
-            };
-        }
+    if sym.kind == SymbolKind::Type
+        && node.kind() == "type_spec"
+        && let Some(type_node) = node.child_by_field_name("type")
+    {
+        sym.kind = match type_node.kind() {
+            "struct_type" => SymbolKind::Struct,
+            "interface_type" => SymbolKind::Interface,
+            _ => SymbolKind::Type,
+        };
+    }
     Some(sym)
 }
 
@@ -122,20 +127,48 @@ pub fn hooks() -> LanguageHooks {
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
         reference_hooks: Some(ReferenceHooks {
-            enclosing_ancestors: &[
-                "function_declaration",
-                "method_declaration",
-            ],
+            enclosing_ancestors: &["function_declaration", "method_declaration"],
             reference_stoplist: &[
-                "true", "false", "nil", "iota",
-                "make", "new", "len", "cap", "append", "copy", "delete",
-                "print", "println", "panic", "recover",
-                "min", "max", "clear",
-                "int", "int32", "int64", "uint", "uint32", "uint64",
-                "string", "bool", "byte", "rune", "float32", "float64",
-                "error", "any",
-                "complex", "real", "imag", "close",
-                "uintptr", "complex64", "complex128", "comparable",
+                "true",
+                "false",
+                "nil",
+                "iota",
+                "make",
+                "new",
+                "len",
+                "cap",
+                "append",
+                "copy",
+                "delete",
+                "print",
+                "println",
+                "panic",
+                "recover",
+                "min",
+                "max",
+                "clear",
+                "int",
+                "int32",
+                "int64",
+                "uint",
+                "uint32",
+                "uint64",
+                "string",
+                "bool",
+                "byte",
+                "rune",
+                "float32",
+                "float64",
+                "error",
+                "any",
+                "complex",
+                "real",
+                "imag",
+                "close",
+                "uintptr",
+                "complex64",
+                "complex128",
+                "comparable",
             ],
         }),
     }

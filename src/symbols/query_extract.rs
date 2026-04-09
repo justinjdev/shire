@@ -3,7 +3,7 @@ use std::sync::Arc;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
-use super::hooks::{resolve_enclosing_symbol, LanguageHooks};
+use super::hooks::{LanguageHooks, resolve_enclosing_symbol};
 use super::{ReferenceInfo, ReferenceKind, SymbolInfo, SymbolKind, Visibility};
 
 thread_local! {
@@ -177,26 +177,22 @@ pub fn extract(
         let mut def_name_ranges: std::collections::HashSet<(usize, usize)> =
             std::collections::HashSet::new();
         let mut pending_references: Vec<(ReferenceInfo, (usize, usize))> = Vec::new();
+        // Track ranges for Impl/Call refs as we stream so Type refs can be
+        // de-duped against them without a second pass over `pending_references`.
+        let mut impl_ranges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        let mut call_ranges: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
         let mut refs_capped = false;
         let source_bytes = source.as_bytes();
 
-        // Collect all matches into a Vec so we can do two logical passes
-        // without re-running the query (avoids double-parse overhead).
-        let all_matches: Vec<_> = {
-            let mut buf = Vec::new();
-            let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
-            while let Some(m) = matches.next() {
-                // Clone captures so we can store them independent of the cursor.
-                buf.push(m.captures.to_vec());
-            }
-            buf
-        };
-
-        for captures in &all_matches {
+        let mut matches = cursor.matches(query, tree.root_node(), source_bytes);
+        while let Some(m) = matches.next() {
+            let captures = m.captures;
             let name_capture = captures.iter().find(|c| c.index == name_idx);
             let name = match name_capture {
                 Some(c) => match c.node.utf8_text(source_bytes) {
-                    Ok(s) => s.to_string(),
+                    Ok(s) => s,
                     Err(_) => continue,
                 },
                 None => continue,
@@ -210,22 +206,24 @@ pub fn extract(
             for capture in captures.iter() {
                 let cname = capture_names[capture.index as usize];
                 if def_kind.is_none()
-                    && let Some(k) = capture_name_to_kind(cname) {
-                        def_kind = Some(k);
-                        def_node = Some(capture.node);
-                        continue;
-                    }
+                    && let Some(k) = capture_name_to_kind(cname)
+                {
+                    def_kind = Some(k);
+                    def_node = Some(capture.node);
+                    continue;
+                }
                 if ref_kind.is_none()
-                    && let Some(k) = capture_name_to_ref_kind(cname) {
-                        ref_kind = Some(k);
-                        ref_node = Some(capture.node);
-                    }
+                    && let Some(k) = capture_name_to_ref_kind(cname)
+                {
+                    ref_kind = Some(k);
+                    ref_node = Some(capture.node);
+                }
             }
 
             // Definition path
             if let (Some(kind), Some(node)) = (def_kind, def_node) {
                 if let Some(sym) = emit_definition(
-                    &name,
+                    name,
                     kind,
                     &node,
                     &name_capture.unwrap().node,
@@ -252,15 +250,22 @@ pub fn extract(
                     Some(rh) => rh,
                     None => continue, // Language has no ref support
                 };
-                if ref_hooks.reference_stoplist.contains(&name.as_str()) {
+                if ref_hooks.reference_stoplist.contains(&name) {
                     continue;
                 }
-                let trimmed_name = normalize_import_name(&name, kind);
+                let trimmed_name = normalize_import_name(name, kind);
                 let line = node.start_position().row + 1;
                 let enclosing =
                     resolve_enclosing_symbol(&node, source, ref_hooks.enclosing_ancestors);
                 let node_range = (node.start_byte(), node.end_byte());
-                if max_references_per_file > 0 && pending_references.len() >= max_references_per_file {
+                if kind == ReferenceKind::Impl {
+                    impl_ranges.insert(node_range);
+                } else if kind == ReferenceKind::Call {
+                    call_ranges.insert(node_range);
+                }
+                if max_references_per_file > 0
+                    && pending_references.len() >= max_references_per_file
+                {
                     refs_capped = true;
                 } else {
                     pending_references.push((
@@ -285,7 +290,12 @@ pub fn extract(
             );
         }
 
-        let references = filter_references(pending_references, &def_name_ranges);
+        let references = filter_references(
+            pending_references,
+            &def_name_ranges,
+            &impl_ranges,
+            &call_ranges,
+        );
         (symbols, references)
     })
 }
@@ -297,28 +307,9 @@ pub fn extract(
 fn filter_references(
     pending: Vec<(ReferenceInfo, (usize, usize))>,
     def_name_ranges: &std::collections::HashSet<(usize, usize)>,
+    impl_ranges: &std::collections::HashSet<(usize, usize)>,
+    call_ranges: &std::collections::HashSet<(usize, usize)>,
 ) -> Vec<ReferenceInfo> {
-    let impl_ranges: std::collections::HashSet<(usize, usize)> = pending
-        .iter()
-        .filter_map(|(r, range)| {
-            if r.kind == ReferenceKind::Impl {
-                Some(*range)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let call_ranges: std::collections::HashSet<(usize, usize)> = pending
-        .iter()
-        .filter_map(|(r, range)| {
-            if r.kind == ReferenceKind::Call {
-                Some(*range)
-            } else {
-                None
-            }
-        })
-        .collect();
-
     pending
         .into_iter()
         .filter_map(|(reference, node_range)| {

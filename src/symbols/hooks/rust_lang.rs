@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, field_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, field_text, find_ancestor, find_child_by_kind};
 use tree_sitter::Node;
 
 /// Check if a node has a `visibility_modifier` child (i.e., is `pub`).

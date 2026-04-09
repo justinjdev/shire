@@ -30,8 +30,7 @@ impl ManifestParser for CpanfileParser {
 
 /// Parse cpanfile content, extracting requires directives and on 'test' blocks.
 fn parse_cpanfile(content: &str, out: &mut Vec<DepInfo>) {
-    let requires_re =
-        Regex::new(r#"^\s*requires\s+'([^']+)'(?:\s*,\s*'([^']*)')?\s*;"#).unwrap();
+    let requires_re = Regex::new(r#"^\s*requires\s+'([^']+)'(?:\s*,\s*'([^']*)')?\s*;"#).unwrap();
     let test_block_start_re = Regex::new(r#"^\s*on\s+'test'\s*=>\s*sub\s*\{"#).unwrap();
 
     let mut in_test_block = false;

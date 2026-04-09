@@ -109,12 +109,7 @@ impl Default for DocsConfig {
 }
 
 fn default_doc_extensions() -> Vec<String> {
-    vec![
-        ".md".into(),
-        ".rst".into(),
-        ".txt".into(),
-        ".adoc".into(),
-    ]
+    vec![".md".into(), ".rst".into(), ".txt".into(), ".adoc".into()]
 }
 
 fn default_doc_max_file_size() -> u64 {
@@ -132,7 +127,6 @@ pub struct RagConfig {
     #[serde(default)]
     pub cache_dir: Option<String>,
 }
-
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LogConfig {
@@ -401,7 +395,9 @@ pub fn load_config_from(config_path: Option<&Path>, repo_root: &Path) -> Result<
             }
         }
         Err(e) => {
-            eprintln!("Warning: could not read HOME environment variable ({e}), skipping global config fallback");
+            eprintln!(
+                "Warning: could not read HOME environment variable ({e}), skipping global config fallback"
+            );
         }
     }
 
@@ -416,7 +412,12 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.discovery.manifests.len(), 13);
-        assert!(config.discovery.exclude.contains(&"node_modules".to_string()));
+        assert!(
+            config
+                .discovery
+                .exclude
+                .contains(&"node_modules".to_string())
+        );
         assert!(config.discovery.exclude.contains(&".gradle".to_string()));
         assert!(config.discovery.exclude.contains(&"build".to_string()));
         assert!(config.packages.is_empty());
@@ -469,7 +470,10 @@ exclude = ["vendor"]
             ..Config::default()
         };
         let resolved = resolve_db_path(&config, Path::new("/home/user/work/monorepo")).unwrap();
-        assert_eq!(resolved, PathBuf::from("/home/user/work/monorepo/tmp/index.db"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/user/work/monorepo/tmp/index.db")
+        );
     }
 
     #[test]
@@ -480,7 +484,12 @@ exclude = ["vendor"]
         };
         let resolved = resolve_db_path(&config, Path::new("/repo")).unwrap();
         assert!(!resolved.to_str().unwrap().contains('~'));
-        assert!(resolved.to_str().unwrap().ends_with("/.claude/shire/index.db"));
+        assert!(
+            resolved
+                .to_str()
+                .unwrap()
+                .ends_with("/.claude/shire/index.db")
+        );
     }
 
     #[test]
@@ -538,9 +547,16 @@ exclude = ["vendor"]
             ..Config::default()
         };
         let info = test_info("my-monorepo", crate::git::PRIMARY_WORKTREE_NAME);
-        let resolved = resolve_db_path_with_info(&config, Path::new("/home/user/git/my-monorepo"), &info).unwrap();
+        let resolved =
+            resolve_db_path_with_info(&config, Path::new("/home/user/git/my-monorepo"), &info)
+                .unwrap();
         assert!(resolved.to_str().unwrap().contains("/my-monorepo/"));
-        assert!(resolved.to_str().unwrap().ends_with("/my-monorepo/index.db"));
+        assert!(
+            resolved
+                .to_str()
+                .unwrap()
+                .ends_with("/my-monorepo/index.db")
+        );
     }
 
     #[test]
@@ -551,7 +567,10 @@ exclude = ["vendor"]
         };
         let info = test_info("my-repo", "feat-xyz");
         let resolved = resolve_db_path_with_info(&config, Path::new("/some/path"), &info).unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/feat-xyz/index.db"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/shire/my-repo/feat-xyz/index.db")
+        );
     }
 
     #[test]
@@ -562,7 +581,10 @@ exclude = ["vendor"]
         };
         let info = test_info("my-repo", crate::git::PRIMARY_WORKTREE_NAME);
         let resolved = resolve_db_path_with_info(&config, Path::new("/some/path"), &info).unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/shire/my-repo/_primary/index.db"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/shire/my-repo/_primary/index.db")
+        );
     }
 
     #[test]
@@ -585,7 +607,12 @@ exclude = ["vendor"]
         let info = test_info("unknown", crate::git::PRIMARY_WORKTREE_NAME);
         let result = resolve_db_path_with_info(&config, Path::new("/"), &info);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Cannot determine repository name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot determine repository name")
+        );
     }
 
     #[test]
@@ -596,7 +623,10 @@ exclude = ["vendor"]
         };
         let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
         let seed = seed_db_path(&config, Path::new("/some/path"), &info).unwrap();
-        assert_eq!(seed, Some(PathBuf::from("/tmp/shire/my-repo/_primary/index.db")));
+        assert_eq!(
+            seed,
+            Some(PathBuf::from("/tmp/shire/my-repo/_primary/index.db"))
+        );
     }
 
     #[test]
@@ -606,7 +636,11 @@ exclude = ["vendor"]
             ..Config::default()
         };
         let info = test_info("my-repo", crate::git::PRIMARY_WORKTREE_NAME);
-        assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
+        assert!(
+            seed_db_path(&config, Path::new("/some/path"), &info)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -616,7 +650,11 @@ exclude = ["vendor"]
             ..Config::default()
         };
         let info = test_linked_info("my-repo", "feat-xyz", "/main/repo");
-        assert!(seed_db_path(&config, Path::new("/some/path"), &info).unwrap().is_none());
+        assert!(
+            seed_db_path(&config, Path::new("/some/path"), &info)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -843,12 +881,16 @@ manifests = ["package.json"]
 
     #[test]
     fn test_exclude_patterns_config() {
-        let config: Config = toml::from_str(
-            "[symbols]\nexclude_patterns = [\"_mock.go\", \"Generated.kt\"]\n",
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("[symbols]\nexclude_patterns = [\"_mock.go\", \"Generated.kt\"]\n")
+                .unwrap();
         assert_eq!(config.symbols.exclude_patterns.len(), 2);
-        assert!(config.symbols.exclude_patterns.contains(&"_mock.go".to_string()));
+        assert!(
+            config
+                .symbols
+                .exclude_patterns
+                .contains(&"_mock.go".to_string())
+        );
     }
 
     #[test]

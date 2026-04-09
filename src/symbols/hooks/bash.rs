@@ -1,4 +1,4 @@
-use super::{node_text, LanguageHooks, SymbolKind};
+use super::{LanguageHooks, SymbolKind, node_text};
 use tree_sitter::Node;
 
 /// Build signature for Bash function definitions.
@@ -18,10 +18,7 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
                 sig.to_string()
             }
         }
-        _ => node_text(node, source)
-            .unwrap_or(name)
-            .trim()
-            .to_string(),
+        _ => node_text(node, source).unwrap_or(name).trim().to_string(),
     }
 }
 

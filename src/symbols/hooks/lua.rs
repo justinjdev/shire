@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Lua visibility: all symbols are visible (Lua has no access modifiers).
@@ -59,7 +59,9 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
         "assignment_statement" => {
             // Find the function_definition to get parameters
             let el = find_child_by_kind(node, "expression_list");
-            let fd = el.as_ref().and_then(|el| find_child_by_kind(el, "function_definition"));
+            let fd = el
+                .as_ref()
+                .and_then(|el| find_child_by_kind(el, "function_definition"));
             let params = fd
                 .as_ref()
                 .and_then(|fd| fd.child_by_field_name("parameters"))
@@ -89,10 +91,7 @@ fn collect_params(params_node: &Node, source: &str) -> Vec<Parameter> {
     for i in 0..params_node.child_count() {
         let child = params_node.child(i).unwrap();
         if child.kind() == "identifier" {
-            let pname = child
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
+            let pname = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             if !pname.is_empty() && pname != "self" {
                 params.push(Parameter {
                     name: pname,
@@ -107,12 +106,10 @@ fn collect_params(params_node: &Node, source: &str) -> Vec<Parameter> {
 /// Extract parameters from a Lua function declaration or assignment.
 fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     match node.kind() {
-        "function_declaration" => {
-            match node.child_by_field_name("parameters") {
-                Some(p) => collect_params(&p, source),
-                None => Vec::new(),
-            }
-        }
+        "function_declaration" => match node.child_by_field_name("parameters") {
+            Some(p) => collect_params(&p, source),
+            None => Vec::new(),
+        },
         "assignment_statement" => {
             // Navigate: assignment_statement > expression_list > function_definition > parameters
             let el = match find_child_by_kind(node, "expression_list") {

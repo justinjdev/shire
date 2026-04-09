@@ -12,7 +12,11 @@ use shire::rag;
 use shire::watch;
 
 #[derive(Parser)]
-#[command(name = "shire", version, about = "Monorepo package index and MCP server")]
+#[command(
+    name = "shire",
+    version,
+    about = "Monorepo package index and MCP server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -144,13 +148,22 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Build { root, force, db, config: cfg_path } => {
+        Commands::Build {
+            root,
+            force,
+            db,
+            config: cfg_path,
+        } => {
             let root = std::fs::canonicalize(&root)?;
             let config = config::load_config_from(cfg_path.as_deref(), &root)?;
             let _sid = logging::init(&config.log, &root, "build");
             index::build_index(&root, &config, force, db.as_deref())
         }
-        Commands::Serve { root, db, config: cfg_path } => {
+        Commands::Serve {
+            root,
+            db,
+            config: cfg_path,
+        } => {
             let cwd = std::fs::canonicalize(".")?;
             let repo_root = root.as_ref().map(std::fs::canonicalize).transpose()?;
             let effective_root = repo_root.as_deref().unwrap_or(&cwd);
@@ -198,7 +211,12 @@ async fn main() -> Result<()> {
                 watch::daemon::start_daemon(&root, db.as_deref(), cfg_path.as_deref())
             }
         }
-        Commands::Init { root, global, no_hook, yes } => {
+        Commands::Init {
+            root,
+            global,
+            no_hook,
+            yes,
+        } => {
             if global {
                 init::run_init_global(no_hook, yes)
             } else {
@@ -211,7 +229,11 @@ async fn main() -> Result<()> {
         }
         Commands::Install { dry_run, force } => install::run_install(dry_run, force),
         Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
-        Commands::Clean { root, db, config: cfg_path } => {
+        Commands::Clean {
+            root,
+            db,
+            config: cfg_path,
+        } => {
             let root = std::fs::canonicalize(&root)?;
 
             // Stop the watch daemon if running

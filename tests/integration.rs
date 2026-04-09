@@ -2391,7 +2391,10 @@ fn test_references_incremental_rebuild() {
         )
         .unwrap()
     };
-    assert_eq!(count_b_before, 1, "call-ref to B should exist after first build");
+    assert_eq!(
+        count_b_before, 1,
+        "call-ref to B should exist after first build"
+    );
 
     // Modify file: remove the call to B()
     fs::write(
@@ -2474,11 +2477,9 @@ type Config struct{}
     );
 
     let db_path = root.join(".shire/index.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
 
     // At least one call-ref to ParseConfig
     let calls_to_parse: i64 = conn
@@ -2502,7 +2503,10 @@ type Config struct{}
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(enclosing, "Handle", "call to ParseConfig should be inside Handle");
+    assert_eq!(
+        enclosing, "Handle",
+        "call to ParseConfig should be inside Handle"
+    );
 
     // At least one call-ref to Validate
     let calls_to_validate: i64 = conn
@@ -2637,7 +2641,10 @@ fn test_references_enabled_flag_transitions() {
         let refs: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(refs, 0, "symbol_refs must be wiped when flag flips to false");
+        assert_eq!(
+            refs, 0,
+            "symbol_refs must be wiped when flag flips to false"
+        );
         let flag: String = conn
             .query_row(
                 "SELECT value FROM shire_meta WHERE key = 'references_enabled'",
@@ -2843,11 +2850,7 @@ fn test_refs_transition_cleans_up_files_deleted_while_refs_off() {
         "package svc\n\nfunc Alive() { Callee() }\nfunc Callee() {}\n",
     )
     .unwrap();
-    fs::write(
-        root.join("svc/old.go"),
-        "package svc\n\nfunc Doomed() {}\n",
-    )
-    .unwrap();
+    fs::write(root.join("svc/old.go"), "package svc\n\nfunc Doomed() {}\n").unwrap();
     fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
 
     let bin = cargo_bin();

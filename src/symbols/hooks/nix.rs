@@ -1,4 +1,4 @@
-use super::{node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, node_text};
 use tree_sitter::Node;
 
 /// Nix has no visibility modifiers — all bindings are visible.
@@ -19,9 +19,10 @@ fn collect_formal_names(formals: &Node, source: &str) -> Vec<String> {
         let child = formals.child(i).unwrap();
         if child.kind() == "formal"
             && let Some(name_node) = child.child_by_field_name("name")
-                && let Some(text) = node_text(&name_node, source) {
-                    names.push(text.to_string());
-                }
+            && let Some(text) = node_text(&name_node, source)
+        {
+            names.push(text.to_string());
+        }
     }
     names
 }
@@ -41,12 +42,13 @@ fn collect_all_params(func_node: &Node, source: &str) -> Vec<Parameter> {
     loop {
         // Check for universal parameter (simple `arg:` binding)
         if let Some(universal) = current.child_by_field_name("universal")
-            && let Some(text) = node_text(&universal, source) {
-                params.push(Parameter {
-                    name: text.to_string(),
-                    type_annotation: None,
-                });
-            }
+            && let Some(text) = node_text(&universal, source)
+        {
+            params.push(Parameter {
+                name: text.to_string(),
+                type_annotation: None,
+            });
+        }
 
         // Check for formals ({ arg1, arg2, ... }: pattern)
         if let Some(formals) = current.child_by_field_name("formals") {
@@ -114,9 +116,10 @@ fn build_param_string(func_node: &Node, source: &str) -> String {
 
     loop {
         if let Some(universal) = current.child_by_field_name("universal")
-            && let Some(text) = node_text(&universal, source) {
-                parts.push(text.to_string());
-            }
+            && let Some(text) = node_text(&universal, source)
+        {
+            parts.push(text.to_string());
+        }
 
         if let Some(formals) = current.child_by_field_name("formals") {
             let names = collect_formal_names(&formals, source);
@@ -206,7 +209,16 @@ mod tests {
         let query_source = include_str!("../queries/nix.scm");
         let query = Query::new(&language, query_source).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.nix"), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from("test.nix"),
+            &hooks,
+            true,
+            0,
+        )
+        .0
     }
 
     #[test]
@@ -233,12 +245,28 @@ mod tests {
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
 
         // All top-level bindings should be extracted
-        assert!(names.contains(&"buildInputs"), "missing buildInputs, got: {:?}", names);
+        assert!(
+            names.contains(&"buildInputs"),
+            "missing buildInputs, got: {:?}",
+            names
+        );
         assert!(names.contains(&"hello"), "missing hello, got: {:?}", names);
         assert!(names.contains(&"add"), "missing add, got: {:?}", names);
-        assert!(names.contains(&"mkDerivation"), "missing mkDerivation, got: {:?}", names);
-        assert!(names.contains(&"config"), "missing config, got: {:?}", names);
-        assert!(names.contains(&"greeting"), "missing greeting, got: {:?}", names);
+        assert!(
+            names.contains(&"mkDerivation"),
+            "missing mkDerivation, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"config"),
+            "missing config, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"greeting"),
+            "missing greeting, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -260,16 +288,40 @@ mod tests {
         let find = |name: &str| symbols.iter().find(|s| s.name == name).unwrap();
 
         // Functions
-        assert_eq!(find("hello").kind, SymbolKind::Function, "hello should be Function");
-        assert_eq!(find("add").kind, SymbolKind::Function, "add should be Function");
-        assert_eq!(find("mkDerivation").kind, SymbolKind::Function, "mkDerivation should be Function");
+        assert_eq!(
+            find("hello").kind,
+            SymbolKind::Function,
+            "hello should be Function"
+        );
+        assert_eq!(
+            find("add").kind,
+            SymbolKind::Function,
+            "add should be Function"
+        );
+        assert_eq!(
+            find("mkDerivation").kind,
+            SymbolKind::Function,
+            "mkDerivation should be Function"
+        );
 
         // Attrset → Class
-        assert_eq!(find("config").kind, SymbolKind::Class, "config should be Class");
+        assert_eq!(
+            find("config").kind,
+            SymbolKind::Class,
+            "config should be Class"
+        );
 
         // Simple values → Constant
-        assert_eq!(find("buildInputs").kind, SymbolKind::Constant, "buildInputs should be Constant");
-        assert_eq!(find("greeting").kind, SymbolKind::Constant, "greeting should be Constant");
+        assert_eq!(
+            find("buildInputs").kind,
+            SymbolKind::Constant,
+            "buildInputs should be Constant"
+        );
+        assert_eq!(
+            find("greeting").kind,
+            SymbolKind::Constant,
+            "greeting should be Constant"
+        );
     }
 
     #[test]
@@ -293,9 +345,21 @@ mod tests {
 
         let mk_params = find("mkDerivation").parameters.as_ref().unwrap();
         let mk_names: Vec<&str> = mk_params.iter().map(|p| p.name.as_str()).collect();
-        assert!(mk_names.contains(&"pname"), "missing pname, got: {:?}", mk_names);
-        assert!(mk_names.contains(&"version"), "missing version, got: {:?}", mk_names);
-        assert!(mk_names.contains(&"src"), "missing src, got: {:?}", mk_names);
+        assert!(
+            mk_names.contains(&"pname"),
+            "missing pname, got: {:?}",
+            mk_names
+        );
+        assert!(
+            mk_names.contains(&"version"),
+            "missing version, got: {:?}",
+            mk_names
+        );
+        assert!(
+            mk_names.contains(&"src"),
+            "missing src, got: {:?}",
+            mk_names
+        );
     }
 
     #[test]
@@ -310,20 +374,52 @@ mod tests {
         let find = |name: &str| symbols.iter().find(|s| s.name == name).unwrap();
 
         let hello_sig = find("hello").signature.as_deref().unwrap();
-        assert!(hello_sig.contains("hello"), "sig should contain name: {}", hello_sig);
-        assert!(hello_sig.contains("name"), "sig should contain param: {}", hello_sig);
+        assert!(
+            hello_sig.contains("hello"),
+            "sig should contain name: {}",
+            hello_sig
+        );
+        assert!(
+            hello_sig.contains("name"),
+            "sig should contain param: {}",
+            hello_sig
+        );
 
         let config_sig = find("config").signature.as_deref().unwrap();
-        assert!(config_sig.contains("config"), "sig should contain name: {}", config_sig);
-        assert!(config_sig.contains("{ ... }"), "sig should contain attrset marker: {}", config_sig);
+        assert!(
+            config_sig.contains("config"),
+            "sig should contain name: {}",
+            config_sig
+        );
+        assert!(
+            config_sig.contains("{ ... }"),
+            "sig should contain attrset marker: {}",
+            config_sig
+        );
 
         let greeting_sig = find("greeting").signature.as_deref().unwrap();
-        assert!(greeting_sig.contains("greeting"), "sig should contain name: {}", greeting_sig);
-        assert!(greeting_sig.contains("hello world"), "sig should contain value: {}", greeting_sig);
+        assert!(
+            greeting_sig.contains("greeting"),
+            "sig should contain name: {}",
+            greeting_sig
+        );
+        assert!(
+            greeting_sig.contains("hello world"),
+            "sig should contain value: {}",
+            greeting_sig
+        );
 
         let mk_sig = find("mkDrv").signature.as_deref().unwrap();
-        assert!(mk_sig.contains("mkDrv"), "sig should contain name: {}", mk_sig);
-        assert!(mk_sig.contains("pname"), "sig should contain param: {}", mk_sig);
+        assert!(
+            mk_sig.contains("mkDrv"),
+            "sig should contain name: {}",
+            mk_sig
+        );
+        assert!(
+            mk_sig.contains("pname"),
+            "sig should contain param: {}",
+            mk_sig
+        );
     }
 
     #[test]
@@ -401,6 +497,10 @@ stdenv.mkDerivation {
         // Bindings inside the mkDerivation attrset should still be found.
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"pname"), "missing pname, got: {:?}", names);
-        assert!(names.contains(&"version"), "missing version, got: {:?}", names);
+        assert!(
+            names.contains(&"version"),
+            "missing version, got: {:?}",
+            names
+        );
     }
 }

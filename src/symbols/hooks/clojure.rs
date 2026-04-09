@@ -1,4 +1,4 @@
-use super::{node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, node_text};
 use tree_sitter::Node;
 
 /// Public def keywords that should be extracted as symbols.
@@ -104,7 +104,7 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
         "def" => {
             format!("(def {name})")
         }
-        _ => format!("({keyword} {name})")
+        _ => format!("({keyword} {name})"),
     }
 }
 
@@ -128,16 +128,17 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     for i in 0..vec_node.named_child_count() {
         let child = vec_node.named_child(i).unwrap();
         if child.kind() == "sym_lit"
-            && let Some(text) = node_text(&child, source) {
-                // Skip the & rest parameter marker
-                if text == "&" {
-                    continue;
-                }
-                params.push(Parameter {
-                    name: text.to_string(),
-                    type_annotation: None,
-                });
+            && let Some(text) = node_text(&child, source)
+        {
+            // Skip the & rest parameter marker
+            if text == "&" {
+                continue;
             }
+            params.push(Parameter {
+                name: text.to_string(),
+                type_annotation: None,
+            });
+        }
     }
     params
 }
@@ -160,10 +161,11 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
     // We need the full sym_lit text for dotted namespaces like "my.namespace".
     if keyword == "ns"
         && let Some(ns_sym) = second_sym_lit(node)
-            && let Some(full_name) = node_text(&ns_sym, source) {
-                sym.name = full_name.to_string();
-                sym.signature = Some(format!("(ns {full_name})"));
-            }
+        && let Some(full_name) = node_text(&ns_sym, source)
+    {
+        sym.name = full_name.to_string();
+        sym.signature = Some(format!("(ns {full_name})"));
+    }
 
     Some(sym)
 }
@@ -194,7 +196,16 @@ mod tests {
         let query_source = include_str!("../queries/clojure.scm");
         let query = Query::new(&language, query_source).unwrap();
         let hooks = hooks();
-        query_extract::extract(&mut parser, &query, source, Arc::from("test.clj"), &hooks, true, 0).0
+        query_extract::extract(
+            &mut parser,
+            &query,
+            source,
+            Arc::from("test.clj"),
+            &hooks,
+            true,
+            0,
+        )
+        .0
     }
 
     #[test]
@@ -203,10 +214,7 @@ mod tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "greet");
         assert_eq!(syms[0].kind, SymbolKind::Function);
-        assert_eq!(
-            syms[0].signature.as_deref(),
-            Some("(defn greet [name])")
-        );
+        assert_eq!(syms[0].signature.as_deref(), Some("(defn greet [name])"));
         let params = syms[0].parameters.as_ref().unwrap();
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "name");
@@ -250,10 +258,7 @@ mod tests {
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].name, "Person");
         assert_eq!(syms[0].kind, SymbolKind::Class);
-        assert_eq!(
-            syms[0].signature.as_deref(),
-            Some("(defrecord Person)")
-        );
+        assert_eq!(syms[0].signature.as_deref(), Some("(defrecord Person)"));
     }
 
     #[test]
@@ -278,7 +283,8 @@ mod tests {
 
     #[test]
     fn test_defmethod_skipped() {
-        let syms = extract("(defmethod area :circle [shape] (* Math/PI (:radius shape) (:radius shape)))");
+        let syms =
+            extract("(defmethod area :circle [shape] (* Math/PI (:radius shape) (:radius shape)))");
         assert!(syms.is_empty(), "defmethod should be filtered out");
     }
 

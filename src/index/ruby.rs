@@ -136,10 +136,11 @@ gem 'puma', '~> 6.0'
         assert!(names.contains(&"pg"));
         assert!(names.contains(&"puma"));
 
-        assert!(info
-            .dependencies
-            .iter()
-            .all(|d| matches!(d.dep_kind, DepKind::Runtime)));
+        assert!(
+            info.dependencies
+                .iter()
+                .all(|d| matches!(d.dep_kind, DepKind::Runtime))
+        );
     }
 
     #[test]

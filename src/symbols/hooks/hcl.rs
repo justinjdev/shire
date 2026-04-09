@@ -1,4 +1,4 @@
-use super::{find_child_by_kind, node_text, LanguageHooks, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Recognized HCL block types that produce symbols.
@@ -8,8 +8,7 @@ const BLOCK_TYPES_ONE_LABEL: &[&str] = &["variable", "output", "module", "provid
 /// Extract the text content from an HCL string_lit node.
 /// string_lit contains: quoted_template_start `"`, template_literal, quoted_template_end `"`
 fn string_lit_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
-    find_child_by_kind(node, "template_literal")
-        .and_then(|n| node_text(&n, source))
+    find_child_by_kind(node, "template_literal").and_then(|n| node_text(&n, source))
 }
 
 /// Collect label strings from a block node's string_lit children.
@@ -18,9 +17,10 @@ fn collect_labels<'a>(node: &Node, source: &'a str) -> Vec<&'a str> {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         if child.kind() == "string_lit"
-            && let Some(text) = string_lit_text(&child, source) {
-                labels.push(text);
-            }
+            && let Some(text) = string_lit_text(&child, source)
+        {
+            labels.push(text);
+        }
     }
     labels
 }
@@ -76,8 +76,8 @@ pub fn hooks() -> LanguageHooks {
 mod tests {
     use std::sync::Arc;
 
-    use crate::symbols::registry::extract_file;
     use crate::symbols::SymbolKind;
+    use crate::symbols::registry::extract_file;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
         extract_file("tf", source, Arc::from("test.tf"), true, 0).0
@@ -93,11 +93,7 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "aws_instance.web");
         assert_eq!(symbols[0].kind, SymbolKind::Class);
-        assert!(symbols[0]
-            .signature
-            .as_ref()
-            .unwrap()
-            .contains("resource"));
+        assert!(symbols[0].signature.as_ref().unwrap().contains("resource"));
     }
 
     #[test]
@@ -110,11 +106,7 @@ mod tests {
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "vpc_cidr");
         assert_eq!(symbols[0].kind, SymbolKind::Type);
-        assert!(symbols[0]
-            .signature
-            .as_ref()
-            .unwrap()
-            .contains("variable"));
+        assert!(symbols[0].signature.as_ref().unwrap().contains("variable"));
     }
 
     #[test]

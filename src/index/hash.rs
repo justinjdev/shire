@@ -37,11 +37,7 @@ pub fn hash_bytes_hex(data: &[u8]) -> String {
 /// Returns `true` if any file has a newer mtime (meaning hash computation is needed).
 /// Returns `true` on any error (conservative fallback).
 /// Short-circuits on the first newer file found.
-pub fn has_newer_source_files(
-    repo_root: &Path,
-    package_path: &str,
-    since: SystemTime,
-) -> bool {
+pub fn has_newer_source_files(repo_root: &Path, package_path: &str, since: SystemTime) -> bool {
     let package_dir = repo_root.join(package_path);
     if !package_dir.is_dir() {
         return false;
@@ -188,7 +184,11 @@ mod tests {
     #[test]
     fn test_has_newer_source_files_nonexistent_dir() {
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(Path::new("/nonexistent/dir"), "", past));
+        assert!(!has_newer_source_files(
+            Path::new("/nonexistent/dir"),
+            "",
+            past
+        ));
     }
 
     #[test]

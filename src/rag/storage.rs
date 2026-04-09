@@ -18,12 +18,12 @@ pub fn load_extension() -> Result<()> {
                 *mut *mut i8,
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> i32,
-        >(sqlite_vec::sqlite3_vec_init as *const ())))
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
+        )))
     };
     if rc != 0 {
-        anyhow::bail!(
-            "Failed to register sqlite-vec extension (SQLite error code: {rc})"
-        );
+        anyhow::bail!("Failed to register sqlite-vec extension (SQLite error code: {rc})");
     }
     Ok(())
 }
@@ -49,9 +49,8 @@ pub fn init_table(conn: &Connection) -> Result<()> {
 pub fn insert_embeddings(conn: &Connection, embeddings: &[(i64, Vec<f32>)]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO symbol_embeddings (symbol_id, embedding) VALUES (?1, ?2)",
-        )?;
+        let mut stmt =
+            tx.prepare("INSERT INTO symbol_embeddings (symbol_id, embedding) VALUES (?1, ?2)")?;
         for (symbol_id, embedding) in embeddings {
             if embedding.len() != EMBEDDING_DIM {
                 anyhow::bail!(

@@ -186,9 +186,9 @@ fn check_requires(dir: &Path, patterns: &[glob::Pattern]) -> bool {
         Err(_) => return false,
     };
 
-    patterns.iter().all(|pattern| {
-        entries.iter().any(|filename| pattern.matches(filename))
-    })
+    patterns
+        .iter()
+        .all(|pattern| entries.iter().any(|filename| pattern.matches(filename)))
 }
 
 #[cfg(test)]
@@ -265,17 +265,15 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         setup_test_repo(dir.path());
 
-        let global_excludes: HashSet<String> =
-            ["vendor", "node_modules"].iter().map(|s| s.to_string()).collect();
+        let global_excludes: HashSet<String> = ["vendor", "node_modules"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let known_paths = HashSet::new();
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[go_rule()],
-            &global_excludes,
-            &known_paths,
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[go_rule()], &global_excludes, &known_paths)
+                .unwrap();
 
         let names: Vec<&str> = packages.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"go:services/auth"), "got: {:?}", names);
@@ -291,13 +289,9 @@ mod tests {
         let global_excludes = HashSet::new();
         let known_paths = HashSet::new();
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[proto_rule()],
-            &global_excludes,
-            &known_paths,
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[proto_rule()], &global_excludes, &known_paths)
+                .unwrap();
 
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "proto/user");
@@ -321,13 +315,9 @@ mod tests {
             extensions: None,
         };
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[rule],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[rule], &HashSet::new(), &HashSet::new())
+                .unwrap();
 
         assert!(packages.is_empty());
     }
@@ -341,13 +331,9 @@ mod tests {
         let mut rule = go_rule();
         rule.max_depth = Some(5);
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[rule],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[rule], &HashSet::new(), &HashSet::new())
+                .unwrap();
 
         let paths: Vec<&str> = packages.iter().map(|p| p.path.as_str()).collect();
         assert!(paths.contains(&"services/gateway"), "got: {:?}", paths);
@@ -363,13 +349,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         setup_test_repo(dir.path());
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[go_rule()],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[go_rule()], &HashSet::new(), &HashSet::new())
+                .unwrap();
 
         for pkg in &packages {
             assert!(
@@ -400,7 +382,10 @@ mod tests {
         .unwrap();
 
         let paths: Vec<&str> = packages.iter().map(|p| p.path.as_str()).collect();
-        assert!(!paths.contains(&"extra/app"), "out-of-scope dir should not match");
+        assert!(
+            !paths.contains(&"extra/app"),
+            "out-of-scope dir should not match"
+        );
     }
 
     #[test]
@@ -416,13 +401,9 @@ mod tests {
         let mut rule = go_rule();
         rule.max_depth = Some(2); // Only search 2 levels deep from services/
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[rule],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[rule], &HashSet::new(), &HashSet::new())
+                .unwrap();
 
         assert!(packages.is_empty(), "deep dir should be beyond max_depth");
     }
@@ -444,13 +425,9 @@ mod tests {
         let mut rule = go_rule();
         rule.exclude = vec!["testdata".to_string()];
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[rule],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[rule], &HashSet::new(), &HashSet::new())
+                .unwrap();
 
         let paths: Vec<&str> = packages.iter().map(|p| p.path.as_str()).collect();
         assert!(paths.contains(&"services/auth"));
@@ -465,16 +442,14 @@ mod tests {
         let mut known = HashSet::new();
         known.insert("services/auth".to_string());
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[go_rule()],
-            &HashSet::new(),
-            &known,
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[go_rule()], &HashSet::new(), &known).unwrap();
 
         let paths: Vec<&str> = packages.iter().map(|p| p.path.as_str()).collect();
-        assert!(!paths.contains(&"services/auth"), "known path should be skipped");
+        assert!(
+            !paths.contains(&"services/auth"),
+            "known path should be skipped"
+        );
         assert!(paths.contains(&"services/gateway"));
     }
 
@@ -483,13 +458,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         setup_test_repo(dir.path());
 
-        let packages = discover_custom_packages(
-            dir.path(),
-            &[],
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-        .unwrap();
+        let packages =
+            discover_custom_packages(dir.path(), &[], &HashSet::new(), &HashSet::new()).unwrap();
 
         assert!(packages.is_empty());
     }

@@ -199,11 +199,19 @@ dependencies {
         assert_eq!(info.kind, "gradle");
         assert_eq!(info.dependencies.len(), 2);
 
-        let guava = info.dependencies.iter().find(|d| d.name.contains("guava")).unwrap();
+        let guava = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("guava"))
+            .unwrap();
         assert_eq!(guava.version_req.as_deref(), Some("32.1"));
         assert!(matches!(guava.dep_kind, DepKind::Runtime));
 
-        let junit = info.dependencies.iter().find(|d| d.name.contains("junit")).unwrap();
+        let junit = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("junit"))
+            .unwrap();
         assert!(matches!(junit.dep_kind, DepKind::Dev));
     }
 
@@ -231,10 +239,18 @@ dependencies {
         assert_eq!(info.version.as_deref(), Some("2.0.0"));
         assert_eq!(info.dependencies.len(), 2);
 
-        let kotlin = info.dependencies.iter().find(|d| d.name.contains("kotlin-stdlib")).unwrap();
+        let kotlin = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("kotlin-stdlib"))
+            .unwrap();
         assert!(matches!(kotlin.dep_kind, DepKind::Runtime));
 
-        let servlet = info.dependencies.iter().find(|d| d.name.contains("servlet")).unwrap();
+        let servlet = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("servlet"))
+            .unwrap();
         assert!(matches!(servlet.dep_kind, DepKind::Peer));
     }
 
@@ -258,11 +274,19 @@ dependencies {
         let parser = GradleParser;
         let info = parser.parse(&path, "app").unwrap();
 
-        let shared = info.dependencies.iter().find(|d| d.name == ":shared:utils").unwrap();
+        let shared = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == ":shared:utils")
+            .unwrap();
         assert_eq!(shared.version_req, None);
         assert!(matches!(shared.dep_kind, DepKind::Runtime));
 
-        let test_helpers = info.dependencies.iter().find(|d| d.name == ":test-helpers").unwrap();
+        let test_helpers = info
+            .dependencies
+            .iter()
+            .find(|d| d.name == ":test-helpers")
+            .unwrap();
         assert!(matches!(test_helpers.dep_kind, DepKind::Dev));
     }
 
@@ -305,7 +329,11 @@ dependencies {
         let parser = GradleParser;
         let info = parser.parse(&path, "app").unwrap();
 
-        let guava = info.dependencies.iter().find(|d| d.name.contains("guava")).unwrap();
+        let guava = info
+            .dependencies
+            .iter()
+            .find(|d| d.name.contains("guava"))
+            .unwrap();
         assert_eq!(guava.version_req, None);
     }
 
@@ -335,13 +363,25 @@ dependencies {
 
         assert_eq!(info.dependencies.len(), 7);
 
-        let runtime_deps: Vec<_> = info.dependencies.iter().filter(|d| matches!(d.dep_kind, DepKind::Runtime)).collect();
+        let runtime_deps: Vec<_> = info
+            .dependencies
+            .iter()
+            .filter(|d| matches!(d.dep_kind, DepKind::Runtime))
+            .collect();
         assert_eq!(runtime_deps.len(), 3); // implementation, api, runtimeOnly
 
-        let dev_deps: Vec<_> = info.dependencies.iter().filter(|d| matches!(d.dep_kind, DepKind::Dev)).collect();
+        let dev_deps: Vec<_> = info
+            .dependencies
+            .iter()
+            .filter(|d| matches!(d.dep_kind, DepKind::Dev))
+            .collect();
         assert_eq!(dev_deps.len(), 2); // testImplementation, testRuntimeOnly
 
-        let peer_deps: Vec<_> = info.dependencies.iter().filter(|d| matches!(d.dep_kind, DepKind::Peer)).collect();
+        let peer_deps: Vec<_> = info
+            .dependencies
+            .iter()
+            .filter(|d| matches!(d.dep_kind, DepKind::Peer))
+            .collect();
         assert_eq!(peer_deps.len(), 2); // compileOnly, testCompileOnly
     }
 

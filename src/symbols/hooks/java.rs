@@ -1,4 +1,7 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility};
+use super::{
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
 /// Check modifiers on a declaration node.
@@ -43,7 +46,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
     // or private class (at any nesting level) is not externally visible.
     let mut current = node.parent();
     while let Some(n) = current {
-        if matches!(n.kind(), "class_declaration" | "interface_declaration" | "enum_declaration") {
+        if matches!(
+            n.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
             let (p_public, p_protected, p_private, _, _) = check_modifiers(&n, source);
             if p_private || !(p_public || p_protected) {
                 return false;
@@ -261,8 +267,8 @@ pub fn hooks() -> LanguageHooks {
             // names into a permanent false negative for reference lookup. Push
             // JDK-noise handling to query/ranking time instead.
             reference_stoplist: &[
-                "true", "false", "null", "this", "super",
-                "void", "int", "long", "boolean", "double", "float", "byte", "char", "short",
+                "true", "false", "null", "this", "super", "void", "int", "long", "boolean",
+                "double", "float", "byte", "char", "short",
             ],
         }),
     }

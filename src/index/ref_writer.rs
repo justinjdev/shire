@@ -13,7 +13,8 @@ use crate::symbols::ReferenceInfo;
 pub enum RefWriter {
     /// References disabled — skip extraction and DB writes.
     Disabled,
-    /// References enabled — carries the file_path→file_id map for DB inserts.
+    /// References enabled — carries a lazily-warmed file_path→file_id cache
+    /// for DB inserts.
     Enabled { file_ids: HashMap<String, i64> },
 }
 

@@ -1,4 +1,4 @@
-use super::{find_ancestor, find_child_by_kind, node_text, LanguageHooks, Parameter, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolKind, find_ancestor, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
 /// Proto visibility: all symbols are public.

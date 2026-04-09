@@ -70,16 +70,17 @@ fn count_named_children_in_args(clause: &Node) -> usize {
 fn callback_arity(node: &Node) -> usize {
     // callback > sigs: type_sig > args: expr_args
     if let Some(sigs) = node.child_by_field_name("sigs")
-        && let Some(args) = sigs.child_by_field_name("args") {
-            let mut count = 0;
-            for j in 0..args.child_count() {
-                let gc = args.child(j).unwrap();
-                if gc.is_named() {
-                    count += 1;
-                }
+        && let Some(args) = sigs.child_by_field_name("args")
+    {
+        let mut count = 0;
+        for j in 0..args.child_count() {
+            let gc = args.child(j).unwrap();
+            if gc.is_named() {
+                count += 1;
             }
-            return count;
         }
+        return count;
+    }
     0
 }
 
@@ -89,9 +90,10 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         if child.kind() == "function_clause"
-            && let Some(args) = child.child_by_field_name("args") {
-                return extract_params_from_args(&args, source);
-            }
+            && let Some(args) = child.child_by_field_name("args")
+        {
+            return extract_params_from_args(&args, source);
+        }
     }
     Vec::new()
 }
@@ -102,10 +104,7 @@ fn extract_params_from_args(args: &Node, source: &str) -> Vec<Parameter> {
     for j in 0..args.child_count() {
         let gc = args.child(j).unwrap();
         if gc.is_named() {
-            let text = gc
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
+            let text = gc.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             if !text.is_empty() {
                 params.push(Parameter {
                     name: text,
@@ -256,36 +255,68 @@ add(A, B) -> A + B.
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         let kinds: Vec<_> = syms.iter().map(|s| (s.name.as_str(), s.kind)).collect();
 
-        assert!(names.contains(&"my_module"), "module missing, got: {:?}", names);
+        assert!(
+            names.contains(&"my_module"),
+            "module missing, got: {:?}",
+            names
+        );
         assert!(names.contains(&"name"), "type missing, got: {:?}", names);
-        assert!(names.contains(&"person"), "record missing, got: {:?}", names);
-        assert!(names.contains(&"init"), "callback missing, got: {:?}", names);
-        assert!(names.contains(&"greet"), "function greet missing, got: {:?}", names);
-        assert!(names.contains(&"add"), "function add missing, got: {:?}", names);
+        assert!(
+            names.contains(&"person"),
+            "record missing, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"init"),
+            "callback missing, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"greet"),
+            "function greet missing, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "function add missing, got: {:?}",
+            names
+        );
 
         // Verify kinds
         assert!(
-            kinds.iter().any(|(n, k)| *n == "my_module" && *k == SymbolKind::Class),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "my_module" && *k == SymbolKind::Class),
             "my_module should be Class (module)"
         );
         assert!(
-            kinds.iter().any(|(n, k)| *n == "name" && *k == SymbolKind::Type),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "name" && *k == SymbolKind::Type),
             "name should be Type"
         );
         assert!(
-            kinds.iter().any(|(n, k)| *n == "person" && *k == SymbolKind::Class),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "person" && *k == SymbolKind::Class),
             "person should be Class (record)"
         );
         assert!(
-            kinds.iter().any(|(n, k)| *n == "init" && *k == SymbolKind::Method),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "init" && *k == SymbolKind::Method),
             "init should be Method (callback)"
         );
         assert!(
-            kinds.iter().any(|(n, k)| *n == "greet" && *k == SymbolKind::Function),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "greet" && *k == SymbolKind::Function),
             "greet should be Function"
         );
         assert!(
-            kinds.iter().any(|(n, k)| *n == "add" && *k == SymbolKind::Function),
+            kinds
+                .iter()
+                .any(|(n, k)| *n == "add" && *k == SymbolKind::Function),
             "add should be Function"
         );
     }

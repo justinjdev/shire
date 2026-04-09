@@ -1,4 +1,4 @@
-use super::{find_ancestor, node_text, LanguageHooks, Parameter, SymbolInfo, SymbolKind};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, node_text};
 use tree_sitter::Node;
 
 /// For methods inside a class declaration, resolve the class name.
@@ -24,9 +24,10 @@ fn find_type_signature<'a>(node: &Node<'a>, source: &'a str, name: &str) -> Opti
         if sib.kind() == "signature" {
             // The function name is the first `variable` child of the signature
             if let Some(sig_name) = first_variable_child(&sib)
-                && node_text(&sig_name, source) == Some(name) {
-                    return source.get(sib.start_byte()..sib.end_byte());
-                }
+                && node_text(&sig_name, source) == Some(name)
+            {
+                return source.get(sib.start_byte()..sib.end_byte());
+            }
             // Stop scanning once we hit a non-matching signature
             return None;
         }
@@ -185,10 +186,11 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             // is a `function` with the same name
             if let Some(prev) = node.prev_named_sibling()
                 && prev.kind() == "function"
-                    && let Some(prev_name) = first_variable_child(&prev)
-                        && node_text(&prev_name, source) == Some(&sym.name) {
-                            return None;
-                        }
+                && let Some(prev_name) = first_variable_child(&prev)
+                && node_text(&prev_name, source) == Some(&sym.name)
+            {
+                return None;
+            }
         }
         _ => {}
     }

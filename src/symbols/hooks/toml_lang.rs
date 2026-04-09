@@ -1,4 +1,4 @@
-use super::{node_text, LanguageHooks};
+use super::{LanguageHooks, node_text};
 use crate::symbols::SymbolInfo;
 use tree_sitter::Node;
 
@@ -6,20 +6,21 @@ use tree_sitter::Node;
 fn pair_value_type(pair_node: &Node) -> &'static str {
     for i in (0..pair_node.child_count()).rev() {
         if let Some(child) = pair_node.child(i)
-            && child.is_named() {
-                return match child.kind() {
-                    "string" | "literal_string" => "<string>",
-                    "integer" => "<integer>",
-                    "float" => "<float>",
-                    "boolean" => "<boolean>",
-                    "local_date" | "local_time" | "local_date_time" | "offset_date_time" => {
-                        "<datetime>"
-                    }
-                    "array" => "<array>",
-                    "inline_table" => "<table>",
-                    _ => "<value>",
-                };
-            }
+            && child.is_named()
+        {
+            return match child.kind() {
+                "string" | "literal_string" => "<string>",
+                "integer" => "<integer>",
+                "float" => "<float>",
+                "boolean" => "<boolean>",
+                "local_date" | "local_time" | "local_date_time" | "offset_date_time" => {
+                    "<datetime>"
+                }
+                "array" => "<array>",
+                "inline_table" => "<table>",
+                _ => "<value>",
+            };
+        }
     }
     "<value>"
 }
@@ -45,11 +46,14 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         Some("dotted_key") => {
             let mut parts = Vec::new();
             collect_dotted_key_parts(name_node.as_ref().unwrap(), source, &mut parts);
-            if parts.is_empty() { None } else { Some(parts.join(".")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("."))
+            }
         }
         Some("quoted_key") => {
-            node_text(name_node.as_ref().unwrap(), source)
-                .map(|t| strip_quotes(t).to_string())
+            node_text(name_node.as_ref().unwrap(), source).map(|t| strip_quotes(t).to_string())
         }
         _ => None,
     };
@@ -87,10 +91,16 @@ fn collect_dotted_key_parts(node: &Node, source: &str, parts: &mut Vec<String>) 
 
 /// Strip surrounding quotes (double or single) from a TOML key.
 fn strip_quotes(s: &str) -> &str {
-    if let Some(stripped) = s.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')) {
+    if let Some(stripped) = s
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
         return stripped;
     }
-    if let Some(stripped) = s.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+    if let Some(stripped) = s
+        .strip_prefix('\'')
+        .and_then(|inner| inner.strip_suffix('\''))
+    {
         return stripped;
     }
     s
@@ -121,8 +131,8 @@ pub fn hooks() -> LanguageHooks {
 mod tests {
     use std::sync::Arc;
 
-    use crate::symbols::registry::extract_file;
     use crate::symbols::SymbolKind;
+    use crate::symbols::registry::extract_file;
 
     fn extract(source: &str) -> Vec<crate::symbols::SymbolInfo> {
         extract_file("toml", source, Arc::from("test.toml"), true, 0).0
@@ -135,13 +145,13 @@ server = "192.168.1.1"
 port = 5432
 "#;
         let symbols = extract(source);
-        let tables: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let tables: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "database");
-        assert_eq!(
-            tables[0].signature.as_deref(),
-            Some("[database]")
-        );
+        assert_eq!(tables[0].signature.as_deref(), Some("[database]"));
     }
 
     #[test]
@@ -150,13 +160,13 @@ port = 5432
 user = "admin"
 "#;
         let symbols = extract(source);
-        let tables: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let tables: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "database.auth");
-        assert_eq!(
-            tables[0].signature.as_deref(),
-            Some("[database.auth]")
-        );
+        assert_eq!(tables[0].signature.as_deref(), Some("[database.auth]"));
     }
 
     #[test]
@@ -168,14 +178,14 @@ name = "Hammer"
 name = "Nail"
 "#;
         let symbols = extract(source);
-        let arrays: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let arrays: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         // Both [[products]] entries should produce symbols
         assert_eq!(arrays.len(), 2);
         assert_eq!(arrays[0].name, "products");
-        assert_eq!(
-            arrays[0].signature.as_deref(),
-            Some("[[products]]")
-        );
+        assert_eq!(arrays[0].signature.as_deref(), Some("[[products]]"));
     }
 
     #[test]
@@ -215,7 +225,10 @@ enabled = true
 
         let find = |name: &str| symbols.iter().find(|s| s.name == name).unwrap();
         assert_eq!(find("name").signature.as_deref(), Some("name = <string>"));
-        assert_eq!(find("count").signature.as_deref(), Some("count = <integer>"));
+        assert_eq!(
+            find("count").signature.as_deref(),
+            Some("count = <integer>")
+        );
         assert_eq!(find("ratio").signature.as_deref(), Some("ratio = <float>"));
         assert_eq!(
             find("enabled").signature.as_deref(),
@@ -252,7 +265,10 @@ port = 8080
         // Tables: database, server.http
         let tables: Vec<_> = symbols
             .iter()
-            .filter(|s| s.kind == SymbolKind::Class && s.signature.as_deref().is_some_and(|s| s.starts_with('[')))
+            .filter(|s| {
+                s.kind == SymbolKind::Class
+                    && s.signature.as_deref().is_some_and(|s| s.starts_with('['))
+            })
             .filter(|s| !s.signature.as_deref().unwrap_or("").starts_with("[["))
             .collect();
         assert_eq!(tables.len(), 2);
@@ -313,9 +329,15 @@ server = "localhost"
 python = "^3.8"
 "#;
         let symbols = extract(source);
-        let table = symbols.iter().find(|s| s.kind == SymbolKind::Class).unwrap();
+        let table = symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Class)
+            .unwrap();
         assert_eq!(table.name, "tool.poetry.dependencies");
-        assert_eq!(table.signature.as_deref(), Some("[tool.poetry.dependencies]"));
+        assert_eq!(
+            table.signature.as_deref(),
+            Some("[tool.poetry.dependencies]")
+        );
     }
 
     #[test]
@@ -324,7 +346,10 @@ python = "^3.8"
 key = "value"
 "#;
         let symbols = extract(source);
-        let tables: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let tables: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "special-table");
         assert_eq!(tables[0].signature.as_deref(), Some("[special-table]"));
@@ -336,9 +361,15 @@ key = "value"
 host = "10.0.0.1"
 "#;
         let symbols = extract(source);
-        let arrays: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let arrays: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(arrays.len(), 1);
         assert_eq!(arrays[0].name, "servers.beta.config");
-        assert_eq!(arrays[0].signature.as_deref(), Some("[[servers.beta.config]]"));
+        assert_eq!(
+            arrays[0].signature.as_deref(),
+            Some("[[servers.beta.config]]")
+        );
     }
 }

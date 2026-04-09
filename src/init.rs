@@ -68,7 +68,11 @@ fn gitignore_dir_from_db_path(db_path: &str) -> Option<String> {
             _ => return None,
         }
     }
-    if parts.is_empty() { None } else { Some(parts.join("/")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 /// Escape special characters for TOML string values.
@@ -223,13 +227,19 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
 
     if global {
         lines.push("# Shire global configuration — shared across all repositories".into());
-        lines.push("# {repo} = repository name, {worktree} = worktree name (\"_primary\" for primary)".into());
+        lines.push(
+            "# {repo} = repository name, {worktree} = worktree name (\"_primary\" for primary)"
+                .into(),
+        );
     } else {
         lines.push("# Shire configuration".into());
     }
     lines.push(String::new());
 
-    lines.push(format!("db_path = \"{}\"", escape_toml_string(&opts.db_path)));
+    lines.push(format!(
+        "db_path = \"{}\"",
+        escape_toml_string(&opts.db_path)
+    ));
     lines.push(String::new());
 
     if !opts.extra_excludes.is_empty() {
@@ -240,7 +250,10 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
             }
         }
         lines.push("[discovery]".into());
-        let quoted: Vec<String> = all_excludes.iter().map(|e| format!("\"{}\"", escape_toml_string(e))).collect();
+        let quoted: Vec<String> = all_excludes
+            .iter()
+            .map(|e| format!("\"{}\"", escape_toml_string(e)))
+            .collect();
         lines.push(format!("exclude = [{}]", quoted.join(", ")));
         lines.push(String::new());
     }
@@ -350,15 +363,22 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     }
 
     // 6. Ensure the db directory is in .gitignore (only when config was actually written)
-    if should_write && opts.gitignore_db_dir
-        && let Some(dir) = gitignore_dir_from_db_path(&opts.db_path) {
-            ensure_gitignore(root, &dir)?;
-        }
+    if should_write
+        && opts.gitignore_db_dir
+        && let Some(dir) = gitignore_dir_from_db_path(&opts.db_path)
+    {
+        ensure_gitignore(root, &dir)?;
+    }
 
     if opts.use_hook {
-        eprintln!("\n  Next: run {} in this repo to create the index.", style("shire build").green().bold());
+        eprintln!(
+            "\n  Next: run {} in this repo to create the index.",
+            style("shire build").green().bold()
+        );
     } else {
-        eprintln!("\n  On-demand reindexing enabled. The MCP server will rebuild the index automatically when needed.");
+        eprintln!(
+            "\n  On-demand reindexing enabled. The MCP server will rebuild the index automatically when needed."
+        );
         print_skipped("No PostToolUse hook installed.");
     }
     Ok(())
@@ -430,7 +450,11 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     // 3. Write hooks to ~/.claude/settings.json (only in hook mode)
     if opts.use_hook {
         let settings_path = claude_dir.join("settings.json");
-        patch_claude_hooks(&settings_path, "~/.claude/settings.json", "shire init --global")?;
+        patch_claude_hooks(
+            &settings_path,
+            "~/.claude/settings.json",
+            "shire init --global",
+        )?;
     }
 
     // 4. Write ~/.claude/rules/shire.md
@@ -445,9 +469,14 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     }
 
     if opts.use_hook {
-        eprintln!("\n  Next: run {} in each repo you want to index.", style("shire build").green().bold());
+        eprintln!(
+            "\n  Next: run {} in each repo you want to index.",
+            style("shire build").green().bold()
+        );
     } else {
-        eprintln!("\n  On-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed.");
+        eprintln!(
+            "\n  On-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed."
+        );
         print_skipped("No PostToolUse hook installed.");
     }
     Ok(())
@@ -465,9 +494,7 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
         Map::new()
     };
 
-    let servers = mcp
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = mcp.entry("mcpServers").or_insert_with(|| json!({}));
     if let Some(servers_obj) = servers.as_object_mut() {
         if servers_obj.contains_key("shire") {
             print_skipped("mcpServers.shire already configured in .mcp.json");
@@ -495,7 +522,11 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
     if let Err(e) = fs::rename(&tmp_path, &mcp_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
-            format!("Failed to rename {} to {}", tmp_path.display(), mcp_path.display())
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                mcp_path.display()
+            )
         });
     }
     print_created("Added mcpServers.shire to .mcp.json");
@@ -503,11 +534,7 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
 }
 
 /// Patch a Claude Code settings JSON file to add hooks.PostToolUse only.
-fn patch_claude_hooks(
-    settings_path: &Path,
-    display_path: &str,
-    reinit_cmd: &str,
-) -> Result<()> {
+fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str) -> Result<()> {
     let mut settings: Map<String, Value> = if settings_path.exists() {
         let content = fs::read_to_string(settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
@@ -517,9 +544,7 @@ fn patch_claude_hooks(
         Map::new()
     };
 
-    let hooks = settings
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
+    let hooks = settings.entry("hooks").or_insert_with(|| json!({}));
     if let Some(hooks_obj) = hooks.as_object_mut() {
         let has_shire_hook = hooks_obj
             .get("PostToolUse")
@@ -542,7 +567,9 @@ fn patch_claude_hooks(
             .unwrap_or(false);
 
         if has_shire_hook {
-            print_skipped(&format!("hooks.PostToolUse already configured in {display_path}"));
+            print_skipped(&format!(
+                "hooks.PostToolUse already configured in {display_path}"
+            ));
             return Ok(());
         }
 
@@ -550,9 +577,7 @@ fn patch_claude_hooks(
             "matcher": "Edit|Write|NotebookEdit|Bash",
             "hooks": [{ "type": "command", "command": "shire rebuild --stdin" }]
         });
-        let post_tool_use = hooks_obj
-            .entry("PostToolUse")
-            .or_insert_with(|| json!([]));
+        let post_tool_use = hooks_obj.entry("PostToolUse").or_insert_with(|| json!([]));
         if let Some(arr) = post_tool_use.as_array_mut() {
             arr.push(hook_entry);
         } else {
@@ -576,7 +601,11 @@ fn patch_claude_hooks(
     if let Err(e) = fs::rename(&tmp_path, settings_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
-            format!("Failed to rename {} to {}", tmp_path.display(), settings_path.display())
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                settings_path.display()
+            )
         });
     }
     print_created(&format!("Added hooks.PostToolUse to {display_path}"));
@@ -594,9 +623,7 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
         Map::new()
     };
 
-    let servers = config
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = config.entry("mcpServers").or_insert_with(|| json!({}));
     if let Some(servers_obj) = servers.as_object_mut() {
         if servers_obj.contains_key("shire") {
             print_skipped("mcpServers.shire already configured in ~/.claude.json");
@@ -624,7 +651,11 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
-            format!("Failed to rename {} to {}", tmp_path.display(), path.display())
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
         });
     }
     print_created("Added mcpServers.shire to ~/.claude.json");
@@ -639,7 +670,11 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
-            format!("Failed to rename {} to {}", tmp_path.display(), path.display())
+            format!(
+                "Failed to rename {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
         });
     }
     Ok(())
@@ -694,7 +729,9 @@ fn write_rules_file(rules_dir: &Path, display_path: &str, refs_enabled: bool) ->
                 let sep = if existing.ends_with('\n') { "" } else { "\n" };
                 let updated = format!("{existing}{sep}{RULES_CONTENT_REFS}");
                 atomic_write(&rules_path, &updated)?;
-                print_created(&format!("Updated {display_path} with cross-reference guidance"));
+                print_created(&format!(
+                    "Updated {display_path} with cross-reference guidance"
+                ));
                 return Ok(());
             }
         }
@@ -726,8 +763,15 @@ fn ensure_claude_md_line_in(claude_dir: &Path) -> Result<()> {
             print_skipped("~/.claude/CLAUDE.md already has Shire guidance");
             return Ok(());
         }
-        let separator = if content.ends_with('\n') { "\n" } else { "\n\n" };
-        atomic_write(&claude_md_path, &format!("{content}{separator}{CLAUDE_MD_LINE}\n"))?;
+        let separator = if content.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        atomic_write(
+            &claude_md_path,
+            &format!("{content}{separator}{CLAUDE_MD_LINE}\n"),
+        )?;
         print_created("Added Shire guidance to ~/.claude/CLAUDE.md");
     } else {
         fs::create_dir_all(claude_dir)?;
@@ -850,7 +894,11 @@ mod tests {
         let existing = json!({
             "permissions": { "allow": ["Bash(git:*)"] }
         });
-        fs::write(&settings_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
         run_init(dir.path(), false, true).unwrap();
 
@@ -950,7 +998,11 @@ mod tests {
             },
             "customSetting": true
         });
-        fs::write(&claude_json, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
         run_init_global_in(&claude_dir, &InitOptions::default_global()).unwrap();
 
@@ -971,8 +1023,15 @@ mod tests {
         let result = run_init_global_in(&claude_dir, &InitOptions::default_global());
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
-        assert!(chain.contains("Failed to parse"), "expected 'Failed to parse' in: {chain}");
+        let chain: String = err
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            chain.contains("Failed to parse"),
+            "expected 'Failed to parse' in: {chain}"
+        );
     }
 
     #[test]
@@ -989,8 +1048,15 @@ mod tests {
         let result = run_init_global_in(&claude_dir, &InitOptions::default_global());
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" ");
-        assert!(chain.contains("non-object type"), "expected 'non-object type' in: {chain}");
+        let chain: String = err
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            chain.contains("non-object type"),
+            "expected 'non-object type' in: {chain}"
+        );
     }
 
     #[test]
@@ -1006,7 +1072,10 @@ mod tests {
         assert_eq!(mcp["args"], json!(["serve", "--root", "."]));
         // No settings.json should be created in no-hook mode
         let settings_path = dir.path().join(".claude/settings.json");
-        assert!(!settings_path.exists(), "settings.json should not exist in no-hook mode");
+        assert!(
+            !settings_path.exists(),
+            "settings.json should not exist in no-hook mode"
+        );
     }
 
     #[test]
@@ -1194,7 +1263,9 @@ mod tests {
         let second = fs::read_to_string(rules_dir.join("shire.md")).unwrap();
         assert_eq!(first, second, "second upgrade should be a no-op");
         assert_eq!(
-            second.matches("## Cross-reference index (experimental)").count(),
+            second
+                .matches("## Cross-reference index (experimental)")
+                .count(),
             1,
             "refs section must appear exactly once"
         );
@@ -1219,22 +1290,40 @@ mod tests {
 
     #[test]
     fn test_gitignore_dir_simple() {
-        assert_eq!(gitignore_dir_from_db_path(".shire/index.db").as_deref(), Some(".shire"));
-        assert_eq!(gitignore_dir_from_db_path("build/shire.db").as_deref(), Some("build"));
+        assert_eq!(
+            gitignore_dir_from_db_path(".shire/index.db").as_deref(),
+            Some(".shire")
+        );
+        assert_eq!(
+            gitignore_dir_from_db_path("build/shire.db").as_deref(),
+            Some("build")
+        );
     }
 
     #[test]
     fn test_gitignore_dir_nested() {
         // Full parent path, not just the first segment
-        assert_eq!(gitignore_dir_from_db_path("src/db/index.db").as_deref(), Some("src/db"));
-        assert_eq!(gitignore_dir_from_db_path("a/b/c/index.db").as_deref(), Some("a/b/c"));
+        assert_eq!(
+            gitignore_dir_from_db_path("src/db/index.db").as_deref(),
+            Some("src/db")
+        );
+        assert_eq!(
+            gitignore_dir_from_db_path("a/b/c/index.db").as_deref(),
+            Some("a/b/c")
+        );
     }
 
     #[test]
     fn test_gitignore_dir_with_leading_dot_slash() {
         // CurDir prefix is stripped
-        assert_eq!(gitignore_dir_from_db_path("./build/shire.db").as_deref(), Some("build"));
-        assert_eq!(gitignore_dir_from_db_path("./src/db/index.db").as_deref(), Some("src/db"));
+        assert_eq!(
+            gitignore_dir_from_db_path("./build/shire.db").as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            gitignore_dir_from_db_path("./src/db/index.db").as_deref(),
+            Some("src/db")
+        );
     }
 
     #[test]
@@ -1260,7 +1349,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         ensure_gitignore(dir.path(), ".shire").unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(content.contains("/.shire/"), "should contain anchored entry");
+        assert!(
+            content.contains("/.shire/"),
+            "should contain anchored entry"
+        );
     }
 
     #[test]
@@ -1270,7 +1362,11 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "/.shire/\n").unwrap();
         ensure_gitignore(dir.path(), ".shire").unwrap();
         let content = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content.matches("/.shire/").count(), 1, "should not duplicate");
+        assert_eq!(
+            content.matches("/.shire/").count(),
+            1,
+            "should not duplicate"
+        );
     }
 
     #[test]

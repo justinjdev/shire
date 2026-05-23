@@ -2953,7 +2953,9 @@ fn build_index_inner(
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     }
 
-    print_summary(&summary, &db_path, is_full_build, force);
+    if progress {
+        print_summary(&summary, &db_path, is_full_build, force);
+    }
     print_timings(&timings, total_duration);
 
     Ok(())

@@ -166,10 +166,8 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
 /// Singleton methods stay as Function.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
     match node.kind() {
-        "method" => {
-            if resolve_parent(node, source).is_some() {
-                sym.kind = SymbolKind::Method;
-            }
+        "method" if resolve_parent(node, source).is_some() => {
+            sym.kind = SymbolKind::Method;
         }
         "singleton_method" => {
             // Class methods stay as Function

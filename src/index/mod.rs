@@ -561,7 +561,7 @@ fn associate_files_with_packages(
         .iter()
         .map(|(n, p)| (n.as_str(), p.as_str()))
         .collect();
-    sorted_pkgs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_pkgs.sort_by_key(|pkg| std::cmp::Reverse(pkg.1.len()));
 
     // Pre-allocate prefix strings with trailing slash to avoid per-file allocations
     let prefixes: Vec<(&str, String)> = sorted_pkgs

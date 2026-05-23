@@ -561,7 +561,7 @@ fn associate_files_with_packages(
         .iter()
         .map(|(n, p)| (n.as_str(), p.as_str()))
         .collect();
-    sorted_pkgs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_pkgs.sort_by_key(|pkg| std::cmp::Reverse(pkg.1.len()));
 
     // Pre-allocate prefix strings with trailing slash to avoid per-file allocations
     let prefixes: Vec<(&str, String)> = sorted_pkgs
@@ -2115,8 +2115,7 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
     Ok(())
 }
 
-/// Print build summary to stdout/stderr.
-fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, force: bool) {
+fn print_summary_failures(summary: &BuildSummary) {
     if !summary.failures.is_empty() {
         eprintln!("{} manifest(s) failed to parse:", summary.failures.len());
         for (path, err) in &summary.failures {
@@ -2124,9 +2123,16 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
             tracing::warn!(path = %path, error = %err, "manifest parse failure");
         }
     }
+}
 
+fn format_summary_line(
+    summary: &BuildSummary,
+    db_path: &Path,
+    is_full_build: bool,
+    force: bool,
+) -> String {
     if is_full_build || force {
-        println!(
+        format!(
             "Indexed {} packages, {} symbols, {} refs, {} files, {} docs into {}",
             summary.total_packages,
             summary.total_symbols,
@@ -2134,9 +2140,9 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
             summary.num_files,
             summary.num_docs,
             db_path.display()
-        );
+        )
     } else if summary.num_source_reextracted > 0 {
-        println!(
+        format!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped, {} source-updated), {} symbols, {} refs, {} files, {} docs into {}",
             summary.total_packages,
             summary.num_added,
@@ -2149,9 +2155,9 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
             summary.num_files,
             summary.num_docs,
             db_path.display()
-        );
+        )
     } else {
-        println!(
+        format!(
             "Indexed {} packages ({} added, {} updated, {} removed, {} skipped), {} symbols, {} refs, {} files, {} docs into {}",
             summary.total_packages,
             summary.num_added,
@@ -2163,8 +2169,26 @@ fn print_summary(summary: &BuildSummary, db_path: &Path, is_full_build: bool, fo
             summary.num_files,
             summary.num_docs,
             db_path.display()
-        );
+        )
     }
+}
+
+fn maybe_write_summary<W: std::io::Write>(
+    out: &mut W,
+    summary: &BuildSummary,
+    db_path: &Path,
+    is_full_build: bool,
+    force: bool,
+    emit: bool,
+) -> std::io::Result<()> {
+    if emit {
+        writeln!(
+            out,
+            "{}",
+            format_summary_line(summary, db_path, is_full_build, force)
+        )?;
+    }
+    Ok(())
 }
 
 /// Check if .git/index has changed since the last build.
@@ -2953,7 +2977,18 @@ fn build_index_inner(
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     }
 
-    print_summary(&summary, &db_path, is_full_build, force);
+    print_summary_failures(&summary);
+    {
+        let mut stdout = std::io::stdout();
+        maybe_write_summary(
+            &mut stdout,
+            &summary,
+            &db_path,
+            is_full_build,
+            force,
+            progress,
+        )?;
+    }
     print_timings(&timings, total_duration);
 
     Ok(())
@@ -3108,6 +3143,61 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    fn sample_summary() -> BuildSummary {
+        BuildSummary {
+            num_added: 1,
+            num_changed: 2,
+            num_removed: 0,
+            num_skipped: 3,
+            num_source_reextracted: 0,
+            num_files: 12,
+            num_docs: 4,
+            total_packages: 6,
+            total_symbols: 24,
+            total_references: 8,
+            failures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_maybe_write_summary_suppresses_output_when_emit_false() {
+        let summary = sample_summary();
+        let mut out = Vec::new();
+
+        maybe_write_summary(
+            &mut out,
+            &summary,
+            Path::new("/tmp/test-index.db"),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(out.is_empty(), "quiet mode should not emit summary");
+    }
+
+    #[test]
+    fn test_maybe_write_summary_emits_output_when_emit_true() {
+        let summary = sample_summary();
+        let mut out = Vec::new();
+
+        maybe_write_summary(
+            &mut out,
+            &summary,
+            Path::new("/tmp/test-index.db"),
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("Indexed 6 packages"));
+        assert!(rendered.contains("/tmp/test-index.db"));
+        assert!(rendered.ends_with('\n'));
+    }
 
     #[test]
     fn test_is_refs_transition_enable_off_to_on() {

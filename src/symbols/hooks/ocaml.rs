@@ -398,13 +398,11 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
                 sym.return_type = None;
             }
         }
-        "value_specification" => {
+        "value_specification" if !has_function_type(node) => {
             // val x : int (non-function) should be Constant
-            if !has_function_type(node) {
-                sym.kind = SymbolKind::Constant;
-                sym.parameters = None;
-                sym.return_type = None;
-            }
+            sym.kind = SymbolKind::Constant;
+            sym.parameters = None;
+            sym.return_type = None;
         }
         "module_binding" => {
             sym.signature = Some(format!("module {}", sym.name));

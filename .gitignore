@@ -1,7 +1,5 @@
 /target
 /result
 .shire/
-/docs/
-/tmp/
-/openspec/changes/
+docs/book/
 results.tsv

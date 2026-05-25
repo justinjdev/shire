@@ -16,6 +16,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -68,5 +71,6 @@ jobs:
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
           files: |
             artifacts/shire-x86_64-unknown-linux-gnu/shire-x86_64-unknown-linux-gnu.tar.gz
+            artifacts/shire-aarch64-unknown-linux-gnu/shire-aarch64-unknown-linux-gnu.tar.gz
             artifacts/shire-aarch64-apple-darwin/shire-aarch64-apple-darwin.tar.gz
             artifacts/shire-x86_64-apple-darwin/shire-x86_64-apple-darwin.tar.gz

@@ -72,7 +72,7 @@ Only applicable to languages that already have tree-sitter-based symbol extracti
 ## Platform Notes
 
 - The `watch` module is Unix-only (Unix domain sockets, Unix signals, `kill` for process management). No Windows build target.
-- Release builds target: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`
+- Release builds target: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`
 
 ## Releasing
 

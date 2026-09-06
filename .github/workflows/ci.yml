@@ -38,9 +38,7 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
-      - name: Check
-        run: cargo check --all-features --all-targets
-
+      # No separate `cargo check`: clippy compiles the same targets.
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 

@@ -437,7 +437,7 @@ impl ShireService {
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        let fts_results = queries::search_symbols(
+        let results = queries::search_symbols(
             &conn,
             query,
             params.package.as_deref(),
@@ -446,7 +446,7 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        let json = serde_json::to_string(&fts_results).map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 

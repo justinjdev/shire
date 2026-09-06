@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 cargo build                     # Debug build
 cargo build --release           # Release build
-cargo test                      # All tests (unit + integration)
+cargo test                      # Unit + integration tests (default features)
+cargo test --all-features       # ...plus the bench-gated autoresearch harness (what CI runs)
 cargo test --lib                # Unit tests only
 cargo test --test integration   # Integration tests only
 cargo test config::tests        # Tests for a specific module

@@ -191,7 +191,8 @@ fn restore_originals(originals: &HashMap<PathBuf, Vec<u8>>) {
 }
 
 /// Remove the benchmark database (and its WAL sidecars) from the target repo,
-/// plus the `.shire` directory if the benchmark was what created it.
+/// then drop the containing `.shire` directory if removing the database left
+/// it empty. A `.shire` that still holds the user's own index is kept.
 fn cleanup_bench_db(db_path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
         let mut p = db_path.as_os_str().to_os_string();
@@ -204,14 +205,33 @@ fn cleanup_bench_db(db_path: &Path) {
     }
 }
 
+/// Undo everything a lifecycle run put into the target repo: delete the
+/// temporary files it created, rewrite the files it modified from the bytes
+/// captured before the first write, and drop the benchmark database.
+///
+/// Every exit from the cycle loop — normal completion or a mid-run abort —
+/// goes through here. An abort that skipped it would leave `// bench cycle N`
+/// lines in tracked source files with nothing telling the user which files to
+/// restore, and would make the next run skip the repo as "dirty".
+fn cleanup_lifecycle_artifacts(
+    modifications: &[(String, String)],
+    originals: &HashMap<PathBuf, Vec<u8>>,
+    db_path: &Path,
+) {
+    for (path, action) in modifications {
+        if action == "create" {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    restore_originals(originals);
+    cleanup_bench_db(db_path);
+}
+
 fn run_build_benchmark(repos: &[PathBuf]) {
     let mut all_results = Vec::new();
 
     for repo_dir in repos {
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let repo_name = repo_display_name(repo_dir);
         let size = repo_size(repo_name);
         let db_path = repo_dir.join(".shire").join("bench.db");
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
@@ -306,10 +326,7 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
     let mut all_results = Vec::new();
 
     for repo_dir in repos {
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let repo_name = repo_display_name(repo_dir);
         let size = repo_size(repo_name);
         let db_path = repo_dir.join(".shire").join("bench.db");
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
@@ -413,10 +430,7 @@ fn run_query_benchmark(repos: &[PathBuf]) {
     let mut all_results = Vec::new();
 
     for repo_dir in repos {
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let repo_name = repo_display_name(repo_dir);
         let size = repo_size(repo_name);
         let db_path = repo_dir.join(".shire").join("bench.db");
 
@@ -615,12 +629,12 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
     const CYCLES: usize = 50;
 
     let mut all_results = Vec::new();
+    // Repos the guard (or an empty source walk) turned away. Reported so a
+    // caller cannot mistake "every repo was skipped" for "the benchmark ran".
+    let mut skipped: Vec<String> = Vec::new();
 
     for repo_dir in repos {
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let repo_name = repo_display_name(repo_dir);
         let size = repo_size(repo_name);
         let db_path = repo_dir.join(".shire").join("bench.db");
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
@@ -628,6 +642,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         eprintln!("\n=== {} ({}) — lifecycle ===", repo_name, size);
 
         if !guard_clean_worktree(repo_dir, "lifecycle") {
+            skipped.push(repo_name.to_string());
             continue;
         }
 
@@ -642,6 +657,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
 
         if source_files.is_empty() {
             eprintln!("[lifecycle] no source files found, skipping");
+            skipped.push(repo_name.to_string());
             continue;
         }
 
@@ -733,13 +749,25 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
                 shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path))
             {
                 eprintln!("error: rebuild failed on cycle {}: {}", cycle + 1, e);
+                cleanup_lifecycle_artifacts(&modifications, &originals, &db_path);
                 std::process::exit(1);
             }
             let rebuild_ms = start.elapsed().as_secs_f64() * 1000.0;
             rebuild_times.push(rebuild_ms);
 
             // Run a query (simulates MCP tool call after rebuild)
-            let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
+            let conn = match shire::db::open_readonly(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "error: failed to open DB readonly on cycle {}: {}",
+                        cycle + 1,
+                        e
+                    );
+                    cleanup_lifecycle_artifacts(&modifications, &originals, &db_path);
+                    std::process::exit(1);
+                }
+            };
             let start = Instant::now();
             let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
             let _ = shire::db::queries::search_files(&conn, "test", None, None);
@@ -772,17 +800,10 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             }
         }
 
-        // Clean up temporary files
-        for (path, action) in &modifications {
-            if action == "create" {
-                let _ = fs::remove_file(path);
-            }
-        }
-
-        // Restore only the files this run rewrote. `git checkout .` would also
-        // discard unstaged edits the user made outside the benchmark.
-        restore_originals(&originals);
-        cleanup_bench_db(&db_path);
+        // Delete the temp files this run created, then restore only the files
+        // it rewrote. `git checkout .` would also discard unstaged edits the
+        // user made outside the benchmark.
+        cleanup_lifecycle_artifacts(&modifications, &originals, &db_path);
 
         // Analyze degradation: compare first 10 cycles vs last 10 cycles
         let first_10_rebuild: Vec<f64> = rebuild_times[..10].to_vec();
@@ -841,10 +862,19 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
 
     let output = serde_json::json!({
         "phase": "lifecycle",
+        "skipped": skipped,
         "repos": all_results,
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
+
+    if all_results.is_empty() {
+        eprintln!(
+            "error: lifecycle benchmarked no repos ({} skipped) — nothing was measured",
+            skipped.len()
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Verify result quality: symbol counts, search correctness, FTS integrity,
@@ -855,12 +885,13 @@ fn run_quality_checks(repos: &[PathBuf]) {
     let mut all_results = Vec::new();
     let mut total_pass = 0usize;
     let mut total_fail = 0usize;
+    // Repos the clean-worktree guard turned away. Without this a run where
+    // every repo was skipped would print "0 passed, 0 failed" and exit 0,
+    // which an automated caller reads as "quality checks passed".
+    let mut skipped: Vec<String> = Vec::new();
 
     for repo_dir in repos {
-        let repo_name = repo_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        let repo_name = repo_display_name(repo_dir);
         let size = repo_size(repo_name);
         let db_path = repo_dir.join(".shire").join("bench.db");
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
@@ -868,6 +899,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
         eprintln!("\n=== {} ({}) — quality checks ===", repo_name, size);
 
         if !guard_clean_worktree(repo_dir, "quality") {
+            skipped.push(repo_name.to_string());
             continue;
         }
 
@@ -876,6 +908,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
         if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
             eprintln!("FAIL: initial build failed: {}", e);
             total_fail += 1;
+            cleanup_bench_db(&db_path);
             continue;
         }
 
@@ -1249,12 +1282,21 @@ fn run_quality_checks(repos: &[PathBuf]) {
         "phase": "quality",
         "total_pass": total_pass,
         "total_fail": total_fail,
+        "skipped": skipped,
         "repos": all_results,
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 
     if total_fail > 0 {
+        std::process::exit(1);
+    }
+
+    if all_results.is_empty() {
+        eprintln!(
+            "error: quality checked no repos ({} skipped) — nothing was verified",
+            skipped.len()
+        );
         std::process::exit(1);
     }
 }
@@ -1453,6 +1495,39 @@ mod tests {
             "nothing was captured, so nothing was written"
         );
         assert!(!missing.exists(), "an unreadable file must not be created");
+    }
+
+    /// An aborted lifecycle run must leave the repo exactly as it found it:
+    /// created temp files gone, modified files restored, bench DB removed.
+    #[test]
+    fn test_cleanup_lifecycle_artifacts_undoes_everything() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tracked = dir.path().join("main.go");
+        std::fs::write(&tracked, "package main\n").unwrap();
+        let created = dir.path().join(".shire-bench-tmp-4.go");
+        std::fs::write(&created, "package bench\n").unwrap();
+        let shire_dir = dir.path().join(".shire");
+        std::fs::create_dir_all(&shire_dir).unwrap();
+        let db = shire_dir.join("bench.db");
+        std::fs::write(&db, "x").unwrap();
+
+        let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        append_bench_line(&tracked, "\n// bench cycle 7\n", &mut originals);
+        let modifications = vec![
+            (created.to_string_lossy().to_string(), "create".to_string()),
+            (tracked.to_string_lossy().to_string(), "modify".to_string()),
+        ];
+
+        cleanup_lifecycle_artifacts(&modifications, &originals, &db);
+
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "package main\n",
+            "an aborted run must not leave bench edits in a tracked file"
+        );
+        assert!(!created.exists(), "temp files must be removed");
+        assert!(!db.exists(), "the bench DB must be removed");
+        assert!(!shire_dir.exists());
     }
 
     #[test]

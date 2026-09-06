@@ -53,7 +53,7 @@ REPEAT:
   3. Read the target module code carefully
   4. Implement the change — small, focused diff
   5. git add <changed files> && git commit -m "experiment: <description>"
-  6. cargo test  ->  must pass
+  6. cargo test --all-features  ->  must pass (--all-features covers the autoresearch harness)
      - If fails: one fix attempt, then revert if still failing
   7. cargo build --release --features bench --bin autoresearch
   8. cargo run --release --features bench --bin autoresearch -- --phase build  ->  parse JSON (reports per-repo)

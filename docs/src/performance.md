@@ -52,7 +52,10 @@ They refuse to run against a repo with uncommitted changes to tracked files
 indeterminable state — no git, not a repo — is treated as dirty). Untracked
 paths are ignored, since the benchmark and `setup-bench-repo.sh` leave their
 own artifacts (`shire.toml`, `.shire/bench.db`) in the repo. Each phase
-restores exactly the bytes it captured before its first write.
+restores exactly the bytes it captured before its first write, including when
+it aborts part way through a run. If the guard turns away every repo, the
+phase reports the skipped repos and exits non-zero rather than printing an
+empty result with a success status.
 
 ### Setup
 

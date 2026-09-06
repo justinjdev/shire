@@ -22,12 +22,12 @@ You are an autonomous performance optimization agent. Your job is to make shire 
 
 3. Build the benchmark binary:
    ```bash
-   cargo build --release --bin autoresearch 2>&1 | tail -5
+   cargo build --release --features bench --bin autoresearch 2>&1 | tail -5
    ```
 
 4. Establish baseline — run build benchmarks across all repo sizes:
    ```bash
-   cargo run --release --bin autoresearch -- --phase build
+   cargo run --release --features bench --bin autoresearch -- --phase build
    ```
    This runs against all repos in `~/.cache/shire-bench/` (small/medium/large).
    You can filter with `--size small|medium|large` or point at a specific repo with `--repo <path>`.
@@ -55,8 +55,8 @@ REPEAT:
   5. git add <changed files> && git commit -m "experiment: <description>"
   6. cargo test  ->  must pass
      - If fails: one fix attempt, then revert if still failing
-  7. cargo build --release --bin autoresearch
-  8. cargo run --release --bin autoresearch -- --phase build  ->  parse JSON (reports per-repo)
+  7. cargo build --release --features bench --bin autoresearch
+  8. cargo run --release --features bench --bin autoresearch -- --phase build  ->  parse JSON (reports per-repo)
   9. Compare new median_ms to baseline FOR EACH REPO:
      - KEEP if: improvement in at least 2 of 3 repos AND no repo regresses > 2%
      - REVERT otherwise (improvement in only 1 repo, or any repo regresses > 2%)

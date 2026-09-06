@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() {
@@ -87,6 +88,94 @@ fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+fn repo_display_name(repo_dir: &Path) -> &str {
+    repo_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+}
+
+/// Whether `git status --porcelain` reports an empty worktree.
+///
+/// Returns `Err` when the status cannot be determined at all (git missing, not
+/// a repository, git exiting non-zero) so callers can fail closed instead of
+/// treating "unknown" as "clean".
+fn worktree_is_clean(repo_dir: &Path) -> Result<bool, String> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("could not run `git status` in {}: {e}", repo_dir.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git status` failed in {} ({}): {}",
+            repo_dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+/// Pre-flight guard for every phase that rewrites files in the target repo.
+///
+/// These phases edit tracked source files in place; running them against a
+/// dirty worktree risks destroying uncommitted work. The guard fails closed —
+/// if the worktree state cannot be established, the repo is skipped rather
+/// than mutated.
+fn guard_clean_worktree(repo_dir: &Path, phase: &str) -> bool {
+    let repo_name = repo_display_name(repo_dir);
+    match worktree_is_clean(repo_dir) {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!("[{phase}] skipping {repo_name} — worktree has uncommitted changes");
+            false
+        }
+        Err(e) => {
+            eprintln!("[{phase}] skipping {repo_name} — cannot verify worktree is clean: {e}");
+            false
+        }
+    }
+}
+
+/// Append `line` to `path`, remembering the file's original contents the first
+/// time it is touched so the benchmark can restore exactly what it wrote —
+/// never `git checkout .`, which would also discard the user's own edits.
+fn append_bench_line(path: &Path, line: &str, originals: &mut HashMap<PathBuf, String>) {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    originals
+        .entry(path.to_path_buf())
+        .or_insert_with(|| content.clone());
+    let _ = std::fs::write(path, format!("{content}{line}"));
+}
+
+/// Restore the files this run modified from the contents captured before the
+/// first write. Only files the benchmark itself touched are rewritten.
+fn restore_originals(originals: &HashMap<PathBuf, String>) {
+    for (path, original) in originals {
+        if let Err(e) = std::fs::write(path, original) {
+            eprintln!(
+                "warning: failed to restore {} — original contents are in the benchmark log: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Remove the benchmark database (and its WAL sidecars) from the target repo,
+/// plus the `.shire` directory if the benchmark was what created it.
+fn cleanup_bench_db(db_path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = db_path.as_os_str().to_os_string();
+        p.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+    if let Some(parent) = db_path.parent() {
+        // Fails when the directory is not empty, which is exactly what we want.
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 fn run_build_benchmark(repos: &[PathBuf]) {
@@ -512,20 +601,8 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
 
         eprintln!("\n=== {} ({}) — lifecycle ===", repo_name, size);
 
-        // Refuse to mutate a dirty worktree to avoid discarding user work
-        let git_status = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(repo_dir)
-            .output();
-        if let Ok(out) = &git_status {
-            let dirty = String::from_utf8_lossy(&out.stdout);
-            if !dirty.trim().is_empty() {
-                eprintln!(
-                    "[lifecycle] skipping {} — worktree has uncommitted changes",
-                    repo_name
-                );
-                continue;
-            }
+        if !guard_clean_worktree(repo_dir, "lifecycle") {
+            continue;
         }
 
         // Collect source files we can modify, using the same walker the
@@ -561,6 +638,9 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         let mut query_times = Vec::with_capacity(CYCLES);
         let mut db_sizes = Vec::with_capacity(CYCLES);
         let mut modifications: Vec<(String, String)> = Vec::new(); // (path, action)
+        // Original contents of every file this run rewrites, captured before
+        // the first write so the repo can be restored without `git checkout .`.
+        let mut originals: HashMap<PathBuf, String> = HashMap::new();
 
         for cycle in 0..CYCLES {
             // Pick a source file to modify (round-robin)
@@ -600,18 +680,22 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
                         "delete"
                     } else {
                         // No file to delete, modify instead
-                        let mut content = fs::read_to_string(target).unwrap_or_default();
-                        content.push_str(&format!("\n// bench cycle {}\n", cycle));
-                        let _ = fs::write(target, &content);
+                        append_bench_line(
+                            target,
+                            &format!("\n// bench cycle {}\n", cycle),
+                            &mut originals,
+                        );
                         modifications.push((target.to_string_lossy().to_string(), "modify".into()));
                         "modify"
                     }
                 }
                 _ => {
                     // Normal cycle: modify existing file
-                    let mut content = fs::read_to_string(target).unwrap_or_default();
-                    content.push_str(&format!("\n// bench cycle {}\n", cycle));
-                    let _ = fs::write(target, &content);
+                    append_bench_line(
+                        target,
+                        &format!("\n// bench cycle {}\n", cycle),
+                        &mut originals,
+                    );
                     modifications.push((target.to_string_lossy().to_string(), "modify".into()));
                     "modify"
                 }
@@ -669,11 +753,10 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             }
         }
 
-        // Restore modified files via git checkout
-        let _ = std::process::Command::new("git")
-            .args(["checkout", "."])
-            .current_dir(repo_dir)
-            .output();
+        // Restore only the files this run rewrote. `git checkout .` would also
+        // discard unstaged edits the user made outside the benchmark.
+        restore_originals(&originals);
+        cleanup_bench_db(&db_path);
 
         // Analyze degradation: compare first 10 cycles vs last 10 cycles
         let first_10_rebuild: Vec<f64> = rebuild_times[..10].to_vec();
@@ -757,6 +840,10 @@ fn run_quality_checks(repos: &[PathBuf]) {
         let config = shire::config::load_config(repo_dir).unwrap_or_default();
 
         eprintln!("\n=== {} ({}) — quality checks ===", repo_name, size);
+
+        if !guard_clean_worktree(repo_dir, "quality") {
+            continue;
+        }
 
         // Build fresh index
         let _ = fs::remove_file(&db_path);
@@ -1054,12 +1141,11 @@ fn run_quality_checks(repos: &[PathBuf]) {
             .map(|e| e.into_path());
 
         if let Some(test_file) = test_file {
-            let original = fs::read_to_string(&test_file).unwrap_or_default();
-            let modified = format!("{}\n// quality check\n", original);
-            let _ = fs::write(&test_file, &modified);
+            let mut originals: HashMap<PathBuf, String> = HashMap::new();
+            append_bench_line(&test_file, "\n// quality check\n", &mut originals);
             let incr_ok =
                 shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
-            let _ = fs::write(&test_file, &original); // restore
+            restore_originals(&originals);
 
             let conn3 = shire::db::open_readonly(&db_path).expect("failed to open DB");
             let sym_count_3: i64 = conn3
@@ -1116,11 +1202,10 @@ fn run_quality_checks(repos: &[PathBuf]) {
             }));
         }
 
-        // Restore repo
-        let _ = std::process::Command::new("git")
-            .args(["checkout", "."])
-            .current_dir(repo_dir)
-            .output();
+        // The one file check 9 rewrites is restored inline right after the
+        // rebuild, so there is nothing left to undo here — and `git checkout .`
+        // would discard the user's own uncommitted edits along with ours.
+        cleanup_bench_db(&db_path);
 
         all_results.push(serde_json::json!({
             "repo": repo_name,
@@ -1189,4 +1274,129 @@ fn round1(v: f64) -> f64 {
 
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be installed to run these tests");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "bench@example.invalid"]);
+        git(dir, &["config", "user.name", "bench"]);
+        std::fs::write(dir.join("main.go"), "package main\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+    }
+
+    #[test]
+    fn test_worktree_is_clean_on_committed_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo(dir.path());
+        assert_eq!(worktree_is_clean(dir.path()), Ok(true));
+        assert!(guard_clean_worktree(dir.path(), "test"));
+    }
+
+    #[test]
+    fn test_worktree_is_dirty_with_unstaged_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("main.go"), "package main\n// precious\n").unwrap();
+        assert_eq!(worktree_is_clean(dir.path()), Ok(false));
+        assert!(
+            !guard_clean_worktree(dir.path(), "test"),
+            "a mutating phase must refuse a dirty worktree"
+        );
+    }
+
+    #[test]
+    fn test_worktree_is_dirty_with_untracked_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("scratch.go"), "package main\n").unwrap();
+        assert_eq!(worktree_is_clean(dir.path()), Ok(false));
+    }
+
+    /// Fail closed: an unknown worktree state must skip the repo, not mutate it.
+    #[test]
+    fn test_guard_fails_closed_outside_a_git_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(worktree_is_clean(dir.path()).is_err());
+        assert!(
+            !guard_clean_worktree(dir.path(), "test"),
+            "an undeterminable worktree state must be treated as dirty"
+        );
+    }
+
+    #[test]
+    fn test_append_and_restore_only_touches_written_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let touched = dir.path().join("touched.go");
+        let untouched = dir.path().join("untouched.go");
+        std::fs::write(&touched, "package a\n").unwrap();
+        std::fs::write(&untouched, "package b\n").unwrap();
+
+        let mut originals: HashMap<PathBuf, String> = HashMap::new();
+        append_bench_line(&touched, "\n// cycle 0\n", &mut originals);
+        append_bench_line(&touched, "\n// cycle 1\n", &mut originals);
+        assert!(
+            std::fs::read_to_string(&touched)
+                .unwrap()
+                .contains("cycle 1")
+        );
+
+        // A file edited outside the benchmark must survive the restore.
+        std::fs::write(&untouched, "package b\n// user edit\n").unwrap();
+
+        restore_originals(&originals);
+        assert_eq!(std::fs::read_to_string(&touched).unwrap(), "package a\n");
+        assert_eq!(
+            std::fs::read_to_string(&untouched).unwrap(),
+            "package b\n// user edit\n",
+            "restore must not revert files the benchmark never wrote"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_bench_db_removes_db_and_empty_shire_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shire_dir = dir.path().join(".shire");
+        std::fs::create_dir_all(&shire_dir).unwrap();
+        let db = shire_dir.join("bench.db");
+        std::fs::write(&db, "x").unwrap();
+        std::fs::write(shire_dir.join("bench.db-wal"), "x").unwrap();
+
+        cleanup_bench_db(&db);
+        assert!(!db.exists());
+        assert!(!shire_dir.exists());
+    }
+
+    #[test]
+    fn test_cleanup_bench_db_keeps_non_empty_shire_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let shire_dir = dir.path().join(".shire");
+        std::fs::create_dir_all(&shire_dir).unwrap();
+        let db = shire_dir.join("bench.db");
+        std::fs::write(&db, "x").unwrap();
+        let user_db = shire_dir.join("index.db");
+        std::fs::write(&user_db, "x").unwrap();
+
+        cleanup_bench_db(&db);
+        assert!(!db.exists());
+        assert!(user_db.exists(), "the real index must not be removed");
+    }
 }

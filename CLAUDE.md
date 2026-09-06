@@ -14,7 +14,18 @@ cargo test config::tests        # Tests for a specific module
 cargo check                     # Type check without building
 ```
 
-The integration test (`tests/integration.rs`) builds the binary and runs it against fixture monorepos it creates in a temp directory.
+The crate has no default features. The optional, non-default `bench` feature gates
+the internal benchmark harness (`src/bin/autoresearch.rs`), so it is not built or
+installed unless explicitly requested:
+
+```sh
+cargo build --features bench --bin autoresearch
+cargo run --features bench --bin autoresearch -- --phase quality
+```
+
+The integration test (`tests/integration.rs`) runs the `shire` binary cargo built for
+the test run (via `CARGO_BIN_EXE_shire`) against fixture monorepos it creates in a temp
+directory.
 
 Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to verify before committing.
 

@@ -1,5 +1,5 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility,
     find_child_by_kind, node_text,
 };
 use tree_sitter::Node;
@@ -77,7 +77,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
                 | "enum_declaration"
                 | "record_declaration"
         ) {
-            let (p_public, p_protected, p_private, _, _) = check_modifiers(&n, source);
+            // `effective_modifiers`, not `check_modifiers`: a type nested
+            // directly in an interface body is implicitly public, so a
+            // raw modifier check would wrongly hide all of its members.
+            let (p_public, p_protected, p_private, _, _) = effective_modifiers(&n, source);
             if p_private || !(p_public || p_protected) {
                 return false;
             }
@@ -93,12 +96,27 @@ fn is_visible(node: &Node, source: &str) -> bool {
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
         "method_declaration" | "field_declaration" | "constant_declaration" => {
-            let class_node = find_ancestor(node, "class_declaration")
-                .or_else(|| find_ancestor(node, "interface_declaration"))
-                .or_else(|| find_ancestor(node, "enum_declaration"))
-                .or_else(|| find_ancestor(node, "record_declaration"))?;
-            let name_node = class_node.child_by_field_name("name")?;
-            node_text(&name_node, source).map(|s| s.to_string())
+            // Walk up once and take the *nearest* type of any kind. Trying
+            // `class_declaration` first (then interface, then enum, then
+            // record) would reach past an inner interface/record to the
+            // outer class that contains it, so a method on
+            // `class Service { public interface Callback { ... } }` would be
+            // attributed to `Service` instead of `Callback`.
+            let mut current = node.parent();
+            while let Some(n) = current {
+                if matches!(
+                    n.kind(),
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                ) {
+                    let name_node = n.child_by_field_name("name")?;
+                    return node_text(&name_node, source).map(|s| s.to_string());
+                }
+                current = n.parent();
+            }
+            None
         }
         _ => None,
     }

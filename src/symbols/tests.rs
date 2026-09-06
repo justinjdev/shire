@@ -1049,6 +1049,41 @@ public class Service {
 }
 
 #[test]
+fn test_java_nested_type_members_attach_to_the_nearest_type() {
+    // A member of a type nested inside a class must be attributed to that
+    // nested type, not to the outer class, and a type nested directly in an
+    // interface body is implicitly public — so its members stay visible.
+    let source = r#"public class Service {
+  public interface Callback { void onDone(); }
+  public record Point(int x, int y) { public int sum() { return x + y; } }
+}
+
+public interface Api {
+  interface Listener { void onEvent(); }
+}
+"#;
+    let (symbols, _) = extract_file("java", source, Arc::from("Service.java"), true, 0);
+    let parent_of = |name: &str| -> Option<String> {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} not extracted, got {:?}",
+                    symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+                )
+            })
+            .parent_symbol
+            .clone()
+    };
+    assert_eq!(parent_of("onDone").as_deref(), Some("Callback"));
+    assert_eq!(parent_of("sum").as_deref(), Some("Point"));
+    // `Listener` has no explicit modifier but is implicitly public (JLS),
+    // so `onEvent` must not be dropped as package-private-by-inheritance.
+    assert_eq!(parent_of("onEvent").as_deref(), Some("Listener"));
+}
+
+#[test]
 fn test_java_interface_members_are_extracted_as_implicitly_public() {
     // SYM-2 / SYM-V1: interface methods and constants carry no explicit
     // modifier (JLS: implicitly public, and constants implicitly static

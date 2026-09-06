@@ -254,7 +254,7 @@ fn handle_explore(
         .map_err(|e| PromptError::Internal(e.to_string()))?;
     let symbols = queries::search_symbols(conn, query, None, None, 20)
         .map_err(|e| PromptError::Internal(e.to_string()))?;
-    let files = queries::search_files(conn, query, None, None)
+    let files = queries::search_files(conn, query, None, None, 20)
         .map_err(|e| PromptError::Internal(e.to_string()))?;
     let docs = queries::search_docs(conn, query, None, 10)
         .map_err(|e| PromptError::Internal(e.to_string()))?;

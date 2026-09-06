@@ -372,7 +372,7 @@ src/
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 14 tool handlers
+│   ├── tools.rs     # 17 tool handlers
 │   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

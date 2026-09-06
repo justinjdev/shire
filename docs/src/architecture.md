@@ -42,8 +42,8 @@ src/
 │                    # (no type system), and Go/Perl omit Impl refs (no extends/implements).
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 11 tool handlers
-│   └── prompts.rs   # explore prompt template for semantic codebase exploration
+│   ├── tools.rs     # 17 tool handlers
+│   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)

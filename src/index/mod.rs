@@ -816,6 +816,15 @@ struct BuildSummary {
 /// directory basename, so both compute the same `group:basename` name),
 /// fall back to a path-derived name so the colliding package isn't silently
 /// dropped by upsert_package's `ON CONFLICT(name)` resolution.
+///
+/// The path-derived fallback (`path` with `/` replaced by `-`) can itself
+/// already be taken by a different package — e.g. a nested `foo/bar` colliding
+/// with a flat directory literally named `foo-bar`, or a second collision on
+/// a name that gradle.rs's own directory-fallback naming (no `group` set)
+/// already derives the same way. A single fallback attempt would then be a
+/// no-op (or a new collision), silently reproducing the exact drop this
+/// function exists to prevent — so keep disambiguating with a numeric suffix
+/// until the candidate name is free (or already belongs to this same path).
 fn resolve_gradle_name_collision(conn: &Connection, pkg: &mut PackageInfo) -> Result<()> {
     let existing_path: Option<String> = conn
         .query_row(
@@ -828,7 +837,25 @@ fn resolve_gradle_name_collision(conn: &Connection, pkg: &mut PackageInfo) -> Re
     if let Some(existing_path) = existing_path
         && existing_path != pkg.path
     {
-        let fallback = pkg.path.replace('/', "-");
+        let base_fallback = pkg.path.replace('/', "-");
+        let mut fallback = base_fallback.clone();
+        let mut suffix = 2;
+        loop {
+            let fallback_owner: Option<String> = conn
+                .query_row(
+                    "SELECT path FROM packages WHERE name = ?1",
+                    [&fallback],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match fallback_owner {
+                Some(owner_path) if owner_path != pkg.path => {
+                    fallback = format!("{base_fallback}-{suffix}");
+                    suffix += 1;
+                }
+                _ => break,
+            }
+        }
         tracing::warn!(
             name = %pkg.name,
             existing_path = %existing_path,
@@ -964,17 +991,24 @@ fn phase_parse(
     // Record a parse error as either a silent "no package" skip or a
     // reported failure (also tracked by manifest key, to exclude it from
     // hash storage).
-    let mut record_err = |manifest: &WalkedManifest, e: anyhow::Error| {
+    let mut record_err = |manifest: &WalkedManifest, e: anyhow::Error| -> Result<()> {
         if manifest::is_no_package_marker(&e) {
             tracing::debug!(
                 manifest = %manifest.abs_path.display(),
                 reason = %e,
                 "manifest declares no package of its own; skipping"
             );
+            // The manifest may previously have declared a real package here
+            // (e.g. a leaf crate later converted into a virtual workspace
+            // root) — remove any such stale row now. Its hash is about to be
+            // (re)stored as "resolved", so this is the only chance to clean
+            // it up; otherwise it would linger in the DB forever.
+            delete_package_at_path(conn, &manifest.relative_dir)?;
         } else {
             failed_keys.insert(manifest.manifest_key.clone());
             failures.push((manifest.abs_path.display().to_string(), e.to_string()));
         }
+        Ok(())
     };
 
     for manifest in to_parse {
@@ -1004,7 +1038,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e),
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -1030,7 +1064,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e),
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -1046,7 +1080,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e),
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -1061,7 +1095,7 @@ fn phase_parse(
                         let winner = upsert_package(conn, &pkg)?;
                         parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
-                    Err(e) => record_err(manifest, e),
+                    Err(e) => record_err(manifest, e)?,
                 }
                 break;
             }
@@ -1082,6 +1116,36 @@ fn phase_parse(
     Ok((parsed_packages, failures, failed_keys))
 }
 
+/// Remove any package row at `path`, along with its dependencies, symbols,
+/// and hash caches. Shared by `phase_remove_deleted` (manifest disappeared
+/// from disk) and `phase_parse`'s `NoPackageManifest` handling (the manifest
+/// is still on disk but no longer declares a package there — e.g. a leaf
+/// crate whose `Cargo.toml` was converted into a virtual workspace root).
+fn delete_package_at_path(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute("DELETE FROM packages WHERE path = ?1", [path])?;
+    Ok(())
+}
+
 /// Phase 4: Remove packages whose manifests were deleted.
 fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
     for manifest_key in removed {
@@ -1089,27 +1153,7 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             .rsplit_once('/')
             .map(|(dir, _)| dir)
             .unwrap_or("");
-        conn.execute(
-            "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute("DELETE FROM packages WHERE path = ?1", [relative_dir])?;
+        delete_package_at_path(conn, relative_dir)?;
         conn.execute(
             "DELETE FROM manifest_hashes WHERE path = ?1",
             [manifest_key.as_str()],
@@ -4507,6 +4551,92 @@ anyhow = "1"
         // Re-parsing the same package at the same path is a normal update,
         // not a collision — the name must not change.
         assert_eq!(pkg.name, "com.example:app");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_disambiguates_when_fallback_also_collides() {
+        // A nested `team-b/app` colliding on name with `team-a/app` falls back
+        // to the path-derived name "team-b-app" — but a THIRD, unrelated flat
+        // directory literally named "team-b-app" may already own that exact
+        // name (its own gradle.rs no-group fallback naming derives the same
+        // string). A single fallback attempt is then a no-op collision that
+        // would silently drop the "team-b-app" package — the resolver must
+        // keep disambiguating instead.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'team-a/app', 'gradle'),
+                ('team-b-app', 'team-b-app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "team-b/app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        // Must not silently reuse "team-b-app" (already owned by a different
+        // path) and must not leave the name unchanged (still colliding).
+        assert_ne!(pkg.name, "com.example:app");
+        assert_ne!(pkg.name, "team-b-app");
+        assert_eq!(pkg.name, "team-b-app-2");
+    }
+
+    // --- MANIFESTS-6 follow-up: NoPackageManifest transitions clean up stale packages ---
+
+    #[test]
+    fn test_manifest_transitioning_to_no_package_removes_stale_package_row() {
+        // A leaf crate (`[package]`) later converted into a virtual workspace
+        // root (`[workspace]`, no `[package]`) must not leave its old package
+        // row (and dependencies) permanently stale in the DB — its manifest
+        // hash is about to be cached as "resolved", so this is the only
+        // chance to clean it up.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(pkg_count(root), 1);
+
+        // Convert to a virtual workspace root.
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        build_index(root, &config, false, None).unwrap();
+
+        assert_eq!(
+            pkg_count(root),
+            0,
+            "the stale 'foo' package must be removed once its manifest no \
+             longer declares a package, not left indexed forever"
+        );
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        let dep_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            dep_count, 0,
+            "the stale package's dependencies must also be cleaned up"
+        );
     }
 
     // --- MANIFESTS-18: unit tests for the cross-package context collectors ---

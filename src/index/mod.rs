@@ -603,10 +603,18 @@ fn associate_files_with_packages(
 
 /// Incrementally update the files table: insert new files, delete removed files,
 /// update files whose package/extension/size changed. Avoids a full table wipe.
+///
+/// Returns `(deleted_rows, changed_packages)`. `changed_packages` names every
+/// package in which a file was added, removed, or had its package/extension/
+/// size change — the only cheap signal for a content change that moves
+/// neither the file's mtime nor its path, and the reason
+/// `phase_source_incremental` cannot trust its mtime pre-check alone
+/// (INDEX-3). It is derived from the `existing` snapshot this function
+/// already loads, so it costs no extra query.
 fn incremental_upsert_files(
     conn: &Connection,
     files: &[(String, Option<String>, String, u64)],
-) -> Result<usize> {
+) -> Result<(usize, HashSet<String>)> {
     // Load existing file paths from DB
     let existing: HashMap<String, (Option<String>, String, i64)> = {
         let mut stmt = conn.prepare("SELECT path, package, extension, size_bytes FROM files")?;
@@ -634,12 +642,37 @@ fn incremental_upsert_files(
         .map(|(path, pkg, ext, size)| (path.as_str(), (pkg, ext.as_str(), *size)))
         .collect();
 
+    // Packages touched by this build, computed against the pre-upsert
+    // snapshot. A file that moved between packages marks both.
+    let mut changed_packages: HashSet<String> = HashSet::new();
+    let mark = |pkg: &Option<String>, changed: &mut HashSet<String>| {
+        if let Some(p) = pkg {
+            changed.insert(p.clone());
+        }
+    };
+    for (path, pkg, ext, size) in files {
+        match existing.get(path) {
+            Some((old_pkg, old_ext, old_size)) => {
+                if old_pkg != pkg || old_ext != ext || *old_size != *size as i64 {
+                    mark(pkg, &mut changed_packages);
+                    mark(old_pkg, &mut changed_packages);
+                }
+            }
+            None => mark(pkg, &mut changed_packages),
+        }
+    }
+
     // Delete files no longer present
     let to_delete: Vec<&str> = existing
         .keys()
         .filter(|p| !new_set.contains_key(p.as_str()))
         .map(|p| p.as_str())
         .collect();
+    for path in &to_delete {
+        if let Some((old_pkg, _, _)) = existing.get(*path) {
+            mark(old_pkg, &mut changed_packages);
+        }
+    }
     let deleted_rows = to_delete.len();
     for chunk in to_delete.chunks(500) {
         let placeholders: String = chunk
@@ -701,7 +734,7 @@ fn incremental_upsert_files(
         }
     }
 
-    Ok(deleted_rows)
+    Ok((deleted_rows, changed_packages))
 }
 
 /// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
@@ -1574,32 +1607,48 @@ fn upsert_symbols_preserving(
     syms: &[symbols::SymbolInfo],
     keep_files: &[String],
 ) -> Result<()> {
-    let placeholders: String = (0..keep_files.len())
-        .map(|i| format!("?{}", i + 2))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keep_files.len() + 1);
-    params.push(&package);
-    for f in keep_files {
-        params.push(f);
+    // Stage the keep-set in a temp table rather than inlining one bound
+    // parameter per path: a package whose whole subtree went unreadable
+    // (an NFS mount dropping out mid-build) would otherwise blow past
+    // SQLITE_MAX_VARIABLE_NUMBER and fail the entire build transaction.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS keep_files (path TEXT PRIMARY KEY);
+         DELETE FROM keep_files;",
+    )?;
+    {
+        let mut stmt =
+            conn.prepare_cached("INSERT OR IGNORE INTO keep_files (path) VALUES (?1)")?;
+        for f in keep_files {
+            stmt.execute([f])?;
+        }
     }
     conn.execute(
-        &format!(
-            "DELETE FROM symbols WHERE package = ?1 AND file_path NOT IN ({})",
-            placeholders
-        ),
-        params.as_slice(),
+        "DELETE FROM symbols WHERE package = ?1 \
+         AND file_path NOT IN (SELECT path FROM keep_files)",
+        [package],
     )?;
     conn.execute(
-        &format!(
-            "DELETE FROM symbol_refs WHERE package = ?1 AND file_id NOT IN \
-             (SELECT id FROM files WHERE path IN ({}))",
-            placeholders
-        ),
-        params.as_slice(),
+        "DELETE FROM symbol_refs WHERE package = ?1 AND file_id NOT IN \
+         (SELECT id FROM files WHERE path IN (SELECT path FROM keep_files))",
+        [package],
     )?;
+    conn.execute_batch("DELETE FROM keep_files;")?;
     batch_insert_symbols(conn, package, syms)?;
     Ok(())
+}
+
+/// Decode a 64-character lowercase hex SHA-256 digest back into raw bytes.
+/// Returns `None` for the sentinel hashes (`"oversized"`, `"unreadable"`)
+/// and anything else that is not a real digest.
+fn hex_to_digest(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Parse an ISO 8601 / RFC 3339 timestamp string into a SystemTime.
@@ -1615,6 +1664,10 @@ struct FileResult {
     raw_digest: [u8; 32],
     symbols: Option<Vec<symbols::SymbolInfo>>, // None if unchanged
     references: Option<Vec<symbols::ReferenceInfo>>, // None if unchanged
+    /// The file exists but could not be read this build. Its stored hash is
+    /// carried across unchanged and `hashed_at` is not advanced, so the next
+    /// build re-checks the package instead of trusting a partial pass.
+    unreadable: bool,
 }
 
 /// Result of parallel phase 8 work for a single package.
@@ -1626,8 +1679,16 @@ enum SourceCheckResult {
         deleted_files: Vec<String>, // file paths no longer on disk
         aggregate_hash: String,
     },
-    /// Package unchanged — just update hashed_at.
-    Unchanged(String, String),
+    /// Package unchanged — just update hashed_at. The bool is set when at
+    /// least one file could not be read, in which case `hashed_at` must NOT
+    /// advance: an unread file's content is unknown, and advancing the
+    /// timestamp past its mtime would let the pre-check skip it forever.
+    Unchanged(String, String, bool),
+    /// The package directory could not be walked at all. Its rows are left
+    /// exactly as they were and the failure is reported to the caller — the
+    /// same contract phase 7 uses, so a package that stays unwalkable does
+    /// not start passing for a clean run on the second build.
+    Failed(String, String),
     // Skipped is implicit (filter_map returns None)
 }
 
@@ -1661,7 +1722,7 @@ fn phase_source_incremental(
     max_file_size: u64,
     max_references_per_file: usize,
     file_index_changed: &HashSet<String>,
-) -> Result<usize> {
+) -> Result<(usize, Vec<(String, String)>)> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
     let unchanged_pkgs: Vec<(
@@ -1730,12 +1791,19 @@ fn phase_source_incremental(
 
                     // One walk, used both by the staleness pre-check and by
                     // the hash pass below.
-                    let source_files = symbols::walker::walk_source_files_with_patterns(
+                    let source_files = match symbols::walker::walk_source_files_with_patterns(
                         &package_dir,
                         &extensions,
                         exclude_patterns,
-                    )
-                    .ok()?;
+                    ) {
+                        Ok(files) => files,
+                        Err(e) => {
+                            return Some(SourceCheckResult::Failed(
+                                pkg_name.clone(),
+                                e.to_string(),
+                            ));
+                        }
+                    };
 
                     // Pre-check: skip the package entirely when nothing on
                     // disk suggests a change. Bypassed when
@@ -1795,17 +1863,46 @@ fn phase_source_incremental(
                                     raw_digest: [0u8; 32],
                                     symbols: None,
                                     references: None,
+                                    unreadable: false,
                                 });
                             }
-                            let content = std::fs::read(file_path).ok()?;
-                            let digest = Sha256::digest(&content);
-                            let raw_digest: [u8; 32] = digest.into();
-                            let content_hash = format!("{:x}", digest);
                             let relative_path = file_path
                                 .strip_prefix(repo_root)
                                 .unwrap_or(file_path)
                                 .to_string_lossy()
                                 .to_string();
+                            let content = match std::fs::read(file_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    // The file exists but could not be read.
+                                    // Dropping it here would put it in
+                                    // `deleted_files` below and delete its
+                                    // symbols, references and hash row — a
+                                    // transient I/O error must never
+                                    // masquerade as "this file is gone".
+                                    tracing::warn!(
+                                        file = %relative_path,
+                                        error = %e,
+                                        "source file could not be read — keeping its previously indexed rows"
+                                    );
+                                    let stored = stored_file_hashes.get(&relative_path);
+                                    return Some(FileResult {
+                                        file_path: relative_path,
+                                        raw_digest: stored
+                                            .and_then(|h| hex_to_digest(h))
+                                            .unwrap_or([0u8; 32]),
+                                        content_hash: stored
+                                            .cloned()
+                                            .unwrap_or_else(|| "unreadable".to_string()),
+                                        symbols: None,
+                                        references: None,
+                                        unreadable: true,
+                                    });
+                                }
+                            };
+                            let digest = Sha256::digest(&content);
+                            let raw_digest: [u8; 32] = digest.into();
+                            let content_hash = format!("{:x}", digest);
 
                             let stored = stored_file_hashes.get(&relative_path);
                             if stored == Some(&content_hash) && !force_source_reextract {
@@ -1820,6 +1917,7 @@ fn phase_source_incremental(
                                     raw_digest,
                                     symbols: None,
                                     references: None,
+                                    unreadable: false,
                                 })
                             } else {
                                 // File changed or new — extract symbols and references.
@@ -1852,6 +1950,7 @@ fn phase_source_incremental(
                                     raw_digest,
                                     symbols: Some(syms),
                                     references: Some(refs),
+                                    unreadable: false,
                                 })
                             }
                         })
@@ -1883,9 +1982,11 @@ fn phase_source_incremental(
                     let has_changes = file_results.iter().any(|r| r.symbols.is_some())
                         || !deleted_files.is_empty();
                     if !has_changes {
+                        let has_unreadable = file_results.iter().any(|r| r.unreadable);
                         return Some(SourceCheckResult::Unchanged(
                             pkg_name.clone(),
                             aggregate_hash,
+                            has_unreadable,
                         ));
                     }
 
@@ -1906,6 +2007,7 @@ fn phase_source_incremental(
 
     // Sequential DB writes
     let mut num_reextracted: usize = 0;
+    let mut failures: Vec<(String, String)> = Vec::new();
     let mut hash_entries: Vec<(&str, &str)> = Vec::new();
     for result in &results {
         match result {
@@ -1967,11 +2069,24 @@ fn phase_source_incremental(
                 if had_changes || !deleted_files.is_empty() {
                     num_reextracted += 1;
                 }
-                hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
+                if !all_files.iter().any(|fr| fr.unreadable) {
+                    hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
+                }
             }
-            SourceCheckResult::Unchanged(pkg_name, aggregate_hash) => {
-                // Update hashed_at to reflect the new computation time
-                hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
+            SourceCheckResult::Unchanged(pkg_name, aggregate_hash, has_unreadable) => {
+                // Update hashed_at to reflect the new computation time — but
+                // only when the whole package was actually read.
+                if !has_unreadable {
+                    hash_entries.push((pkg_name.as_str(), aggregate_hash.as_str()));
+                }
+            }
+            SourceCheckResult::Failed(pkg_name, error) => {
+                tracing::warn!(
+                    package = %pkg_name,
+                    error = %error,
+                    "source walk failed — keeping the package's existing rows"
+                );
+                failures.push((pkg_name.clone(), error.clone()));
             }
         }
     }
@@ -1988,7 +2103,7 @@ fn phase_source_incremental(
         "phase_source_incremental: incremental source check complete"
     );
 
-    Ok(num_reextracted)
+    Ok((num_reextracted, failures))
 }
 
 /// Backfill `boundary_edges` from the `files` table when the table is empty.
@@ -2112,8 +2227,7 @@ fn phase_index_files(
         .collect();
 
     let num_files = validated_files.len();
-    let changed_packages = packages_with_file_changes(conn, &validated_files)?;
-    let deleted_file_rows = incremental_upsert_files(conn, &validated_files)?;
+    let (deleted_file_rows, changed_packages) = incremental_upsert_files(conn, &validated_files)?;
 
     // Detect proto→generated boundary edges from the walked file set.
     // Runs after file upsert so package associations are current.
@@ -2135,67 +2249,6 @@ fn phase_index_files(
         deleted_file_rows,
         changed_packages,
     })
-}
-
-/// Packages in which a file was added, removed, or changed size relative to
-/// the `files` table as it stands *before* this build's upsert.
-///
-/// This is the only cheap signal that catches a content change which moves
-/// neither the file's mtime nor its path (a `cp -p`/rsync restore, a
-/// timestamp-preserving checkout). It is derived from data
-/// `incremental_upsert_files` would load anyway, so it costs one extra scan
-/// of the `files` table and no filesystem work.
-fn packages_with_file_changes(
-    conn: &Connection,
-    files: &[(String, Option<String>, String, u64)],
-) -> Result<HashSet<String>> {
-    let mut existing: HashMap<String, (Option<String>, i64)> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT path, package, size_bytes FROM files")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?),
-            ))
-        })?;
-        for row in rows {
-            let (path, rest) = row?;
-            existing.insert(path, rest);
-        }
-    }
-
-    let mut changed: HashSet<String> = HashSet::new();
-    let mut seen: HashSet<&str> = HashSet::with_capacity(files.len());
-    for (path, pkg, _ext, size) in files {
-        seen.insert(path.as_str());
-        match existing.get(path) {
-            // New file, moved between packages, or resized.
-            Some((old_pkg, old_size)) => {
-                if *old_size != *size as i64 || old_pkg.as_deref() != pkg.as_deref() {
-                    if let Some(p) = pkg {
-                        changed.insert(p.clone());
-                    }
-                    if let Some(p) = old_pkg {
-                        changed.insert(p.clone());
-                    }
-                }
-            }
-            None => {
-                if let Some(p) = pkg {
-                    changed.insert(p.clone());
-                }
-            }
-        }
-    }
-    // Deleted files.
-    for (path, (old_pkg, _)) in &existing {
-        if !seen.contains(path.as_str())
-            && let Some(p) = old_pkg
-        {
-            changed.insert(p.clone());
-        }
-    }
-    Ok(changed)
 }
 
 /// Index documentation files: read content from doc files in the files table,
@@ -2703,22 +2756,51 @@ fn make_progress(mp: &MultiProgress, len: u64, msg: &str) -> ProgressBar {
     pb
 }
 
+/// Build the index, reporting a package that could not be indexed at all as
+/// a non-zero exit — the CLI entry point, where the caller is a human or CI.
 pub fn build_index(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    build_index_inner(repo_root, config, force, db_override, true)
+    let extract_failures = build_index_inner(repo_root, config, force, db_override, true)?;
+    if !extract_failures.is_empty() {
+        anyhow::bail!(
+            "{} package(s) could not be indexed: {}",
+            extract_failures.len(),
+            extract_failures
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
+/// Build the index for a long-running process (the MCP server's on-demand
+/// rebuild, the watch daemon).
+///
+/// A package that could not be walked is reported through the log, never as
+/// `Err`: the build itself completed and committed, and its callers treat
+/// `Err` as "the rebuild did not happen" — `ShireService::maybe_rebuild`
+/// would then keep serving the pre-rebuild connection and re-run a full
+/// rebuild on every single tool call.
 pub fn build_index_quiet(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    build_index_inner(repo_root, config, force, db_override, false)
+    let extract_failures = build_index_inner(repo_root, config, force, db_override, false)?;
+    if !extract_failures.is_empty() {
+        tracing::warn!(
+            packages = extract_failures.len(),
+            "some packages could not be indexed; their previously indexed rows were kept"
+        );
+    }
+    Ok(())
 }
 
 /// Restores the DB to a servable state when `build_index_inner` returns,
@@ -2746,13 +2828,16 @@ impl Drop for BuildGuard<'_> {
     }
 }
 
+/// Returns the packages whose symbol extraction failed outright. Their
+/// previously indexed rows were left untouched; it is up to the caller to
+/// decide whether that is fatal (see `build_index` vs `build_index_quiet`).
 fn build_index_inner(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
     progress: bool,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
     let mp = if progress {
@@ -2814,9 +2899,10 @@ fn build_index_inner(
     let switched_journal: String = conn
         .query_row("PRAGMA journal_mode=MEMORY", [], |row| row.get(0))
         .unwrap_or_else(|_| "wal".to_string());
-    // Restore WAL and clear the marker even if a phase below returns early:
-    // a DB left in rollback mode is not servable (readers cannot switch it
-    // back), and a stale marker would force a needless integrity check.
+    // Restore WAL even if a phase below returns early: a DB left in rollback
+    // mode is not servable (readers cannot switch it back). The
+    // `build_in_progress` marker is deliberately only cleared on the success
+    // path, so a build that died leaves the next open to verify the file.
     let mut guard = BuildGuard {
         conn: &conn,
         restore_wal: switched_journal == "memory",
@@ -3076,7 +3162,7 @@ fn build_index_inner(
         )?;
         // Always run: this phase's own per-package mtime/dir-mtime/file-set
         // pre-check and per-file content hashes are the freshness oracle.
-        let count = phase_source_incremental(
+        let (count, incremental_failures) = phase_source_incremental(
             &conn,
             repo_root,
             &diff.unchanged,
@@ -3095,6 +3181,8 @@ fn build_index_inner(
         // symbol_refs — so MCP tools cannot return silent [] from a
         // partially-repopulated table.
         crate::db::write_references_enabled(&conn, refs_enabled)?;
+        let mut extract_failures = extract_failures;
+        extract_failures.extend(incremental_failures);
         Ok((count, extract_failures))
     })?;
     if let Some(pb) = pb_sym {
@@ -3144,7 +3232,9 @@ fn build_index_inner(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('total_duration_ms', ?1)",
             [total_duration.as_millis().to_string()],
         )?;
-        // Timestamp for .git/index mtime fast-path on next build
+        // Informational only: nothing in the build gates on this any more
+        // (the `.git/index` fast-path it once fed has been removed, because
+        // an ordinary working-tree edit never touches `.git/index`).
         conn.execute(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('last_build_at', ?1)",
             [&now],
@@ -3214,22 +3304,11 @@ fn build_index_inner(
     print_timings(&timings, total_duration);
 
     // A package that could not be walked at all is a real failure: its rows
-    // are now stale by definition, and exiting 0 would let CI and the watch
-    // daemon treat the run as clean.
-    if !summary.extract_failures.is_empty() {
-        anyhow::bail!(
-            "{} package(s) could not be indexed: {}",
-            summary.extract_failures.len(),
-            summary
-                .extract_failures
-                .iter()
-                .map(|(p, _)| p.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    Ok(())
+    // are now stale by definition. Hand it back rather than bailing here —
+    // everything above is already committed, so turning a committed build
+    // into an `Err` would make in-process callers believe no rebuild
+    // happened. `build_index` turns this into a non-zero exit for the CLI.
+    Ok(summary.extract_failures)
 }
 
 /// Detect proto→generated-code boundary edges from walked files.
@@ -4925,5 +5004,86 @@ mod extract_write_tests {
 
         write_package_extract_results(&conn, &results, false, &mut rw).unwrap();
         assert_eq!(symbol_names(&conn), vec!["fresh".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod incremental_signal_tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_to_digest_round_trips_and_rejects_sentinels() {
+        let digest: [u8; 32] = Sha256::digest(b"hello").into();
+        let hex = format!("{:x}", Sha256::digest(b"hello"));
+        assert_eq!(hex_to_digest(&hex), Some(digest));
+        // The sentinel hashes stored for oversized/unreadable files are not
+        // digests and must not be decoded into a bogus one.
+        assert_eq!(hex_to_digest("oversized"), None);
+        assert_eq!(hex_to_digest("unreadable"), None);
+        assert_eq!(hex_to_digest(&"z".repeat(64)), None);
+    }
+
+    fn files_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        for name in ["a", "b"] {
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES (?1, ?1, 'npm')",
+                [name],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn f(path: &str, pkg: &str, size: u64) -> (String, Option<String>, String, u64) {
+        (
+            path.to_string(),
+            Some(pkg.to_string()),
+            "ts".to_string(),
+            size,
+        )
+    }
+
+    #[test]
+    fn test_incremental_upsert_files_reports_changed_packages() {
+        let conn = files_db();
+
+        // First build: everything is new.
+        let (deleted, changed) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)]).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            changed,
+            HashSet::from(["a".to_string(), "b".to_string()]),
+            "new files mark their package"
+        );
+
+        // Nothing moved.
+        let (_, changed) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)]).unwrap();
+        assert!(changed.is_empty(), "an unchanged tree marks nothing");
+
+        // A size change marks only that package.
+        let (_, changed) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11), f("b/y.ts", "b", 10)]).unwrap();
+        assert_eq!(changed, HashSet::from(["a".to_string()]));
+
+        // A deletion marks the package the file used to belong to.
+        let (deleted, changed) = incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11)]).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(changed, HashSet::from(["b".to_string()]));
+    }
+
+    #[test]
+    fn test_incremental_upsert_files_marks_both_sides_of_a_move() {
+        let conn = files_db();
+        incremental_upsert_files(&conn, &[f("shared.ts", "a", 10)]).unwrap();
+        let (_, changed) = incremental_upsert_files(&conn, &[f("shared.ts", "b", 10)]).unwrap();
+        assert_eq!(
+            changed,
+            HashSet::from(["a".to_string(), "b".to_string()]),
+            "a file moving between packages must re-check both"
+        );
     }
 }

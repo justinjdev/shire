@@ -274,7 +274,12 @@ fn promote_exact_name(
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return Ok(());
     }
-    if let Some(pos) = result.iter().position(|r| r.name == name) {
+    // FTS matching folds case, so the promotion has to as well: an LLM
+    // querying `config` for a type called `Config` must still get it.
+    if let Some(pos) = result
+        .iter()
+        .position(|r| r.name.eq_ignore_ascii_case(name))
+    {
         if pos > 0 {
             let exact = result.remove(pos);
             result.insert(0, exact);
@@ -286,7 +291,7 @@ fn promote_exact_name(
         "SELECT name, kind, signature, package, file_path, line,
                 visibility, parent_symbol, return_type, parameters
          FROM symbols
-         WHERE name = ?1
+         WHERE name = ?1 COLLATE NOCASE
            AND (?2 IS NULL OR package = ?2)
            AND (?3 IS NULL OR kind = ?3)
          ORDER BY file_path, line
@@ -806,10 +811,14 @@ pub fn dependency_graph(
 ) -> Result<Vec<GraphEdge>> {
     const MAX_EDGES: usize = 10_000;
 
+    // Ordered so that a caller truncating the edge list (package_dependencies
+    // with depth > 1) always keeps the same edges.
     let sql = if internal_only {
-        "SELECT dependency, dep_kind FROM dependencies WHERE package = ?1 AND is_internal = 1"
+        "SELECT dependency, dep_kind FROM dependencies \
+         WHERE package = ?1 AND is_internal = 1 ORDER BY dependency, dep_kind"
     } else {
-        "SELECT dependency, dep_kind FROM dependencies WHERE package = ?1"
+        "SELECT dependency, dep_kind FROM dependencies \
+         WHERE package = ?1 ORDER BY dependency, dep_kind"
     };
 
     let mut edges = Vec::new();
@@ -1327,6 +1336,19 @@ pub struct CallerRow {
     pub call_sites: i64,
 }
 
+/// Escape the LIKE wildcards in a user-supplied string so it can be used as
+/// a literal inside a `LIKE ... ESCAPE '\\'` pattern.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn query_symbol_callers(
     conn: &Connection,
     name: &str,
@@ -1391,9 +1413,18 @@ pub fn query_symbol_callees(
          FROM ( \
              SELECT r.name, r.file_id, MIN(r.line) AS first_line, COUNT(*) AS call_sites \
              FROM symbol_refs r \
-             WHERE r.enclosing_symbol = ? AND r.kind = 'call'",
+             WHERE (r.enclosing_symbol = ? OR r.enclosing_symbol LIKE ? ESCAPE '\\') \
+               AND r.kind = 'call'",
     );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(enclosing.to_string())];
+    // `enclosing_symbol` is stored dot-qualified for methods
+    // (`AuthService.login`), so a caller asking for `login` must also reach
+    // `AuthService.login`, while `AuthService.login` still selects only that
+    // one. The equality branch keeps using idx_refs_callees_cover; the LIKE
+    // branch is the fallback for the bare-name case.
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(enclosing.to_string()),
+        Box::new(format!("%.{}", escape_like(enclosing))),
+    ];
     if let Some(p) = package {
         sql.push_str(" AND r.package = ?");
         params.push(Box::new(p.to_string()));
@@ -2045,6 +2076,15 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "dependencies come back in a stable order");
+    }
+
+    #[test]
+    fn test_search_symbols_exact_name_promotion_folds_case() {
+        // FTS matching folds case, so an LLM asking for `authmiddleware` (or
+        // `config`) must still get the PascalCase symbol promoted.
+        let conn = test_db_with_identifiers();
+        let hits = search_symbols(&conn, "authmiddleware", None, None, 5).unwrap();
+        assert_eq!(hits[0].name, "AuthMiddleware");
     }
 
     #[test]
@@ -3196,6 +3236,87 @@ mod refs_tests {
         assert_eq!(p_only.len(), 2);
         let none = query_symbol_callees(&conn, "handler", Some("other"), 100).unwrap();
         assert!(none.is_empty());
+    }
+
+    /// `enclosing_symbol` is stored dot-qualified for methods
+    /// (`AuthService.login`), so a callee lookup by the bare method name has
+    /// to reach every qualified form, while a qualified lookup stays exact.
+    #[test]
+    fn test_query_symbol_callees_matches_qualified_enclosing() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("qual.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["a.rs"]);
+        let a = ids["a.rs"];
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('fromA', 'call', {a}, 1, 'p', 'A.login'), \
+                        ('fromB', 'call', {a}, 2, 'p', 'B.login'), \
+                        ('fromBare', 'call', {a}, 3, 'p', 'login'), \
+                        ('other', 'call', {a}, 4, 'p', 'A.logout'), \
+                        ('nested', 'call', {a}, 5, 'p', 'A.B.login')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let mut bare: Vec<String> = query_symbol_callees(&conn, "login", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.callee_name)
+            .collect();
+        bare.sort();
+        assert_eq!(bare, vec!["fromA", "fromB", "fromBare", "nested"]);
+
+        let qualified: Vec<String> = query_symbol_callees(&conn, "A.login", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.callee_name)
+            .collect();
+        assert_eq!(qualified, vec!["fromA"]);
+
+        // A bare name must not reach a different method that merely ends the
+        // same way as a substring (`logout` vs `login`).
+        let logout: Vec<String> = query_symbol_callees(&conn, "logout", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.callee_name)
+            .collect();
+        assert_eq!(logout, vec!["other"]);
+    }
+
+    /// LIKE wildcards in the queried name must be literal, or `_ogin` would
+    /// match `A.login`.
+    #[test]
+    fn test_query_symbol_callees_escapes_like_wildcards() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("esc.db");
+        let conn = open_or_create(&db_path, false).unwrap();
+        let ids = seed_files(&conn, &["a.rs"]);
+        let a = ids["a.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('fromA', 'call', {a}, 1, 'p', 'A.login'), \
+                        ('literal', 'call', {a}, 2, 'p', 'A._ogin')"
+            ),
+            [],
+        )
+        .unwrap();
+        let hits: Vec<String> = query_symbol_callees(&conn, "_ogin", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.callee_name)
+            .collect();
+        assert_eq!(hits, vec!["literal"], "`_` must not act as a wildcard");
+        assert!(
+            query_symbol_callees(&conn, "%", None, 100)
+                .unwrap()
+                .is_empty(),
+            "`%` must not match every qualified symbol"
+        );
     }
 
     /// Seed a package row for dependency graph tests. Each package needs a

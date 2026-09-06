@@ -492,6 +492,16 @@ pub fn write_references_enabled(conn: &Connection, enabled: bool) -> Result<()> 
 /// build's bulk rebuild (tokenchars `'_-'` + `prefix='2,3'`).
 const FTS_SCHEMA_VERSION: &str = "8";
 
+/// True when the database's derived schema matches this build.
+///
+/// A read-only connection never migrates (only `open_or_create` does), so an
+/// index built by an older release keeps serving its old FTS tables — no
+/// error, just missing behaviour. `serve` uses this to tell the user to run
+/// `shire build`.
+pub fn schema_is_current(conn: &Connection) -> bool {
+    read_fts_schema_version(conn).as_deref() == Some(FTS_SCHEMA_VERSION)
+}
+
 fn read_fts_schema_version(conn: &Connection) -> Option<String> {
     conn.query_row(
         "SELECT value FROM shire_meta WHERE key = 'fts_schema_version'",
@@ -1103,7 +1113,9 @@ mod schema_tests {
     fn write_v7_db(path: &std::path::Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);
+            // WAL like a real index, so the DB can also be opened read-only.
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);
              INSERT INTO shire_meta (key, value) VALUES ('fts_schema_version', '7');
              CREATE TABLE packages (
                  name TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
@@ -1215,6 +1227,21 @@ mod schema_tests {
             read_fts_schema_version(&conn).as_deref(),
             Some(FTS_SCHEMA_VERSION)
         );
+    }
+
+    #[test]
+    fn test_schema_is_current_reports_stale_read_only_indexes() {
+        let dir = tempdir().unwrap();
+        let fresh = dir.path().join("fresh.db");
+        let conn = open_or_create(&fresh, false).unwrap();
+        assert!(schema_is_current(&conn));
+
+        // An index written by an older release, opened read-only: nothing
+        // migrates it, so `serve` has to be able to notice.
+        let old = dir.path().join("old.db");
+        write_v7_db(&old);
+        let ro = open_readonly(&old).unwrap();
+        assert!(!schema_is_current(&ro));
     }
 
     #[test]

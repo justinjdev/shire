@@ -87,6 +87,17 @@ impl ShireService {
         #[cfg(not(feature = "rag"))]
         let _ = rag_config;
 
+        // A read-only connection never migrates, so an index written by an
+        // older release keeps serving its old FTS tables: no error, just
+        // silently missing prefix/sub-token matching. Say so once at startup.
+        if !crate::db::schema_is_current(&conn) {
+            tracing::warn!(
+                "index was built by an older shire and has not been migrated — \
+                 symbol search will miss prefix and sub-token matches until you \
+                 run `shire build`"
+            );
+        }
+
         // Initialize last_indexed from DB metadata if available
         let last_indexed = Self::read_indexed_at(&conn);
 

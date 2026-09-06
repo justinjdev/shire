@@ -20,6 +20,33 @@ fn print_header(msg: &str) {
     eprintln!("\n{}", style(msg).cyan().bold());
 }
 
+/// Copy `path`'s current permission bits onto `tmp_path`, if `path` exists. Used before
+/// an atomic rename-into-place so rewriting a config file doesn't silently drop its mode
+/// to the process umask (rename() preserves the *source* file's mode, i.e. the temp
+/// file's, not the destination's). A no-op (and not an error) when `path` doesn't exist
+/// yet or its permissions can't be read.
+#[cfg(unix)]
+fn preserve_mode(path: &Path, tmp_path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(tmp_path, meta.permissions());
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_mode(_path: &Path, _tmp_path: &Path) {}
+
+/// Set `path`'s permission bits to `mode`, best-effort. Used for brand-new files that
+/// carry credentials (~/.claude.json, ~/.claude/settings.json) so they start at a
+/// restrictive mode instead of whatever the process umask would otherwise leave.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 const CLAUDE_MD_LINE: &str = "When searching code, use Shire MCP tools (search_symbols, search_files, explore) instead of Grep/Glob.";
 
 const RULES_CONTENT: &str = r#"# Shire — codebase search index
@@ -332,7 +359,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         fs::create_dir_all(&claude_dir)
             .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
         let settings_path = claude_dir.join("settings.json");
-        patch_claude_hooks(&settings_path, ".claude/settings.json", "shire init")?;
+        patch_claude_hooks(&settings_path, ".claude/settings.json", "shire init", None)?;
     }
 
     // 4. Write .claude/rules/shire.md
@@ -438,6 +465,7 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
             &settings_path,
             "~/.claude/settings.json",
             "shire init --global",
+            Some(0o600),
         )?;
     }
 
@@ -503,6 +531,7 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
     let tmp_path = mcp_path.with_extension("json.tmp");
     fs::write(&tmp_path, format!("{output}\n"))
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(&mcp_path, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, &mcp_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -518,7 +547,19 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
 }
 
 /// Patch a Claude Code settings JSON file to add hooks.PostToolUse only.
-fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str) -> Result<()> {
+///
+/// `new_file_mode` is applied (unix only) if `settings_path` doesn't exist yet — used for
+/// ~/.claude/settings.json, which can carry hook commands with embedded secrets, to match
+/// Claude Code's own default of 0600 rather than leaving a freshly created file at the
+/// process umask. Pass `None` for project-local `.claude/settings.json`, which isn't a
+/// credential-bearing $HOME file.
+fn patch_claude_hooks(
+    settings_path: &Path,
+    display_path: &str,
+    reinit_cmd: &str,
+    new_file_mode: Option<u32>,
+) -> Result<()> {
+    let existed = settings_path.exists();
     let mut settings: Map<String, Value> = if settings_path.exists() {
         let content = fs::read_to_string(settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
@@ -582,6 +623,7 @@ fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str
     let tmp_path = settings_path.with_extension("json.tmp");
     fs::write(&tmp_path, format!("{output}\n"))
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(settings_path, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, settings_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -592,12 +634,16 @@ fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str
             )
         });
     }
+    if !existed && let Some(mode) = new_file_mode {
+        set_mode(settings_path, mode);
+    }
     print_created(&format!("Added hooks.PostToolUse to {display_path}"));
     Ok(())
 }
 
 /// Patch ~/.claude.json to add mcpServers.shire (user-scoped MCP config).
 fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()> {
+    let existed = path.exists();
     let mut config: Map<String, Value> = if path.exists() {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -632,6 +678,7 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     let tmp_path = path.with_extension("json.tmp");
     fs::write(&tmp_path, format!("{output}\n"))
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(path, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -642,6 +689,11 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
             )
         });
     }
+    if !existed {
+        // ~/.claude.json routinely carries oauth/account metadata and mcpServers env
+        // blocks; match Claude Code's own default of 0600 for a file we just created.
+        set_mode(path, 0o600);
+    }
     print_created("Added mcpServers.shire to ~/.claude.json");
     Ok(())
 }
@@ -651,6 +703,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, content)
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(path, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -1413,5 +1466,100 @@ mod tests {
         let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
         assert!(content.contains("# No newline\n\n"));
         assert!(content.contains(CLAUDE_MD_LINE));
+    }
+
+    // --- CLI-1: rewriting ~/.claude.json / ~/.claude/settings.json must not drop an
+    // existing permission mode, and a freshly created one should start at 0600 ---
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".claude.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        patch_claude_json(&path, json!(["serve"]), "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_sets_0600_on_a_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".claude.json");
+
+        patch_claude_json(&path, json!(["serve"]), "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_sets_0600_on_a_new_global_file_when_requested() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_claude_hooks(
+            &path,
+            "~/.claude/settings.json",
+            "shire init --global",
+            Some(0o600),
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_does_not_force_a_mode_when_not_requested() {
+        // Project-local .claude/settings.json isn't a $HOME credential file, so its
+        // call site passes new_file_mode: None and a fresh file should be left at
+        // whatever the process umask produced, not forced to 0600.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_claude_hooks(&path, ".claude/settings.json", "shire init", None).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_ne!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_preserves_existing_mode_regardless_of_new_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        patch_claude_hooks(
+            &path,
+            "~/.claude/settings.json",
+            "shire init --global",
+            Some(0o600),
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "an existing mode must be preserved, not overridden by new_file_mode"
+        );
     }
 }

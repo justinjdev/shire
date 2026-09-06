@@ -18,6 +18,33 @@ enum RegStatus {
     Failed(String),
 }
 
+/// Copy `path`'s current permission bits onto `tmp_path`, if `path` exists. Used before
+/// an atomic rename-into-place so rewriting a config file doesn't silently drop its mode
+/// to the process umask (rename() preserves the *source* file's mode, i.e. the temp
+/// file's, not the destination's). A no-op (and not an error) when `path` doesn't exist
+/// yet or its permissions can't be read.
+#[cfg(unix)]
+fn preserve_mode(path: &Path, tmp_path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(tmp_path, meta.permissions());
+    }
+}
+
+#[cfg(not(unix))]
+fn preserve_mode(_path: &Path, _tmp_path: &Path) {}
+
+/// Set `path`'s permission bits to `mode`, best-effort. Used for brand-new files that
+/// carry credentials (e.g. a freshly created ~/.claude.json) so they start at a
+/// restrictive mode instead of whatever the process umask would otherwise leave.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 /// Installs shire MCP entries for supported CLIs and editors.
 ///
 /// Attempts to register the current binary with supported tools (Claude Code, Codex CLI,
@@ -150,7 +177,11 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
             _ => None,
         })
         .collect();
-    if !dry_run && !failures.is_empty() {
+    // A tool with a config format we can't parse (e.g. Zed's JSONC settings.json, which
+    // ships with `//` comments serde_json rejects) shouldn't fail the whole install when
+    // other tools registered successfully — report it as a skipped/failed entry above
+    // and only return an error if nothing at all got registered.
+    if !dry_run && !failures.is_empty() && registered == 0 {
         anyhow::bail!("installation failed for {}", failures.join(", "));
     }
 
@@ -461,6 +492,11 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
 
     match upsert_json_mcp(&claude_json, "mcpServers", "shire", entry, force) {
         Ok(UpsertResult::Created) => {
+            // ~/.claude.json routinely carries oauth/account metadata and
+            // mcpServers env blocks; match Claude Code's own default of 0600
+            // for a file we just created (there was no existing mode to
+            // preserve).
+            set_mode(&claude_json, 0o600);
             println!("  Added mcpServers.shire to ~/.claude.json");
             Registration {
                 tool: "Claude Code",
@@ -483,7 +519,7 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
         }
         Err(e) => Registration {
             tool: "Claude Code",
-            status: RegStatus::Failed(e.to_string()),
+            status: RegStatus::Failed(format!("{e:#}")),
         },
     }
 }
@@ -520,7 +556,7 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         Err(e) => {
             return Registration {
                 tool: "Codex CLI",
-                status: RegStatus::Failed(e.to_string()),
+                status: RegStatus::Failed(format!("{e:#}")),
             };
         }
     };
@@ -568,7 +604,7 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         }
         Err(e) => Registration {
             tool: "Codex CLI",
-            status: RegStatus::Failed(e.to_string()),
+            status: RegStatus::Failed(format!("{e:#}")),
         },
     }
 }
@@ -651,6 +687,7 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
     let tmp_path = config_file.with_extension("toml.tmp");
     fs::write(&tmp_path, &output)
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(config_file, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, config_file) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -725,6 +762,7 @@ fn remove_codex_mcp(dry_run: bool) {
     let output = toml::to_string_pretty(&doc).unwrap_or_default();
     let tmp_path = config_file.with_extension("toml.tmp");
     if fs::write(&tmp_path, &output).is_ok() {
+        preserve_mode(&config_file, &tmp_path);
         if fs::rename(&tmp_path, &config_file).is_ok() {
             println!("  Removed MCP section");
         } else {
@@ -834,10 +872,14 @@ fn register_editor_mcp(
             }
         }
         Err(e) => {
-            println!("  Failed: {}", e);
+            // Print the full anyhow cause chain (e.g. the serde line/column for a
+            // JSONC file like Zed's settings.json, which ships with `//` comments
+            // serde_json rejects) instead of just the outermost "Failed to parse
+            // <path>" context, which gave the user nothing to act on.
+            println!("  Failed: {e:#}");
             Registration {
                 tool: tool_name,
-                status: RegStatus::Failed(e.to_string()),
+                status: RegStatus::Failed(format!("{e:#}")),
             }
         }
     }
@@ -904,6 +946,7 @@ fn remove_editor_mcp(
     if let Ok(out) = serde_json::to_string_pretty(&Value::Object(root)) {
         let tmp_path = config_path.with_extension("json.tmp");
         if fs::write(&tmp_path, format!("{}\n", out)).is_ok() {
+            preserve_mode(config_path, &tmp_path);
             if fs::rename(&tmp_path, config_path).is_ok() {
                 println!("  Removed shire");
             } else {
@@ -1099,6 +1142,7 @@ fn upsert_json_mcp(
     let tmp_path = path.with_extension("json.tmp");
     fs::write(&tmp_path, format!("{}\n", output))
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    preserve_mode(path, &tmp_path);
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -1405,5 +1449,183 @@ mod tests {
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(parsed["mcpServers"]["other"].is_object());
+    }
+
+    // --- CLI-1: rewriting a config file must not drop its permission mode ---
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(&path, json!({"mcpServers": {}}).to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "rewriting must preserve the existing 0600 mode"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_does_not_force_a_mode_on_new_files() {
+        // Only ~/.claude.json gets forced to 0600 on creation (handled by the caller,
+        // register_claude_code_file); the shared upsert helper itself should leave a
+        // brand-new file at whatever the process umask produced.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        // fs::write's default create mode is 0o666 & !umask; assert it's *not* forced to
+        // 0o600, without hardcoding a specific umask-dependent value.
+        assert_ne!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_codex_toml_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn register_claude_code_file_sets_0600_on_a_new_claude_json() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        // SAFETY: single-threaded test process; no other test reads HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        let reg = register_claude_code_file(Path::new("/usr/local/bin/shire"), false, false);
+        assert!(matches!(reg.status, RegStatus::Registered(_)));
+
+        let claude_json = dir.path().join(".claude.json");
+        let mode = fs::metadata(&claude_json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // --- CLI-3: install shouldn't abort entirely just because one tool's config
+    // couldn't be parsed, as long as something else registered ---
+
+    #[test]
+    fn run_install_exit_logic_only_fails_when_nothing_registered() {
+        fn any_registered(statuses: &[RegStatus]) -> bool {
+            statuses.iter().any(|s| {
+                matches!(
+                    s,
+                    RegStatus::Registered(_)
+                        | RegStatus::Updated(_)
+                        | RegStatus::AlreadyRegistered(_)
+                )
+            })
+        }
+
+        let mixed = [
+            RegStatus::Registered("a".into()),
+            RegStatus::Failed("bad JSONC".into()),
+        ];
+        assert!(
+            any_registered(&mixed),
+            "a mix of one success and one failure must count as \"something registered\""
+        );
+
+        let all_failed = [RegStatus::Failed("bad JSONC".into())];
+        assert!(!any_registered(&all_failed));
+    }
+
+    #[test]
+    fn register_editor_mcp_reports_full_cause_chain_on_jsonc_parse_failure() {
+        // A stock Zed settings.json ships with `//` comments, which serde_json rejects.
+        // The failure message must carry the underlying serde error (line/column),
+        // not just the outer "Failed to parse <path>" context, or the user has nothing
+        // to act on.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            "// Zed settings\n{ \"theme\": \"One Dark\" // trailing comment\n}\n",
+        )
+        .unwrap();
+
+        let reg = register_editor_mcp(
+            Path::new("/usr/local/bin/shire"),
+            "Zed",
+            &Some(path.clone()),
+            "context_servers",
+            None,
+            false,
+            false,
+        );
+
+        match reg.status {
+            RegStatus::Failed(msg) => {
+                assert!(
+                    msg.len() > "Failed to parse ...".len() && msg.contains(':'),
+                    "expected the full cause chain (outer context + serde detail), got: {msg}"
+                );
+                assert!(
+                    !msg.to_lowercase().contains("panic"),
+                    "message should be a clean error, not a panic: {msg}"
+                );
+            }
+            other => panic!(
+                "expected RegStatus::Failed for unparseable JSONC, got a different status (tool={}, is_failed={})",
+                reg.tool,
+                matches!(other, RegStatus::Failed(_))
+            ),
+        }
+
+        // The file itself must be untouched — a failed parse must not corrupt it.
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.contains("// Zed settings"));
+    }
+
+    #[test]
+    fn run_install_bail_condition_treats_partial_success_as_ok() {
+        // Mirrors the exact condition in run_install(): only bail when nothing at all
+        // registered, even if some tools failed.
+        let dry_run = false;
+        let failures = ["Zed: Failed to parse ...".to_string()];
+        let registered = 1usize;
+        assert!(!(!dry_run && !failures.is_empty() && registered == 0));
+
+        let registered = 0usize;
+        assert!(!dry_run && !failures.is_empty() && registered == 0);
     }
 }

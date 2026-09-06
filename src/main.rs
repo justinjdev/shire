@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use shire::config;
 use shire::index;
@@ -58,6 +58,9 @@ enum Commands {
         /// Stop the running daemon
         #[arg(long)]
         stop: bool,
+        /// Print whether the daemon is running (pid, socket, liveness) and exit
+        #[arg(long)]
+        status: bool,
         /// Run in foreground (used internally by the daemon)
         #[arg(long, hide = true)]
         foreground: bool,
@@ -190,12 +193,16 @@ async fn main() -> Result<()> {
         Commands::Watch {
             root,
             stop,
+            status,
             foreground,
             db,
             config: cfg_path,
         } => {
             let root = std::fs::canonicalize(&root)?;
-            if stop {
+            if status {
+                watch::daemon::print_status(&root);
+                Ok(())
+            } else if stop {
                 watch::daemon::stop_daemon(&root)
             } else if foreground {
                 let config = config::load_config_from(cfg_path.as_deref(), &root)?;
@@ -230,40 +237,31 @@ async fn main() -> Result<()> {
         } => {
             let root = std::fs::canonicalize(&root)?;
 
-            // Stop the watch daemon if running
+            // Stop the watch daemon if running. stop_daemon() itself waits (up to ~5s)
+            // for the process to actually exit before touching its pid/socket files, so
+            // a single is_running() check afterward is meaningful: if the daemon is
+            // still alive at this point, it truly did not stop cleanly (previously the
+            // pid file was deleted before the process had exited, which made this
+            // check — and the bail below — unreachable, and let `clean` remove `.shire`
+            // out from under a daemon that was still mid-rebuild).
             if watch::daemon::is_running(&root) {
                 eprintln!("Stopping watch daemon...");
                 watch::daemon::stop_daemon(&root)?;
-                // Wait for the daemon to actually exit
-                for _ in 0..50 {
-                    if !watch::daemon::is_running(&root) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
                 if watch::daemon::is_running(&root) {
                     anyhow::bail!("Watch daemon did not stop cleanly");
                 }
             }
 
-            // Resolve and remove the database file
+            // Resolve and remove the database file. db_path comes from a
+            // repo-controlled shire.toml (or a global ~/.claude/shire.toml), so it must
+            // not be deleted unconditionally — see remove_index_db().
             let db_path = if let Some(p) = db {
                 p
             } else {
                 let config = config::load_config_from(cfg_path.as_deref(), &root)?;
                 config::resolve_db_path(&config, &root)?
             };
-            if db_path.exists() {
-                std::fs::remove_file(&db_path)
-                    .with_context(|| format!("Failed to remove database {}", db_path.display()))?;
-                eprintln!("Removed {}", db_path.display());
-            }
-            // Also remove WAL/SHM files that SQLite may leave behind
-            for suffix in &["-wal", "-shm"] {
-                let mut p = db_path.as_os_str().to_owned();
-                p.push(suffix);
-                let _ = std::fs::remove_file(PathBuf::from(p));
-            }
+            remove_index_db(&db_path)?;
 
             // Remove the .shire directory
             let shire_dir = root.join(".shire");
@@ -290,8 +288,16 @@ async fn main() -> Result<()> {
                         } else if let Some(path) = hook.tool_input.notebook_path {
                             file.push(path);
                         }
-                        // Use cwd from hook JSON as root (falls back to --root)
-                        hook.cwd.unwrap_or(root)
+                        let cwd = hook.cwd.unwrap_or(root);
+                        // Claude Code's hook `cwd` is wherever the session was
+                        // launched, which in a monorepo is often a package
+                        // subdirectory rather than the repo root the watch daemon's
+                        // socket lives under. Walk up to find it instead of using
+                        // cwd verbatim, the way git/cargo resolve their root.
+                        match std::fs::canonicalize(&cwd) {
+                            Ok(canon) => config::find_repo_root(&canon),
+                            Err(_) => cwd,
+                        }
                     }
                     None => root,
                 }
@@ -299,7 +305,184 @@ async fn main() -> Result<()> {
                 root
             };
             let root = std::fs::canonicalize(&root)?;
+
+            // A `--file` argument may be relative (to wherever `shire rebuild` was
+            // invoked); resolve it against the repo root rather than letting the
+            // daemon's relevance filter silently treat it as outside the repo.
+            let file: Vec<PathBuf> = file
+                .into_iter()
+                .map(|f| if f.is_relative() { root.join(f) } else { f })
+                .collect();
+
             watch::send_rebuild(&root, file)
         }
+    }
+}
+
+/// SQLite's on-disk file header — the first 16 bytes of every valid SQLite database
+/// file (see the SQLite file format spec).
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Remove the index database file at `db_path` (plus its `-wal`/`-shm` sidecars), but
+/// only after verifying it is really a SQLite database.
+///
+/// `db_path` is resolved from a repo-controlled `shire.toml` (with `~`/`$VAR` shell
+/// expansion and no confinement to the repo root, since the documented global setup
+/// puts real per-worktree databases under `~/.claude/shire/{repo}/{worktree}/`), so a
+/// hostile repo could otherwise point it at an arbitrary file — e.g. `~/.ssh/id_ed25519`
+/// — and have `shire clean` delete it unconditionally. Refuses (without deleting
+/// anything or following a symlink) unless the target's first 16 bytes are the SQLite
+/// magic header, reading that header from the same handle used for the symlink check to
+/// avoid a check-then-delete race.
+///
+/// A missing `db_path` is not an error (nothing to clean up).
+fn remove_index_db(db_path: &Path) -> Result<()> {
+    // Open with O_NOFOLLOW so a symlink at db_path is refused atomically at the syscall
+    // level (ELOOP) instead of via a separate symlink_metadata() check followed by a
+    // plain open() — that two-step form has a TOCTOU window where the path could be
+    // swapped for a symlink between the check and the open. The header is then read
+    // from this same handle, so what we verify is exactly what we're about to delete.
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(db_path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(db_path);
+
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            anyhow::bail!(
+                "Refusing to remove {}: it is a symlink, not a plain database file. \
+                 Remove it by hand if that's intentional.",
+                db_path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", db_path.display())),
+    };
+
+    let is_sqlite = {
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
+    };
+    drop(file);
+
+    if !is_sqlite {
+        anyhow::bail!(
+            "Refusing to remove {}: it does not look like a shire index database \
+             (missing the SQLite file header). Check shire.toml's db_path before \
+             removing this file by hand.",
+            db_path.display()
+        );
+    }
+
+    std::fs::remove_file(db_path)
+        .with_context(|| format!("Failed to remove database {}", db_path.display()))?;
+    eprintln!("Removed {}", db_path.display());
+
+    // Only remove WAL/SHM sidecars once the main file passed the SQLite check.
+    for suffix in &["-wal", "-shm"] {
+        let mut p = db_path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_sqlite_db(path: &Path) {
+        let mut content = SQLITE_HEADER.to_vec();
+        content.extend_from_slice(b"rest of a fake but header-valid sqlite file");
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Build a sidecar path the same way remove_index_db() does: appended directly to
+    /// the full path string, not via Path::with_extension (e.g. "index.db" + "-wal" =>
+    /// "index.db-wal", and "id_rsa" + "-wal" => "id_rsa-wal").
+    fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        PathBuf::from(p)
+    }
+
+    #[test]
+    fn remove_index_db_removes_valid_sqlite_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("index.db");
+        write_sqlite_db(&db);
+        std::fs::write(sidecar(&db, "-wal"), b"wal").unwrap();
+        std::fs::write(sidecar(&db, "-shm"), b"shm").unwrap();
+
+        remove_index_db(&db).unwrap();
+
+        assert!(!db.exists());
+        assert!(!sidecar(&db, "-wal").exists());
+        assert!(!sidecar(&db, "-shm").exists());
+    }
+
+    #[test]
+    fn remove_index_db_refuses_non_sqlite_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("id_rsa");
+        std::fs::write(&victim, "PRIVATE KEY MATERIAL").unwrap();
+
+        let result = remove_index_db(&victim);
+
+        assert!(result.is_err());
+        assert!(victim.exists(), "non-sqlite target must be left untouched");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "PRIVATE KEY MATERIAL"
+        );
+    }
+
+    #[test]
+    fn remove_index_db_refuses_symlink_even_if_target_is_sqlite() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real_db = dir.path().join("real.db");
+        write_sqlite_db(&real_db);
+        let link = dir.path().join("db_via_symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_db, &link).unwrap();
+
+        #[cfg(unix)]
+        {
+            let result = remove_index_db(&link);
+            assert!(result.is_err());
+            assert!(link.exists(), "symlink must not be followed and removed");
+            assert!(real_db.exists(), "symlink target must be untouched");
+        }
+    }
+
+    #[test]
+    fn remove_index_db_missing_file_is_not_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist.db");
+        assert!(remove_index_db(&missing).is_ok());
+    }
+
+    #[test]
+    fn remove_index_db_leaves_sidecars_when_main_file_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("id_rsa");
+        std::fs::write(&victim, "PRIVATE KEY MATERIAL").unwrap();
+        // An attacker-controlled db_path could also have coincidentally-named
+        // "sidecar" files; those must survive a refusal on the main file too.
+        std::fs::write(sidecar(&victim, "-wal"), b"unrelated").unwrap();
+
+        let _ = remove_index_db(&victim);
+
+        assert!(sidecar(&victim, "-wal").exists());
     }
 }

@@ -242,16 +242,25 @@ Add to your `claude_desktop_config.json`:
 
 ### Watch daemon
 
-`shire watch` starts a background daemon that auto-rebuilds the index when files change. It uses Unix domain socket IPC with configurable debounce (default 2s).
+`shire watch` starts a background daemon that rebuilds the index whenever a rebuild
+signal arrives — from the Claude Code `PostToolUse` hook or a manual `shire rebuild`. It
+does not watch the filesystem itself; edits made outside Claude Code are only picked up
+once something signals a rebuild. It uses Unix domain socket IPC with configurable
+debounce (default 2s). See [Watch Daemon](docs/src/watch-daemon.md) for details,
+including the `--status` flag and troubleshooting log locations.
 
 ```sh
 # Start the daemon (idempotent — safe to call multiple times)
 shire watch --root /path/to/repo
 
+# Check whether it's running
+shire watch --root /path/to/repo --status
+
 # Signal a rebuild manually
 shire rebuild --root /path/to/repo
 
-# Signal a rebuild from a Claude Code hook (reads JSON from stdin, uses cwd as repo root)
+# Signal a rebuild from a Claude Code hook (reads JSON from stdin; the repo root is
+# resolved by walking up from cwd to the nearest shire.toml/.shire/.git)
 shire rebuild --stdin
 
 # Stop the daemon

@@ -335,6 +335,31 @@ pub(crate) fn seed_db_path(
 }
 
 #[allow(dead_code)]
+/// Walk up from `start` to the nearest ancestor directory containing `shire.toml`, a
+/// `.shire/` directory, or a `.git` entry — the same "find the repo root" heuristic
+/// tools like git and cargo use. Falls back to `start` itself if no such ancestor is
+/// found (e.g. it isn't inside a repo at all).
+///
+/// Used to resolve the repository root for `shire rebuild --stdin`: the Claude Code
+/// hook's `cwd` is wherever the session happened to be launched, which in a monorepo is
+/// often a package subdirectory rather than the repo root the watch daemon's socket
+/// lives under.
+pub fn find_repo_root(start: &Path) -> PathBuf {
+    let mut dir = start;
+    loop {
+        if dir.join("shire.toml").exists()
+            || dir.join(".shire").exists()
+            || dir.join(".git").exists()
+        {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return start.to_path_buf(),
+        }
+    }
+}
+
 pub fn load_config(repo_root: &Path) -> Result<Config> {
     load_config_from(None, repo_root)
 }
@@ -906,5 +931,59 @@ max_file_size = 524288
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.docs.extensions, vec![".md", ".mdx"]);
         assert_eq!(config.docs.max_file_size, 524_288);
+    }
+
+    #[test]
+    fn find_repo_root_finds_shire_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shire.toml"), "").unwrap();
+        let sub = root.join("pkg/nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(find_repo_root(&sub), root);
+    }
+
+    #[test]
+    fn find_repo_root_finds_dot_shire_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".shire")).unwrap();
+        let sub = root.join("a/b/c");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(find_repo_root(&sub), root);
+    }
+
+    #[test]
+    fn find_repo_root_finds_dot_git() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(find_repo_root(&sub), root);
+    }
+
+    #[test]
+    fn find_repo_root_returns_start_when_nothing_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Use a leaf dir with no shire.toml/.shire/.git anywhere above it within the
+        // tempdir tree (the tempdir itself has none of those markers either).
+        let leaf = dir.path().join("just/a/plain/dir");
+        std::fs::create_dir_all(&leaf).unwrap();
+        assert_eq!(find_repo_root(&leaf), leaf);
+    }
+
+    #[test]
+    fn find_repo_root_prefers_nearest_ancestor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shire.toml"), "").unwrap();
+        let nested_root = root.join("nested-repo");
+        std::fs::create_dir_all(&nested_root).unwrap();
+        std::fs::write(nested_root.join("shire.toml"), "").unwrap();
+        let sub = nested_root.join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Should stop at the nearer nested-repo, not walk all the way up to `root`.
+        assert_eq!(find_repo_root(&sub), nested_root);
     }
 }

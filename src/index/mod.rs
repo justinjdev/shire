@@ -868,11 +868,15 @@ fn governing_gradle_settings_dir<'a>(
 /// packages)` check can match them. Runs over every Gradle dependency row
 /// each build — not just newly parsed ones — so it isn't sensitive to
 /// manifest processing order within a build and self-heals rows written
-/// before this resolution existed.
+/// before this resolution existed. The caller must invoke this
+/// unconditionally (not just when manifests changed) for that self-heal
+/// guarantee to actually hold; returns whether any row was rewritten, so
+/// the caller can decide whether `recompute_is_internal` also needs to
+/// rerun.
 fn resolve_gradle_project_dependencies(
     conn: &Connection,
     gradle_root_names: &HashMap<String, Option<String>>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut path_to_name: HashMap<String, String> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT name, path FROM packages WHERE kind = 'gradle'")?;
@@ -902,10 +906,17 @@ fn resolve_gradle_project_dependencies(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    // `OR REPLACE`: `dependencies` is keyed on (package, dependency,
+    // dep_kind), and a build file may name the same module both ways —
+    // `implementation project(':core')` alongside a coordinate that resolves
+    // to the same package name. Rewriting the project ref would then collide
+    // with the existing row and abort the whole build; replacing collapses
+    // the duplicate edge instead, which is what the rows mean anyway.
     let mut update_stmt = conn.prepare(
-        "UPDATE dependencies SET dependency = ?1 WHERE package = ?2 AND dependency = ?3",
+        "UPDATE OR REPLACE dependencies SET dependency = ?1 WHERE package = ?2 AND dependency = ?3",
     )?;
 
+    let mut any_updated = false;
     for (owner_name, owner_path, raw_dep) in &raw_refs {
         let settings_dir = governing_gradle_settings_dir(gradle_root_names, owner_path);
         let project_dir = raw_dep.trim_start_matches(':').replace(':', "/");
@@ -918,10 +929,11 @@ fn resolve_gradle_project_dependencies(
             && resolved_name != raw_dep
         {
             update_stmt.execute((resolved_name, owner_name, raw_dep))?;
+            any_updated = true;
         }
     }
 
-    Ok(())
+    Ok(any_updated)
 }
 
 /// Phase 3: Parse new and changed manifests into packages.
@@ -2737,8 +2749,13 @@ fn build_index_inner(
     let sp = make_spinner(&mp, "Recomputing internals…");
     let t = Instant::now();
     with_transaction(&conn, || {
-        if num_added > 0 || num_changed > 0 || num_removed > 0 {
+        // Always run, not just when manifests changed this build: this is
+        // what lets it self-heal Gradle project() dependency rows written
+        // by a shire version predating this resolution, even on a build
+        // where nothing else changed (see resolve_gradle_project_dependencies).
+        let gradle_deps_resolved =
             resolve_gradle_project_dependencies(&conn, &ws_ctx.gradle_settings.1)?;
+        if num_added > 0 || num_changed > 0 || num_removed > 0 || gradle_deps_resolved {
             recompute_is_internal(&conn)?;
         }
         Ok(())
@@ -4358,6 +4375,54 @@ anyhow = "1"
             .unwrap();
         assert_eq!(dependency, "com.example:utils");
         assert_eq!(is_internal, 1);
+    }
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_survives_duplicate_edge() {
+        // `implementation project(':core')` plus a coordinate that resolves
+        // to the same package name would make the rewrite collide with the
+        // existing (package, dependency, dep_kind) row. The build must not
+        // fail; the duplicate edge collapses into one row.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'app', 'gradle'),
+                ('com.example:core', 'core', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':core', 'runtime', 0),
+                    ('com.example:app', 'com.example:core', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        gradle_root_names.insert("".to_string(), None);
+
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names)
+            .expect("a duplicate edge must not abort the build");
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let dependency: String = conn
+            .query_row(
+                "SELECT dependency FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, "com.example:core");
     }
 
     #[test]

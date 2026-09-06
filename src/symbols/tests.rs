@@ -2208,6 +2208,45 @@ fn test_zig_skip_non_pub() {
     assert!(symbols.is_empty());
 }
 
+// ============================================================
+// Lua tests (SYM-12: previously untested — see registry.rs)
+// ============================================================
+
+#[test]
+fn test_lua_function_declaration() {
+    let source = "function greet(name)\n  return name\nend\n";
+    let (symbols, _) = extract_file("lua", source, Arc::from("greet.lua"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "greet");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+}
+
+#[test]
+fn test_lua_method_declaration() {
+    let source = "function M:process(item)\n  return item\nend\n";
+    let (symbols, _) = extract_file("lua", source, Arc::from("m.lua"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "process");
+    assert_eq!(symbols[0].kind, SymbolKind::Method);
+}
+
+// ============================================================
+// TSX tests (SYM-12: `tsx` compiles LANGUAGE_TSX, a distinct grammar
+// compilation from `LANGUAGE_TYPESCRIPT` — previously untested)
+// ============================================================
+
+#[test]
+fn test_tsx_exported_function() {
+    let source = r#"export function Greeting(name: string) {
+    return name;
+}
+"#;
+    let (symbols, _) = extract_file("tsx", source, Arc::from("Greeting.tsx"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Greeting");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+}
+
 #[test]
 fn test_zig_const() {
     let source = r#"pub const MAX_SIZE: usize = 1024;

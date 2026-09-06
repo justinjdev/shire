@@ -244,7 +244,7 @@ fn run_build_benchmark(repos: &[PathBuf]) {
         let mut durations_ms: Vec<f64> = Vec::with_capacity(TOTAL_ITERATIONS);
 
         for i in 0..TOTAL_ITERATIONS {
-            let _ = std::fs::remove_file(&db_path);
+            cleanup_bench_db(&db_path);
 
             eprintln!(
                 "[build] iteration {}/{} {}...",
@@ -337,7 +337,7 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
         eprintln!("\n=== {} ({}) — incremental ===", repo_name, size);
 
         // Initial full build (creates the DB from scratch)
-        let _ = std::fs::remove_file(&db_path);
+        cleanup_bench_db(&db_path);
         eprintln!("[incremental] initial full build...");
         let start = Instant::now();
         if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
@@ -662,11 +662,14 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         }
 
         // Phase 1: Fresh full build
-        let _ = fs::remove_file(&db_path);
+        cleanup_bench_db(&db_path);
         eprintln!("[lifecycle] initial full build...");
         let start = Instant::now();
         if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
             eprintln!("error: initial build failed: {}", e);
+            // Nothing has been written to the repo's source files yet, but the
+            // failed build may have left a partial DB behind.
+            cleanup_bench_db(&db_path);
             std::process::exit(1);
         }
         let initial_build_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -880,8 +883,6 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
 /// Verify result quality: symbol counts, search correctness, FTS integrity,
 /// deterministic builds, and no data loss from generated file skipping.
 fn run_quality_checks(repos: &[PathBuf]) {
-    use std::fs;
-
     let mut all_results = Vec::new();
     let mut total_pass = 0usize;
     let mut total_fail = 0usize;
@@ -904,7 +905,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
         }
 
         // Build fresh index
-        let _ = fs::remove_file(&db_path);
+        cleanup_bench_db(&db_path);
         if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
             eprintln!("FAIL: initial build failed: {}", e);
             total_fail += 1;
@@ -1170,7 +1171,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
 
         // 12. Deterministic: build twice, same symbol count
         drop(conn);
-        let _ = fs::remove_file(&db_path);
+        cleanup_bench_db(&db_path);
         let _ = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path));
         let conn2 = shire::db::open_readonly(&db_path).expect("failed to open DB");
         let sym_count_2: i64 = conn2
@@ -1419,12 +1420,18 @@ mod tests {
     }
 
     /// Fail closed: an unknown worktree state must skip the repo, not mutate it.
+    ///
+    /// The probe points at a path that does not exist, so `git status` cannot
+    /// even be spawned. A bare temp dir would not do: when `TMPDIR` happens to
+    /// live inside a git worktree, `git status` succeeds against the enclosing
+    /// repository and the guard would (correctly) report a state.
     #[test]
-    fn test_guard_fails_closed_outside_a_git_repo() {
+    fn test_guard_fails_closed_on_undeterminable_state() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(worktree_is_clean(dir.path()).is_err());
+        let missing = dir.path().join("not-a-directory");
+        assert!(worktree_is_clean(&missing).is_err());
         assert!(
-            !guard_clean_worktree(dir.path(), "test"),
+            !guard_clean_worktree(&missing, "test"),
             "an undeterminable worktree state must be treated as dirty"
         );
     }

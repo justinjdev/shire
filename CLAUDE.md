@@ -28,7 +28,10 @@ The integration test (`tests/integration.rs`) runs the `shire` binary cargo buil
 the test run (via `CARGO_BIN_EXE_shire`) against fixture monorepos it creates in a temp
 directory.
 
-Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to verify before committing.
+Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to
+verify before committing — and `cargo test --all-features` when you touch
+`src/bin/autoresearch.rs`, whose tests live in a `bench`-gated bin target that `--lib` does
+not build.
 
 ## Architecture
 

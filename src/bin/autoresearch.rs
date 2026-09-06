@@ -97,14 +97,23 @@ fn repo_display_name(repo_dir: &Path) -> &str {
         .unwrap_or("unknown")
 }
 
-/// Whether `git status --porcelain` reports an empty worktree.
+/// Whether the worktree is free of uncommitted changes to *tracked* files.
+///
+/// Untracked paths are deliberately ignored (`--untracked-files=no`). The
+/// benchmark drops its own artifacts into the target repo (`.shire/bench.db`
+/// from the build/incremental/query phases, `.shire-bench-tmp-*.go` during
+/// lifecycle) and `scripts/setup-bench-repo.sh` writes an untracked
+/// `shire.toml` into every bench repo — counting those as "dirty" would make
+/// the mutating phases skip every repo they are meant to run against.
+/// Tracked modifications are the only thing the benchmark can destroy, and
+/// they are what this guard protects.
 ///
 /// Returns `Err` when the status cannot be determined at all (git missing, not
 /// a repository, git exiting non-zero) so callers can fail closed instead of
 /// treating "unknown" as "clean".
 fn worktree_is_clean(repo_dir: &Path) -> Result<bool, String> {
     let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("could not run `git status` in {}: {e}", repo_dir.display()))?;
@@ -140,25 +149,42 @@ fn guard_clean_worktree(repo_dir: &Path, phase: &str) -> bool {
     }
 }
 
-/// Append `line` to `path`, remembering the file's original contents the first
+/// Append `line` to `path`, remembering the file's original bytes the first
 /// time it is touched so the benchmark can restore exactly what it wrote —
 /// never `git checkout .`, which would also discard the user's own edits.
-fn append_bench_line(path: &Path, line: &str, originals: &mut HashMap<PathBuf, String>) {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+///
+/// Reads and writes raw bytes so a source file that is not valid UTF-8 still
+/// round-trips unchanged, and leaves an unreadable file completely alone:
+/// writing a file whose original contents we failed to capture would destroy
+/// it, because "restore" would then write back an empty file.
+fn append_bench_line(path: &Path, line: &str, originals: &mut HashMap<PathBuf, Vec<u8>>) {
+    let content = match std::fs::read(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "warning: not modifying {} — could not read its original contents: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
     originals
         .entry(path.to_path_buf())
         .or_insert_with(|| content.clone());
-    let _ = std::fs::write(path, format!("{content}{line}"));
+    let mut next = content;
+    next.extend_from_slice(line.as_bytes());
+    let _ = std::fs::write(path, next);
 }
 
 /// Restore the files this run modified from the contents captured before the
 /// first write. Only files the benchmark itself touched are rewritten.
-fn restore_originals(originals: &HashMap<PathBuf, String>) {
+fn restore_originals(originals: &HashMap<PathBuf, Vec<u8>>) {
     for (path, original) in originals {
         if let Err(e) = std::fs::write(path, original) {
+            let display = path.display();
             eprintln!(
-                "warning: failed to restore {} — original contents are in the benchmark log: {e}",
-                path.display()
+                "warning: failed to restore {display} — recover it with \
+                 `git checkout -- {display}`: {e}"
             );
         }
     }
@@ -640,7 +666,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         let mut modifications: Vec<(String, String)> = Vec::new(); // (path, action)
         // Original contents of every file this run rewrites, captured before
         // the first write so the repo can be restored without `git checkout .`.
-        let mut originals: HashMap<PathBuf, String> = HashMap::new();
+        let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
 
         for cycle in 0..CYCLES {
             // Pick a source file to modify (round-robin)
@@ -1141,7 +1167,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
             .map(|e| e.into_path());
 
         if let Some(test_file) = test_file {
-            let mut originals: HashMap<PathBuf, String> = HashMap::new();
+            let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
             append_bench_line(&test_file, "\n// quality check\n", &mut originals);
             let incr_ok =
                 shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
@@ -1323,11 +1349,30 @@ mod tests {
         );
     }
 
+    /// Untracked files must not block a mutating phase. Every bench repo has
+    /// an untracked `shire.toml` (written by scripts/setup-bench-repo.sh) and
+    /// an untracked `.shire/bench.db` left by the build/incremental/query
+    /// phases; treating those as "dirty" would make lifecycle and quality skip
+    /// every repo. The benchmark never destroys untracked files — it restores
+    /// from bytes it captured itself.
     #[test]
-    fn test_worktree_is_dirty_with_untracked_file() {
+    fn test_untracked_files_do_not_block_the_guard() {
         let dir = tempfile::TempDir::new().unwrap();
         init_repo(dir.path());
-        std::fs::write(dir.path().join("scratch.go"), "package main\n").unwrap();
+        std::fs::write(dir.path().join("shire.toml"), "db_path = \".shire/x.db\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".shire")).unwrap();
+        std::fs::write(dir.path().join(".shire/bench.db"), "x").unwrap();
+        assert_eq!(worktree_is_clean(dir.path()), Ok(true));
+        assert!(guard_clean_worktree(dir.path(), "test"));
+    }
+
+    /// A staged-but-uncommitted change is still uncommitted work.
+    #[test]
+    fn test_worktree_is_dirty_with_staged_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("main.go"), "package main\n// staged\n").unwrap();
+        git(dir.path(), &["add", "main.go"]);
         assert_eq!(worktree_is_clean(dir.path()), Ok(false));
     }
 
@@ -1350,7 +1395,7 @@ mod tests {
         std::fs::write(&touched, "package a\n").unwrap();
         std::fs::write(&untouched, "package b\n").unwrap();
 
-        let mut originals: HashMap<PathBuf, String> = HashMap::new();
+        let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
         append_bench_line(&touched, "\n// cycle 0\n", &mut originals);
         append_bench_line(&touched, "\n// cycle 1\n", &mut originals);
         assert!(
@@ -1369,6 +1414,45 @@ mod tests {
             "package b\n// user edit\n",
             "restore must not revert files the benchmark never wrote"
         );
+    }
+
+    /// A source file that is not valid UTF-8 must round-trip byte-for-byte.
+    /// Reading it as a `String` would yield "" and the restore would then
+    /// permanently truncate the file.
+    #[test]
+    fn test_append_and_restore_preserves_non_utf8_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("latin1.go");
+        let original: Vec<u8> = b"package a // caf\xe9\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        append_bench_line(&path, "\n// cycle 0\n", &mut originals);
+        let after_write = std::fs::read(&path).unwrap();
+        assert!(
+            after_write.starts_with(&original),
+            "the append must not drop the file's existing bytes"
+        );
+
+        restore_originals(&originals);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    /// A file that cannot be read must be left untouched — writing it would
+    /// destroy content the restore cannot reproduce.
+    #[test]
+    fn test_append_skips_unreadable_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist.go");
+
+        let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        append_bench_line(&missing, "\n// cycle 0\n", &mut originals);
+
+        assert!(
+            originals.is_empty(),
+            "nothing was captured, so nothing was written"
+        );
+        assert!(!missing.exists(), "an unreadable file must not be created");
     }
 
     #[test]

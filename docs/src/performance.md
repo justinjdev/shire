@@ -47,8 +47,12 @@ development tool, not part of the shipped CLI: it lives behind the non-default
 `bench` cargo feature, so every invocation needs `--features bench`.
 
 The `lifecycle` and `quality` phases rewrite source files in the target repo.
-They refuse to run against a repo whose worktree is not verifiably clean
-(`git status --porcelain` empty), and restore only the files they wrote.
+They refuse to run against a repo with uncommitted changes to tracked files
+(`git status --porcelain --untracked-files=no` must be empty, and an
+indeterminable state — no git, not a repo — is treated as dirty). Untracked
+paths are ignored, since the benchmark and `setup-bench-repo.sh` leave their
+own artifacts (`shire.toml`, `.shire/bench.db`) in the repo. Each phase
+restores exactly the bytes it captured before its first write.
 
 ### Setup
 

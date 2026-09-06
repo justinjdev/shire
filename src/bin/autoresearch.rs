@@ -375,19 +375,19 @@ fn run_query_benchmark(repos: &[PathBuf]) {
             QueryBench {
                 name: "search_files(\"mod\")".into(),
                 run: Box::new(|c| {
-                    let _ = shire::db::queries::search_files(c, "mod", None, None);
+                    let _ = shire::db::queries::search_files(c, "mod", None, None, 20);
                 }),
             },
             QueryBench {
                 name: "search_files(\"test\")".into(),
                 run: Box::new(|c| {
-                    let _ = shire::db::queries::search_files(c, "test", None, None);
+                    let _ = shire::db::queries::search_files(c, "test", None, None, 20);
                 }),
             },
             QueryBench {
                 name: "list_packages(None)".into(),
                 run: Box::new(|c| {
-                    let _ = shire::db::queries::list_packages(c, None);
+                    let _ = shire::db::queries::list_packages(c, None, 100);
                 }),
             },
         ];
@@ -632,7 +632,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             let conn = shire::db::open_readonly(&db_path).expect("failed to open DB readonly");
             let start = Instant::now();
             let _ = shire::db::queries::search_symbols(&conn, "Config", None, None, 50);
-            let _ = shire::db::queries::search_files(&conn, "test", None, None);
+            let _ = shire::db::queries::search_files(&conn, "test", None, None, 20);
             let _ = shire::db::queries::search_packages(&conn, "api", 20);
             // Only benchmark ref-queries when the index actually has refs —
             // otherwise we're just measuring an empty-table lookup, which
@@ -910,7 +910,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
             format!("{} results for 'new'", fts_sym_results),
         ));
 
-        let fts_file_results = shire::db::queries::search_files(&conn, "src", None, None)
+        let fts_file_results = shire::db::queries::search_files(&conn, "src", None, None, 20)
             .map(|r| r.len())
             .unwrap_or(0);
         checks.push((
@@ -965,7 +965,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
 
         // 9. File search relevance: results should contain the query in path
         let file_results =
-            shire::db::queries::search_files(&conn, "config", None, None).unwrap_or_default();
+            shire::db::queries::search_files(&conn, "config", None, None, 20).unwrap_or_default();
         let files_relevant = file_results
             .iter()
             .filter(|f| f.path.to_lowercase().contains("config"))

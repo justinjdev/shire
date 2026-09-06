@@ -55,6 +55,85 @@ pub struct SymbolRow {
     pub parameters: Option<String>,
 }
 
+/// Hard ceiling on rows returned by any single query in this module. Tool
+/// responses go straight into an LLM context window, so a caller cannot ask
+/// for an unbounded list.
+pub const MAX_ROWS: u32 = 200;
+
+/// Default row count for the "list everything" queries (files in a package,
+/// symbols in a file, packages, dependencies) when the caller does not ask
+/// for a specific limit.
+pub const DEFAULT_LIST_LIMIT: u32 = 100;
+
+/// Minimum length of the trailing term of a token before a `*` (FTS5
+/// phrase-prefix) is appended. The FTS tables carry `prefix='2,3'`, so 2- and
+/// 3-character prefixes resolve through the prefix index; a 1-character
+/// prefix has no index to use and would scan the whole term list, so
+/// single-character tokens are matched exactly instead.
+const MIN_PREFIX_CHARS: usize = 2;
+
+/// Clamp a caller-supplied limit into `1..=MAX_ROWS` for use in SQL.
+fn clamp_limit(limit: u32) -> i64 {
+    i64::from(limit.clamp(1, MAX_ROWS))
+}
+
+/// Build an FTS5 MATCH expression from a raw user query.
+///
+/// Each whitespace-separated token becomes its own quoted phrase, implicitly
+/// ANDed with the others, with a trailing `*` so it matches by prefix:
+/// `verify jwt` becomes `"verify"* "jwt"*`, which matches `verifyJwtToken`
+/// via the `name_tokens` sub-token column. Previously the whole query was one
+/// quoted phrase, so only an exact whole-token match ever hit.
+///
+/// The quoting is what keeps this injection-safe: inside a phrase FTS5 treats
+/// every character as text (a `"` is escaped by doubling it), so `OR`, `NEAR`,
+/// `*`, `(`, `-`, `^` and `column:` filters arriving in user input are inert.
+/// The trailing `*` is the only operator this function ever emits.
+///
+/// Returns `None` when the query has no searchable token, in which case
+/// callers return an empty result rather than issuing a MATCH.
+fn fts_match_expr(query: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for raw in query.split_whitespace() {
+        // Tokens the tokenizer would reduce to nothing (`*`, `()`, `--`)
+        // become empty phrases that match nothing; drop them so the rest of
+        // the query still searches.
+        if !raw.chars().any(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let mut part = String::with_capacity(raw.len() + 3);
+        part.push('"');
+        for c in raw.chars() {
+            // FTS5 parses the MATCH expression as a C string, so an embedded
+            // NUL (or any other control character) would truncate it
+            // mid-phrase and raise "unterminated string". Drop them.
+            if c.is_control() {
+                continue;
+            }
+            if c == '"' {
+                part.push('"');
+            }
+            part.push(c);
+        }
+        part.push('"');
+        // `*` applies to the *last* term of the phrase, so only append it
+        // when that term is long enough to use the prefix index.
+        let tail = raw
+            .chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if tail >= MIN_PREFIX_CHARS {
+            part.push('*');
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(" "))
+}
+
 /// FTS5 search across symbol names and signatures.
 pub fn search_symbols(
     conn: &Connection,
@@ -66,8 +145,11 @@ pub fn search_symbols(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
-    let limit = limit.min(200) as i64;
+    let sanitized = match fts_match_expr(query) {
+        Some(expr) => expr,
+        None => return Ok(Vec::new()),
+    };
+    let limit = clamp_limit(limit);
 
     // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
     // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
@@ -157,28 +239,42 @@ pub fn search_symbols(
     Ok(result)
 }
 
-/// List all symbols in a package, optionally filtered by kind.
+/// List symbols in a package, optionally filtered by kind, ordered by
+/// `(file_path, line)` and capped at `limit` (clamped to `1..=MAX_ROWS`).
+/// The cap is enforced in SQL: this is the query behind `search_symbols`
+/// with no `query`, whose output goes straight into an LLM context window.
 pub fn get_package_symbols(
     conn: &Connection,
     package: &str,
     kind_filter: Option<&str>,
+    limit: u32,
 ) -> Result<Vec<SymbolRow>> {
+    let limit = clamp_limit(limit);
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind_filter {
         Some(kind) => (
             "SELECT name, kind, signature, package, file_path, line,
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE package = ?1 AND kind = ?2
-             ORDER BY file_path, line",
-            vec![Box::new(package.to_string()), Box::new(kind.to_string())],
+             ORDER BY file_path, line
+             LIMIT ?3",
+            vec![
+                Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(kind.to_string()),
+                Box::new(limit),
+            ],
         ),
         None => (
             "SELECT name, kind, signature, package, file_path, line,
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE package = ?1
-             ORDER BY file_path, line",
-            vec![Box::new(package.to_string())],
+             ORDER BY file_path, line
+             LIMIT ?2",
+            vec![
+                Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
         ),
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -203,28 +299,40 @@ pub fn get_package_symbols(
     Ok(result)
 }
 
-/// List all symbols defined in a specific file, optionally filtered by kind.
+/// List symbols defined in a specific file, optionally filtered by kind,
+/// ordered by line and capped at `limit` (clamped to `1..=MAX_ROWS`).
 pub fn get_file_symbols(
     conn: &Connection,
     file_path: &str,
     kind_filter: Option<&str>,
+    limit: u32,
 ) -> Result<Vec<SymbolRow>> {
+    let limit = clamp_limit(limit);
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind_filter {
         Some(kind) => (
             "SELECT name, kind, signature, package, file_path, line,
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE file_path = ?1 AND kind = ?2
-             ORDER BY line",
-            vec![Box::new(file_path.to_string()), Box::new(kind.to_string())],
+             ORDER BY line
+             LIMIT ?3",
+            vec![
+                Box::new(file_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(kind.to_string()),
+                Box::new(limit),
+            ],
         ),
         None => (
             "SELECT name, kind, signature, package, file_path, line,
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE file_path = ?1
-             ORDER BY line",
-            vec![Box::new(file_path.to_string())],
+             ORDER BY line
+             LIMIT ?2",
+            vec![
+                Box::new(file_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
         ),
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -347,19 +455,22 @@ pub struct FileRow {
     pub size_bytes: i64,
 }
 
-/// FTS5 search across file paths. Returns up to 20 results.
+/// FTS5 search across file paths.
 pub fn search_files(
     conn: &Connection,
     query: &str,
     package_filter: Option<&str>,
     extension_filter: Option<&str>,
+    limit: u32,
 ) -> Result<Vec<FileRow>> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
-
-    let limit = 20i64;
+    let sanitized = match fts_match_expr(query) {
+        Some(expr) => expr,
+        None => return Ok(Vec::new()),
+    };
+    let limit = clamp_limit(limit);
 
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
         match (package_filter, extension_filter) {
@@ -433,26 +544,38 @@ pub fn search_files(
     Ok(result)
 }
 
-/// List all files belonging to a package, optionally filtered by extension. Ordered by path.
+/// List files belonging to a package, optionally filtered by extension,
+/// ordered by path and capped at `limit` (clamped to `1..=MAX_ROWS`).
 pub fn list_package_files(
     conn: &Connection,
     package: &str,
     extension_filter: Option<&str>,
+    limit: u32,
 ) -> Result<Vec<FileRow>> {
+    let limit = clamp_limit(limit);
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match extension_filter {
         Some(ext) => (
             "SELECT path, package, extension, size_bytes
              FROM files
              WHERE package = ?1 AND extension = ?2
-             ORDER BY path",
-            vec![Box::new(package.to_string()), Box::new(ext.to_string())],
+             ORDER BY path
+             LIMIT ?3",
+            vec![
+                Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(ext.to_string()),
+                Box::new(limit),
+            ],
         ),
         None => (
             "SELECT path, package, extension, size_bytes
              FROM files
              WHERE package = ?1
-             ORDER BY path",
-            vec![Box::new(package.to_string())],
+             ORDER BY path
+             LIMIT ?2",
+            vec![
+                Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
         ),
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -476,9 +599,11 @@ pub fn search_packages(conn: &Connection, query: &str, limit: u32) -> Result<Vec
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    // Sanitize for FTS5: wrap in double quotes, escape internal quotes
-    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
-    let limit = limit.min(200) as i64;
+    let sanitized = match fts_match_expr(query) {
+        Some(expr) => expr,
+        None => return Ok(Vec::new()),
+    };
+    let limit = clamp_limit(limit);
     let mut stmt = conn.prepare_cached(
         "SELECT p.name, p.path, p.kind, p.version, p.description, p.metadata
          FROM packages_fts f
@@ -534,18 +659,22 @@ pub fn package_dependencies(
     conn: &Connection,
     name: &str,
     internal_only: bool,
+    limit: u32,
 ) -> Result<Vec<DependencyRow>> {
+    let limit = clamp_limit(limit);
     let sql = if internal_only {
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
-         WHERE package = ?1 AND is_internal = 1"
+         WHERE package = ?1 AND is_internal = 1
+         LIMIT ?2"
     } else {
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
-         WHERE package = ?1"
+         WHERE package = ?1
+         LIMIT ?2"
     };
     let mut stmt = conn.prepare_cached(sql)?;
-    let rows = stmt.query_map([name], |row| {
+    let rows = stmt.query_map(rusqlite::params![name, limit], |row| {
         Ok(DependencyRow {
             package: row.get(0)?,
             dependency: row.get(1)?,
@@ -562,13 +691,15 @@ pub fn package_dependencies(
 }
 
 /// Reverse dependency lookup: find all packages that depend on `name`.
-pub fn package_dependents(conn: &Connection, name: &str) -> Result<Vec<DependencyRow>> {
+pub fn package_dependents(conn: &Connection, name: &str, limit: u32) -> Result<Vec<DependencyRow>> {
+    let limit = clamp_limit(limit);
     let mut stmt = conn.prepare_cached(
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
-         WHERE dependency = ?1",
+         WHERE dependency = ?1
+         LIMIT ?2",
     )?;
-    let rows = stmt.query_map([name], |row| {
+    let rows = stmt.query_map(rusqlite::params![name, limit], |row| {
         Ok(DependencyRow {
             package: row.get(0)?,
             dependency: row.get(1)?,
@@ -636,21 +767,28 @@ pub fn dependency_graph(
     Ok(edges)
 }
 
-/// List all packages, optionally filtered by kind (e.g. "npm", "go").
-pub fn list_packages(conn: &Connection, kind: Option<&str>) -> Result<Vec<PackageRow>> {
+/// List packages, optionally filtered by kind (e.g. "npm", "go"), ordered by
+/// name and capped at `limit` (clamped to `1..=MAX_ROWS`).
+pub fn list_packages(conn: &Connection, kind: Option<&str>, limit: u32) -> Result<Vec<PackageRow>> {
+    let limit = clamp_limit(limit);
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match kind {
         Some(k) => (
             "SELECT name, path, kind, version, description, metadata
              FROM packages
              WHERE kind = ?1
-             ORDER BY name",
-            vec![Box::new(k.to_string())],
+             ORDER BY name
+             LIMIT ?2",
+            vec![
+                Box::new(k.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                Box::new(limit),
+            ],
         ),
         None => (
             "SELECT name, path, kind, version, description, metadata
              FROM packages
-             ORDER BY name",
-            vec![],
+             ORDER BY name
+             LIMIT ?1",
+            vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
         ),
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -762,8 +900,11 @@ pub fn search_docs(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let sanitized = format!("\"{}\"", query.replace('"', "\"\""));
-    let limit = limit.min(200) as i64;
+    let sanitized = match fts_match_expr(query) {
+        Some(expr) => expr,
+        None => return Ok(Vec::new()),
+    };
+    let limit = clamp_limit(limit);
 
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match package_filter {
         Some(pkg) => (
@@ -1556,7 +1697,7 @@ mod tests {
     #[test]
     fn test_package_dependencies_all() {
         let conn = test_db();
-        let deps = package_dependencies(&conn, "auth-service", false).unwrap();
+        let deps = package_dependencies(&conn, "auth-service", false, 100).unwrap();
         assert_eq!(deps.len(), 2);
         let dep_names: Vec<&str> = deps.iter().map(|d| d.dependency.as_str()).collect();
         assert!(dep_names.contains(&"shared-types"));
@@ -1566,7 +1707,7 @@ mod tests {
     #[test]
     fn test_package_dependencies_internal_only() {
         let conn = test_db();
-        let deps = package_dependencies(&conn, "auth-service", true).unwrap();
+        let deps = package_dependencies(&conn, "auth-service", true, 100).unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].dependency, "shared-types");
         assert!(deps[0].is_internal);
@@ -1575,7 +1716,7 @@ mod tests {
     #[test]
     fn test_package_dependents() {
         let conn = test_db();
-        let dependents = package_dependents(&conn, "auth-service").unwrap();
+        let dependents = package_dependents(&conn, "auth-service", 100).unwrap();
         assert_eq!(dependents.len(), 1);
         assert_eq!(dependents[0].package, "api-gateway");
     }
@@ -1615,7 +1756,7 @@ mod tests {
     #[test]
     fn test_list_packages_all() {
         let conn = test_db();
-        let pkgs = list_packages(&conn, None).unwrap();
+        let pkgs = list_packages(&conn, None, 100).unwrap();
         assert_eq!(pkgs.len(), 3);
         // Ordered by name
         assert_eq!(pkgs[0].name, "api-gateway");
@@ -1626,9 +1767,9 @@ mod tests {
     #[test]
     fn test_list_packages_by_kind() {
         let conn = test_db();
-        let npm = list_packages(&conn, Some("npm")).unwrap();
+        let npm = list_packages(&conn, Some("npm"), 100).unwrap();
         assert_eq!(npm.len(), 2);
-        let go = list_packages(&conn, Some("go")).unwrap();
+        let go = list_packages(&conn, Some("go"), 100).unwrap();
         assert_eq!(go.len(), 1);
         assert_eq!(go[0].name, "api-gateway");
     }
@@ -1701,6 +1842,328 @@ mod tests {
                 None::<String>,
             ),
         ).unwrap();
+    }
+
+    /// Seed a package with realistic camelCase / snake_case identifiers and
+    /// the `name_tokens` sub-token column populated the way a build does.
+    fn test_db_with_identifiers() -> Connection {
+        let conn = test_db();
+        let rows = [
+            (
+                "verifyJwtToken",
+                "function",
+                "services/auth/src/middleware.ts",
+            ),
+            ("AuthMiddleware", "class", "services/auth/src/middleware.ts"),
+            (
+                "check_rate_limit",
+                "function",
+                "services/auth/src/rate_limit.ts",
+            ),
+            ("handleRequest", "function", "services/auth/src/handlers.ts"),
+            ("handle", "method", "services/auth/src/handlers.ts"),
+            ("parseConfig", "function", "services/auth/src/config.ts"),
+            ("makeToken", "function", "services/auth/src/token-store.ts"),
+        ];
+        for (i, (name, kind, file)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, signature, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    name,
+                    kind,
+                    format!("export function {name}()"),
+                    file,
+                    i as i64 + 1,
+                    crate::db::split_identifier(name),
+                ],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    // ── MCP-12 / DB-9: prefix matching ──────────────────────────────────
+
+    #[test]
+    fn test_search_symbols_matches_by_prefix() {
+        let conn = test_db_with_identifiers();
+        let names = |rows: Vec<SymbolRow>| {
+            let mut n: Vec<String> = rows.into_iter().map(|r| r.name).collect();
+            n.sort();
+            n
+        };
+        // `handle` used to match only the method literally named `handle`.
+        let hits = names(search_symbols(&conn, "handle", None, None, 20).unwrap());
+        assert!(hits.contains(&"handleRequest".to_string()), "got {hits:?}");
+        assert!(hits.contains(&"handle".to_string()), "got {hits:?}");
+        // Prefix of a camelCase identifier.
+        let hits = names(search_symbols(&conn, "parse", None, None, 20).unwrap());
+        assert_eq!(hits, vec!["parseConfig"]);
+    }
+
+    #[test]
+    fn test_search_symbols_single_char_query_is_not_a_prefix_query() {
+        // A 1-character prefix has no prefix index to use (`prefix='2,3'`),
+        // so it is matched as an exact token instead of scanning every term.
+        assert_eq!(fts_match_expr("h").as_deref(), Some("\"h\""));
+        assert_eq!(fts_match_expr("ha").as_deref(), Some("\"ha\"*"));
+        let conn = test_db_with_identifiers();
+        assert!(
+            search_symbols(&conn, "h", None, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ── RAG-V1: identifier sub-tokens ───────────────────────────────────
+
+    #[test]
+    fn test_search_symbols_matches_identifier_sub_tokens() {
+        let conn = test_db_with_identifiers();
+        let names = |q: &str| -> Vec<String> {
+            search_symbols(&conn, q, None, None, 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // Interior word of a camelCase name.
+        assert_eq!(names("jwt"), vec!["verifyJwtToken"]);
+        // Multi-token query: every token must match (implicit AND).
+        assert_eq!(names("verify jwt"), vec!["verifyJwtToken"]);
+        // snake_case interior word.
+        assert_eq!(names("rate"), vec!["check_rate_limit"]);
+        // A token that matches nothing rules the whole query out.
+        assert!(names("verify nonexistenttoken").is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_hyphenated_path_token() {
+        // DB-4: with a single tokenizer ('_-') the whole `token-store` is one
+        // term; the prefix query is what makes `token` reach it.
+        let conn = test_db_with_identifiers();
+        let hits = search_symbols(&conn, "token", None, None, 20).unwrap();
+        assert!(
+            hits.iter().any(|r| r.name == "makeToken"),
+            "got {:?}",
+            hits.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Injection safety of the query builder ───────────────────────────
+
+    /// Hostile inputs must never produce an FTS5 syntax error, never panic,
+    /// and never turn into operators. The builder quotes every token, so the
+    /// only operator it can emit is its own trailing `*`.
+    #[test]
+    fn test_fts_match_expr_neutralizes_operators() {
+        let conn = test_db_with_identifiers();
+        let long = "a".repeat(500);
+        let hostile = [
+            "\"",
+            "\"\"",
+            "handle\" OR \"",
+            "* OR *",
+            "handle*",
+            "^handle",
+            "NEAR(handle jwt)",
+            "handle OR jwt",
+            "handle AND jwt",
+            "handle NOT jwt",
+            "kind:function",
+            "name:handle",
+            "{name kind}:handle",
+            "handle)",
+            "(handle",
+            "handle -jwt",
+            "\\",
+            "'; DROP TABLE symbols; --",
+            "%",
+            "_",
+            "()",
+            "***",
+            "handle\"*\"",
+            "\u{0}handle",
+            "日本語",
+            long.as_str(),
+        ];
+        for q in hostile {
+            let r = search_symbols(&conn, q, None, None, 20);
+            assert!(r.is_ok(), "query {q:?} errored: {:?}", r.err());
+            let r = search_files(&conn, q, None, None, 20);
+            assert!(r.is_ok(), "search_files {q:?} errored: {:?}", r.err());
+            let r = search_packages(&conn, q, 20);
+            assert!(r.is_ok(), "search_packages {q:?} errored: {:?}", r.err());
+            let r = search_docs(&conn, q, None, 20);
+            assert!(r.is_ok(), "search_docs {q:?} errored: {:?}", r.err());
+        }
+        // Quoting keeps `OR` a literal term rather than an operator: this
+        // must not match every symbol in the index.
+        let all = get_package_symbols(&conn, "auth-service", None, 200)
+            .unwrap()
+            .len();
+        let injected = search_symbols(&conn, "handle\" OR \"jwt", None, None, 200)
+            .unwrap()
+            .len();
+        assert!(injected < all, "injected OR returned {injected} of {all}");
+    }
+
+    #[test]
+    fn test_fts_match_expr_shapes() {
+        assert_eq!(
+            fts_match_expr("verify jwt").as_deref(),
+            Some("\"verify\"* \"jwt\"*")
+        );
+        // Embedded quotes are escaped by doubling, inside the phrase. The
+        // phrase's last term here is the 1-char `b`, so no prefix star.
+        assert_eq!(fts_match_expr("a\"b").as_deref(), Some("\"a\"\"b\""));
+        // Control characters are dropped rather than passed to the parser.
+        assert_eq!(
+            fts_match_expr("\u{0}handle").as_deref(),
+            Some("\"handle\"*")
+        );
+        // Tokens with nothing indexable are dropped, not emitted as empty
+        // phrases that would match nothing.
+        assert_eq!(fts_match_expr("* handle").as_deref(), Some("\"handle\"*"));
+        assert_eq!(fts_match_expr("***"), None);
+        assert_eq!(fts_match_expr("   "), None);
+    }
+
+    // ── MCP-1 / DB-5 / MCP-5: limits enforced in SQL ─────────────────────
+
+    fn seed_many_symbols(conn: &Connection, n: usize) {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'function', ?2, ?3, ?4)",
+                rusqlite::params![
+                    format!("handleThing{i}"),
+                    format!("services/auth/src/f{:03}.ts", i),
+                    i as i64,
+                    "handle thing"
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_get_package_symbols_enforces_limit() {
+        let conn = test_db();
+        seed_many_symbols(&conn, 300);
+        assert_eq!(
+            get_package_symbols(&conn, "auth-service", None, 5)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            get_package_symbols(&conn, "auth-service", Some("function"), 7)
+                .unwrap()
+                .len(),
+            7
+        );
+        // Hard ceiling, even when the caller asks for more.
+        assert_eq!(
+            get_package_symbols(&conn, "auth-service", None, u32::MAX)
+                .unwrap()
+                .len(),
+            MAX_ROWS as usize
+        );
+        // A zero limit still returns one row rather than an empty list.
+        assert_eq!(
+            get_package_symbols(&conn, "auth-service", None, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_list_paths_enforce_limits() {
+        let conn = test_db();
+        seed_many_symbols(&conn, 300);
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes)
+                 VALUES (?1, 'auth-service', 'ts', 10)",
+                [format!("services/auth/src/f{i:03}.ts")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line)
+                 VALUES ('auth-service', ?1, 'function', 'services/auth/src/big.ts', ?2)",
+                rusqlite::params![format!("sym{i}"), i as i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            list_package_files(&conn, "auth-service", None, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            list_package_files(&conn, "auth-service", Some("ts"), 4)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            list_package_files(&conn, "auth-service", None, u32::MAX)
+                .unwrap()
+                .len(),
+            MAX_ROWS as usize
+        );
+        assert_eq!(
+            get_file_symbols(&conn, "services/auth/src/big.ts", None, 6)
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(
+            get_file_symbols(&conn, "services/auth/src/big.ts", None, u32::MAX)
+                .unwrap()
+                .len(),
+            MAX_ROWS as usize
+        );
+        assert_eq!(list_packages(&conn, None, 2).unwrap().len(), 2);
+        assert_eq!(
+            search_symbols(&conn, "handle", None, None, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            search_files(&conn, "services", None, None, 9)
+                .unwrap()
+                .len(),
+            9
+        );
+    }
+
+    #[test]
+    fn test_dependency_lists_enforce_limits() {
+        let conn = test_db();
+        assert_eq!(
+            package_dependencies(&conn, "auth-service", false, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            package_dependencies(&conn, "auth-service", false, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            package_dependents(&conn, "auth-service", 100)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn test_db_with_symbols() -> Connection {
@@ -1785,10 +2248,10 @@ mod tests {
     #[test]
     fn test_get_package_symbols() {
         let conn = test_db_with_symbols();
-        let results = get_package_symbols(&conn, "auth-service", None).unwrap();
+        let results = get_package_symbols(&conn, "auth-service", None, 100).unwrap();
         assert_eq!(results.len(), 2);
 
-        let results = get_package_symbols(&conn, "auth-service", Some("method")).unwrap();
+        let results = get_package_symbols(&conn, "auth-service", Some("method"), 100).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
     }
@@ -1847,7 +2310,7 @@ mod tests {
     #[test]
     fn test_search_files_by_filename() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "middleware", None, None).unwrap();
+        let results = search_files(&conn, "middleware", None, None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "services/auth/src/middleware.ts");
     }
@@ -1855,14 +2318,14 @@ mod tests {
     #[test]
     fn test_search_files_by_path_segment() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "gateway", None, None).unwrap();
+        let results = search_files(&conn, "gateway", None, None, 20).unwrap();
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_search_files_filter_by_package() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "ts", Some("auth-service"), None).unwrap();
+        let results = search_files(&conn, "ts", Some("auth-service"), None, 20).unwrap();
         assert!(
             results
                 .iter()
@@ -1873,14 +2336,14 @@ mod tests {
     #[test]
     fn test_search_files_filter_by_extension() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "auth", None, Some("ts")).unwrap();
+        let results = search_files(&conn, "auth", None, Some("ts"), 20).unwrap();
         assert!(results.iter().all(|f| f.extension == "ts"));
     }
 
     #[test]
     fn test_search_files_combined_filters() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "auth", Some("auth-service"), Some("ts")).unwrap();
+        let results = search_files(&conn, "auth", Some("auth-service"), Some("ts"), 20).unwrap();
         assert!(
             results
                 .iter()
@@ -1892,14 +2355,14 @@ mod tests {
     #[test]
     fn test_search_files_empty_query() {
         let conn = test_db_with_files();
-        let results = search_files(&conn, "", None, None).unwrap();
+        let results = search_files(&conn, "", None, None, 20).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_list_package_files_basic() {
         let conn = test_db_with_files();
-        let results = list_package_files(&conn, "auth-service", None).unwrap();
+        let results = list_package_files(&conn, "auth-service", None, 100).unwrap();
         assert_eq!(results.len(), 3);
         // Should be ordered by path
         assert!(results[0].path < results[1].path);
@@ -1908,7 +2371,7 @@ mod tests {
     #[test]
     fn test_list_package_files_extension_filter() {
         let conn = test_db_with_files();
-        let results = list_package_files(&conn, "auth-service", Some("ts")).unwrap();
+        let results = list_package_files(&conn, "auth-service", Some("ts"), 100).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|f| f.extension == "ts"));
     }

@@ -49,7 +49,10 @@ impl ServerHandler for tools::ShireService {
                  | Check what X depends on | `package_dependencies` | Reading manifests |\n\n\
                  ## Fall back to Grep/Glob when\n\n\
                  - Searching for literal strings, log messages, or error text inside function bodies\n\
-                 - Shire indexes definitions, not implementations — use Grep for content within functions"
+                 - Shire indexes definitions, not implementations — use Grep for content within functions\n\
+                 - You need regex or substring matching: search tools match identifiers by prefix \
+                 (and by camelCase/snake_case sub-token for symbol names), so `handle` finds \
+                 `handleRequest` but `andleRequ` finds nothing"
                     .into(),
             ),
         }

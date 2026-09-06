@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{DepInfo, DepKind, ManifestParser, NoPackageManifest, PackageInfo};
 use anyhow::{Result, anyhow};
 use quick_xml::de::from_str;
 use serde::Deserialize;
@@ -111,9 +111,10 @@ impl MavenParser {
             .unwrap_or(false);
 
         if has_modules && is_pom_packaging {
-            return Err(anyhow!(
-                "Parent/aggregator POM (has <modules> with pom packaging)"
-            ));
+            return Err(NoPackageManifest(
+                "Parent/aggregator POM (has <modules> with pom packaging)".to_string(),
+            )
+            .into());
         }
 
         // Resolve groupId: own > parent in-repo > parent declared > fallback
@@ -407,7 +408,30 @@ mod tests {
         );
 
         let parser = MavenParser;
-        assert!(parser.parse(&path, "").is_err());
+        let result = parser.parse(&path, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // An aggregator POM is a recognized "no package" outcome, not a
+        // genuine parse failure — callers must be able to tell them apart.
+        assert!(crate::index::manifest::is_no_package_marker(&err));
+    }
+
+    #[test]
+    fn test_parse_pom_no_artifact_id_is_not_a_skip_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+</project>"#,
+        );
+
+        let parser = MavenParser;
+        let err = parser.parse(&path, "libs/core").unwrap_err();
+        // Missing <artifactId> is a genuine parse failure, distinct from the
+        // aggregator-POM "no package" marker — it must still be reported.
+        assert!(!crate::index::manifest::is_no_package_marker(&err));
     }
 
     #[test]
@@ -489,6 +513,81 @@ mod tests {
             .find(|d| d.name.contains("mystery"))
             .unwrap();
         assert_eq!(mystery.version_req, None);
+    }
+
+    // --- MANIFESTS-18: collect_maven_parent_context has no direct coverage ---
+
+    #[test]
+    fn test_collect_maven_parent_context_only_collects_aggregator_poms() {
+        let dir = TempDir::new().unwrap();
+
+        // Aggregator POM (has <modules>) — should contribute context.
+        std::fs::write(
+            dir.path().join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.0.0</version>
+    <packaging>pom</packaging>
+    <modules>
+        <module>auth</module>
+    </modules>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>32.1</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#,
+        )
+        .unwrap();
+
+        // Leaf POM (no <modules>) — must NOT contribute context, even though
+        // it's a perfectly normal child module.
+        let auth_dir = dir.path().join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        std::fs::write(
+            auth_dir.join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>2.0.0</version>
+    </parent>
+    <artifactId>auth</artifactId>
+</project>"#,
+        )
+        .unwrap();
+
+        let walked = vec![
+            super::super::WalkedManifest {
+                abs_path: dir.path().join("pom.xml"),
+                relative_dir: "".to_string(),
+                manifest_key: "pom.xml".to_string(),
+                content_hash: String::new(),
+            },
+            super::super::WalkedManifest {
+                abs_path: auth_dir.join("pom.xml"),
+                relative_dir: "auth".to_string(),
+                manifest_key: "auth/pom.xml".to_string(),
+                content_hash: String::new(),
+            },
+        ];
+
+        let context = collect_maven_parent_context(&walked);
+        assert_eq!(context.len(), 1);
+        let parent_ctx = context.get("com.example:parent").unwrap();
+        assert_eq!(parent_ctx.group_id.as_deref(), Some("com.example"));
+        assert_eq!(parent_ctx.version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            parent_ctx.managed_deps.get("com.google.guava:guava"),
+            Some(&"32.1".to_string())
+        );
     }
 
     #[test]

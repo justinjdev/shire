@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
 use regex::Regex;
 use std::path::Path;
@@ -15,7 +15,7 @@ impl ManifestParser for RubyParser {
         let dependencies = parse_gemfile(&content);
 
         Ok(PackageInfo {
-            name: relative_dir.to_string(),
+            name: manifest::fallback_name(manifest_path, relative_dir),
             path: relative_dir.to_string(),
             kind: "ruby",
             version: None,
@@ -125,7 +125,7 @@ gem 'puma', '~> 6.0'
         let parser = RubyParser;
         let info = parser.parse(&path, "services/api").unwrap();
 
-        assert_eq!(info.name, "services/api");
+        assert_eq!(info.name, "services-api");
         assert_eq!(info.kind, "ruby");
         assert_eq!(info.path, "services/api");
         assert_eq!(info.version, None);
@@ -247,6 +247,25 @@ gem 'puma', '~> 6.0'
         // Verify version on dev dep
         let rspec = dev.iter().find(|d| d.name == "rspec-rails").unwrap();
         assert_eq!(rspec.version_req.as_deref(), Some("~> 6.0"));
+    }
+
+    #[test]
+    fn test_parse_root_gemfile_uses_repo_dir_name_not_empty_string() {
+        // A Gemfile at the repo root (relative_dir == "") must not produce a
+        // package with an empty name — that name is also the join key other
+        // tables (dependencies, symbols) key on.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(dir.path(), "gem 'rails', '~> 7.0'\n");
+
+        let parser = RubyParser;
+        let info = parser.parse(&path, "").unwrap();
+
+        assert!(!info.name.is_empty());
+        let expected = dir.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(info.name, expected);
+        // The path column must stay "" so file association / stale-hash
+        // cleanup keys the root package the same way every other parser does.
+        assert_eq!(info.path, "");
     }
 
     #[test]

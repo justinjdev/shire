@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{DepInfo, DepKind, ManifestParser, NoPackageManifest, PackageInfo};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,9 +14,9 @@ impl ManifestParser for CargoParser {
         let content = std::fs::read_to_string(manifest_path)?;
         let doc: toml::Value = toml::from_str(&content)?;
 
-        let package = doc
-            .get("package")
-            .ok_or_else(|| anyhow::anyhow!("No [package] section"))?;
+        let package = doc.get("package").ok_or_else(|| {
+            NoPackageManifest("No [package] section (likely a virtual workspace root)".to_string())
+        })?;
 
         let name = package
             .get("name")
@@ -100,9 +100,9 @@ impl CargoParser {
         let content = std::fs::read_to_string(manifest_path)?;
         let doc: toml::Value = toml::from_str(&content)?;
 
-        let package = doc
-            .get("package")
-            .ok_or_else(|| anyhow::anyhow!("No [package] section"))?;
+        let package = doc.get("package").ok_or_else(|| {
+            NoPackageManifest("No [package] section (likely a virtual workspace root)".to_string())
+        })?;
 
         let name = package
             .get("name")
@@ -416,6 +416,10 @@ serde = "1"
         let parser = CargoParser;
         let result = parser.parse(&path, "crates/unnamed");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("[package]"));
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("[package]"));
+        // A virtual workspace root is a recognized "no package" outcome, not
+        // a genuine parse failure — callers must be able to tell them apart.
+        assert!(crate::index::manifest::is_no_package_marker(&err));
     }
 }

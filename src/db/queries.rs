@@ -832,13 +832,12 @@ pub fn batch_insert_references(
     let full_chunk_sql = build_multi_row_insert_sql(ROWS_PER_CHUNK, COLS_PER_ROW);
     let mut full_stmt = conn.prepare_cached(&full_chunk_sql)?;
 
-    let mut iter = resolved.chunks_exact(ROWS_PER_CHUNK);
-    for chunk in &mut iter {
+    let (full_chunks, remainder) = resolved.as_chunks::<ROWS_PER_CHUNK>();
+    for chunk in full_chunks {
         bind_and_execute_chunk(&mut full_stmt, chunk, package)?;
     }
 
     // Handle the tail (rows that didn't fit a full chunk) with a sized statement.
-    let remainder = iter.remainder();
     if !remainder.is_empty() {
         let tail_sql = build_multi_row_insert_sql(remainder.len(), COLS_PER_ROW);
         let mut tail_stmt = conn.prepare_cached(&tail_sql)?;

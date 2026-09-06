@@ -748,7 +748,9 @@ fn test_typescript_arrow_call_references_use_anonymous_enclosing() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
         .unwrap();
     assert_eq!(parse.line, 3);
-    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
+    // `f` is nameable from its `const f = ...` binding, and the enclosing
+    // path is qualified through the containing method and class.
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("Handler.run.f"));
 }
 
 #[test]
@@ -826,7 +828,57 @@ fn test_javascript_arrow_call_references_use_anonymous_enclosing() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
         .unwrap();
     assert_eq!(parse.line, 3);
-    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
+    // `f` is nameable from its `const f = ...` binding, and the enclosing
+    // path is qualified through the containing method and class.
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("Handler.run.f"));
+}
+
+#[test]
+fn test_javascript_arrow_const_uses_binding_name_not_anonymous() {
+    // Reproduces SYM-4 case A: top-level arrow functions bound to a const
+    // must be individually attributable, not collapsed into "<anonymous>".
+    let source = r#"export const loadUser = async (id) => { return fetchUser(id); };
+export const saveUser = async (u) => { return fetchUser(u); };
+export function fetchUser(id) { return id; }
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("a.js"), false, 0);
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "fetchUser")
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.1);
+    assert_eq!(
+        call_refs,
+        vec![
+            ("fetchUser".into(), 1, Some("loadUser".into())),
+            ("fetchUser".into(), 2, Some("saveUser".into())),
+        ]
+    );
+}
+
+#[test]
+fn test_javascript_same_named_methods_on_different_classes_do_not_collapse() {
+    // Reproduces SYM-4 case B: same-named methods on different classes must
+    // not share one `enclosing_symbol` bucket.
+    let source = r#"export class Alpha { run() { return helper(1); } }
+export class Beta  { run() { return helper(2); } }
+export function helper(x) { return x; }
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("c.js"), false, 0);
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.1);
+    assert_eq!(
+        call_refs,
+        vec![
+            ("helper".into(), 1, Some("Alpha.run".into())),
+            ("helper".into(), 2, Some("Beta.run".into())),
+        ]
+    );
 }
 
 // ============================================================
@@ -1027,9 +1079,9 @@ public class UserService {
     assert_eq!(
         call_refs,
         vec![
-            ("insert".into(), 14, Some("saveUser".into())),
-            ("lookup".into(), 9, Some("fetchUser".into())),
-            ("validate".into(), 13, Some("saveUser".into())),
+            ("insert".into(), 14, Some("UserService.saveUser".into())),
+            ("lookup".into(), 9, Some("UserService.fetchUser".into())),
+            ("validate".into(), 13, Some("UserService.saveUser".into())),
         ]
     );
 }
@@ -1105,7 +1157,13 @@ fn test_java_inner_class_call_enclosing_uses_inner_method() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "helper")
         .unwrap();
     assert_eq!(helper_call.line, 4);
-    assert_eq!(helper_call.enclosing_symbol.as_deref(), Some("run"));
+    // Qualified through every enclosing method/class, innermost last, so the
+    // call is unambiguously attributed to `Inner.run`, not to any other
+    // same-named method elsewhere in the file.
+    assert_eq!(
+        helper_call.enclosing_symbol.as_deref(),
+        Some("Outer.outer.Inner.run")
+    );
 }
 
 // ============================================================
@@ -1987,10 +2045,10 @@ object Service {
     assert_eq!(
         call_refs,
         vec![
-            ("Config".into(), 9, Some("parseConfig".into())),
-            ("Response".into(), 10, Some("buildResponse".into())),
-            ("buildResponse".into(), 6, Some("process".into())),
-            ("parseConfig".into(), 5, Some("process".into())),
+            ("Config".into(), 9, Some("Service.parseConfig".into())),
+            ("Response".into(), 10, Some("Service.buildResponse".into())),
+            ("buildResponse".into(), 6, Some("Service.process".into())),
+            ("parseConfig".into(), 5, Some("Service.process".into())),
         ]
     );
 }
@@ -2917,10 +2975,10 @@ end
     assert_eq!(
         call_refs,
         vec![
-            ("dump".into(), 10, Some("save".into())),
-            ("parse".into(), 6, Some("load".into())),
-            ("read".into(), 5, Some("load".into())),
-            ("write".into(), 10, Some("save".into())),
+            ("dump".into(), 10, Some("Loader.save".into())),
+            ("parse".into(), 6, Some("Loader.load".into())),
+            ("read".into(), 5, Some("Loader.load".into())),
+            ("write".into(), 10, Some("Loader.save".into())),
         ]
     );
 }
@@ -2997,7 +3055,7 @@ end
         .find(|r| r.kind == ReferenceKind::Call && r.name == "process")
         .unwrap();
     assert_eq!(process_call.line, 4);
-    assert_eq!(process_call.enclosing_symbol.as_deref(), Some("run"));
+    assert_eq!(process_call.enclosing_symbol.as_deref(), Some("Job.run"));
 }
 
 #[test]

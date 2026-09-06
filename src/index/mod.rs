@@ -2149,11 +2149,63 @@ struct FileIndexResult {
     num_files: usize,
     deleted_file_rows: usize,
     /// Packages in which a file appeared, disappeared or changed size since
-    /// the last build. Empty when the repo-wide file-tree hash matched, in
-    /// which case no path or size changed anywhere. Used by
-    /// `phase_source_incremental` to force a hash pass for packages whose
-    /// content changed without any mtime moving (INDEX-3).
+    /// the last build. Used by `phase_source_incremental` to force a hash
+    /// pass for packages whose content changed without any mtime moving
+    /// (INDEX-3).
+    ///
+    /// The set is *durable*: it is persisted to
+    /// `shire_meta.pending_source_recheck` inside this phase's transaction
+    /// and only cleared once the extraction transaction has committed. It
+    /// has to be, because this phase commits the new `files` rows and the
+    /// new `file_tree_hash` in its own transaction: if the build then dies
+    /// (or a later phase errors) before symbols are written, the next build
+    /// would see a matching tree hash and an already-updated `files` table,
+    /// recompute an *empty* changed set, and — for a change that moved no
+    /// mtime and no path, e.g. `rsync -a`/`cp -p` over a file — skip the
+    /// package indefinitely.
     changed_packages: HashSet<String>,
+}
+
+/// `shire_meta` key holding the packages that still owe a source re-check.
+const PENDING_SOURCE_RECHECK_KEY: &str = "pending_source_recheck";
+
+/// Read the persisted set of packages that still need a source hash pass.
+fn read_pending_source_recheck(conn: &Connection) -> HashSet<String> {
+    conn.query_row(
+        "SELECT value FROM shire_meta WHERE key = ?1",
+        [PENDING_SOURCE_RECHECK_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+    .map(|v| v.into_iter().collect())
+    .unwrap_or_default()
+}
+
+/// Persist the packages that still owe a source hash pass. Written in the
+/// same transaction as the `files` upsert and `file_tree_hash`.
+fn write_pending_source_recheck(conn: &Connection, pkgs: &HashSet<String>) -> Result<()> {
+    if pkgs.is_empty() {
+        clear_pending_source_recheck(conn)?;
+        return Ok(());
+    }
+    let mut sorted: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![PENDING_SOURCE_RECHECK_KEY, serde_json::to_string(&sorted)?],
+    )?;
+    Ok(())
+}
+
+/// Drop the pending set. Called from the extraction transaction, so it
+/// commits atomically with the symbols the re-check produced.
+fn clear_pending_source_recheck(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM shire_meta WHERE key = ?1",
+        [PENDING_SOURCE_RECHECK_KEY],
+    )?;
+    Ok(())
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
@@ -2195,7 +2247,9 @@ fn phase_index_files(
         return Ok(FileIndexResult {
             num_files,
             deleted_file_rows: 0,
-            changed_packages: HashSet::new(),
+            // Nothing moved this build, but a previous build may have died
+            // between committing its file index and committing its symbols.
+            changed_packages: read_pending_source_recheck(conn),
         });
     }
 
@@ -2227,7 +2281,14 @@ fn phase_index_files(
         .collect();
 
     let num_files = validated_files.len();
-    let (deleted_file_rows, changed_packages) = incremental_upsert_files(conn, &validated_files)?;
+    let (deleted_file_rows, mut changed_packages) =
+        incremental_upsert_files(conn, &validated_files)?;
+
+    // Carry forward anything an earlier build recorded but never got to
+    // re-extract — `incremental_upsert_files` compares against the `files`
+    // rows that build already committed, so it cannot rediscover them.
+    changed_packages.extend(read_pending_source_recheck(conn));
+    write_pending_source_recheck(conn, &changed_packages)?;
 
     // Detect proto→generated boundary edges from the walked file set.
     // Runs after file upsert so package associations are current.
@@ -3181,6 +3242,11 @@ fn build_index_inner(
         // symbol_refs — so MCP tools cannot return silent [] from a
         // partially-repopulated table.
         crate::db::write_references_enabled(&conn, refs_enabled)?;
+        // The packages phase_index_files flagged have now been re-checked,
+        // and that fact commits together with the symbols it produced. If
+        // this transaction never commits, the flags survive for the next
+        // build (see FileIndexResult::changed_packages).
+        clear_pending_source_recheck(&conn)?;
         let mut extract_failures = extract_failures;
         extract_failures.extend(incremental_failures);
         Ok((count, extract_failures))
@@ -5084,6 +5150,99 @@ mod incremental_signal_tests {
             changed,
             HashSet::from(["a".to_string(), "b".to_string()]),
             "a file moving between packages must re-check both"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_recheck_tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn
+    }
+
+    #[test]
+    fn test_pending_source_recheck_round_trips() {
+        let conn = db();
+        assert!(read_pending_source_recheck(&conn).is_empty());
+
+        let set = HashSet::from(["a".to_string(), "b".to_string()]);
+        write_pending_source_recheck(&conn, &set).unwrap();
+        assert_eq!(read_pending_source_recheck(&conn), set);
+
+        clear_pending_source_recheck(&conn).unwrap();
+        assert!(read_pending_source_recheck(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_writing_an_empty_set_clears_the_key() {
+        let conn = db();
+        write_pending_source_recheck(&conn, &HashSet::from(["a".to_string()])).unwrap();
+        write_pending_source_recheck(&conn, &HashSet::new()).unwrap();
+        assert!(read_pending_source_recheck(&conn).is_empty());
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shire_meta WHERE key = 'pending_source_recheck'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "an empty set must not leave a stale row behind");
+    }
+
+    #[test]
+    fn test_pending_signal_survives_a_build_that_never_extracted() {
+        // The mtime-preserving, path-preserving, size-changing edit that
+        // `changed_packages` exists to catch: phase_index_files commits the
+        // new `files` rows and file_tree_hash, then the build dies before
+        // the extraction transaction. The next build's
+        // `incremental_upsert_files` sees no difference at all — only the
+        // persisted set can still name the package.
+        let conn = db();
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('a', 'a', 'npm')",
+            [],
+        )
+        .unwrap();
+
+        // Build 1: file indexed at 10 bytes, extraction succeeds.
+        let (_, changed) = incremental_upsert_files(
+            &conn,
+            &[("a/x.ts".into(), Some("a".into()), "ts".into(), 10)],
+        )
+        .unwrap();
+        write_pending_source_recheck(&conn, &changed).unwrap();
+        clear_pending_source_recheck(&conn).unwrap(); // extraction committed
+
+        // Build 2: same path and mtime, different size. Phase 9 commits…
+        let (_, mut changed) = incremental_upsert_files(
+            &conn,
+            &[("a/x.ts".into(), Some("a".into()), "ts".into(), 11)],
+        )
+        .unwrap();
+        assert_eq!(changed, HashSet::from(["a".to_string()]));
+        changed.extend(read_pending_source_recheck(&conn));
+        write_pending_source_recheck(&conn, &changed).unwrap();
+        // …and the build dies here: no clear_pending_source_recheck.
+
+        // Build 3: nothing changed on disk since build 2, so the file-tree
+        // hash matches and incremental_upsert_files would report nothing.
+        let (_, rediscovered) = incremental_upsert_files(
+            &conn,
+            &[("a/x.ts".into(), Some("a".into()), "ts".into(), 11)],
+        )
+        .unwrap();
+        assert!(
+            rediscovered.is_empty(),
+            "the files table already carries the new state — the signal is gone"
+        );
+        assert_eq!(
+            read_pending_source_recheck(&conn),
+            HashSet::from(["a".to_string()]),
+            "the persisted set must still force a hash pass for package a"
         );
     }
 }

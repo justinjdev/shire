@@ -78,11 +78,17 @@ fn is_relevant(path: &Path, root: &Path, filter: &RelevanceFilter) -> bool {
     };
 
     // Excluded directory anywhere in the path (matches how the indexer itself skips
-    // vendored/build dirs via discovery.exclude — e.g. node_modules).
-    if rel.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| filter.exclude_dirs.contains(s))
+    // vendored/build dirs via discovery.exclude — e.g. node_modules). Only ancestor
+    // directory components are checked, not the filename itself — the indexer's own
+    // WalkBuilder filter only excludes directory entries, so a file whose *basename*
+    // happens to match an excluded directory name (e.g. a manifest literally named
+    // "target") would otherwise be wrongly treated as irrelevant here.
+    if rel.parent().is_some_and(|dir| {
+        dir.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| filter.exclude_dirs.contains(s))
+        })
     }) {
         return false;
     }
@@ -422,6 +428,21 @@ mod tests {
         ));
         assert!(!is_relevant(
             Path::new("/repo/vendor/pkg/mod.go"),
+            root,
+            &filter(&config)
+        ));
+    }
+
+    #[test]
+    fn excluded_directory_check_does_not_match_the_filename_itself() {
+        // The indexer's own walk only excludes directory *entries*, not files whose
+        // basename happens to collide with an excluded directory name — a source file
+        // literally named "target" (default_exclude includes "target") must still be
+        // treated normally, not silently dropped.
+        let config = Config::default();
+        let root = Path::new("/repo");
+        assert!(is_relevant(
+            Path::new("/repo/src/target.rs"),
             root,
             &filter(&config)
         ));

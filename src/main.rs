@@ -337,27 +337,42 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 ///
 /// A missing `db_path` is not an error (nothing to clean up).
 fn remove_index_db(db_path: &Path) -> Result<()> {
-    let meta = match std::fs::symlink_metadata(db_path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("Failed to stat {}", db_path.display())),
+    // Open with O_NOFOLLOW so a symlink at db_path is refused atomically at the syscall
+    // level (ELOOP) instead of via a separate symlink_metadata() check followed by a
+    // plain open() — that two-step form has a TOCTOU window where the path could be
+    // swapped for a symlink between the check and the open. The header is then read
+    // from this same handle, so what we verify is exactly what we're about to delete.
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(db_path)
     };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(db_path);
 
-    if meta.file_type().is_symlink() {
-        anyhow::bail!(
-            "Refusing to remove {}: it is a symlink, not a plain database file. \
-             Remove it by hand if that's intentional.",
-            db_path.display()
-        );
-    }
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            anyhow::bail!(
+                "Refusing to remove {}: it is a symlink, not a plain database file. \
+                 Remove it by hand if that's intentional.",
+                db_path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", db_path.display())),
+    };
 
     let is_sqlite = {
         use std::io::Read;
-        let mut file = std::fs::File::open(db_path)
-            .with_context(|| format!("Failed to open {}", db_path.display()))?;
         let mut header = [0u8; 16];
         file.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
     };
+    drop(file);
 
     if !is_sqlite {
         anyhow::bail!(

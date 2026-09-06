@@ -560,7 +560,7 @@ fn patch_claude_hooks(
     new_file_mode: Option<u32>,
 ) -> Result<()> {
     let existed = settings_path.exists();
-    let mut settings: Map<String, Value> = if settings_path.exists() {
+    let mut settings: Map<String, Value> = if existed {
         let content = fs::read_to_string(settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
         serde_json::from_str(&content)
@@ -644,7 +644,7 @@ fn patch_claude_hooks(
 /// Patch ~/.claude.json to add mcpServers.shire (user-scoped MCP config).
 fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()> {
     let existed = path.exists();
-    let mut config: Map<String, Value> = if path.exists() {
+    let mut config: Map<String, Value> = if existed {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         serde_json::from_str(&content)

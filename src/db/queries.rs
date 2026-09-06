@@ -173,13 +173,12 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             ORDER BY (s.name = ?4) DESC, rank
+             ORDER BY rank
              LIMIT ?3",
                     vec![
                         Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
                         Box::new(pkg.to_string()),
                         Box::new(limit),
-                        Box::new(query.to_string()),
                     ],
                 )
             }
@@ -189,13 +188,12 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             ORDER BY (s.name = ?4) DESC, rank
+             ORDER BY rank
              LIMIT ?3",
                 vec![
                     Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(pkg.to_string()),
                     Box::new(limit),
-                    Box::new(query.to_string()),
                 ],
             ),
             (None, Some(kind)) => {
@@ -206,12 +204,11 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             ORDER BY (s.name = ?3) DESC, rank
+             ORDER BY rank
              LIMIT ?2",
                     vec![
                         Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
                         Box::new(limit),
-                        Box::new(query.to_string()),
                     ],
                 )
             }
@@ -221,12 +218,11 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             ORDER BY (s.name = ?3) DESC, rank
+             ORDER BY rank
              LIMIT ?2",
                 vec![
                     Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(limit),
-                    Box::new(query.to_string()),
                 ],
             ),
         };
@@ -250,7 +246,74 @@ pub fn search_symbols(
     for row in rows {
         result.push(row?);
     }
+
+    promote_exact_name(conn, query, package_filter, kind_filter, limit, &mut result)?;
     Ok(result)
+}
+
+/// Make sure a symbol named exactly like the query is in the result, and
+/// first.
+///
+/// Prefix and sub-token matching means `handle` also matches `handleRequest`
+/// and everything else starting with `handle`; on a big index the symbol the
+/// caller actually named can fall outside the `limit` window. Sorting that
+/// in SQL (`ORDER BY (s.name = ?) DESC, rank`) costs the fts5 streaming plan
+/// — every matched row goes through a temp B-tree before LIMIT applies — so
+/// instead we do nothing in the common case (the exact match already ranked
+/// in) and otherwise pay one indexed lookup on `idx_symbols_name`.
+fn promote_exact_name(
+    conn: &Connection,
+    query: &str,
+    package_filter: Option<&str>,
+    kind_filter: Option<&str>,
+    limit: i64,
+    result: &mut Vec<SymbolRow>,
+) -> Result<()> {
+    let name = query.trim();
+    // Multi-token queries do not name a single symbol.
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return Ok(());
+    }
+    if let Some(pos) = result.iter().position(|r| r.name == name) {
+        if pos > 0 {
+            let exact = result.remove(pos);
+            result.insert(0, exact);
+        }
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, kind, signature, package, file_path, line,
+                visibility, parent_symbol, return_type, parameters
+         FROM symbols
+         WHERE name = ?1
+           AND (?2 IS NULL OR package = ?2)
+           AND (?3 IS NULL OR kind = ?3)
+         ORDER BY file_path, line
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(
+        rusqlite::params![name, package_filter, kind_filter],
+        |row| {
+            Ok(SymbolRow {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                signature: row.get(2)?,
+                package: row.get(3)?,
+                file_path: row.get(4)?,
+                line: row.get(5)?,
+                visibility: row.get(6)?,
+                parent_symbol: row.get(7)?,
+                return_type: row.get(8)?,
+                parameters: row.get(9)?,
+            })
+        },
+    )?;
+    if let Some(exact) = rows.next().transpose()? {
+        result.insert(0, exact);
+        result.truncate(limit as usize);
+    }
+    Ok(())
 }
 
 /// List symbols in a package, optionally filtered by kind, ordered by
@@ -680,11 +743,13 @@ pub fn package_dependencies(
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
          WHERE package = ?1 AND is_internal = 1
+         ORDER BY dependency, dep_kind
          LIMIT ?2"
     } else {
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
          WHERE package = ?1
+         ORDER BY dependency, dep_kind
          LIMIT ?2"
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -711,6 +776,7 @@ pub fn package_dependents(conn: &Connection, name: &str, limit: u32) -> Result<V
         "SELECT package, dependency, dep_kind, version_req, is_internal
          FROM dependencies
          WHERE dependency = ?1
+         ORDER BY package, dep_kind
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![name, limit], |row| {
@@ -1568,12 +1634,17 @@ pub fn clear_boundary_edges(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn query_schema_consumers(conn: &Connection, source_path: &str) -> Result<Vec<BoundaryEdge>> {
+pub fn query_schema_consumers(
+    conn: &Connection,
+    source_path: &str,
+    limit: u32,
+) -> Result<Vec<BoundaryEdge>> {
+    let limit = clamp_limit(limit);
     let mut stmt = conn.prepare_cached(
         "SELECT source_path, generated_path, source_package, generated_package, kind \
-         FROM boundary_edges WHERE source_path = ?1 ORDER BY generated_path",
+         FROM boundary_edges WHERE source_path = ?1 ORDER BY generated_path LIMIT ?2",
     )?;
-    let rows = stmt.query_map([source_path], |row| {
+    let rows = stmt.query_map(rusqlite::params![source_path, limit], |row| {
         Ok(BoundaryEdge {
             source_path: row.get(0)?,
             generated_path: row.get(1)?,
@@ -1585,12 +1656,17 @@ pub fn query_schema_consumers(conn: &Connection, source_path: &str) -> Result<Ve
     Ok(collect_rows(rows))
 }
 
-pub fn query_generated_from(conn: &Connection, generated_path: &str) -> Result<Vec<BoundaryEdge>> {
+pub fn query_generated_from(
+    conn: &Connection,
+    generated_path: &str,
+    limit: u32,
+) -> Result<Vec<BoundaryEdge>> {
+    let limit = clamp_limit(limit);
     let mut stmt = conn.prepare_cached(
         "SELECT source_path, generated_path, source_package, generated_package, kind \
-         FROM boundary_edges WHERE generated_path = ?1 ORDER BY source_path",
+         FROM boundary_edges WHERE generated_path = ?1 ORDER BY source_path LIMIT ?2",
     )?;
-    let rows = stmt.query_map([generated_path], |row| {
+    let rows = stmt.query_map(rusqlite::params![generated_path, limit], |row| {
         Ok(BoundaryEdge {
             source_path: row.get(0)?,
             generated_path: row.get(1)?,
@@ -1925,6 +2001,50 @@ mod tests {
         assert_eq!(hits[0].name, "handle");
         let hits = search_symbols(&conn, "handle", Some("auth-service"), None, 20).unwrap();
         assert_eq!(hits[0].name, "handle");
+    }
+
+    /// The exact match must survive even when the limit is smaller than the
+    /// number of rows its own prefix matches.
+    #[test]
+    fn test_search_symbols_exact_name_survives_a_tiny_limit() {
+        let conn = test_db();
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'function', ?2, ?3, '')",
+                rusqlite::params![
+                    format!("handle{i:03}"),
+                    format!("services/auth/src/f{i:03}.ts"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+             VALUES ('auth-service', 'handle', 'function', 'services/auth/src/zz.ts', 99, '')",
+            [],
+        )
+        .unwrap();
+        let hits = search_symbols(&conn, "handle", None, None, 3).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].name, "handle");
+        // A kind filter that excludes the exact symbol must not resurrect it.
+        let hits = search_symbols(&conn, "handle", None, Some("class"), 3).unwrap();
+        assert!(hits.iter().all(|h| h.kind == "class"), "got {hits:?}");
+    }
+
+    #[test]
+    fn test_dependency_lists_are_ordered() {
+        // Without ORDER BY, which rows survive the LIMIT is whatever order
+        // SQLite happened to scan in — the same call could answer differently
+        // between builds.
+        let conn = test_db();
+        let deps = package_dependencies(&conn, "auth-service", false, 100).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.dependency.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "dependencies come back in a stable order");
     }
 
     #[test]
@@ -3449,10 +3569,10 @@ mod boundary_tests {
         ];
         batch_insert_boundary_edges(&conn, &edges).unwrap();
 
-        let consumers = query_schema_consumers(&conn, "proto/user.proto").unwrap();
+        let consumers = query_schema_consumers(&conn, "proto/user.proto", 100).unwrap();
         assert_eq!(consumers.len(), 2);
 
-        let from = query_generated_from(&conn, "gen/user.pb.go").unwrap();
+        let from = query_generated_from(&conn, "gen/user.pb.go", 100).unwrap();
         assert_eq!(from.len(), 1);
         assert_eq!(from[0].source_path, "proto/user.proto");
     }

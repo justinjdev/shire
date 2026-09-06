@@ -53,7 +53,7 @@ list-returning tool is bounded:
 | Tool | `limit` default | Maximum |
 |---|---|---|
 | `search_symbols`, `search_packages`, `search_files`, `search_docs` | 20 | 200 |
-| `get_file_symbols`, `list_package_files`, `list_packages`, `package_dependencies`, `package_dependents` | 100 | 200 |
+| `get_file_symbols`, `list_package_files`, `list_packages`, `package_dependencies`, `package_dependents`, `schema_consumers`, `generated_from` | 100 | 200 |
 | `symbol_references`, `symbol_callers`, `symbol_callees`, `change_impact` | 100 | 1000 |
 
 The limit is applied in SQL. When a result fills the limit exactly, the

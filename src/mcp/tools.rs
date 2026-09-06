@@ -23,6 +23,11 @@ pub struct ShireService {
     /// answered with a bare -32603. Holders re-check staleness under the
     /// guard, so waiters see the winner's fresh index instead of rebuilding.
     rebuild_lock: Mutex<()>,
+    /// When the last rebuild attempt failed. `last_indexed` is deliberately
+    /// left alone on failure so a transient error is retried, but without
+    /// this every waiter in the same burst would run its own full build
+    /// while the failure persists.
+    last_rebuild_failure: Mutex<Option<SystemTime>>,
     /// Number of index rebuilds this process has actually run. Used by the
     /// concurrency test to assert that N racing tool calls produce one build.
     rebuild_count: std::sync::atomic::AtomicU64,
@@ -91,6 +96,7 @@ impl ShireService {
             build_ctx,
             last_indexed: Mutex::new(last_indexed),
             rebuild_lock: Mutex::new(()),
+            last_rebuild_failure: Mutex::new(None),
             rebuild_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "rag")]
             rag_embedder,
@@ -185,6 +191,19 @@ impl ShireService {
             return;
         }
 
+        // Back off after a failure for the same window the staleness check
+        // debounces by, so a burst of calls against a repo that cannot build
+        // does not turn into one full build per call.
+        if let Ok(failed) = self.last_rebuild_failure.lock()
+            && let Some(at) = *failed
+            && at
+                .elapsed()
+                .is_ok_and(|e| e < std::time::Duration::from_secs(ctx.config.serve.debounce_s))
+        {
+            tracing::debug!("skipping rebuild: previous attempt failed recently");
+            return;
+        }
+
         tracing::info!("rebuilding index (stale)");
         self.rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -206,6 +225,9 @@ impl ShireService {
                             if let Ok(mut li) = self.last_indexed.lock() {
                                 *li = now;
                             }
+                            if let Ok(mut failed) = self.last_rebuild_failure.lock() {
+                                *failed = None;
+                            }
                             tracing::info!("index rebuilt");
                         }
                         Err(e) => tracing::warn!(%e, "index rebuilt but failed to swap connection"),
@@ -219,7 +241,12 @@ impl ShireService {
                     }
                 }
             }
-            Err(e) => tracing::warn!(%e, "rebuild failed"),
+            Err(e) => {
+                if let Ok(mut failed) = self.last_rebuild_failure.lock() {
+                    *failed = Some(SystemTime::now());
+                }
+                tracing::warn!(%e, "rebuild failed")
+            }
         }
     }
 
@@ -524,12 +551,16 @@ pub struct ChangeImpactArgs {
 pub struct SchemaConsumersArgs {
     /// Path to the schema file (e.g. "proto/user.proto")
     pub path: String,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GeneratedFromArgs {
     /// Path to the generated file (e.g. "gen/user.pb.go")
     pub path: String,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[tool_router]
@@ -927,10 +958,10 @@ impl ShireService {
         tracing::debug!(tool = "schema_consumers", path = %args.path);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let rows = queries::query_schema_consumers(&conn, &args.path)
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_schema_consumers(&conn, &args.path, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&rows, limit, "raise `limit`")
     }
 
     #[tool(
@@ -943,10 +974,10 @@ impl ShireService {
         tracing::debug!(tool = "generated_from", path = %args.path);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let rows = queries::query_generated_from(&conn, &args.path)
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_generated_from(&conn, &args.path, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&rows, limit, "raise `limit`")
     }
 }
 
@@ -1273,6 +1304,7 @@ mod tests {
         let svc = ShireService::new(conn, &default_rag_config(), None);
         let args = SchemaConsumersArgs {
             path: "a.proto".into(),
+            limit: None,
         };
         let r = svc.schema_consumers(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {
@@ -1558,6 +1590,7 @@ mod tests {
         let svc = ShireService::new(conn, &default_rag_config(), None);
         let args = GeneratedFromArgs {
             path: "a.pb.go".into(),
+            limit: None,
         };
         let r = svc.generated_from(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {

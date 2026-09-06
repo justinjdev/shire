@@ -91,9 +91,11 @@ pub const SYMBOLS_FTS_TRIGGERS: &str =
 /// `verifyJwtToken` -> `"verify jwt token"`, `handle_rate_limit` ->
 /// `"handle rate limit"`, `HTTPServer` -> `"http server"`.
 ///
-/// Returns an empty string when the identifier has no sub-tokens (a single
-/// word such as `handle`): the FTS `name` column already indexes that term,
-/// so storing it twice would only cost space.
+/// Returns an empty string only when the split adds nothing the `name`
+/// column already indexes — i.e. when it yields exactly the lowercased name.
+/// A leading or trailing separator does change the term (`_helper` is one
+/// `name` term because `_` is a tokenchar, and `"helper"*` does not match
+/// it), so those still get a `name_tokens` entry.
 ///
 /// Called once per symbol from the batched INSERT in `index`. It allocates a
 /// few small buffers per call (no regex, no shared state); measured at ~2% of
@@ -131,10 +133,14 @@ pub fn split_identifier(name: &str) -> String {
     if !cur.is_empty() {
         tokens.push(cur);
     }
-    if tokens.len() < 2 {
+    let joined = tokens.join(" ");
+    // Nothing gained when the split is the name itself: `handle` is already
+    // one `name` term. `_helper` is not — its `name` term keeps the
+    // underscore — so it does get an entry.
+    if joined == name.to_lowercase() {
         return String::new();
     }
-    tokens.join(" ")
+    joined
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -1021,6 +1027,16 @@ mod schema_tests {
         assert_eq!(split_identifier("parseHTTPHeader"), "parse http header");
         // Digits stay attached to the word they follow.
         assert_eq!(split_identifier("sha256Hash"), "sha256 hash");
+    }
+
+    /// A leading or trailing separator stays part of the `name` term
+    /// (`_` and `-` are tokenchars), so `"helper"*` cannot reach `_helper` —
+    /// these names need a sub-token entry even though they are one word.
+    #[test]
+    fn test_split_identifier_keeps_names_with_leading_separators() {
+        assert_eq!(split_identifier("_helper"), "helper");
+        assert_eq!(split_identifier("__init__"), "init");
+        assert_eq!(split_identifier("-flag"), "flag");
     }
 
     #[test]

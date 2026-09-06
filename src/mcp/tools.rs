@@ -16,6 +16,16 @@ pub struct ShireService {
     pub tool_router: ToolRouter<ShireService>,
     build_ctx: Option<BuildContext>,
     last_indexed: Mutex<Option<SystemTime>>,
+    /// Serializes on-demand rebuilds. Tool calls arrive concurrently, and
+    /// without this every one of them saw `is_stale() == true` and started
+    /// its own `build_index_quiet` against the same SQLite file: the losers
+    /// hit "database is locked", never swapped their connection, and
+    /// answered with a bare -32603. Holders re-check staleness under the
+    /// guard, so waiters see the winner's fresh index instead of rebuilding.
+    rebuild_lock: Mutex<()>,
+    /// Number of index rebuilds this process has actually run. Used by the
+    /// concurrency test to assert that N racing tool calls produce one build.
+    rebuild_count: std::sync::atomic::AtomicU64,
     #[cfg(feature = "rag")]
     rag_embedder: Option<crate::rag::embedder::Embedder>,
 }
@@ -80,6 +90,8 @@ impl ShireService {
             tool_router: Self::tool_router(),
             build_ctx,
             last_indexed: Mutex::new(last_indexed),
+            rebuild_lock: Mutex::new(()),
+            rebuild_count: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "rag")]
             rag_embedder,
         }
@@ -137,8 +149,20 @@ impl ShireService {
         }
     }
 
+    /// Number of rebuilds this service has run since start.
+    #[cfg(test)]
+    fn rebuild_count(&self) -> u64 {
+        self.rebuild_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Rebuild the index if stale. No-op in read-only mode.
+    ///
+    /// The staleness check and the build happen together under
+    /// `rebuild_lock`, so concurrent tool calls wait for the in-flight
+    /// rebuild rather than starting their own.
     fn maybe_rebuild(&self) {
+        // Cheap pre-check outside the lock: the common case is a warm index
+        // where nothing is stale and nothing should serialize.
         if !self.is_stale() {
             return;
         }
@@ -148,7 +172,22 @@ impl ShireService {
             None => return,
         };
 
+        // A poisoned lock only means some other rebuild panicked; the guard
+        // still gives us the mutual exclusion we need, so recover it.
+        let _guard = match self.rebuild_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Re-check under the guard: whoever held it before us may have
+        // rebuilt and swapped in a fresh connection already.
+        if !self.is_stale() {
+            return;
+        }
+
         tracing::info!("rebuilding index (stale)");
+        self.rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         match crate::index::build_index_quiet(
             &ctx.repo_root,
@@ -1422,6 +1461,61 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(r.content.len(), 1, "no note for a complete list");
+    }
+
+    /// MCP-2: concurrent tool calls under `serve --root` all saw
+    /// `is_stale() == true` and each started its own build against the same
+    /// SQLite file; the losers failed with "database is locked" and answered
+    /// -32603. The rebuild lock must collapse them into one build.
+    #[test]
+    fn test_concurrent_rebuilds_run_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"p","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/a.ts"),
+            "export function verifyJwtToken(): string { return \"t\"; }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/index"), "x").unwrap();
+
+        let svc = make_service_with_ctx(root.clone());
+        assert!(svc.is_stale(), "no index yet");
+
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| svc.maybe_rebuild());
+            }
+        });
+
+        assert_eq!(
+            svc.rebuild_count(),
+            1,
+            "six racing callers must produce exactly one build"
+        );
+        assert!(!svc.is_stale(), "index is fresh after the rebuild");
+
+        // The winner's connection was swapped in, so every caller can query.
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: Some("jwt".into()),
+                package: None,
+                kind: None,
+                limit: None,
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            1,
+            "sub-token search over the freshly built index"
+        );
     }
 
     #[test]

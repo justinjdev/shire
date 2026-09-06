@@ -19,8 +19,16 @@ fn is_visible(node: &Node, source: &str) -> bool {
 
     // Only apply underscore filtering to methods (functions inside a class body)
     if node.kind() == "function_definition"
-        && let Some(parent) = node.parent()
+        && let Some(mut parent) = node.parent()
     {
+        // A decorated function/method is wrapped in a `decorated_definition`
+        // node; walk through it to reach the real parent (`block`).
+        if parent.kind() == "decorated_definition"
+            && let Some(grandparent) = parent.parent()
+        {
+            parent = grandparent;
+        }
+
         // parent is the `block` node; its parent is the `class_definition`
         if parent.kind() == "block"
             && let Some(grandparent) = parent.parent()

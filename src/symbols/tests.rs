@@ -57,6 +57,64 @@ fn test_python_class_with_methods() {
 }
 
 #[test]
+fn test_python_decorated_functions_and_methods_are_extracted() {
+    // SYM-1: a decorated def is wrapped in `decorated_definition`, which the
+    // undecorated-only query patterns did not match at all.
+    let source = r#"from dataclasses import dataclass
+
+def plain_function(x):
+    return x
+
+@app.route("/users")
+def list_users():
+    return []
+
+@dataclass
+class User:
+    name: str
+
+    @property
+    def display_name(self):
+        return self.name
+
+    @staticmethod
+    def make():
+        return User("x")
+
+    def plain_method(self):
+        return 1
+
+    @property
+    def _hidden(self):
+        return 0
+"#;
+    let (symbols, _) = extract_file("py", source, Arc::from("app.py"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    let mut expected: Vec<(&str, SymbolKind, Option<&str>)> = vec![
+        ("plain_function", SymbolKind::Function, None),
+        ("list_users", SymbolKind::Function, None),
+        ("User", SymbolKind::Class, None),
+        ("display_name", SymbolKind::Method, Some("User")),
+        ("make", SymbolKind::Method, Some("User")),
+        ("plain_method", SymbolKind::Method, Some("User")),
+        // `_hidden` is decorated but still private inside a class — must stay excluded.
+    ];
+    expected.sort_by_key(|s| s.0);
+    assert_eq!(got, expected, "got {:?}", got);
+
+    let list_users = symbols.iter().find(|s| s.name == "list_users").unwrap();
+    assert_eq!(list_users.line, 7);
+    let display_name = symbols.iter().find(|s| s.name == "display_name").unwrap();
+    assert_eq!(display_name.line, 15);
+    let make = symbols.iter().find(|s| s.name == "make").unwrap();
+    assert_eq!(make.line, 19);
+}
+
+#[test]
 fn test_python_function_no_hints() {
     let source = r#"def greet(name):
     return f"Hello {name}"
@@ -690,7 +748,9 @@ fn test_typescript_arrow_call_references_use_anonymous_enclosing() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
         .unwrap();
     assert_eq!(parse.line, 3);
-    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
+    // `f` is nameable from its `const f = ...` binding, and the enclosing
+    // path is qualified through the containing method and class.
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("Handler.run.f"));
 }
 
 #[test]
@@ -768,7 +828,88 @@ fn test_javascript_arrow_call_references_use_anonymous_enclosing() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "parseConfig")
         .unwrap();
     assert_eq!(parse.line, 3);
-    assert_eq!(parse.enclosing_symbol.as_deref(), Some("<anonymous>"));
+    // `f` is nameable from its `const f = ...` binding, and the enclosing
+    // path is qualified through the containing method and class.
+    assert_eq!(parse.enclosing_symbol.as_deref(), Some("Handler.run.f"));
+}
+
+#[test]
+fn test_javascript_arrow_const_uses_binding_name_not_anonymous() {
+    // Reproduces SYM-4 case A: top-level arrow functions bound to a const
+    // must be individually attributable, not collapsed into "<anonymous>".
+    let source = r#"export const loadUser = async (id) => { return fetchUser(id); };
+export const saveUser = async (u) => { return fetchUser(u); };
+export function fetchUser(id) { return id; }
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("a.js"), false, 0);
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "fetchUser")
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.1);
+    assert_eq!(
+        call_refs,
+        vec![
+            ("fetchUser".into(), 1, Some("loadUser".into())),
+            ("fetchUser".into(), 2, Some("saveUser".into())),
+        ]
+    );
+}
+
+#[test]
+fn test_javascript_same_named_methods_on_different_classes_do_not_collapse() {
+    // Reproduces SYM-4 case B: same-named methods on different classes must
+    // not share one `enclosing_symbol` bucket.
+    let source = r#"export class Alpha { run() { return helper(1); } }
+export class Beta  { run() { return helper(2); } }
+export function helper(x) { return x; }
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("c.js"), false, 0);
+    let mut call_refs: Vec<(String, usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+        .map(|r| (r.name.clone(), r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.1);
+    assert_eq!(
+        call_refs,
+        vec![
+            ("helper".into(), 1, Some("Alpha.run".into())),
+            ("helper".into(), 2, Some("Beta.run".into())),
+        ]
+    );
+}
+
+#[test]
+fn test_javascript_member_assigned_arrow_uses_property_not_full_lhs() {
+    // An arrow assigned via a member expression (`this.f = ...`, `obj.f =
+    // ...`) must be named from the property alone. Taking the assignment's
+    // `left` text verbatim would name it "this.run" / "Obj.run", leaking the
+    // receiver into the enclosing-symbol path instead of just "run".
+    let source = r#"class Handler {
+  constructor() {
+    this.run = () => { helper(); };
+  }
+}
+const Obj = {};
+Obj.run = () => { helper(); };
+function helper() {}
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("d.js"), false, 0);
+    let mut call_refs: Vec<(usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+        .map(|r| (r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.0);
+    assert_eq!(
+        call_refs,
+        vec![
+            (3, Some("Handler.constructor.run".into())),
+            (7, Some("run".into())),
+        ]
+    );
 }
 
 // ============================================================
@@ -939,6 +1080,118 @@ public class Service {
 }
 
 #[test]
+fn test_java_nested_type_members_attach_to_the_nearest_type() {
+    // A member of a type nested inside a class must be attributed to that
+    // nested type, not to the outer class, and a type nested directly in an
+    // interface body is implicitly public — so its members stay visible.
+    let source = r#"public class Service {
+  public interface Callback { void onDone(); }
+  public record Point(int x, int y) { public int sum() { return x + y; } }
+}
+
+public interface Api {
+  interface Listener { void onEvent(); }
+}
+"#;
+    let (symbols, _) = extract_file("java", source, Arc::from("Service.java"), true, 0);
+    let parent_of = |name: &str| -> Option<String> {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} not extracted, got {:?}",
+                    symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+                )
+            })
+            .parent_symbol
+            .clone()
+    };
+    assert_eq!(parent_of("onDone").as_deref(), Some("Callback"));
+    assert_eq!(parent_of("sum").as_deref(), Some("Point"));
+    // `Listener` has no explicit modifier but is implicitly public (JLS),
+    // so `onEvent` must not be dropped as package-private-by-inheritance.
+    assert_eq!(parent_of("onEvent").as_deref(), Some("Listener"));
+}
+
+#[test]
+fn test_java_interface_members_are_extracted_as_implicitly_public() {
+    // SYM-2 / SYM-V1: interface methods and constants carry no explicit
+    // modifier (JLS: implicitly public, and constants implicitly static
+    // final), so a query fix alone is not enough — is_visible/post_process
+    // must treat `interface_body` members as visible.
+    let source = r#"public interface Repo {
+  String NAME = "repo";
+  User findById(long id);
+  default User findOrNull(long id) { return null; }
+}
+"#;
+    let (symbols, _) = extract_file("java", source, Arc::from("Repo.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    let mut expected: Vec<(&str, SymbolKind, Option<&str>)> = vec![
+        ("Repo", SymbolKind::Interface, None),
+        ("NAME", SymbolKind::Constant, Some("Repo")),
+        ("findById", SymbolKind::Method, Some("Repo")),
+        ("findOrNull", SymbolKind::Method, Some("Repo")),
+    ];
+    expected.sort_by_key(|s| s.0);
+    assert_eq!(got, expected, "got {:?}", got);
+
+    let find_by_id = symbols.iter().find(|s| s.name == "findById").unwrap();
+    assert_eq!(find_by_id.line, 3);
+    let find_or_null = symbols.iter().find(|s| s.name == "findOrNull").unwrap();
+    assert_eq!(find_or_null.line, 4);
+}
+
+#[test]
+fn test_java_enum_methods_and_record_are_extracted() {
+    // SYM-2: enum method bodies live in `enum_body_declarations`, not
+    // `class_body`, so they need their own query pattern. Records need both
+    // a pattern for the record type itself and a `parent_symbol` fix for
+    // their (already-matching) `class_body` methods (SYM-V1).
+    let color_source = r#"public enum Color {
+  RED, GREEN;
+  public String label() { return name(); }
+}
+"#;
+    let (color_symbols, _) = extract_file("java", color_source, Arc::from("Color.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = color_symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    assert_eq!(
+        got,
+        vec![
+            ("Color", SymbolKind::Enum, None),
+            ("label", SymbolKind::Method, Some("Color")),
+        ]
+    );
+
+    let point_source = r#"public record Point(int x, int y) {
+  public int sum() { return x + y; }
+}
+"#;
+    let (point_symbols, _) = extract_file("java", point_source, Arc::from("Point.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = point_symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    assert_eq!(
+        got,
+        vec![
+            ("Point", SymbolKind::Struct, None),
+            ("sum", SymbolKind::Method, Some("Point")),
+        ]
+    );
+}
+
+#[test]
 fn test_java_call_references() {
     let source = r#"package com.example;
 
@@ -969,9 +1222,9 @@ public class UserService {
     assert_eq!(
         call_refs,
         vec![
-            ("insert".into(), 14, Some("saveUser".into())),
-            ("lookup".into(), 9, Some("fetchUser".into())),
-            ("validate".into(), 13, Some("saveUser".into())),
+            ("insert".into(), 14, Some("UserService.saveUser".into())),
+            ("lookup".into(), 9, Some("UserService.fetchUser".into())),
+            ("validate".into(), 13, Some("UserService.saveUser".into())),
         ]
     );
 }
@@ -1047,7 +1300,13 @@ fn test_java_inner_class_call_enclosing_uses_inner_method() {
         .find(|r| r.kind == ReferenceKind::Call && r.name == "helper")
         .unwrap();
     assert_eq!(helper_call.line, 4);
-    assert_eq!(helper_call.enclosing_symbol.as_deref(), Some("run"));
+    // Qualified through every enclosing method/class, innermost last, so the
+    // call is unambiguously attributed to `Inner.run`, not to any other
+    // same-named method elsewhere in the file.
+    assert_eq!(
+        helper_call.enclosing_symbol.as_deref(),
+        Some("Outer.outer.Inner.run")
+    );
 }
 
 // ============================================================
@@ -1929,10 +2188,10 @@ object Service {
     assert_eq!(
         call_refs,
         vec![
-            ("Config".into(), 9, Some("parseConfig".into())),
-            ("Response".into(), 10, Some("buildResponse".into())),
-            ("buildResponse".into(), 6, Some("process".into())),
-            ("parseConfig".into(), 5, Some("process".into())),
+            ("Config".into(), 9, Some("Service.parseConfig".into())),
+            ("Response".into(), 10, Some("Service.buildResponse".into())),
+            ("buildResponse".into(), 6, Some("Service.process".into())),
+            ("parseConfig".into(), 5, Some("Service.process".into())),
         ]
     );
 }
@@ -2013,6 +2272,45 @@ fn test_zig_skip_non_pub() {
 "#;
     let (symbols, _) = extract_file("zig", source, Arc::from("internal.zig"), true, 0);
     assert!(symbols.is_empty());
+}
+
+// ============================================================
+// Lua tests (SYM-12: previously untested — see registry.rs)
+// ============================================================
+
+#[test]
+fn test_lua_function_declaration() {
+    let source = "function greet(name)\n  return name\nend\n";
+    let (symbols, _) = extract_file("lua", source, Arc::from("greet.lua"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "greet");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
+}
+
+#[test]
+fn test_lua_method_declaration() {
+    let source = "function M:process(item)\n  return item\nend\n";
+    let (symbols, _) = extract_file("lua", source, Arc::from("m.lua"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "process");
+    assert_eq!(symbols[0].kind, SymbolKind::Method);
+}
+
+// ============================================================
+// TSX tests (SYM-12: `tsx` compiles LANGUAGE_TSX, a distinct grammar
+// compilation from `LANGUAGE_TYPESCRIPT` — previously untested)
+// ============================================================
+
+#[test]
+fn test_tsx_exported_function() {
+    let source = r#"export function Greeting(name: string) {
+    return name;
+}
+"#;
+    let (symbols, _) = extract_file("tsx", source, Arc::from("Greeting.tsx"), true, 0);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Greeting");
+    assert_eq!(symbols[0].kind, SymbolKind::Function);
 }
 
 #[test]
@@ -2859,10 +3157,10 @@ end
     assert_eq!(
         call_refs,
         vec![
-            ("dump".into(), 10, Some("save".into())),
-            ("parse".into(), 6, Some("load".into())),
-            ("read".into(), 5, Some("load".into())),
-            ("write".into(), 10, Some("save".into())),
+            ("dump".into(), 10, Some("Loader.save".into())),
+            ("parse".into(), 6, Some("Loader.load".into())),
+            ("read".into(), 5, Some("Loader.load".into())),
+            ("write".into(), 10, Some("Loader.save".into())),
         ]
     );
 }
@@ -2939,7 +3237,7 @@ end
         .find(|r| r.kind == ReferenceKind::Call && r.name == "process")
         .unwrap();
     assert_eq!(process_call.line, 4);
-    assert_eq!(process_call.enclosing_symbol.as_deref(), Some("run"));
+    assert_eq!(process_call.enclosing_symbol.as_deref(), Some("Job.run"));
 }
 
 #[test]

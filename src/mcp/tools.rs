@@ -16,8 +16,6 @@ pub struct ShireService {
     pub tool_router: ToolRouter<ShireService>,
     build_ctx: Option<BuildContext>,
     last_indexed: Mutex<Option<SystemTime>>,
-    #[cfg(feature = "rag")]
-    rag_embedder: Option<crate::rag::embedder::Embedder>,
 }
 
 impl std::fmt::Debug for ShireService {
@@ -26,52 +24,12 @@ impl std::fmt::Debug for ShireService {
         d.field("conn", &self.conn);
         d.field("tool_router", &self.tool_router);
         d.field("build_ctx", &self.build_ctx.as_ref().map(|c| &c.repo_root));
-        #[cfg(feature = "rag")]
-        d.field(
-            "rag_embedder",
-            &self.rag_embedder.as_ref().map(|_| "Embedder(...)"),
-        );
         d.finish()
     }
 }
 
 impl ShireService {
-    pub fn new(
-        conn: Connection,
-        rag_config: &crate::config::RagConfig,
-        build_ctx: Option<BuildContext>,
-    ) -> Self {
-        #[cfg(feature = "rag")]
-        let rag_embedder = if rag_config.enabled {
-            match crate::rag::embedder::Embedder::new(rag_config) {
-                Ok(e) => {
-                    // Verify vector table exists before enabling hybrid search
-                    let table_check = conn.prepare("SELECT 1 FROM file_embeddings LIMIT 0");
-                    match &table_check {
-                        Ok(_) => {
-                            tracing::info!("RAG hybrid search enabled");
-                            Some(e)
-                        }
-                        Err(err) => {
-                            tracing::warn!(%err,
-                                "RAG enabled but file_embeddings table not accessible — \
-                                 run `shire build` with [rag] enabled to generate embeddings");
-                            None
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "RAG embedder init failed");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        #[cfg(not(feature = "rag"))]
-        let _ = rag_config;
-
+    pub fn new(conn: Connection, build_ctx: Option<BuildContext>) -> Self {
         // Initialize last_indexed from DB metadata if available
         let last_indexed = Self::read_indexed_at(&conn);
 
@@ -80,8 +38,6 @@ impl ShireService {
             tool_router: Self::tool_router(),
             build_ctx,
             last_indexed: Mutex::new(last_indexed),
-            #[cfg(feature = "rag")]
-            rag_embedder,
         }
     }
 
@@ -212,84 +168,6 @@ impl ShireService {
                  `shire build --force`, then retry this tool.",
             )])),
         }
-    }
-
-    /// Merge FTS5 and vector search results using Reciprocal Rank Fusion (RRF).
-    #[cfg(feature = "rag")]
-    fn hybrid_search(
-        conn: &Connection,
-        embedder: &crate::rag::embedder::Embedder,
-        params: &SearchSymbolsParams,
-        fts_results: &[queries::SymbolRow],
-    ) -> Result<Vec<queries::SymbolRow>, ErrorData> {
-        let query_text = params.query.as_deref().unwrap_or("");
-        if query_text.is_empty() {
-            return Ok(fts_results.to_vec());
-        }
-
-        // Embed the query
-        let query_embeddings = embedder
-            .embed(vec![query_text.to_string()])
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let query_vec = query_embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| Self::mcp_err("No embedding returned".into()))?;
-
-        // File-level vector search → find matching files → return their symbols
-        let file_vec_results = crate::rag::storage::search_similar_files(conn, &query_vec, 20)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-
-        if file_vec_results.is_empty() {
-            return Ok(fts_results.to_vec());
-        }
-
-        let mut vec_symbols: Vec<queries::SymbolRow> = Vec::new();
-        // Fetch up to 50 symbols per file to avoid missing matches after filtering
-        let mut sym_stmt = conn.prepare(
-            "SELECT name, kind, signature, package, file_path, line, visibility, parent_symbol, return_type, parameters \
-             FROM symbols WHERE file_path = ?1 LIMIT 50"
-        ).map_err(|e| Self::mcp_err(e.to_string()))?;
-
-        for (file_id, _distance) in &file_vec_results {
-            let file_path: String =
-                match conn.query_row("SELECT path FROM files WHERE id = ?1", [file_id], |row| {
-                    row.get(0)
-                }) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-
-            if let Ok(rows) = sym_stmt.query_map([&file_path], |row| {
-                Ok(queries::SymbolRow {
-                    name: row.get(0)?,
-                    kind: row.get(1)?,
-                    signature: row.get(2)?,
-                    package: row.get(3)?,
-                    file_path: row.get(4)?,
-                    line: row.get(5)?,
-                    visibility: row.get(6)?,
-                    parent_symbol: row.get(7)?,
-                    return_type: row.get(8)?,
-                    parameters: row.get(9)?,
-                })
-            }) {
-                for sym in rows.flatten() {
-                    if params.package.as_ref().is_none_or(|p| sym.package == *p)
-                        && params.kind.as_ref().is_none_or(|k| sym.kind == *k)
-                    {
-                        vec_symbols.push(sym);
-                    }
-                }
-            }
-        }
-
-        if vec_symbols.is_empty() {
-            return Ok(fts_results.to_vec());
-        }
-
-        let limit = params.limit.unwrap_or(20) as usize;
-        Ok(queries::rrf_merge(fts_results, &vec_symbols, limit))
     }
 }
 
@@ -568,23 +446,7 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        #[cfg(feature = "rag")]
-        let results = if let Some(ref embedder) = self.rag_embedder {
-            match Self::hybrid_search(&conn, embedder, &params, &fts_results) {
-                Ok(merged) => merged,
-                Err(e) => {
-                    tracing::warn!(error = %e.message, "hybrid search failed, falling back to FTS-only");
-                    fts_results
-                }
-            }
-        } else {
-            fts_results
-        };
-
-        #[cfg(not(feature = "rag"))]
-        let results = fts_results;
-
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
+        let json = serde_json::to_string(&fts_results).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -848,13 +710,9 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
-    fn default_rag_config() -> crate::config::RagConfig {
-        crate::config::RagConfig::default()
-    }
-
     fn make_service_readonly() -> ShireService {
         let conn = Connection::open_in_memory().unwrap();
-        ShireService::new(conn, &default_rag_config(), None)
+        ShireService::new(conn, None)
     }
 
     fn make_service_with_ctx(repo_root: std::path::PathBuf) -> ShireService {
@@ -865,7 +723,7 @@ mod tests {
             config: crate::config::Config::default(),
             db_path,
         };
-        ShireService::new(conn, &default_rag_config(), Some(build_ctx))
+        ShireService::new(conn, Some(build_ctx))
     }
 
     #[test]
@@ -965,7 +823,7 @@ mod tests {
     fn test_refs_disabled_result_none_when_enabled() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
-        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let conn = crate::db::open_or_create(&path).unwrap();
         crate::db::write_references_enabled(&conn, true).unwrap();
         assert!(
             ShireService::refs_disabled_result(&conn).is_none(),
@@ -977,7 +835,7 @@ mod tests {
     fn test_refs_disabled_result_some_when_disabled() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
-        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let conn = crate::db::open_or_create(&path).unwrap();
         crate::db::write_references_enabled(&conn, false).unwrap();
         let r = ShireService::refs_disabled_result(&conn);
         assert!(r.is_some(), "disabled flag short-circuits the tool");
@@ -987,7 +845,7 @@ mod tests {
     fn test_refs_disabled_result_some_when_unset() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
-        let conn = crate::db::open_or_create(&path, false).unwrap();
+        let conn = crate::db::open_or_create(&path).unwrap();
         // Flag was never written — simulates an old DB or an index that
         // predates this guard. Tools must still refuse to serve.
         let r = ShireService::refs_disabled_result(&conn);
@@ -1003,11 +861,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
         {
-            let conn = crate::db::open_or_create(&path, false).unwrap();
+            let conn = crate::db::open_or_create(&path).unwrap();
             crate::db::write_references_enabled(&conn, true).unwrap();
         }
-        let conn = crate::db::open_or_create(&path, false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&path).unwrap();
+        let svc = ShireService::new(conn, None);
 
         let args = SymbolRefsArgs {
             name: "foo".into(),
@@ -1036,11 +894,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
         {
-            let conn = crate::db::open_or_create(&path, false).unwrap();
+            let conn = crate::db::open_or_create(&path).unwrap();
             crate::db::write_references_enabled(&conn, true).unwrap();
         }
-        let conn = crate::db::open_or_create(&path, false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&path).unwrap();
+        let svc = ShireService::new(conn, None);
 
         let args = SymbolRefsArgs {
             name: "foo".into(),
@@ -1062,11 +920,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
         {
-            let conn = crate::db::open_or_create(&path, false).unwrap();
+            let conn = crate::db::open_or_create(&path).unwrap();
             crate::db::write_references_enabled(&conn, false).unwrap();
         }
-        let conn = crate::db::open_or_create(&path, false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&path).unwrap();
+        let svc = ShireService::new(conn, None);
 
         let args = ChangeImpactArgs {
             name: "foo".into(),
@@ -1089,7 +947,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
         {
-            let conn = crate::db::open_or_create(&path, false).unwrap();
+            let conn = crate::db::open_or_create(&path).unwrap();
             crate::db::write_references_enabled(&conn, true).unwrap();
             conn.execute(
                 "INSERT INTO packages (name, path, kind) VALUES ('core','core','rust'),('dep','dep','rust'),('grand','grand','rust')",
@@ -1131,8 +989,8 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = crate::db::open_or_create(&path, false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&path).unwrap();
+        let svc = ShireService::new(conn, None);
 
         let args = ChangeImpactArgs {
             name: "foo".into(),
@@ -1162,8 +1020,8 @@ mod tests {
     #[test]
     fn test_schema_consumers_empty_db() {
         let dir = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&dir.path().join("t.db")).unwrap();
+        let svc = ShireService::new(conn, None);
         let args = SchemaConsumersArgs {
             path: "a.proto".into(),
         };
@@ -1193,8 +1051,8 @@ mod tests {
     #[test]
     fn test_generated_from_empty_db() {
         let dir = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_or_create(&dir.path().join("t.db"), false).unwrap();
-        let svc = ShireService::new(conn, &default_rag_config(), None);
+        let conn = crate::db::open_or_create(&dir.path().join("t.db")).unwrap();
+        let svc = ShireService::new(conn, None);
         let args = GeneratedFromArgs {
             path: "a.pb.go".into(),
         };

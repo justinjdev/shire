@@ -3,7 +3,7 @@ pub mod queries;
 use anyhow::Result;
 use rusqlite::Connection;
 
-pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Connection> {
+pub fn open_or_create(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -25,13 +25,6 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
     )?;
     create_schema(&conn)?;
     migrate_fts_if_needed(&conn)?;
-
-    #[cfg(feature = "rag")]
-    if rag_enabled {
-        crate::rag::storage::init_table(&conn)?;
-    }
-
-    let _ = rag_enabled;
 
     Ok(conn)
 }
@@ -721,7 +714,7 @@ mod schema_tests {
     fn test_symbol_refs_schema_created() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -737,7 +730,7 @@ mod schema_tests {
     fn test_symbol_refs_insert_and_query() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         conn.execute(
             "INSERT INTO files (path, package, extension, size_bytes) VALUES ('src/main.rs', NULL, 'rs', 0)",
@@ -779,7 +772,7 @@ mod schema_tests {
         // missing for a stretch — verify it's created for fresh DBs.
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -796,7 +789,7 @@ mod schema_tests {
     fn test_call_ref_covering_indexes_exist() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let callers_idx: i64 = conn
             .query_row(
@@ -823,7 +816,7 @@ mod schema_tests {
     fn test_references_enabled_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         assert_eq!(
             read_references_enabled(&conn),

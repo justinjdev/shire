@@ -16,6 +16,14 @@
 - **WHEN** a `build.gradle` has no `group` assignment
 - **THEN** the package name falls back to directory-based naming (relative path with slashes replaced by hyphens)
 
+#### Scenario: group:projectName collides with another subproject
+
+- **WHEN** two `build.gradle` files in different directories share a `group` and compute the same `group:projectName` name (e.g. both directories are named `app`)
+- **THEN** the first-seen package keeps the `group:projectName` name
+- **AND** the second, colliding package instead gets a path-derived name (its relative directory with `/` replaced by `-`)
+- **AND** a warning is logged naming both directories
+- **AND** neither package is silently dropped
+
 #### Scenario: Kotlin DSL build.gradle.kts
 
 - **WHEN** a `build.gradle.kts` is parsed
@@ -44,6 +52,20 @@
 - **WHEN** a dependency is declared as `implementation project(':submodule')` or `implementation(project(":submodule"))`
 - **THEN** the dependency is extracted with the project path as the dep name (e.g., `:submodule`)
 - **AND** `version_req` is None
+
+#### Scenario: Project dependency resolves to the target package's real name
+
+- **WHEN** a `project(':a:b')` dependency is stored as `:a:b`
+- **AND** `:a:b` resolves (relative to the owning `settings.gradle`) to a directory holding an indexed Gradle package
+- **THEN** the stored dependency is rewritten to that package's actual `group:projectName` (or fallback) name
+- **AND** `is_internal` is 1 for that dependency
+- **AND** this resolution re-runs on every build (not just when the referencing manifest changes), so it is unaffected by manifest processing order and self-heals dependency rows written before this resolution existed
+
+#### Scenario: Unresolvable project dependency is left as-is
+
+- **WHEN** a `project(':a:b')` dependency does not resolve to any known package directory (e.g. a stale or out-of-repo reference)
+- **THEN** the stored dependency name is left as `:a:b`
+- **AND** `is_internal` is 0
 
 #### Scenario: Unrecognized dependency format
 

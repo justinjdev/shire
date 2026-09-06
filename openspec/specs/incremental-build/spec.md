@@ -28,6 +28,14 @@ The system stores a SHA-256 content hash for each manifest file after successful
 - **AND** the stored hash is updated
 - **AND** `is_internal` is recomputed for all dependencies
 
+#### Scenario: Manifest fails to parse
+
+- **WHEN** `shire build` re-parses a manifest and parsing genuinely fails (e.g. malformed content, not a recognized "no package" case such as a Cargo virtual workspace root)
+- **THEN** the manifest's content hash is NOT stored or updated — its previously stored hash (if any) is left as-is
+- **AND** any existing package row for that manifest's directory is left untouched, so previously indexed data continues to be served
+- **AND** the failure is reported in the build summary
+- **AND** the next build sees the same (still-differing) hash and retries the parse, reporting the failure again — it does not silently start reporting 0 failures
+
 ### Requirement: Manifest addition detection
 
 #### Scenario: New manifest appears

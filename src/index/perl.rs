@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
 use regex::Regex;
 use std::path::Path;
@@ -17,7 +17,7 @@ impl ManifestParser for CpanfileParser {
         parse_cpanfile(&content, &mut dependencies);
 
         Ok(PackageInfo {
-            name: relative_dir.to_string(),
+            name: manifest::fallback_name(manifest_path, relative_dir),
             path: relative_dir.to_string(),
             kind: "perl",
             version: None,
@@ -125,7 +125,7 @@ mod tests {
         let parser = CpanfileParser;
         let info = parser.parse(&path, "lib/myapp").unwrap();
 
-        assert_eq!(info.name, "lib/myapp");
+        assert_eq!(info.name, "lib-myapp");
         assert_eq!(info.kind, "perl");
         assert_eq!(info.path, "lib/myapp");
         assert_eq!(info.dependencies.len(), 2);
@@ -233,11 +233,39 @@ requires 'DBI';
         let parser = CpanfileParser;
         let info = parser.parse(&path, "lib/myapp").unwrap();
 
-        // Should parse Moose, DBD::SQLite (inside a sub block), and DBI
-        // The comment and garbage line are silently skipped
-        let names: Vec<&str> = info.dependencies.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"Moose"));
-        assert!(names.contains(&"DBI"));
+        // Should parse exactly Moose, DBD::SQLite (inside the `feature` sub
+        // block) and DBI — the comment and garbage line contribute nothing.
+        assert_eq!(info.dependencies.len(), 3);
+        assert_eq!(info.dependencies[0].name, "Moose");
+        assert_eq!(info.dependencies[0].version_req.as_deref(), Some("2.2009"));
+        assert!(matches!(info.dependencies[0].dep_kind, DepKind::Runtime));
+
+        assert_eq!(info.dependencies[1].name, "DBD::SQLite");
+        assert_eq!(info.dependencies[1].version_req, None);
+        assert!(matches!(info.dependencies[1].dep_kind, DepKind::Runtime));
+
+        assert_eq!(info.dependencies[2].name, "DBI");
+        assert_eq!(info.dependencies[2].version_req, None);
+        assert!(matches!(info.dependencies[2].dep_kind, DepKind::Runtime));
+    }
+
+    #[test]
+    fn test_parse_root_cpanfile_uses_repo_dir_name_not_empty_string() {
+        // A cpanfile at the repo root (relative_dir == "") must not produce a
+        // package with an empty name — that name is also the join key other
+        // tables (dependencies, symbols) key on.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(dir.path(), "requires 'Moose', '2.2009';\n");
+
+        let parser = CpanfileParser;
+        let info = parser.parse(&path, "").unwrap();
+
+        assert!(!info.name.is_empty());
+        let expected = dir.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(info.name, expected);
+        // The path column must stay "" so file association / stale-hash
+        // cleanup keys the root package the same way every other parser does.
+        assert_eq!(info.path, "");
     }
 
     #[test]

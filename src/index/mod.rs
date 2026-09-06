@@ -25,7 +25,7 @@ use ignore::WalkBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -811,17 +811,205 @@ struct BuildSummary {
     failures: Vec<(String, String)>,
 }
 
+/// If `pkg`'s computed name is already used by a *different* package path
+/// in the DB (e.g. two Gradle subprojects that share a `group` and a
+/// directory basename, so both compute the same `group:basename` name),
+/// fall back to a path-derived name so the colliding package isn't silently
+/// dropped by upsert_package's `ON CONFLICT(name)` resolution.
+///
+/// The path-derived fallback (`path` with `/` replaced by `-`) can itself
+/// already be taken by a different package — e.g. a nested `foo/bar` colliding
+/// with a flat directory literally named `foo-bar`, or a second collision on
+/// a name that gradle.rs's own directory-fallback naming (no `group` set)
+/// already derives the same way. A single fallback attempt would then be a
+/// no-op (or a new collision), silently reproducing the exact drop this
+/// function exists to prevent — so keep disambiguating with a numeric suffix
+/// until the candidate name is free (or already belongs to this same path).
+fn resolve_gradle_name_collision(conn: &Connection, pkg: &mut PackageInfo) -> Result<()> {
+    let existing_path: Option<String> = conn
+        .query_row(
+            "SELECT path FROM packages WHERE name = ?1",
+            [&pkg.name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(existing_path) = existing_path
+        && existing_path != pkg.path
+    {
+        let base_fallback = pkg.path.replace('/', "-");
+        let mut fallback = base_fallback.clone();
+        let mut suffix = 2;
+        loop {
+            let fallback_owner: Option<String> = conn
+                .query_row(
+                    "SELECT path FROM packages WHERE name = ?1",
+                    [&fallback],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match fallback_owner {
+                Some(owner_path) if owner_path != pkg.path => {
+                    fallback = format!("{base_fallback}-{suffix}");
+                    suffix += 1;
+                }
+                _ => break,
+            }
+        }
+        tracing::warn!(
+            name = %pkg.name,
+            existing_path = %existing_path,
+            new_path = %pkg.path,
+            fallback_name = %fallback,
+            "Gradle package name collision detected; falling back to a path-derived name"
+        );
+        pkg.name = fallback;
+    }
+
+    Ok(())
+}
+
+/// Find the settings.gradle directory that governs `relative_dir` — the
+/// longest known settings dir that is a prefix of `relative_dir` (or the
+/// repo root `""` when none is more specific). Used to resolve Gradle
+/// `project(':a:b')` references to a directory path.
+fn governing_gradle_settings_dir<'a>(
+    settings_dirs: &'a HashMap<String, Option<String>>,
+    relative_dir: &str,
+) -> &'a str {
+    settings_dirs
+        .keys()
+        .filter(|dir| {
+            dir.is_empty()
+                || relative_dir == dir.as_str()
+                || relative_dir.starts_with(&format!("{}/", dir))
+        })
+        .max_by_key(|dir| dir.len())
+        .map(|s| s.as_str())
+        .unwrap_or("")
+}
+
+/// Resolve Gradle `project(':a:b')` dependency references (stored as
+/// `:a:b`) to the target project's actual package name, so
+/// `recompute_is_internal`'s simple `dependency IN (SELECT name FROM
+/// packages)` check can match them. Runs over every Gradle dependency row
+/// each build — not just newly parsed ones — so it isn't sensitive to
+/// manifest processing order within a build and self-heals rows written
+/// before this resolution existed. The caller must invoke this
+/// unconditionally (not just when manifests changed) for that self-heal
+/// guarantee to actually hold; returns whether any row was rewritten, so
+/// the caller can decide whether `recompute_is_internal` also needs to
+/// rerun.
+fn resolve_gradle_project_dependencies(
+    conn: &Connection,
+    gradle_root_names: &HashMap<String, Option<String>>,
+) -> Result<bool> {
+    let mut path_to_name: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT name, path FROM packages WHERE kind = 'gradle'")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, path) = row?;
+            path_to_name.insert(path, name);
+        }
+    }
+
+    let raw_refs: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT d.package, p.path, d.dependency
+             FROM dependencies d
+             JOIN packages p ON p.name = d.package
+             WHERE p.kind = 'gradle' AND d.dependency LIKE ':%'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // `OR REPLACE`: `dependencies` is keyed on (package, dependency,
+    // dep_kind), and a build file may name the same module both ways —
+    // `implementation project(':core')` alongside a coordinate that resolves
+    // to the same package name. Rewriting the project ref would then collide
+    // with the existing row and abort the whole build; replacing collapses
+    // the duplicate edge instead, which is what the rows mean anyway.
+    let mut update_stmt = conn.prepare(
+        "UPDATE OR REPLACE dependencies SET dependency = ?1 WHERE package = ?2 AND dependency = ?3",
+    )?;
+
+    let mut any_updated = false;
+    for (owner_name, owner_path, raw_dep) in &raw_refs {
+        let settings_dir = governing_gradle_settings_dir(gradle_root_names, owner_path);
+        let project_dir = raw_dep.trim_start_matches(':').replace(':', "/");
+        let target_dir = if settings_dir.is_empty() {
+            project_dir
+        } else {
+            format!("{}/{}", settings_dir, project_dir)
+        };
+        if let Some(resolved_name) = path_to_name.get(&target_dir)
+            && resolved_name != raw_dep
+        {
+            update_stmt.execute((resolved_name, owner_name, raw_dep))?;
+            any_updated = true;
+        }
+    }
+
+    Ok(any_updated)
+}
+
 /// Phase 3: Parse new and changed manifests into packages.
+///
+/// Returns the parsed packages, the manifests that genuinely failed to
+/// parse (for reporting), and the manifest keys of those genuine failures
+/// (so the caller can exclude them from hash storage — see MANIFESTS-6).
+/// A manifest that legitimately declares no package of its own (a Cargo
+/// virtual workspace root, a Maven aggregator POM — see
+/// [`manifest::is_no_package_marker`]) is neither a parsed package nor a
+/// failure: it's logged at debug level and its hash is still stored.
 #[allow(clippy::type_complexity)]
 fn phase_parse(
     to_parse: &[&WalkedManifest],
     conn: &Connection,
     parsers: &[Box<dyn ManifestParser>],
     ws: &WorkspaceContext,
-) -> Result<(Vec<(String, String, String)>, Vec<(String, String)>)> {
+) -> Result<(
+    Vec<(String, String, String)>,
+    Vec<(String, String)>,
+    HashSet<String>,
+)> {
     let mut parsed_packages: Vec<(String, String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut failed_keys: HashSet<String> = HashSet::new();
     let cargo_parser = cargo::CargoParser;
+
+    // Record a parse error as either a silent "no package" skip or a
+    // reported failure (also tracked by manifest key, to exclude it from
+    // hash storage).
+    let mut record_err = |manifest: &WalkedManifest, e: anyhow::Error| -> Result<()> {
+        if manifest::is_no_package_marker(&e) {
+            tracing::debug!(
+                manifest = %manifest.abs_path.display(),
+                reason = %e,
+                "manifest declares no package of its own; skipping"
+            );
+            // The manifest may previously have declared a real package here
+            // (e.g. a leaf crate later converted into a virtual workspace
+            // root) — remove any such stale row now. Its hash is about to be
+            // (re)stored as "resolved", so this is the only chance to clean
+            // it up; otherwise it would linger in the DB forever.
+            delete_package_at_path(conn, &manifest.relative_dir)?;
+        } else {
+            failed_keys.insert(manifest.manifest_key.clone());
+            failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+        }
+        Ok(())
+    };
 
     for manifest in to_parse {
         let filename = manifest
@@ -850,9 +1038,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -874,12 +1060,11 @@ fn phase_parse(
                     if gradle_dirs.contains(&manifest.relative_dir) {
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
+                    resolve_gradle_name_collision(conn, &mut pkg)?;
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -895,9 +1080,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e)?,
             }
             continue;
         }
@@ -912,9 +1095,7 @@ fn phase_parse(
                         let winner = upsert_package(conn, &pkg)?;
                         parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
-                    Err(e) => {
-                        failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                    }
+                    Err(e) => record_err(manifest, e)?,
                 }
                 break;
             }
@@ -932,7 +1113,37 @@ fn phase_parse(
         parsed_packages = by_path.into_values().collect();
     }
 
-    Ok((parsed_packages, failures))
+    Ok((parsed_packages, failures, failed_keys))
+}
+
+/// Remove any package row at `path`, along with its dependencies, symbols,
+/// and hash caches. Shared by `phase_remove_deleted` (manifest disappeared
+/// from disk) and `phase_parse`'s `NoPackageManifest` handling (the manifest
+/// is still on disk but no longer declares a package there — e.g. a leaf
+/// crate whose `Cargo.toml` was converted into a virtual workspace root).
+fn delete_package_at_path(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute(
+        "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
+        [path],
+    )?;
+    conn.execute("DELETE FROM packages WHERE path = ?1", [path])?;
+    Ok(())
 }
 
 /// Phase 4: Remove packages whose manifests were deleted.
@@ -942,27 +1153,7 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             .rsplit_once('/')
             .map(|(dir, _)| dir)
             .unwrap_or("");
-        conn.execute(
-            "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute(
-            "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-            [relative_dir],
-        )?;
-        conn.execute("DELETE FROM packages WHERE path = ?1", [relative_dir])?;
+        delete_package_at_path(conn, relative_dir)?;
         conn.execute(
             "DELETE FROM manifest_hashes WHERE path = ?1",
             [manifest_key.as_str()],
@@ -2012,7 +2203,16 @@ fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
 /// Remove stale entries from manifest_hashes and source_hashes that no longer
 /// correspond to existing packages. This prevents unbounded growth when packages
 /// are renamed, moved, or removed across builds.
-fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
+///
+/// `walked_keys` is the set of manifest keys seen in the current filesystem
+/// walk. A manifest that is still on disk is never pruned here even if it
+/// has no package of its own (e.g. a Cargo virtual workspace root or a
+/// Maven aggregator POM, see MANIFESTS-12) — deleting its manifest_hashes
+/// row would make it look "new" on the next build, re-triggering a parse
+/// (and, before that fix, a re-reported failure) forever. A manifest that
+/// truly disappeared is instead pruned by phase_remove_deleted, keyed
+/// exactly by its removed manifest key.
+fn cleanup_stale_hashes(conn: &Connection, walked_keys: &HashSet<String>) -> Result<()> {
     // source_hashes: key is package name — delete if package no longer exists
     conn.execute(
         "DELETE FROM source_hashes WHERE package NOT IN (SELECT name FROM packages)",
@@ -2045,6 +2245,9 @@ fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
     let stale_keys: Vec<&str> = all_manifest_keys
         .iter()
         .filter(|key| {
+            if walked_keys.contains(key.as_str()) {
+                return false; // still present on disk this build; not stale
+            }
             let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key.as_str());
             if WORKSPACE_MANIFESTS.contains(&filename) {
                 return false; // never prune workspace manifests
@@ -2541,7 +2744,7 @@ fn build_index_inner(
     } else {
         None
     };
-    let (mut parsed_packages, failures) =
+    let (mut parsed_packages, failures, failed_manifest_keys) =
         with_transaction(&conn, || phase_parse(&to_parse, &conn, &parsers, &ws_ctx))?;
     if let Some(pb) = pb_parse {
         pb.finish_with_message(format!("Parsed {} manifests", to_parse.len()));
@@ -2607,7 +2810,13 @@ fn build_index_inner(
     let sp = make_spinner(&mp, "Recomputing internals…");
     let t = Instant::now();
     with_transaction(&conn, || {
-        if num_added > 0 || num_changed > 0 || num_removed > 0 {
+        // Always run, not just when manifests changed this build: this is
+        // what lets it self-heal Gradle project() dependency rows written
+        // by a shire version predating this resolution, even on a build
+        // where nothing else changed (see resolve_gradle_project_dependencies).
+        let gradle_deps_resolved =
+            resolve_gradle_project_dependencies(&conn, &ws_ctx.gradle_settings.1)?;
+        if num_added > 0 || num_changed > 0 || num_removed > 0 || gradle_deps_resolved {
             recompute_is_internal(&conn)?;
         }
         Ok(())
@@ -2616,14 +2825,27 @@ fn build_index_inner(
     sp.finish_with_message("Internals recomputed");
 
     // Phase 6: Store manifest hashes (transaction-wrapped)
+    //
+    // Manifests that genuinely failed to parse are excluded: storing their
+    // hash would make the next build see them as unchanged and skip them
+    // silently, serving stale package data with no further warning (see
+    // MANIFESTS-6). Excluding them here means their (stored) hash is left
+    // as whatever it was before this build — absent for a manifest that has
+    // never parsed successfully, or the last-good hash for one that used
+    // to — so the next build retries and re-reports the failure.
     tracing::debug!("phase 6: store manifest hashes");
     let t = Instant::now();
-    if !to_parse.is_empty() {
-        let pb = make_progress(&mp, to_parse.len() as u64, "Storing hashes");
-        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
-        pb.finish_with_message(format!("Stored {} hashes", to_parse.len()));
+    let to_store_hashes: Vec<&WalkedManifest> = to_parse
+        .iter()
+        .filter(|m| !failed_manifest_keys.contains(&m.manifest_key))
+        .copied()
+        .collect();
+    if !to_store_hashes.is_empty() {
+        let pb = make_progress(&mp, to_store_hashes.len() as u64, "Storing hashes");
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_store_hashes))?;
+        pb.finish_with_message(format!("Stored {} hashes", to_store_hashes.len()));
     } else {
-        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_store_hashes))?;
     }
     timings.push(("update-hashes", t.elapsed()));
 
@@ -2956,8 +3178,11 @@ fn build_index_inner(
     // source_hashes keys on package name, so orphans are easy to detect.
     // manifest_hashes keys on manifest path — orphans occur when packages are
     // renamed/moved; we detect them by checking if the manifest's parent directory
-    // still matches a known package path.
-    cleanup_stale_hashes(&conn)?;
+    // still matches a known package path (unless the manifest is still on disk
+    // this build — see cleanup_stale_hashes).
+    let walked_manifest_keys: HashSet<String> =
+        walked.iter().map(|m| m.manifest_key.clone()).collect();
+    cleanup_stale_hashes(&conn, &walked_manifest_keys)?;
 
     // FTS5 maintenance: incremental merge on non-full builds.
     // Skip optimize on full/forced builds — the FTS was just rebuilt from scratch.
@@ -3664,6 +3889,172 @@ anyhow = "1"
         assert_eq!(pkg_count(root), 1);
     }
 
+    // --- MANIFESTS-12 / MANIFESTS-V1: virtual workspace roots aren't failures ---
+
+    #[test]
+    fn test_virtual_cargo_workspace_root_hash_persists_across_builds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let member_dir = root.join("crates/a");
+        fs::create_dir_all(&member_dir).unwrap();
+        fs::write(
+            member_dir.join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+
+        let db_path = root.join(".shire/index.db");
+        let root_hash_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM manifest_hashes WHERE path = 'Cargo.toml'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        assert_eq!(
+            root_hash_count(&conn),
+            1,
+            "the virtual workspace root's hash must be stored, or it is \
+             re-parsed (and, before this fix, re-reported as a failure) \
+             every build"
+        );
+        drop(conn);
+
+        // A second, no-op build must not drop-then-re-add the root
+        // manifest's hash, and must not grow the package count.
+        build_index(root, &config, false, None).unwrap();
+        let conn = db::open_readonly(&db_path).unwrap();
+        assert_eq!(root_hash_count(&conn), 1);
+        drop(conn);
+        assert_eq!(pkg_count(root), 1);
+    }
+
+    #[test]
+    fn test_maven_aggregator_pom_is_not_a_parse_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <modules>
+        <module>auth</module>
+    </modules>
+</project>"#,
+        )
+        .unwrap();
+        let auth_dir = root.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>auth</artifactId>
+    <version>1.0.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(pkg_count(root), 1);
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        let root_hash_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_hashes WHERE path = 'pom.xml'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            root_hash_count, 1,
+            "an aggregator POM's hash must be stored so it isn't re-parsed every build"
+        );
+    }
+
+    // --- MANIFESTS-6: a manifest that fails to parse keeps the last-good package ---
+
+    #[test]
+    fn test_broken_manifest_keeps_last_good_package_and_retries_every_build() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc_dir = dir.path().join("svc");
+        fs::create_dir_all(&svc_dir).unwrap();
+        let manifest_path = svc_dir.join("package.json");
+        fs::write(
+            &manifest_path,
+            br#"{"name": "auth-service", "version": "1.0.0", "dependencies": {"express": "^4.0"}}"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(dir.path(), &config, false, None).unwrap();
+        assert_eq!(pkg_count(dir.path()), 1);
+
+        // Corrupt the manifest (mid-edit / merge-conflict scenario).
+        fs::write(
+            &manifest_path,
+            br#"{"name": "auth-service", "version": BROKEN"#,
+        )
+        .unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        // The last-good package/version survives untouched.
+        let version: String = conn
+            .query_row(
+                "SELECT version FROM packages WHERE name = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1.0.0");
+        let dep_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE package = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dep_count, 1);
+        drop(conn);
+
+        // The broken content's hash must never have been stored — otherwise
+        // the next build would see it as unchanged and stop reporting the
+        // failure entirely.
+        let conn = db::open_readonly(&db_path).unwrap();
+        let stored_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM manifest_hashes WHERE path = 'svc/package.json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let broken_hash = crate::index::hash::hash_file(&manifest_path).unwrap();
+        assert_ne!(
+            stored_hash, broken_hash,
+            "a failed manifest's content hash must never be stored, so the next build retries it"
+        );
+    }
+
     #[test]
     fn test_npm_workspace_protocol_in_index() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4033,5 +4424,353 @@ anyhow = "1"
         let edges = detect_boundary_edges(&conn, &files).unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].generated_package.as_deref(), Some("consumer"));
+    }
+
+    // --- MANIFESTS-1 / MANIFESTS-2: Gradle project() resolution & name collisions ---
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_matches_by_settings_dir() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'app', 'gradle'),
+                ('com.example:utils', 'shared/utils', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':shared:utils', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        gradle_root_names.insert("".to_string(), None); // settings.gradle at repo root
+
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names).unwrap();
+        recompute_is_internal(&conn).unwrap();
+
+        let (dependency, is_internal): (String, i64) = conn
+            .query_row(
+                "SELECT dependency, is_internal FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dependency, "com.example:utils");
+        assert_eq!(is_internal, 1);
+    }
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_survives_duplicate_edge() {
+        // `implementation project(':core')` plus a coordinate that resolves
+        // to the same package name would make the rewrite collide with the
+        // existing (package, dependency, dep_kind) row. The build must not
+        // fail; the duplicate edge collapses into one row.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'app', 'gradle'),
+                ('com.example:core', 'core', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':core', 'runtime', 0),
+                    ('com.example:app', 'com.example:core', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        gradle_root_names.insert("".to_string(), None);
+
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names)
+            .expect("a duplicate edge must not abort the build");
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let dependency: String = conn
+            .query_row(
+                "SELECT dependency FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, "com.example:core");
+    }
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_leaves_unresolvable_refs_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'app', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':missing:project', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names).unwrap();
+
+        let dependency: String = conn
+            .query_row(
+                "SELECT dependency FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, ":missing:project");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_falls_back_to_path_derived_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'svc1/app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "svc2/app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        assert_eq!(pkg.name, "svc2-app");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_no_op_when_same_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        // Re-parsing the same package at the same path is a normal update,
+        // not a collision — the name must not change.
+        assert_eq!(pkg.name, "com.example:app");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_disambiguates_when_fallback_also_collides() {
+        // A nested `team-b/app` colliding on name with `team-a/app` falls back
+        // to the path-derived name "team-b-app" — but a THIRD, unrelated flat
+        // directory literally named "team-b-app" may already own that exact
+        // name (its own gradle.rs no-group fallback naming derives the same
+        // string). A single fallback attempt is then a no-op collision that
+        // would silently drop the "team-b-app" package — the resolver must
+        // keep disambiguating instead.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'team-a/app', 'gradle'),
+                ('team-b-app', 'team-b-app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "team-b/app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        // Must not silently reuse "team-b-app" (already owned by a different
+        // path) and must not leave the name unchanged (still colliding).
+        assert_ne!(pkg.name, "com.example:app");
+        assert_ne!(pkg.name, "team-b-app");
+        assert_eq!(pkg.name, "team-b-app-2");
+    }
+
+    // --- MANIFESTS-6 follow-up: NoPackageManifest transitions clean up stale packages ---
+
+    #[test]
+    fn test_manifest_transitioning_to_no_package_removes_stale_package_row() {
+        // A leaf crate (`[package]`) later converted into a virtual workspace
+        // root (`[workspace]`, no `[package]`) must not leave its old package
+        // row (and dependencies) permanently stale in the DB — its manifest
+        // hash is about to be cached as "resolved", so this is the only
+        // chance to clean it up.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(pkg_count(root), 1);
+
+        // Convert to a virtual workspace root.
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        build_index(root, &config, false, None).unwrap();
+
+        assert_eq!(
+            pkg_count(root),
+            0,
+            "the stale 'foo' package must be removed once its manifest no \
+             longer declares a package, not left indexed forever"
+        );
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        let dep_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dependencies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            dep_count, 0,
+            "the stale package's dependencies must also be cleaned up"
+        );
+    }
+
+    // --- MANIFESTS-18: unit tests for the cross-package context collectors ---
+
+    fn walked_manifest(
+        dir: &std::path::Path,
+        relative_dir: &str,
+        filename: &str,
+    ) -> WalkedManifest {
+        let abs_path = if relative_dir.is_empty() {
+            dir.join(filename)
+        } else {
+            dir.join(relative_dir).join(filename)
+        };
+        let manifest_key = if relative_dir.is_empty() {
+            filename.to_string()
+        } else {
+            format!("{}/{}", relative_dir, filename)
+        };
+        WalkedManifest {
+            abs_path,
+            relative_dir: relative_dir.to_string(),
+            manifest_key,
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_collect_cargo_workspace_context_reads_workspace_dependencies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\ntokio = \"1.35\"\n",
+        )
+        .unwrap();
+        // A non-root Cargo.toml with no [workspace.dependencies] must
+        // contribute nothing (and must not error the collector).
+        fs::create_dir_all(dir.path().join("crates/a")).unwrap();
+        fs::write(
+            dir.path().join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let walked = vec![
+            walked_manifest(dir.path(), "", "Cargo.toml"),
+            walked_manifest(dir.path(), "crates/a", "Cargo.toml"),
+        ];
+
+        let deps = collect_cargo_workspace_context(&walked);
+        assert_eq!(deps.get("tokio").map(String::as_str), Some("1.35"));
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_gradle_settings_context_prefixes_settings_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("group-a")).unwrap();
+        fs::write(
+            dir.path().join("group-a/settings.gradle"),
+            "rootProject.name = 'group-a'\ninclude ':app', ':lib:core'\n",
+        )
+        .unwrap();
+
+        let walked = vec![walked_manifest(dir.path(), "group-a", "settings.gradle")];
+
+        let (dirs, root_names) = collect_gradle_settings_context(&walked);
+        // Include paths are resolved relative to the settings.gradle's own
+        // directory, not the repo root.
+        assert!(dirs.contains("group-a/app"));
+        assert!(dirs.contains("group-a/lib/core"));
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(
+            root_names.get("group-a").cloned().flatten().as_deref(),
+            Some("group-a")
+        );
+    }
+
+    #[test]
+    fn test_governing_gradle_settings_dir_picks_longest_prefix() {
+        let mut settings_dirs: HashMap<String, Option<String>> = HashMap::new();
+        settings_dirs.insert("".to_string(), None);
+        settings_dirs.insert("group-a".to_string(), None);
+
+        assert_eq!(
+            governing_gradle_settings_dir(&settings_dirs, "group-a/app"),
+            "group-a"
+        );
+        assert_eq!(
+            governing_gradle_settings_dir(&settings_dirs, "group-b/app"),
+            ""
+        );
     }
 }

@@ -18,6 +18,13 @@ A dependency is marked `is_internal = 1` when it refers to another package in th
 - **AND** a Go package in the index has that module path as its description
 - **THEN** the dependency is marked as internal
 
+#### Scenario: Gradle project() reference match
+
+- **WHEN** a Gradle package declares a dependency via `project(':a:b')`
+- **AND** that project path resolves (through the owning `settings.gradle`) to a directory that holds an indexed Gradle package
+- **THEN** the stored dependency is rewritten to that package's actual name
+- **AND** the dependency is marked as internal
+
 #### Scenario: External dependency
 
 - **WHEN** a dependency name does not match any indexed package name or Go module path

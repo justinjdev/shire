@@ -3448,20 +3448,54 @@ fn test_serve_works_on_non_wal_db() {
         assert_eq!(mode, "delete");
     }
 
-    let out = Command::new(&bin)
-        .args(["serve", "--db", db.to_str().unwrap()])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
+    let out = serve_and_call(&bin, &db, "alpha");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("readonly database"),
         "serve must not attempt to write to a read-only connection: {}",
         stderr
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success(),
-        "serve on a healthy non-WAL DB must start: {}",
+        stdout.contains("alpha"),
+        "serve on a healthy non-WAL DB must answer queries; stdout={} stderr={}",
+        stdout,
         stderr
     );
+}
+
+/// Run `shire serve --db <db>`, drive a full MCP handshake plus one
+/// `search_symbols` call over stdio, and return the finished process output.
+fn serve_and_call(bin: &Path, db: &Path, query: &str) -> std::process::Output {
+    use std::process::Stdio;
+    let mut child = Command::new(bin)
+        .args(["serve", "--db", db.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn shire serve");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_symbols","arguments":{{"query":"{}"}}}}}}"#,
+            query
+        )
+        .unwrap();
+    }
+    // Give the server a moment to answer before EOF cancels the session.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    child.stdin.take();
+    child.wait_with_output().expect("serve did not exit")
 }

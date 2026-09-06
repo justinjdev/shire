@@ -2567,6 +2567,31 @@ pub fn build_index_quiet(
     build_index_inner(repo_root, config, force, db_override, false)
 }
 
+/// Restores the DB to a servable state when `build_index_inner` returns,
+/// including on error paths. `completed` is set only on the success path, so
+/// a failed build keeps its `build_in_progress` marker and the next open
+/// verifies the file.
+struct BuildGuard<'a> {
+    conn: &'a Connection,
+    restore_wal: bool,
+    completed: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed
+            && let Err(e) = crate::db::set_build_in_progress(self.conn, false)
+        {
+            tracing::warn!(%e, "failed to clear build_in_progress marker");
+        }
+        if self.restore_wal
+            && let Err(e) = self.conn.execute_batch("PRAGMA journal_mode=WAL;")
+        {
+            tracing::warn!(%e, "failed to restore WAL journal mode after build");
+        }
+    }
+}
+
 fn build_index_inner(
     repo_root: &Path,
     config: &Config,
@@ -2624,12 +2649,25 @@ fn build_index_inner(
     // up any orphaned rows.
     conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
 
+    // Record that a build is under way BEFORE switching the journal, while
+    // writes are still crash-safe. If the process is killed during the build
+    // the marker survives, and the next `open_or_create` verifies the file
+    // instead of trusting it.
+    db::set_build_in_progress(&conn, true)?;
+
     // Try MEMORY journal mode to eliminate WAL checkpoint overhead on COMMIT.
     // Falls back silently to WAL if another connection holds a lock.
     let switched_journal: String = conn
         .query_row("PRAGMA journal_mode=MEMORY", [], |row| row.get(0))
         .unwrap_or_else(|_| "wal".to_string());
-    let restore_wal = switched_journal == "memory";
+    // Restore WAL and clear the marker even if a phase below returns early:
+    // a DB left in rollback mode is not servable (readers cannot switch it
+    // back), and a stale marker would force a needless integrity check.
+    let mut guard = BuildGuard {
+        conn: &conn,
+        restore_wal: switched_journal == "memory",
+        completed: false,
+    };
 
     let parsers: Vec<Box<dyn ManifestParser>> = vec![
         Box::new(npm::NpmParser),
@@ -3001,10 +3039,10 @@ fn build_index_inner(
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
 
-    // Restore WAL mode for read-heavy query workloads after the build.
-    if restore_wal {
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    }
+    // Build finished cleanly: the guard clears the in-progress marker and
+    // restores WAL mode for read-heavy query workloads.
+    guard.completed = true;
+    drop(guard);
 
     print_summary_failures(&summary);
     {

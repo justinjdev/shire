@@ -2,12 +2,121 @@ pub mod queries;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use std::path::Path;
+use std::time::Duration;
 
-pub fn open_or_create(path: &std::path::Path) -> Result<Connection> {
+/// How long a connection waits for a competing writer before giving up.
+/// `shire` is a multi-process design (watch daemon, ad-hoc builds,
+/// `serve --root` on-demand rebuilds, several worktrees possibly sharing one
+/// db_path), and SQLite's default is 0 — the first collision fails instantly
+/// with "database is locked".
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Message appended to corruption errors that we could not repair
+/// automatically (read-only paths).
+pub const CORRUPT_DB_HINT: &str =
+    "the index database is corrupt or unreadable — run `shire build` to rebuild it";
+
+/// True when a rusqlite error means "this file is not a usable SQLite
+/// database": `SQLITE_CORRUPT` (11), `SQLITE_NOTADB` (26), or the
+/// "malformed database schema" variants SQLite reports while preparing a
+/// statement against a shredded schema page.
+pub fn is_corruption_error(err: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode;
+    if let Some(code) = sqlite_error_code(err)
+        && matches!(code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    {
+        return true;
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("malformed") || text.contains("file is not a database")
+}
+
+fn sqlite_error_code(err: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
+    match err {
+        rusqlite::Error::SqliteFailure(e, _) => Some(e.code),
+        _ => None,
+    }
+}
+
+/// True when an error returned by [`open_readonly`] / [`open_or_create`]
+/// was caused by database corruption.
+pub fn error_is_corruption(err: &anyhow::Error) -> bool {
+    anyhow_is_corruption(err)
+}
+
+fn anyhow_is_corruption(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<rusqlite::Error>())
+        .any(is_corruption_error)
+}
+
+/// Delete a database file and its WAL/SHM sidecars.
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let p = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            let mut os = path.as_os_str().to_os_string();
+            os.push(suffix);
+            std::path::PathBuf::from(os)
+        };
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// True when auto-deleting `path` is safe: it is either absent, empty, or
+/// starts with the SQLite file magic. Guards against wiping an unrelated
+/// file a user pointed `--db` at.
+fn looks_like_sqlite_file(path: &Path) -> bool {
+    use std::io::Read;
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return true, // nothing there to destroy
+    };
+    let mut header = [0u8; 16];
+    match f.read_exact(&mut header) {
+        Ok(()) => &header == MAGIC,
+        Err(_) => true, // shorter than a header — a truncated/empty DB
+    }
+}
+
+/// Open the index for writing, creating it if needed.
+///
+/// Builds run with `journal_mode=MEMORY` for throughput, which SQLite
+/// documents as "will very likely" corrupt the file if the process dies
+/// mid-transaction. Rather than dead-ending the user on the next run with
+/// "database disk image is malformed" (whose only cure was `shire clean`),
+/// detect that state and rebuild from scratch: a corrupt index is a
+/// derived artifact, never a source of truth.
+pub fn open_or_create(path: &Path) -> Result<Connection> {
+    match open_or_create_inner(path) {
+        Ok(conn) => Ok(conn),
+        Err(e) if anyhow_is_corruption(&e) && looks_like_sqlite_file(path) => {
+            tracing::warn!(
+                db = %path.display(),
+                error = %e,
+                "index database is corrupt (most likely an interrupted build) — \
+                 deleting it and rebuilding from scratch"
+            );
+            eprintln!(
+                "warning: index database at {} is corrupt — deleting it and rebuilding from scratch",
+                path.display()
+            );
+            remove_db_files(path);
+            open_or_create_inner(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn open_or_create_inner(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     // Set auto_vacuum before schema creation (must be set on empty DB)
     let page_count: i64 = conn
         .query_row("PRAGMA page_count", [], |r| r.get(0))
@@ -23,25 +132,86 @@ pub fn open_or_create(path: &std::path::Path) -> Result<Connection> {
          PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size=268435456;",
     )?;
+    // A build that did not finish cleanly may have left silent damage that
+    // only shows up pages later, so verify before writing more into it.
+    // Skipped on the common path — this only runs when the previous build
+    // never cleared its in-progress flag.
+    if interrupted_build_flag(&conn) {
+        tracing::warn!("previous build did not complete — verifying index integrity");
+        let check: String = conn
+            .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+            .map_err(|e| anyhow::Error::new(e).context("quick_check failed"))?;
+        if check != "ok" {
+            return Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                Some(format!("quick_check reported: {}", check)),
+            )));
+        }
+    }
     create_schema(&conn)?;
     migrate_fts_if_needed(&conn)?;
 
     Ok(conn)
 }
 
-pub fn open_readonly(path: &std::path::Path) -> Result<Connection> {
+/// Read the `build_in_progress` marker without assuming the schema exists.
+fn interrupted_build_flag(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM shire_meta WHERE key = 'build_in_progress'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|v| v == "1")
+    .unwrap_or(false)
+}
+
+/// Mark a build as started/finished. Written in WAL mode before the build
+/// switches the journal to MEMORY, so it survives a `kill -9` and tells the
+/// next `open_or_create` to verify the file.
+pub fn set_build_in_progress(conn: &Connection, in_progress: bool) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('build_in_progress', ?1)",
+        [if in_progress { "1" } else { "0" }],
+    )?;
+    Ok(())
+}
+
+pub fn open_readonly(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+    )
+    .map_err(readonly_open_error)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // NOTE: deliberately no `PRAGMA journal_mode=WAL` here. Journal mode is a
+    // property of the database *file*, not the connection, and setting it is a
+    // write — on a READ_ONLY connection it fails with "attempt to write a
+    // readonly database" for every DB that is not already in WAL (e.g. one
+    // left in rollback mode by an interrupted build), which took the MCP
+    // server down entirely for an otherwise perfectly intact index.
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA query_only=ON;
+        "PRAGMA query_only=ON;
          PRAGMA cache_size=-64000;
          PRAGMA temp_store=MEMORY;
          PRAGMA mmap_size=268435456;",
-    )?;
+    )
+    .map_err(readonly_open_error)?;
+    // Force SQLite to actually read the schema now, so a corrupt file is
+    // reported here with an actionable message rather than as an opaque
+    // failure on the first tool call.
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(readonly_open_error)?;
     Ok(conn)
+}
+
+fn readonly_open_error(err: rusqlite::Error) -> anyhow::Error {
+    if is_corruption_error(&err) {
+        anyhow::Error::new(err).context(CORRUPT_DB_HINT)
+    } else {
+        anyhow::Error::new(err)
+    }
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
@@ -829,5 +999,172 @@ mod schema_tests {
 
         write_references_enabled(&conn, false).unwrap();
         assert_eq!(read_references_enabled(&conn), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+    use tempfile::tempdir;
+
+    /// Shred the schema b-tree on page 1 while leaving the SQLite header
+    /// intact — what a SIGKILL during a MEMORY-journal build produces.
+    fn corrupt(path: &Path) {
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(100)).unwrap();
+        f.write_all(&[0xEEu8; 3000]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn test_open_readonly_works_on_non_wal_db() {
+        // DB-2: an interrupted build leaves the DB in rollback-journal mode.
+        // `open_readonly` must not try to switch it back — that is a write.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = open_or_create(&path).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('p', 'p', 'npm')",
+                [],
+            )
+            .unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+        }
+
+        let conn = open_readonly(&path).expect("read-only open of a DELETE-mode DB must succeed");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete", "a reader must not change the journal mode");
+    }
+
+    #[test]
+    fn test_busy_timeout_lets_a_writer_wait_out_a_lock() {
+        // DB-3: without a busy timeout the first collision fails instantly.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let _ = open_or_create(&path).unwrap();
+
+        let holder = open_or_create(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let path2 = path.clone();
+        let handle = std::thread::spawn(move || {
+            let conn = open_or_create(&path2).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('k', 'v')",
+                [],
+            )
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holder.execute_batch("ROLLBACK").unwrap();
+
+        handle
+            .join()
+            .unwrap()
+            .expect("writer must wait out the lock instead of failing immediately");
+    }
+
+    #[test]
+    fn test_open_or_create_rebuilds_corrupt_db() {
+        // DB-1: a corrupt index is a derived artifact — delete and recreate.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = open_or_create(&path).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('p', 'p', 'npm')",
+                [],
+            )
+            .unwrap();
+        }
+        corrupt(&path);
+
+        let conn = open_or_create(&path).expect("open_or_create must recover from corruption");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "recovered DB starts empty and gets rebuilt");
+    }
+
+    #[test]
+    fn test_open_or_create_deletes_wal_sidecars_on_recovery() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let _ = open_or_create(&path).unwrap();
+        let wal = dir.path().join("t.db-wal");
+        std::fs::write(&wal, b"stale wal").unwrap();
+        corrupt(&path);
+
+        let _conn = open_or_create(&path).unwrap();
+        assert_ne!(
+            std::fs::read(&wal).unwrap_or_default(),
+            b"stale wal".to_vec(),
+            "a stale WAL sidecar must not survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn test_open_readonly_reports_corruption_with_a_hint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let _ = open_or_create(&path).unwrap();
+        corrupt(&path);
+
+        let err = open_readonly(&path).expect_err("corrupt DB must not open read-only");
+        assert!(
+            error_is_corruption(&err),
+            "corruption must be recognised: {err:?}"
+        );
+        assert!(
+            format!("{err:#}").contains("shire build"),
+            "the error must name the recovery command: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_open_or_create_does_not_delete_a_non_sqlite_file() {
+        // Guard against wiping whatever a user pointed `--db` at.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"important user data, definitely not a database").unwrap();
+
+        let _ = open_or_create(&path);
+        assert!(path.exists(), "an unrelated file must never be deleted");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"important user data, definitely not a database".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_interrupted_build_marker_triggers_integrity_check() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = open_or_create(&path).unwrap();
+            assert!(!interrupted_build_flag(&conn));
+            set_build_in_progress(&conn, true).unwrap();
+            assert!(interrupted_build_flag(&conn));
+        }
+        // Reopening with the marker set runs quick_check and succeeds on a
+        // healthy file.
+        {
+            let conn = open_or_create(&path).unwrap();
+            assert!(interrupted_build_flag(&conn));
+            set_build_in_progress(&conn, false).unwrap();
+        }
+        let conn = open_or_create(&path).unwrap();
+        assert!(!interrupted_build_flag(&conn));
     }
 }

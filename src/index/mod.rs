@@ -809,6 +809,10 @@ struct BuildSummary {
     total_symbols: i64,
     total_references: i64,
     failures: Vec<(String, String)>,
+    /// Packages whose symbol extraction failed outright. Their previously
+    /// indexed rows were left untouched; the build reports a non-zero exit
+    /// so the failure cannot pass for a clean run.
+    extract_failures: Vec<(String, String)>,
 }
 
 /// If `pkg`'s computed name is already used by a *different* package path
@@ -1200,6 +1204,20 @@ struct PackageExtractResult {
     references: Vec<symbols::ReferenceInfo>,
     aggregate_hash: String,
     file_hashes: Vec<(String, String)>, // (relative_path, content_hash)
+    /// Files that exist but could not be read this build. Their previously
+    /// indexed rows are preserved rather than deleted — a transient I/O
+    /// error must never masquerade as "this file has no symbols".
+    unreadable_files: Vec<String>,
+}
+
+/// Outcome of extracting one package. A package whose directory walk failed
+/// (permission denied, a path past `PATH_MAX`, a directory that vanished
+/// mid-walk) is skipped entirely: writing its empty result would delete
+/// every symbol, reference and file hash it has, with a normal summary and
+/// exit code 0.
+enum PackageExtractOutcome {
+    Extracted(PackageExtractResult),
+    Failed { pkg_name: String, error: String },
 }
 
 /// Intermediate per-file result carrying raw hash bytes for aggregation.
@@ -1209,6 +1227,27 @@ struct FileExtractResult {
     raw_digest: [u8; 32],
     symbols: Vec<symbols::SymbolInfo>,
     references: Vec<symbols::ReferenceInfo>,
+}
+
+/// What one package's single-pass extraction produced.
+struct SinglePassExtract {
+    symbols: Vec<symbols::SymbolInfo>,
+    references: Vec<symbols::ReferenceInfo>,
+    aggregate_hash: String,
+    file_hashes: Vec<(String, String)>,
+    unreadable_files: Vec<String>,
+}
+
+impl SinglePassExtract {
+    fn empty() -> Self {
+        Self {
+            symbols: Vec::new(),
+            references: Vec::new(),
+            aggregate_hash: hash::hash_bytes_hex(b""),
+            file_hashes: Vec::new(),
+            unreadable_files: Vec::new(),
+        }
+    }
 }
 
 /// Single-pass: walk source files, read once, hash + extract symbols.
@@ -1222,16 +1261,10 @@ fn single_pass_extract(
     skip_references: bool,
     max_file_size: u64,
     max_references_per_file: usize,
-) -> Result<(
-    Vec<symbols::SymbolInfo>,
-    Vec<symbols::ReferenceInfo>,
-    String,
-    Vec<(String, String)>,
-)> {
+) -> Result<SinglePassExtract> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
-        let empty_hash = hash::hash_bytes_hex(b"");
-        return Ok((Vec::new(), Vec::new(), empty_hash, Vec::new()));
+        return Ok(SinglePassExtract::empty());
     }
 
     let all_exts = symbols::walker::all_extensions();
@@ -1249,16 +1282,16 @@ fn single_pass_extract(
     )?;
 
     if source_files.is_empty() {
-        let empty_hash = hash::hash_bytes_hex(b"");
-        return Ok((Vec::new(), Vec::new(), empty_hash, Vec::new()));
+        return Ok(SinglePassExtract::empty());
     }
 
     tracing::debug!(package = %pkg_path, files = source_files.len(), "extracting symbols");
 
-    // Process files in parallel: read once, hash, extract symbols
-    let file_results: Vec<FileExtractResult> = source_files
+    // Process files in parallel: read once, hash, extract symbols.
+    // `Err(path)` marks a file that exists but could not be read.
+    let raw_results: Vec<Result<FileExtractResult, String>> = source_files
         .par_iter()
-        .filter_map(|file_path| {
+        .map(|file_path| {
             let relative_path = file_path
                 .strip_prefix(repo_root)
                 .unwrap_or(file_path)
@@ -1276,7 +1309,7 @@ fn single_pass_extract(
                 );
                 // Return a sentinel result matching the incremental path so
                 // aggregate hashes are consistent across build modes.
-                return Some(FileExtractResult {
+                return Ok(FileExtractResult {
                     relative_path,
                     content_hash_hex: "oversized".to_string(),
                     raw_digest: [0u8; 32],
@@ -1284,7 +1317,17 @@ fn single_pass_extract(
                     references: Vec::new(),
                 });
             }
-            let content = std::fs::read(file_path).ok()?;
+            let content = match std::fs::read(file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        file = %relative_path,
+                        error = %e,
+                        "source file could not be read — keeping its previously indexed rows"
+                    );
+                    return Err(relative_path);
+                }
+            };
             let digest = Sha256::digest(&content);
             let raw_digest: [u8; 32] = digest.into();
             let content_hash_hex = format!("{:x}", digest);
@@ -1312,7 +1355,7 @@ fn single_pass_extract(
                 skip_references,
                 max_references_per_file,
             );
-            Some(FileExtractResult {
+            Ok(FileExtractResult {
                 relative_path,
                 content_hash_hex,
                 raw_digest,
@@ -1321,6 +1364,15 @@ fn single_pass_extract(
             })
         })
         .collect();
+
+    let mut file_results: Vec<FileExtractResult> = Vec::with_capacity(raw_results.len());
+    let mut unreadable_files: Vec<String> = Vec::new();
+    for r in raw_results {
+        match r {
+            Ok(f) => file_results.push(f),
+            Err(path) => unreadable_files.push(path),
+        }
+    }
 
     // Aggregate: collect symbols and references, build aggregate hash, collect per-file hashes
     let mut all_symbols = Vec::new();
@@ -1340,7 +1392,13 @@ fn single_pass_extract(
     }
     let aggregate_hash = format!("{:x}", hasher.finalize());
 
-    Ok((all_symbols, all_references, aggregate_hash, file_hashes))
+    Ok(SinglePassExtract {
+        symbols: all_symbols,
+        references: all_references,
+        aggregate_hash,
+        file_hashes,
+        unreadable_files,
+    })
 }
 
 /// Phase 7: Extract symbols for new/changed packages (parallel).
@@ -1357,14 +1415,14 @@ fn phase_extract_symbols(
     ref_writer: &mut RefWriter,
     max_file_size: u64,
     max_references_per_file: usize,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     tracing::debug!(
         packages = parsed_packages.len(),
         "phase_extract_symbols: extracting symbols for new/changed packages"
     );
 
     let skip_references = ref_writer.skip_references();
-    let results: Vec<_> = parsed_packages
+    let results: Vec<PackageExtractOutcome> = parsed_packages
         .par_iter()
         .map(|(pkg_name, pkg_path, pkg_kind)| {
             let result = single_pass_extract(
@@ -1381,23 +1439,18 @@ fn phase_extract_symbols(
                 pb.inc(1);
             }
             match result {
-                Ok((symbols, references, aggregate_hash, file_hashes)) => PackageExtractResult {
+                Ok(extract) => PackageExtractOutcome::Extracted(PackageExtractResult {
                     pkg_name: pkg_name.clone(),
-                    symbols,
-                    references,
-                    aggregate_hash,
-                    file_hashes,
+                    symbols: extract.symbols,
+                    references: extract.references,
+                    aggregate_hash: extract.aggregate_hash,
+                    file_hashes: extract.file_hashes,
+                    unreadable_files: extract.unreadable_files,
+                }),
+                Err(e) => PackageExtractOutcome::Failed {
+                    pkg_name: pkg_name.clone(),
+                    error: e.to_string(),
                 },
-                Err(e) => {
-                    tracing::warn!(package = %pkg_name, error = %e, "symbol extraction failed");
-                    PackageExtractResult {
-                        pkg_name: pkg_name.clone(),
-                        symbols: Vec::new(),
-                        references: Vec::new(),
-                        aggregate_hash: String::new(),
-                        file_hashes: Vec::new(),
-                    }
-                }
             }
         })
         .collect();
@@ -1406,33 +1459,8 @@ fn phase_extract_symbols(
     db::drop_symbols_fts_triggers(conn)?;
     db::drop_symbol_refs_indexes(conn)?;
 
-    let mut hash_entries: Vec<(&str, String)> = Vec::new();
-    for r in &results {
-        if skip_deletes {
-            // Symbols and refs tables already empty (force/full build) — insert only
-            batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
-            ref_writer.insert(conn, Some(&r.pkg_name), &r.references)?;
-        } else {
-            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
-            ref_writer.insert(conn, Some(&r.pkg_name), &r.references)?;
-        }
-        if !r.aggregate_hash.is_empty() {
-            hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
-        }
-        if r.file_hashes.is_empty() {
-            conn.execute(
-                "DELETE FROM file_hashes WHERE package = ?1",
-                [r.pkg_name.as_str()],
-            )?;
-        } else {
-            let fh_refs: Vec<(&str, &str)> = r
-                .file_hashes
-                .iter()
-                .map(|(p, h)| (p.as_str(), h.as_str()))
-                .collect();
-            batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
-        }
-    }
+    let failures = write_package_extract_results(conn, &results, skip_deletes, ref_writer)?;
+
     // Drop and recreate FTS table, then rebuild from content table.
     // Skip entirely when phase 7 had no packages to process.
     if !results.is_empty() {
@@ -1452,9 +1480,125 @@ fn phase_extract_symbols(
     db::recreate_symbols_fts_triggers(conn)?;
     db::recreate_symbol_refs_indexes(conn)?;
 
-    // Batch-upsert all source hashes collected in this phase
+    Ok(failures)
+}
+
+/// Write the results of phase 7 to the DB, returning the packages whose
+/// extraction failed outright (those are left exactly as they were).
+///
+/// Never deletes rows it cannot replace: a package that failed to walk is
+/// skipped completely, and within a package that walked, files that could
+/// not be read keep their existing symbols, references and file hashes.
+fn write_package_extract_results(
+    conn: &Connection,
+    results: &[PackageExtractOutcome],
+    skip_deletes: bool,
+    ref_writer: &mut RefWriter,
+) -> Result<Vec<(String, String)>> {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut hash_entries: Vec<(&str, String)> = Vec::new();
+
+    for outcome in results {
+        let r = match outcome {
+            PackageExtractOutcome::Extracted(r) => r,
+            PackageExtractOutcome::Failed { pkg_name, error } => {
+                tracing::warn!(
+                    package = %pkg_name,
+                    error = %error,
+                    "symbol extraction failed — keeping the package's existing rows"
+                );
+                failures.push((pkg_name.clone(), error.clone()));
+                continue;
+            }
+        };
+
+        if skip_deletes {
+            // Symbols and refs tables already empty (force/full build) — insert only
+            batch_insert_symbols(conn, &r.pkg_name, &r.symbols)?;
+        } else if r.unreadable_files.is_empty() {
+            upsert_symbols_no_triggers(conn, &r.pkg_name, &r.symbols)?;
+        } else {
+            upsert_symbols_preserving(conn, &r.pkg_name, &r.symbols, &r.unreadable_files)?;
+        }
+        ref_writer.insert(conn, Some(&r.pkg_name), &r.references)?;
+
+        // Leave `hashed_at` alone when files could not be read, so the next
+        // build re-checks the package instead of trusting a partial pass.
+        if !r.aggregate_hash.is_empty() && r.unreadable_files.is_empty() {
+            hash_entries.push((r.pkg_name.as_str(), r.aggregate_hash.clone()));
+        }
+
+        if r.unreadable_files.is_empty() {
+            if r.file_hashes.is_empty() {
+                conn.execute(
+                    "DELETE FROM file_hashes WHERE package = ?1",
+                    [r.pkg_name.as_str()],
+                )?;
+            } else {
+                let fh_refs: Vec<(&str, &str)> = r
+                    .file_hashes
+                    .iter()
+                    .map(|(p, h)| (p.as_str(), h.as_str()))
+                    .collect();
+                batch_upsert_file_hashes(conn, &r.pkg_name, &fh_refs)?;
+            }
+        } else {
+            // batch_upsert_file_hashes replaces the package's whole row set,
+            // so carry the unreadable files' stored hashes across explicitly —
+            // dropping them would report the files as deleted next build.
+            let stored = load_stored_file_hashes(conn, &r.pkg_name)?;
+            let mut merged: Vec<(&str, &str)> = r
+                .file_hashes
+                .iter()
+                .map(|(p, h)| (p.as_str(), h.as_str()))
+                .collect();
+            for path in &r.unreadable_files {
+                if let Some(hash) = stored.get(path) {
+                    merged.push((path.as_str(), hash.as_str()));
+                }
+            }
+            batch_upsert_file_hashes(conn, &r.pkg_name, &merged)?;
+        }
+    }
+
     let refs: Vec<(&str, &str)> = hash_entries.iter().map(|(p, h)| (*p, h.as_str())).collect();
     batch_upsert_source_hashes(conn, &refs)?;
+    Ok(failures)
+}
+
+/// Replace a package's symbols and references, but keep the rows belonging
+/// to files that could not be read this build.
+fn upsert_symbols_preserving(
+    conn: &Connection,
+    package: &str,
+    syms: &[symbols::SymbolInfo],
+    keep_files: &[String],
+) -> Result<()> {
+    let placeholders: String = (0..keep_files.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(keep_files.len() + 1);
+    params.push(&package);
+    for f in keep_files {
+        params.push(f);
+    }
+    conn.execute(
+        &format!(
+            "DELETE FROM symbols WHERE package = ?1 AND file_path NOT IN ({})",
+            placeholders
+        ),
+        params.as_slice(),
+    )?;
+    conn.execute(
+        &format!(
+            "DELETE FROM symbol_refs WHERE package = ?1 AND file_id NOT IN \
+             (SELECT id FROM files WHERE path IN ({}))",
+            placeholders
+        ),
+        params.as_slice(),
+    )?;
+    batch_insert_symbols(conn, package, syms)?;
     Ok(())
 }
 
@@ -2401,6 +2545,16 @@ fn print_summary_failures(summary: &BuildSummary) {
             tracing::warn!(path = %path, error = %err, "manifest parse failure");
         }
     }
+    if !summary.extract_failures.is_empty() {
+        eprintln!(
+            "{} package(s) could not be indexed (previous symbols kept):",
+            summary.extract_failures.len()
+        );
+        for (pkg, err) in &summary.extract_failures {
+            eprintln!("  {}: {}", pkg, err);
+            tracing::warn!(package = %pkg, error = %err, "symbol extraction failure");
+        }
+    }
 }
 
 fn format_summary_line(
@@ -2899,7 +3053,7 @@ fn build_index_inner(
              so symbol_refs is populated for every source file"
         );
     }
-    let num_source_reextracted = with_transaction(&conn, || {
+    let (num_source_reextracted, extract_failures) = with_transaction(&conn, || {
         // Wipe symbol_refs if the user has turned the experimental refs
         // feature off — this keeps the DB from carrying stale refs while
         // disabled. Cheap: DELETE FROM without a WHERE is O(1) in SQLite
@@ -2908,7 +3062,7 @@ fn build_index_inner(
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
-        phase_extract_symbols(
+        let extract_failures = phase_extract_symbols(
             &conn,
             repo_root,
             &parsed_packages,
@@ -2941,7 +3095,7 @@ fn build_index_inner(
         // symbol_refs — so MCP tools cannot return silent [] from a
         // partially-repopulated table.
         crate::db::write_references_enabled(&conn, refs_enabled)?;
-        Ok(count)
+        Ok((count, extract_failures))
     })?;
     if let Some(pb) = pb_sym {
         pb.finish_with_message("Symbols extracted");
@@ -2978,6 +3132,7 @@ fn build_index_inner(
         total_symbols,
         total_references,
         failures,
+        extract_failures,
     };
 
     let total_duration = build_start.elapsed();
@@ -3057,6 +3212,22 @@ fn build_index_inner(
         )?;
     }
     print_timings(&timings, total_duration);
+
+    // A package that could not be walked at all is a real failure: its rows
+    // are now stale by definition, and exiting 0 would let CI and the watch
+    // daemon treat the run as clean.
+    if !summary.extract_failures.is_empty() {
+        anyhow::bail!(
+            "{} package(s) could not be indexed: {}",
+            summary.extract_failures.len(),
+            summary
+                .extract_failures
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     Ok(())
 }
@@ -3224,6 +3395,7 @@ mod tests {
             total_symbols: 24,
             total_references: 8,
             failures: Vec::new(),
+            extract_failures: Vec::new(),
         }
     }
 
@@ -4134,14 +4306,17 @@ anyhow = "1"
         )
         .unwrap();
 
-        let (symbols, _refs, _hash, file_hashes) =
-            single_pass_extract(dir.path(), "pkg", "go", &[], &[], true, 0, 0).unwrap();
+        let extract = single_pass_extract(dir.path(), "pkg", "go", &[], &[], true, 0, 0).unwrap();
 
-        assert_eq!(file_hashes.len(), 1, "the file should still be hashed");
+        assert_eq!(
+            extract.file_hashes.len(),
+            1,
+            "the file should still be hashed"
+        );
         assert!(
-            symbols.iter().any(|s| s.name == "Greet"),
+            extract.symbols.iter().any(|s| s.name == "Greet"),
             "expected Greet to be recovered via lossy decoding, got {:?}",
-            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            extract.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
     }
 
@@ -4597,5 +4772,158 @@ anyhow = "1"
             governing_gradle_settings_dir(&settings_dirs, "group-b/app"),
             ""
         );
+    }
+}
+
+#[cfg(test)]
+mod extract_write_tests {
+    use super::*;
+    use crate::symbols::{SymbolInfo, SymbolKind, Visibility};
+
+    fn sym(name: &str, file_path: &str) -> SymbolInfo {
+        SymbolInfo {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            signature: None,
+            file_path: Arc::from(file_path),
+            line: 1,
+            visibility: Visibility::Public,
+            parent_symbol: None,
+            return_type: None,
+            parameters: None,
+        }
+    }
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('p', 'p', 'npm')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, package, extension, size_bytes) \
+             VALUES ('p/src/g.ts', 'p', 'ts', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('p', 'good', 'function', 'p/src/g.ts', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_hashes (package, file_path, content_hash) \
+             VALUES ('p', 'p/src/g.ts', 'abc')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn symbol_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM symbols ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn hashed_files(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT file_path FROM file_hashes ORDER BY file_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_failed_package_keeps_its_existing_rows() {
+        // INDEX-10: a walk error (permission denied, ENAMETOOLONG, a
+        // directory that vanished) used to produce an empty result which was
+        // then written, deleting every symbol and file hash the package had.
+        let conn = setup();
+        let mut rw = RefWriter::new(&conn, false).unwrap();
+        let results = vec![PackageExtractOutcome::Failed {
+            pkg_name: "p".to_string(),
+            error: "File name too long (os error 36)".to_string(),
+        }];
+
+        let failures = write_package_extract_results(&conn, &results, false, &mut rw).unwrap();
+
+        assert_eq!(failures.len(), 1, "the failure must be reported");
+        assert_eq!(failures[0].0, "p");
+        assert_eq!(
+            symbol_names(&conn),
+            vec!["good".to_string()],
+            "symbols must survive a failed extraction"
+        );
+        assert_eq!(
+            hashed_files(&conn),
+            vec!["p/src/g.ts".to_string()],
+            "file hashes must survive a failed extraction"
+        );
+    }
+
+    #[test]
+    fn test_unreadable_file_keeps_its_rows_while_the_rest_updates() {
+        let conn = setup();
+        let mut rw = RefWriter::new(&conn, false).unwrap();
+        let results = vec![PackageExtractOutcome::Extracted(PackageExtractResult {
+            pkg_name: "p".to_string(),
+            symbols: vec![sym("fresh", "p/src/other.ts")],
+            references: Vec::new(),
+            aggregate_hash: "agg".to_string(),
+            file_hashes: vec![("p/src/other.ts".to_string(), "def".to_string())],
+            unreadable_files: vec!["p/src/g.ts".to_string()],
+        })];
+
+        let failures = write_package_extract_results(&conn, &results, false, &mut rw).unwrap();
+        assert!(
+            failures.is_empty(),
+            "an unreadable file is not a package failure"
+        );
+
+        let mut names = symbol_names(&conn);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["fresh".to_string(), "good".to_string()],
+            "the unreadable file keeps its symbols; the rest is replaced"
+        );
+        let files = hashed_files(&conn);
+        assert!(files.contains(&"p/src/g.ts".to_string()));
+        assert!(files.contains(&"p/src/other.ts".to_string()));
+
+        // hashed_at is not advanced, so the next build re-checks the package.
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_hashes WHERE package = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "a partial pass must not record a fresh hash");
+    }
+
+    #[test]
+    fn test_successful_package_replaces_its_rows() {
+        let conn = setup();
+        let mut rw = RefWriter::new(&conn, false).unwrap();
+        let results = vec![PackageExtractOutcome::Extracted(PackageExtractResult {
+            pkg_name: "p".to_string(),
+            symbols: vec![sym("fresh", "p/src/g.ts")],
+            references: Vec::new(),
+            aggregate_hash: "agg".to_string(),
+            file_hashes: vec![("p/src/g.ts".to_string(), "def".to_string())],
+            unreadable_files: Vec::new(),
+        })];
+
+        write_package_extract_results(&conn, &results, false, &mut rw).unwrap();
+        assert_eq!(symbol_names(&conn), vec!["fresh".to_string()]);
     }
 }

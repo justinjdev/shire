@@ -94,30 +94,37 @@ fn clamp_limit(limit: u32) -> i64 {
 ///
 /// Returns `None` when the query has no searchable token, in which case
 /// callers return an empty result rather than issuing a MATCH.
+/// Wrap one token as a quoted FTS5 phrase. Returns `None` when the token has
+/// nothing the tokenizer would keep (`*`, `()`, `--`), which would otherwise
+/// become an empty phrase that matches nothing.
+fn fts_phrase(raw: &str) -> Option<String> {
+    if !raw.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    let mut part = String::with_capacity(raw.len() + 3);
+    part.push('"');
+    for c in raw.chars() {
+        // FTS5 parses the MATCH expression as a C string, so an embedded NUL
+        // (or any other control character) would truncate it mid-phrase and
+        // raise "unterminated string". Drop them.
+        if c.is_control() {
+            continue;
+        }
+        if c == '"' {
+            part.push('"');
+        }
+        part.push(c);
+    }
+    part.push('"');
+    Some(part)
+}
+
 fn fts_match_expr(query: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for raw in query.split_whitespace() {
-        // Tokens the tokenizer would reduce to nothing (`*`, `()`, `--`)
-        // become empty phrases that match nothing; drop them so the rest of
-        // the query still searches.
-        if !raw.chars().any(|c| c.is_alphanumeric()) {
+        let Some(mut part) = fts_phrase(raw) else {
             continue;
-        }
-        let mut part = String::with_capacity(raw.len() + 3);
-        part.push('"');
-        for c in raw.chars() {
-            // FTS5 parses the MATCH expression as a C string, so an embedded
-            // NUL (or any other control character) would truncate it
-            // mid-phrase and raise "unterminated string". Drop them.
-            if c.is_control() {
-                continue;
-            }
-            if c == '"' {
-                part.push('"');
-            }
-            part.push(c);
-        }
-        part.push('"');
+        };
         // `*` applies to the *last term* of the phrase. Trailing punctuation
         // is not part of any term (`handle*`, `handle)`, `config.` all end in
         // the term before it), so skip it before measuring, or a user typing
@@ -287,18 +294,28 @@ fn promote_exact_name(
         return Ok(());
     }
 
+    // Look the name up through the FTS index rather than `symbols`: it is
+    // case-insensitive (the tokenizer folds case) *and* index-backed.
+    // `WHERE name = ?1 COLLATE NOCASE` on `symbols` would be case-insensitive
+    // too, but the NOCASE collation cannot use idx_symbols_name, so every
+    // miss would scan the whole table — and a miss is the common case here.
+    let Some(phrase) = fts_phrase(name) else {
+        return Ok(());
+    };
+    let fts_expr = format!("name:{phrase}");
     let mut stmt = conn.prepare_cached(
-        "SELECT name, kind, signature, package, file_path, line,
-                visibility, parent_symbol, return_type, parameters
-         FROM symbols
-         WHERE name = ?1 COLLATE NOCASE
-           AND (?2 IS NULL OR package = ?2)
-           AND (?3 IS NULL OR kind = ?3)
-         ORDER BY file_path, line
-         LIMIT 1",
+        "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
+                s.visibility, s.parent_symbol, s.return_type, s.parameters
+         FROM symbols_fts f
+         JOIN symbols s ON s.rowid = f.rowid
+         WHERE symbols_fts MATCH ?1
+           AND (?2 IS NULL OR s.package = ?2)
+           AND (?3 IS NULL OR s.kind = ?3)
+         ORDER BY rank
+         LIMIT 8",
     )?;
-    let mut rows = stmt.query_map(
-        rusqlite::params![name, package_filter, kind_filter],
+    let rows = stmt.query_map(
+        rusqlite::params![fts_expr, package_filter, kind_filter],
         |row| {
             Ok(SymbolRow {
                 name: row.get(0)?,
@@ -314,7 +331,13 @@ fn promote_exact_name(
             })
         },
     )?;
-    if let Some(exact) = rows.next().transpose()? {
+    // The MATCH is a whole-token lookup on the name column, which can still
+    // land on a name the tokenizer folds onto the same term, so confirm.
+    let mut rows = rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|r: &SymbolRow| r.name.eq_ignore_ascii_case(name));
+    if let Some(exact) = rows.next() {
         result.insert(0, exact);
         result.truncate(limit as usize);
     }

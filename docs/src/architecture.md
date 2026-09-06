@@ -40,14 +40,10 @@ src/
 │                    # in the language's .scm query and written to the symbol_refs table.
 │                    # Coverage is asymmetric per language: JavaScript omits Type refs
 │                    # (no type system), and Go/Perl omit Impl refs (no extends/implements).
-├── rag/             # Optional RAG vector search (behind `rag` feature flag)
-│   ├── mod.rs       # Feature-gated module root
-│   ├── embedder.rs  # fastembed wrapper, file-level text formatting, batch embedding (64 files/batch)
-│   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 11 tool handlers (+ hybrid search when RAG enabled)
-│   └── prompts.rs   # explore prompt template for semantic codebase exploration
+│   ├── tools.rs     # 17 tool handlers
+│   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
     ├── daemon.rs    # Process management (start/stop/is_running via PID)
@@ -70,18 +66,3 @@ The `symbol_refs` table stores cross-reference records extracted alongside symbo
 B-tree indexes on `name`, `file_path`, and `enclosing_symbol` support the exact-match lookups used by the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools. No FTS5 table — reference queries are exact-name only.
 
 Incremental behavior mirrors symbol extraction: references for a file are dropped and re-extracted whenever the file's SHA-256 hash changes. No separate pass is needed — references are extracted in the same tree-sitter walk as symbol definitions.
-
-## File embeddings
-
-When [RAG is enabled](./configuration.md#rag-vector-search), the build produces file-level vector embeddings for hybrid search. Each file is represented as a `FileForEmbedding` containing its symbols via `FileSymbol` (name, kind, and optional signature).
-
-The text representation (`file_to_text`) works as follows:
-- Symbols are sorted by kind then name
-- Signatures are preferred over `kind name` fallback when available
-- A **total character budget of 1800** caps the output text — after the file path prefix is accounted for, remaining budget is filled with symbols until exhausted
-- Files with no symbols produce a minimal `file <path> in <package>` string
-
-Embedding runs in a **background thread** spawned during the build, executing concurrently with post-build housekeeping:
-- Files are processed in **batches of 64** to balance throughput and memory
-- A progress callback reports batch completion for progress bar updates
-- Errors (model init, embedding, DB write) are reported on the progress bar rather than failing the build

@@ -42,7 +42,20 @@ All queries use SQLite FTS5 full-text search with `unicode61` tokenizer and pref
 
 ## Reproducing benchmarks
 
-Shire includes an `autoresearch` binary for reproducible benchmarking.
+Shire includes an `autoresearch` binary for reproducible benchmarking. It is a
+development tool, not part of the shipped CLI: it lives behind the non-default
+`bench` cargo feature, so every invocation needs `--features bench`.
+
+The `lifecycle` and `quality` phases rewrite source files in the target repo.
+They refuse to run against a repo with uncommitted changes to tracked files
+(`git status --porcelain --untracked-files=no` must be empty, and an
+indeterminable state — no git, not a repo — is treated as dirty). Untracked
+paths are ignored, since the benchmark and `setup-bench-repo.sh` leave their
+own artifacts (`shire.toml`, `.shire/bench.db`) in the repo. Each phase
+restores exactly the bytes it captured before its first write, including when
+it aborts part way through a run. If the guard turns away every repo, the
+phase reports the skipped repos and exits non-zero rather than printing an
+empty result with a success status.
 
 ### Setup
 
@@ -58,19 +71,19 @@ This clones the three repos into `~/.cache/shire-bench/` and creates a `shire.to
 
 ```sh
 # Build the benchmark binary
-cargo build --release --bin autoresearch
+cargo build --release --features bench --bin autoresearch
 
 # Run build benchmarks (all repos)
-cargo run --release --bin autoresearch -- --phase build
+cargo run --release --features bench --bin autoresearch -- --phase build
 
 # Run query benchmarks (all repos)
-cargo run --release --bin autoresearch -- --phase query
+cargo run --release --features bench --bin autoresearch -- --phase query
 
 # Filter by repo size
-cargo run --release --bin autoresearch -- --phase build --size small
+cargo run --release --features bench --bin autoresearch -- --phase build --size small
 
-# Point at a specific repo
-cargo run --release --bin autoresearch -- --phase build --repo /path/to/repo
+# Point at a specific repo (must have a clean worktree for lifecycle/quality)
+cargo run --release --features bench --bin autoresearch -- --phase build --repo /path/to/repo
 ```
 
 Build benchmarks run 5 iterations (1 warmup + 4 measured) per repo. Query benchmarks run 100 iterations per query. Results are printed as JSON to stdout.

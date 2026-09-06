@@ -8,7 +8,6 @@ use shire::init;
 use shire::install;
 use shire::logging;
 use shire::mcp;
-use shire::rag;
 use shire::watch;
 
 #[derive(Parser)]
@@ -142,11 +141,6 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    #[cfg(feature = "rag")]
-    if let Err(e) = rag::storage::load_extension() {
-        eprintln!("Warning: {e}");
-    }
-
     match cli.command {
         Commands::Build {
             root,
@@ -191,7 +185,7 @@ async fn main() -> Result<()> {
                 }
                 None
             };
-            mcp::run_server(&db_path, &cfg.rag, build_ctx).await
+            mcp::run_server(&db_path, build_ctx).await
         }
         Commands::Watch {
             root,

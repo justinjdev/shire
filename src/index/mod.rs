@@ -2629,7 +2629,7 @@ fn build_index_inner(
         eprintln!("Seeded DB from {}", seed_path.display());
     }
 
-    let conn = db::open_or_create(&db_path, config.rag.enabled)?;
+    let conn = db::open_or_create(&db_path)?;
 
     if force {
         with_transaction(&conn, || {
@@ -2948,7 +2948,7 @@ fn build_index_inner(
             0
         };
         // Commit the refs-trustworthy flag atomically with the extraction
-        // results. If a later phase (docs, rag, meta) fails, the flag's
+        // results. If a later phase (docs, meta) fails, the flag's
         // committed state still matches the committed state of
         // symbol_refs — so MCP tools cannot return silent [] from a
         // partially-repopulated table.
@@ -2967,154 +2967,6 @@ fn build_index_inner(
     let num_docs = with_transaction(&conn, || phase_index_docs(&conn, repo_root, config))?;
     timings.push(("index-docs", t.elapsed()));
     sp.finish_with_message(format!("Indexed {} docs", num_docs));
-
-    // Phase 10: RAG file-level embedding (optional, runs in background thread)
-    // Build completes and prints summary immediately. Embedding continues in a
-    // background thread that opens its own DB connection. The thread handle is
-    // returned so callers can optionally wait for it.
-    #[cfg(feature = "rag")]
-    let rag_handle: Option<std::thread::JoinHandle<()>> = if config.rag.enabled {
-        use crate::rag::embedder::{Embedder, FileForEmbedding, FileSymbol, embed_files};
-
-        let changed_packages: Vec<String> = parsed_packages
-            .iter()
-            .map(|(name, _, _)| name.clone())
-            .collect();
-
-        if changed_packages.is_empty() {
-            tracing::debug!("rag: no changed packages, skipping embedding");
-            None
-        } else {
-            // Clean stale embeddings (fast, inline)
-            conn.execute(
-                "DELETE FROM file_embeddings WHERE file_id NOT IN (SELECT id FROM files)",
-                [],
-            )?;
-
-            // Collect files needing embeddings (fast DB reads)
-            let placeholders: String = (1..=changed_packages.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let params: Vec<Box<dyn rusqlite::types::ToSql>> = changed_packages
-                .iter()
-                .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
-                .collect();
-            // Delete existing embeddings for changed packages so we can re-embed
-            conn.execute(
-                &format!(
-                    "DELETE FROM file_embeddings WHERE file_id IN \
-                     (SELECT id FROM files WHERE package IN ({placeholders}))"
-                ),
-                rusqlite::params_from_iter(params.iter()),
-            )?;
-
-            let file_sql = format!(
-                "SELECT f.id, f.path, f.package \
-                 FROM files f \
-                 WHERE f.package IN ({placeholders}) \
-                 AND EXISTS (SELECT 1 FROM symbols s WHERE s.file_path = f.path)"
-            );
-            let file_inputs: Vec<FileForEmbedding> = conn
-                .prepare(&file_sql)?
-                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(|(file_id, file_path, package)| {
-                    let symbols: Vec<FileSymbol> = conn
-                        .prepare("SELECT name, kind, signature FROM symbols WHERE file_path = ?1")
-                        .and_then(|mut s| {
-                            s.query_map([file_path.as_str()], |row| {
-                                Ok(FileSymbol {
-                                    name: row.get(0)?,
-                                    kind: row.get(1)?,
-                                    signature: row.get(2)?,
-                                })
-                            })
-                            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                        })
-                        .unwrap_or_else(|e| {
-                            tracing::debug!(error = %e, file = %file_path, "failed to load symbols for embedding");
-                            Vec::new()
-                        });
-                    FileForEmbedding {
-                        id: file_id,
-                        file_path,
-                        package,
-                        symbols,
-                    }
-                })
-                .collect();
-
-            if file_inputs.is_empty() {
-                None
-            } else {
-                let num_files = file_inputs.len();
-                let db_path_owned = db_path.clone();
-                let rag_config = config.rag.clone();
-                let show_progress = progress;
-
-                Some(std::thread::spawn(move || {
-                    let pb = ProgressBar::new(num_files as u64);
-                    if !show_progress {
-                        pb.set_draw_target(ProgressDrawTarget::hidden());
-                    }
-                    pb.set_style(
-                        ProgressStyle::default_bar()
-                            .template(
-                                "{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {pos}/{len} ({eta})",
-                            )
-                            .expect("hardcoded progress template must be valid")
-                            .progress_chars("━╸─"),
-                    );
-                    pb.set_message("Embedding files");
-
-                    let t = Instant::now();
-                    let embedder = match Embedder::new(&rag_config) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            pb.finish_with_message(format!("Embedding failed: {e}"));
-                            tracing::warn!(error = %e, "RAG background: model init failed");
-                            return;
-                        }
-                    };
-                    match embed_files(&embedder, &file_inputs, |n| pb.inc(n as u64)) {
-                        Ok(embeddings) => match db::open_or_create(&db_path_owned, true) {
-                            Ok(bg_conn) => {
-                                if let Err(e) = crate::rag::storage::insert_file_embeddings(
-                                    &bg_conn,
-                                    &embeddings,
-                                ) {
-                                    pb.finish_with_message(format!("Embedding failed: {e}"));
-                                    tracing::warn!(error = %e, "RAG background: insert failed");
-                                } else {
-                                    pb.finish_with_message(format!(
-                                        "Embedded {num_files} files in {:.1}s",
-                                        t.elapsed().as_secs_f64()
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                pb.finish_with_message(format!("Embedding failed: {e}"));
-                                tracing::warn!(error = %e, "RAG background: DB open failed");
-                            }
-                        },
-                        Err(e) => {
-                            pb.finish_with_message(format!("Embedding failed: {e}"));
-                            tracing::warn!(error = %e, "RAG background: embed failed");
-                        }
-                    }
-                }))
-            }
-        }
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "rag"))]
-    let rag_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Post-build: config overrides, metadata, summary (transaction-wrapped)
     with_transaction(&conn, || apply_config_overrides(&conn, config))?;
@@ -3198,21 +3050,6 @@ fn build_index_inner(
 
     // Reclaim free pages from incremental updates (prevents DB bloat over time)
     conn.execute_batch("PRAGMA incremental_vacuum(100);")?;
-
-    // Wait for RAG embedding to complete before restoring journal mode.
-    // The background RAG thread opened its own connection to this DB; switching
-    // back to WAL requires an exclusive lock, which can fail with SQLITE_BUSY
-    // if the RAG thread's connection is still active.
-    if let Some(handle) = rag_handle
-        && let Err(panic_payload) = handle.join()
-    {
-        let msg = panic_payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
-            .unwrap_or("unknown panic");
-        tracing::error!(panic = %msg, "RAG embedding thread panicked");
-    }
 
     // Restore WAL mode for read-heavy query workloads after the build.
     if restore_wal {
@@ -3525,7 +3362,7 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("t.db");
-        let conn = db::open_or_create(&path, false).unwrap();
+        let conn = db::open_or_create(&path).unwrap();
 
         // Seed a package row (NOT a files row for the path we're about
         // to process). This simulates the walker-mismatch scenario.

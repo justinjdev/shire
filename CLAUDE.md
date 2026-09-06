@@ -7,16 +7,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 cargo build                     # Debug build
 cargo build --release           # Release build
-cargo test                      # All tests (unit + integration)
+cargo test                      # Unit + integration tests (default features)
+cargo test --all-features       # ...plus the bench-gated autoresearch harness (what CI runs)
 cargo test --lib                # Unit tests only
 cargo test --test integration   # Integration tests only
 cargo test config::tests        # Tests for a specific module
 cargo check                     # Type check without building
 ```
 
-The integration test (`tests/integration.rs`) builds the binary and runs it against fixture monorepos it creates in a temp directory.
+The crate has no default features. The optional, non-default `bench` feature gates
+the internal benchmark harness (`src/bin/autoresearch.rs`), so it is not built or
+installed unless explicitly requested:
 
-Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to verify before committing.
+```sh
+cargo build --features bench --bin autoresearch
+cargo run --features bench --bin autoresearch -- --phase quality
+```
+
+The integration test (`tests/integration.rs`) runs the `shire` binary cargo built for
+the test run (via `CARGO_BIN_EXE_shire`) against fixture monorepos it creates in a temp
+directory.
+
+Changes should include unit tests covering new or modified logic. Run `cargo test --lib` to
+verify before committing — and `cargo test --all-features` when you touch
+`src/bin/autoresearch.rs`, whose tests live in a `bench`-gated bin target that `--lib` does
+not build.
 
 ## Architecture
 

@@ -4444,6 +4444,82 @@ anyhow = "1"
         assert_eq!(pkg.name, "com.example:app");
     }
 
+    // --- MANIFESTS-18: unit tests for the cross-package context collectors ---
+
+    fn walked_manifest(
+        dir: &std::path::Path,
+        relative_dir: &str,
+        filename: &str,
+    ) -> WalkedManifest {
+        let abs_path = if relative_dir.is_empty() {
+            dir.join(filename)
+        } else {
+            dir.join(relative_dir).join(filename)
+        };
+        let manifest_key = if relative_dir.is_empty() {
+            filename.to_string()
+        } else {
+            format!("{}/{}", relative_dir, filename)
+        };
+        WalkedManifest {
+            abs_path,
+            relative_dir: relative_dir.to_string(),
+            manifest_key,
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_collect_cargo_workspace_context_reads_workspace_dependencies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\ntokio = \"1.35\"\n",
+        )
+        .unwrap();
+        // A non-root Cargo.toml with no [workspace.dependencies] must
+        // contribute nothing (and must not error the collector).
+        fs::create_dir_all(dir.path().join("crates/a")).unwrap();
+        fs::write(
+            dir.path().join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let walked = vec![
+            walked_manifest(dir.path(), "", "Cargo.toml"),
+            walked_manifest(dir.path(), "crates/a", "Cargo.toml"),
+        ];
+
+        let deps = collect_cargo_workspace_context(&walked);
+        assert_eq!(deps.get("tokio").map(String::as_str), Some("1.35"));
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_gradle_settings_context_prefixes_settings_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("group-a")).unwrap();
+        fs::write(
+            dir.path().join("group-a/settings.gradle"),
+            "rootProject.name = 'group-a'\ninclude ':app', ':lib:core'\n",
+        )
+        .unwrap();
+
+        let walked = vec![walked_manifest(dir.path(), "group-a", "settings.gradle")];
+
+        let (dirs, root_names) = collect_gradle_settings_context(&walked);
+        // Include paths are resolved relative to the settings.gradle's own
+        // directory, not the repo root.
+        assert!(dirs.contains("group-a/app"));
+        assert!(dirs.contains("group-a/lib/core"));
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(
+            root_names.get("group-a").cloned().flatten().as_deref(),
+            Some("group-a")
+        );
+    }
+
     #[test]
     fn test_governing_gradle_settings_dir_picks_longest_prefix() {
         let mut settings_dirs: HashMap<String, Option<String>> = HashMap::new();

@@ -41,8 +41,6 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 
 `shire build` walks a repository, parses manifest files, and stores packages + dependencies in a local SQLite database with full-text search. It also extracts public symbols (functions, classes, types, methods) from source files using tree-sitter, with full signatures, parameters, and return types. For 8 tier-1 languages (Go, Python, Java, TypeScript, JavaScript, Perl, Ruby, Scala), shire also extracts cross-references — calls, type references, imports, and implementations — stored in the `symbol_refs` table for call-graph and impact queries. Every file in the repo is indexed with its path, extension, size, and owning package for instant file lookup. `shire serve` exposes that index as an MCP server over stdio.
 
-Optionally, shire can augment symbol search with **vector similarity** (RAG). When enabled, symbols are embedded at index time using [fastembed](https://github.com/Anush008/fastembed-rs) (BAAI/bge-small-en-v1.5, fully offline after first model download) and stored via [sqlite-vec](https://github.com/asg017/sqlite-vec). Queries like "find the auth middleware" can then match `verify_jwt_token` even without keyword overlap. Results are merged with FTS5 using Reciprocal Rank Fusion. See [RAG vector search](#rag-vector-search) for setup.
-
 **Supported ecosystems:**
 
 | Manifest | Kind | Workspace support |
@@ -74,9 +72,6 @@ Download the latest release from [GitHub Releases](https://github.com/justinjdev
 
 ```sh
 cargo install --path .
-
-# With RAG vector search support (~30-50MB larger binary due to ONNX Runtime):
-cargo install --path . --features rag
 ```
 
 ## Usage
@@ -290,29 +285,6 @@ description = "Deprecated auth service — do not add new dependencies"
 
 All fields are optional. Defaults are shown above. The `--db` CLI flag takes precedence over `db_path` in config.
 
-### RAG vector search
-
-RAG adds semantic vector search to `search_symbols`. It requires compiling with the `rag` feature flag and enabling it in config.
-
-**Build with RAG support:**
-
-```sh
-cargo install --path . --features rag
-```
-
-**Enable in `shire.toml`:**
-
-```toml
-[rag]
-enabled = true
-# model = "BAAI/bge-small-en-v1.5"   # default, only supported model currently
-# cache_dir = "~/.cache/shire-rag"    # optional, for model file storage
-```
-
-When enabled, `shire build` embeds all symbols after extraction. The first build downloads the model (~33MB) automatically. Subsequent builds are incremental — only changed packages get re-embedded.
-
-RAG is non-fatal: if the model fails to load or embeddings fail, shire falls back to FTS-only search with a warning. If the `rag` feature is not compiled in, the `[rag]` config section is silently ignored.
-
 ### Custom package discovery
 
 For codebases where packages aren't defined by standard manifest files — Go single-module monorepos, repos that use `ownership.yml` + build files, or any non-standard convention — you can define custom discovery rules:
@@ -398,13 +370,9 @@ src/
 │   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
 │   ├── perl.rs      # Perl extractor (regex-based)
 │   └── ruby.rs      # Ruby extractor (tree-sitter)
-├── rag/             # Optional RAG vector search (behind `rag` feature flag)
-│   ├── mod.rs       # Feature-gated module root
-│   ├── embedder.rs  # fastembed wrapper, symbol text formatting, batch embedding
-│   └── storage.rs   # sqlite-vec extension, vec0 table, vector CRUD, KNN search
 ├── mcp/
 │   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 14 tool handlers (+ hybrid search when RAG enabled)
+│   ├── tools.rs     # 14 tool handlers
 │   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
 └── watch/
     ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)

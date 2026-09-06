@@ -27,7 +27,4 @@ Requires [Rust](https://rustup.rs/) toolchain.
 
 ```sh
 cargo install --path .
-
-# With RAG vector search support (~30-50MB larger binary due to ONNX Runtime):
-cargo install --path . --features rag
 ```

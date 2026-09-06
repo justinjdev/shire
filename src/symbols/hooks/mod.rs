@@ -121,45 +121,95 @@ pub fn find_ancestor<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     None
 }
 
-/// Walk up from `node` through ancestors looking for the first node whose kind
-/// is listed in `ancestors`. Returns the text of that ancestor's `name` field
-/// (or its first `identifier`/`type_identifier` child) as the enclosing symbol
-/// name. Returns None if no qualifying named ancestor is found.
-pub fn resolve_enclosing_symbol(node: &Node, source: &str, ancestors: &[&str]) -> Option<String> {
-    fn is_anonymous_callable_kind(kind: &str) -> bool {
-        matches!(
-            kind,
-            "arrow_function" | "function_expression" | "lambda" | "lambda_expression"
-        )
-    }
+fn is_anonymous_callable_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "arrow_function" | "function_expression" | "lambda" | "lambda_expression"
+    )
+}
 
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if ancestors.contains(&n.kind()) {
-            // Try the `name` field first (most grammars)
-            if let Some(name) = field_text(&n, "name", source) {
-                return Some(name.to_string());
-            }
-            // Anonymous callable scopes should still be attributable, but they
-            // don't have a stable identifier node to read as a name.
-            if is_anonymous_callable_kind(n.kind()) {
-                return Some("<anonymous>".to_string());
-            }
-            // Fall back to scanning direct children for an identifier-like node
-            for i in 0..n.child_count() {
-                let child = n.child(i).unwrap();
-                match child.kind() {
-                    "identifier" | "type_identifier" | "constant" | "simple_identifier" => {
-                        if let Some(txt) = node_text(&child, source) {
-                            return Some(txt.to_string());
-                        }
-                    }
-                    _ => {}
+/// Name an anonymous callable (arrow function / function expression / lambda)
+/// from the binding it is immediately assigned to, e.g. `const f = () => ...`,
+/// `{ f: () => ... }`, `this.f = () => ...`, or a class field `f = () => ...`.
+/// Falls back to `<anonymous>` when no such binding exists (e.g. an inline
+/// callback passed directly as a call argument).
+fn name_anonymous_callable(n: &Node, source: &str) -> String {
+    if let Some(parent) = n.parent() {
+        let bound_name = match parent.kind() {
+            "variable_declarator" => field_text(&parent, "name", source),
+            "pair" => field_text(&parent, "key", source),
+            // `left` can be a bare identifier (`f = () => ...`) or a member
+            // expression (`this.f = () => ...`, `obj.f = () => ...`); taking
+            // its raw text verbatim would name the callable "this.f" (or
+            // "obj.f"), leaking the receiver into the enclosing-symbol path.
+            // Use only the member's final property when it is one.
+            "assignment_expression" => parent.child_by_field_name("left").and_then(|left| {
+                if left.kind() == "member_expression" {
+                    field_text(&left, "property", source)
+                } else {
+                    node_text(&left, source)
+                }
+            }),
+            // JS class fields use `field_definition` (field `property`); the
+            // TS grammar instead uses `public_field_definition` (field `name`).
+            "field_definition" => field_text(&parent, "property", source),
+            "public_field_definition" => field_text(&parent, "name", source),
+            _ => None,
+        };
+        if let Some(name) = bound_name {
+            return name.to_string();
+        }
+    }
+    "<anonymous>".to_string()
+}
+
+/// Name a single enclosing-ancestor node: its `name` field (most grammars),
+/// a derived binding name for anonymous callables, or the first
+/// identifier-like child as a fallback. Returns None if the node cannot be
+/// named at all (in which case the caller keeps climbing past it).
+fn enclosing_ancestor_name(n: &Node, source: &str) -> Option<String> {
+    if let Some(name) = field_text(n, "name", source) {
+        return Some(name.to_string());
+    }
+    if is_anonymous_callable_kind(n.kind()) {
+        return Some(name_anonymous_callable(n, source));
+    }
+    // Fall back to scanning direct children for an identifier-like node
+    for i in 0..n.child_count() {
+        let child = n.child(i).unwrap();
+        match child.kind() {
+            "identifier" | "type_identifier" | "constant" | "simple_identifier" => {
+                if let Some(txt) = node_text(&child, source) {
+                    return Some(txt.to_string());
                 }
             }
-            // Found an ancestor but couldn't name it — continue walking
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Walk up from `node` through ancestors, collecting the name of every node
+/// whose kind is listed in `ancestors`, and join them innermost-last with `.`
+/// (e.g. `Class.method`) so that callers with the same name in different
+/// scopes don't collapse into one `enclosing_symbol`. Anonymous callables
+/// (arrow functions, function expressions, lambdas) are named from the
+/// binding they are assigned to rather than reported as a bare
+/// `"<anonymous>"`. Returns None if no qualifying ancestor is found at all.
+pub fn resolve_enclosing_symbol(node: &Node, source: &str, ancestors: &[&str]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if ancestors.contains(&n.kind())
+            && let Some(name) = enclosing_ancestor_name(&n, source)
+        {
+            parts.push(name);
         }
         current = n.parent();
     }
-    None
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.join("."))
 }

@@ -12,6 +12,12 @@
 (enum_declaration
   name: (identifier) @name) @definition.enum
 
+; Records (a record's body is itself a `class_body`, so its explicit methods
+; already match the `class_body (method_declaration ...)` pattern below; this
+; pattern captures the record type itself).
+(record_declaration
+  name: (identifier) @name) @definition.struct
+
 ; Methods inside class bodies
 (class_body
   (method_declaration
@@ -22,6 +28,22 @@
   (field_declaration
     declarator: (variable_declarator
       name: (identifier) @name)) @definition.constant)
+
+; Methods inside interface bodies (implicitly public — see is_visible in java.rs)
+(interface_body
+  (method_declaration
+    name: (identifier) @name) @definition.method)
+
+; Constants inside interface bodies (implicitly public static final)
+(interface_body
+  (constant_declaration
+    declarator: (variable_declarator
+      name: (identifier) @name)) @definition.constant)
+
+; Methods inside enum bodies (e.g. `enum Color { RED, GREEN; String label() {} }`)
+(enum_body_declarations
+  (method_declaration
+    name: (identifier) @name) @definition.method)
 
 ; Reference: method calls
 (method_invocation

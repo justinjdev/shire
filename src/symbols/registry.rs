@@ -336,3 +336,141 @@ pub fn extract_file(
 
     (Vec::new(), Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SYM-12: `LanguageEntry::query()` compiles its `.scm` inside a
+    /// `Query::new(...).expect(...)`, so a malformed query or a node kind a
+    /// grammar bump removed panics on the first file of that language —
+    /// inside a rayon `par_iter`, aborting the whole build. Compile every
+    /// registered query here so a bad `.scm` fails in CI, not at user
+    /// runtime.
+    #[test]
+    fn all_registry_queries_compile() {
+        for entry in registry() {
+            let _query = entry.query();
+        }
+    }
+
+    /// `walker::all_extensions()` is a hand-written list that must stay in
+    /// sync with the registry (plus the regex-based COBOL extensions) so the
+    /// two never silently drift apart.
+    #[test]
+    fn walker_extensions_match_registry() {
+        use std::collections::HashSet;
+
+        let mut expected: HashSet<&str> = registry()
+            .iter()
+            .flat_map(|e| e.extensions.iter().copied())
+            .collect();
+        // COBOL is regex-based (handled directly in `extract_file`), not a
+        // registry entry.
+        expected.extend(["cob", "cbl", "cpy"]);
+
+        let walker: HashSet<&str> = super::super::walker::all_extensions().into_iter().collect();
+
+        assert_eq!(
+            expected, walker,
+            "registry() (+ COBOL) and walker::all_extensions() have drifted apart"
+        );
+    }
+
+    /// Every registered language should be reachable via `extract_file` with
+    /// a minimal one-line sample. This is a smoke test, not a correctness
+    /// test for any one language's query patterns — it just proves the query
+    /// compiles AND runs against real source without panicking.
+    #[test]
+    fn every_registered_extension_extracts_without_panicking() {
+        let samples: &[(&str, &str)] = &[
+            ("py", "def f():\n    pass\n"),
+            ("go", "package main\nfunc F() {}\n"),
+            ("rs", "pub fn f() {}\n"),
+            ("ts", "export function f() {}\n"),
+            ("tsx", "export function f() {}\n"),
+            ("js", "export function f() {}\n"),
+            ("jsx", "export function f() {}\n"),
+            ("java", "public class C { public void f() {} }\n"),
+            ("kt", "fun f() {}\n"),
+            ("dart", "void f() {}\n"),
+            ("proto", "syntax = \"proto3\";\nmessage M {}\n"),
+            ("cs", "public class C { public void F() {} }\n"),
+            ("swift", "func f() {}\n"),
+            ("c", "int f() { return 0; }\n"),
+            ("h", "int f() { return 0; }\n"),
+            ("cpp", "int f() { return 0; }\n"),
+            ("cc", "int f() { return 0; }\n"),
+            ("cxx", "int f() { return 0; }\n"),
+            ("hpp", "int f() { return 0; }\n"),
+            ("hxx", "int f() { return 0; }\n"),
+            ("php", "<?php\nfunction f() {}\n"),
+            ("scala", "def f(): Unit = {}\n"),
+            ("sc", "def f(): Unit = {}\n"),
+            ("zig", "pub fn f() void {}\n"),
+            ("sh", "f() {\n  echo hi\n}\n"),
+            ("bash", "f() {\n  echo hi\n}\n"),
+            ("r", "f <- function() {}\n"),
+            ("R", "f <- function() {}\n"),
+            ("hs", "f :: Int -> Int\nf x = x\n"),
+            ("yaml", "key: value\n"),
+            ("yml", "key: value\n"),
+            ("sql", "CREATE TABLE t (id INT);\n"),
+            ("hcl", "resource \"a\" \"b\" {}\n"),
+            ("tf", "resource \"a\" \"b\" {}\n"),
+            ("toml", "key = \"value\"\n"),
+            ("pm", "package M;\nsub f { }\n1;\n"),
+            ("pl", "package M;\nsub f { }\n1;\n"),
+            ("rb", "def f\nend\n"),
+            ("ml", "let f x = x\n"),
+            ("mli", "val f : int -> int\n"),
+            ("lua", "function f() end\n"),
+            ("ex", "defmodule M do\nend\n"),
+            ("exs", "defmodule M do\nend\n"),
+            ("clj", "(defn f [] 1)\n"),
+            ("cljs", "(defn f [] 1)\n"),
+            ("cljc", "(defn f [] 1)\n"),
+            // `edn` shares the Clojure grammar/query registry entry — use the
+            // same defn-shaped sample as clj/cljs/cljc rather than literal
+            // EDN data (which has no `defn` form to capture).
+            ("edn", "(defn f [] 1)\n"),
+            ("erl", "-module(m).\nf() -> ok.\n"),
+            ("hrl", "-define(X, 1).\n"),
+            ("jl", "function f()\nend\n"),
+            ("gleam", "pub fn f() {\n  1\n}\n"),
+            ("odin", "f :: proc() {}\n"),
+            ("nix", "{ f = 1; }\n"),
+            ("nim", "proc f*() =\n  discard\n"),
+            ("nims", "proc f*() =\n  discard\n"),
+        ];
+
+        let registry_exts: std::collections::HashSet<&str> = registry()
+            .iter()
+            .flat_map(|e| e.extensions.iter().copied())
+            .collect();
+        let sample_exts: std::collections::HashSet<&str> =
+            samples.iter().map(|(ext, _)| *ext).collect();
+        assert_eq!(
+            registry_exts, sample_exts,
+            "every registry extension needs a smoke-test sample above (and vice versa)"
+        );
+
+        for (ext, source) in samples {
+            // Must not panic (a bad .scm panics inside `entry.query()`), and
+            // an OK extraction over a minimal, syntactically valid sample
+            // should find at least one symbol.
+            let (symbols, _refs) = extract_file(
+                ext,
+                source,
+                Arc::from(format!("sample.{ext}").as_str()),
+                true,
+                0,
+            );
+            assert!(
+                !symbols.is_empty(),
+                "expected at least one symbol extracted for .{ext}, got none from {:?}",
+                source
+            );
+        }
+    }
+}

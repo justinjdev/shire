@@ -1516,6 +1516,7 @@ fn phase_source_incremental(
     force_source_reextract: bool,
     max_file_size: u64,
     max_references_per_file: usize,
+    file_index_changed: &HashSet<String>,
 ) -> Result<usize> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
     #[allow(clippy::type_complexity)]
@@ -1560,44 +1561,66 @@ fn phase_source_incremental(
     // cannot be shared across threads but the bool is Copy.
     let skip_references = ref_writer.skip_references();
 
+    // Resolve the effective extension list once — it is identical for every
+    // package, and the staleness pre-check must see exactly the file set the
+    // hash pass would see (see hash::package_source_staleness).
+    let all_exts = symbols::walker::all_extensions();
+    let extensions: Vec<&str> = all_exts
+        .into_iter()
+        .filter(|ext| {
+            let with_dot = format!(".{}", ext);
+            !exclude_extensions.contains(&with_dot)
+        })
+        .collect();
+
     // Parallel: mtime pre-check, then per-file hash comparison and selective extraction
     let results: Vec<SourceCheckResult> = unchanged_pkgs
         .par_iter()
         .filter_map(
             |(pkg_name, pkg_path, _pkg_kind, _stored_hash, hashed_at, stored_file_hashes)| {
                 let result = (|| -> Option<SourceCheckResult> {
-                    // Mtime pre-check: if hashed_at exists and no files are newer, skip entirely.
-                    // `force_source_reextract` bypasses this fast-path — used during a
-                    // references_enabled false→true transition, where refs must populate
-                    // even for packages whose source files haven't been touched.
-                    if !force_source_reextract
-                        && let Some(ts_str) = hashed_at
-                        && let Some(since) = parse_hashed_at(ts_str)
-                        && !hash::has_newer_source_files(repo_root, pkg_path, since)
-                    {
-                        return None; // No files changed — skip entirely
-                    }
-
-                    // Mtime says check needed — walk files and do per-file comparison
                     let package_dir = repo_root.join(pkg_path);
                     if !package_dir.is_dir() {
                         return None;
                     }
 
-                    let all_exts = symbols::walker::all_extensions();
-                    let extensions: Vec<&str> = all_exts
-                        .into_iter()
-                        .filter(|ext| {
-                            let with_dot = format!(".{}", ext);
-                            !exclude_extensions.contains(&with_dot)
-                        })
-                        .collect();
+                    // One walk, used both by the staleness pre-check and by
+                    // the hash pass below.
                     let source_files = symbols::walker::walk_source_files_with_patterns(
                         &package_dir,
                         &extensions,
                         exclude_patterns,
                     )
                     .ok()?;
+
+                    // Pre-check: skip the package entirely when nothing on
+                    // disk suggests a change. Bypassed when
+                    // `force_source_reextract` is set (a references_enabled
+                    // false→true transition must repopulate refs even for
+                    // untouched packages), and when phase_index_files
+                    // observed a path/size change inside this package —
+                    // that signal catches mtime-preserving edits the stat
+                    // scan cannot see.
+                    if !force_source_reextract
+                        && !file_index_changed.contains(pkg_name.as_str())
+                        && let Some(ts_str) = hashed_at
+                        && let Some(since) = parse_hashed_at(ts_str)
+                    {
+                        let staleness = hash::package_source_staleness(
+                            repo_root,
+                            &source_files,
+                            since,
+                            stored_file_hashes,
+                        );
+                        if staleness == hash::SourceStaleness::Unchanged {
+                            return None; // Nothing changed — skip entirely
+                        }
+                        tracing::debug!(
+                            package = %pkg_name,
+                            reason = ?staleness,
+                            "phase_source_incremental: package needs a hash pass"
+                        );
+                    }
 
                     // Process each file: read, hash, compare, extract if changed
                     let file_results: Vec<FileResult> = source_files
@@ -1866,45 +1889,27 @@ fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
 struct FileIndexResult {
     num_files: usize,
     deleted_file_rows: usize,
+    /// Packages in which a file appeared, disappeared or changed size since
+    /// the last build. Empty when the repo-wide file-tree hash matched, in
+    /// which case no path or size changed anywhere. Used by
+    /// `phase_source_incremental` to force a hash pass for packages whose
+    /// content changed without any mtime moving (INDEX-3).
+    changed_packages: HashSet<String>,
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
-/// Uses .git/index mtime as a fast pre-check, then file-tree hash to skip
-/// the full rebuild when no files have changed.
+/// The file-tree hash (paths + sizes) short-circuits the rebuild when the
+/// walk shows nothing changed.
+///
+/// This phase deliberately has NO `.git/index` pre-check. Editing, creating
+/// or deleting a file in the working tree does not touch `.git/index`, so
+/// gating the walk on it silently froze the index for the most common
+/// workflow of all (edit, then rebuild).
 fn phase_index_files(
     conn: &Connection,
     repo_root: &Path,
     config: &Config,
 ) -> Result<FileIndexResult> {
-    // Fast pre-check: if .git/index mtime hasn't changed since last file index,
-    // the file tree can't have changed. Skip the expensive walk entirely.
-    let git_index_path = repo_root.join(".git/index");
-    let stored_file_index_at: Option<String> = conn
-        .query_row(
-            "SELECT value FROM shire_meta WHERE key = 'file_index_at'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    if let (Ok(git_meta), Some(stored_ts)) =
-        (std::fs::metadata(&git_index_path), &stored_file_index_at)
-        && let Ok(git_mtime) = git_meta.modified()
-        && let Some(since) = parse_hashed_at(stored_ts)
-    {
-        let margin = std::time::Duration::from_secs(1);
-        if git_mtime <= since.checked_add(margin).unwrap_or(since) {
-            tracing::debug!("phase_index_files: .git/index unchanged, skipping walk");
-            backfill_boundary_edges_if_needed(conn)?;
-            let num_files: usize = conn
-                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?
-                as usize;
-            return Ok(FileIndexResult {
-                num_files,
-                deleted_file_rows: 0,
-            });
-        }
-    }
-
     let walked_files = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
@@ -1926,17 +1931,12 @@ fn phase_index_files(
     if stored_hash.as_deref() == Some(current_hash.as_str()) {
         tracing::debug!("phase_index_files: file tree hash matched, skipping rebuild");
         backfill_boundary_edges_if_needed(conn)?;
-        // Update timestamp so mtime pre-check works next time
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        conn.execute(
-            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
-            [&now],
-        )?;
         let num_files: usize =
             conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))? as usize;
         return Ok(FileIndexResult {
             num_files,
             deleted_file_rows: 0,
+            changed_packages: HashSet::new(),
         });
     }
 
@@ -1968,6 +1968,7 @@ fn phase_index_files(
         .collect();
 
     let num_files = validated_files.len();
+    let changed_packages = packages_with_file_changes(conn, &validated_files)?;
     let deleted_file_rows = incremental_upsert_files(conn, &validated_files)?;
 
     // Detect proto→generated boundary edges from the walked file set.
@@ -1979,21 +1980,78 @@ fn phase_index_files(
         crate::db::queries::batch_insert_boundary_edges(conn, &boundary_edges)?;
     }
 
-    // Store the new file-tree hash and timestamp for mtime pre-check
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // Store the new file-tree hash so the next build can short-circuit here.
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
         [&current_hash],
-    )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_index_at', ?1)",
-        [&now],
     )?;
 
     Ok(FileIndexResult {
         num_files,
         deleted_file_rows,
+        changed_packages,
     })
+}
+
+/// Packages in which a file was added, removed, or changed size relative to
+/// the `files` table as it stands *before* this build's upsert.
+///
+/// This is the only cheap signal that catches a content change which moves
+/// neither the file's mtime nor its path (a `cp -p`/rsync restore, a
+/// timestamp-preserving checkout). It is derived from data
+/// `incremental_upsert_files` would load anyway, so it costs one extra scan
+/// of the `files` table and no filesystem work.
+fn packages_with_file_changes(
+    conn: &Connection,
+    files: &[(String, Option<String>, String, u64)],
+) -> Result<HashSet<String>> {
+    let mut existing: HashMap<String, (Option<String>, i64)> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT path, package, size_bytes FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        for row in rows {
+            let (path, rest) = row?;
+            existing.insert(path, rest);
+        }
+    }
+
+    let mut changed: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(files.len());
+    for (path, pkg, _ext, size) in files {
+        seen.insert(path.as_str());
+        match existing.get(path) {
+            // New file, moved between packages, or resized.
+            Some((old_pkg, old_size)) => {
+                if *old_size != *size as i64 || old_pkg.as_deref() != pkg.as_deref() {
+                    if let Some(p) = pkg {
+                        changed.insert(p.clone());
+                    }
+                    if let Some(p) = old_pkg {
+                        changed.insert(p.clone());
+                    }
+                }
+            }
+            None => {
+                if let Some(p) = pkg {
+                    changed.insert(p.clone());
+                }
+            }
+        }
+    }
+    // Deleted files.
+    for (path, (old_pkg, _)) in &existing {
+        if !seen.contains(path.as_str())
+            && let Some(p) = old_pkg
+        {
+            changed.insert(p.clone());
+        }
+    }
+    Ok(changed)
 }
 
 /// Index documentation files: read content from doc files in the files table,
@@ -2411,34 +2469,6 @@ fn maybe_write_summary<W: std::io::Write>(
     Ok(())
 }
 
-/// Check if .git/index has changed since the last build.
-/// Returns true if changed or unknown (conservative).
-fn git_index_changed_since_build(repo_root: &Path, conn: &Connection) -> bool {
-    let git_index_path = repo_root.join(".git/index");
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM shire_meta WHERE key = 'last_build_at'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    match (std::fs::metadata(&git_index_path), stored) {
-        (Ok(meta), Some(ts)) => {
-            let git_mtime = match meta.modified() {
-                Ok(m) => m,
-                Err(_) => return true,
-            };
-            let since = match parse_hashed_at(&ts) {
-                Some(s) => s,
-                None => return true,
-            };
-            let margin = std::time::Duration::from_secs(1);
-            git_mtime > since.checked_add(margin).unwrap_or(since)
-        }
-        _ => true, // unknown — assume changed
-    }
-}
-
 /// True when `references_enabled` flipped off→on since the last build.
 ///
 /// `prior` is the value read from `shire_meta.references_enabled`:
@@ -2474,66 +2504,6 @@ fn needs_integrity_validation(
     deleted_file_rows: usize,
 ) -> bool {
     force || removed_manifests > 0 || deleted_file_rows > 0
-}
-
-/// Check if the DB has been populated (has manifest hashes).
-fn is_fresh_db(conn: &Connection) -> bool {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM manifest_hashes", [], |row| row.get(0))
-        .unwrap_or(0);
-    count == 0
-}
-
-/// Try to reconstruct manifest walk from cached DB state.
-/// Returns None if we can't determine the manifest list (forces full walk).
-fn cached_manifest_walk(repo_root: &Path, conn: &Connection) -> Option<Vec<WalkedManifest>> {
-    // Read stored manifest paths and hashes from DB
-    let mut stmt = conn
-        .prepare("SELECT path, content_hash FROM manifest_hashes")
-        .ok()?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if rows.is_empty() {
-        return None;
-    }
-
-    let mut manifests = Vec::with_capacity(rows.len());
-    for (manifest_key, _stored_hash) in &rows {
-        let abs_path = repo_root.join(manifest_key);
-        if !abs_path.exists() {
-            // Manifest was deleted — need full walk to detect removals
-            return None;
-        }
-        // Re-hash to check if content changed
-        let current_hash = match hash::hash_file(&abs_path) {
-            Ok(h) => h,
-            Err(_) => return None,
-        };
-
-        let relative_dir = abs_path
-            .parent()
-            .and_then(|p| p.strip_prefix(repo_root).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        manifests.push(WalkedManifest {
-            abs_path,
-            relative_dir,
-            manifest_key: manifest_key.clone(),
-            content_hash: current_hash,
-        });
-    }
-
-    // Check if any NEW manifests have appeared by comparing count with DB
-    // This is a heuristic: we can't know for sure without walking, but if
-    // the stored count matches and all files exist, it's very likely correct.
-    // New manifests will be caught on the next full walk (triggered by force
-    // rebuild or when a known manifest changes).
-    Some(manifests)
 }
 
 /// Print timing breakdown. Emits to stderr when SHIRE_BENCH_TIMINGS is set,
@@ -2674,26 +2644,16 @@ fn build_index_inner(
         Box::new(nix::FlakeNixParser),
     ];
 
-    // Phase 1: Walk manifests
-    // On incremental builds, use cached manifest paths to skip the full walk
-    // when no manifests have been added or removed.
+    // Phase 1: Walk manifests.
+    //
+    // Always a real walk: a new manifest (i.e. a brand-new package) is
+    // invisible to any cache reconstructed from the DB, and nothing in the
+    // working tree announces its arrival. The walk honours .gitignore and
+    // is bounded by the same file cap as the file-index walk.
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let git_index_changed =
-        force || is_fresh_db(&conn) || git_index_changed_since_build(repo_root, &conn);
-    let walked = if !git_index_changed {
-        // .git/index unchanged — no files added/removed. Use cached manifest paths.
-        match cached_manifest_walk(repo_root, &conn) {
-            Some(cached) => {
-                tracing::debug!(manifests = cached.len(), "using cached manifest paths");
-                cached
-            }
-            None => walk_manifests(repo_root, config, &parsers)?,
-        }
-    } else {
-        walk_manifests(repo_root, config, &parsers)?
-    };
+    let walked = walk_manifests(repo_root, config, &parsers)?;
     timings.push(("walk", t.elapsed()));
     sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
@@ -2922,31 +2882,21 @@ fn build_index_inner(
             config.symbols.max_file_size,
             config.symbols.max_references_per_file,
         )?;
-        let count = if git_index_changed || refs_just_enabled {
-            // The refs_just_enabled branch is load-bearing: flipping the
-            // flag in shire.toml does not touch .git/index, so without
-            // this override phase_source_incremental would skip unchanged
-            // packages and leave symbol_refs empty for every file the
-            // user hasn't edited since the last build.
-            phase_source_incremental(
-                &conn,
-                repo_root,
-                &diff.unchanged,
-                &config.symbols.exclude_extensions,
-                &config.symbols.exclude_patterns,
-                &pb_sym_clone,
-                &mut ref_writer,
-                force_source_reextract,
-                config.symbols.max_file_size,
-                config.symbols.max_references_per_file,
-            )?
-        } else {
-            // .git/index unchanged — no tracked files can have changed, skip per-file mtime walks
-            if let Some(pb) = &pb_sym_clone {
-                pb.inc(diff.unchanged.len() as u64);
-            }
-            0
-        };
+        // Always run: this phase's own per-package mtime/dir-mtime/file-set
+        // pre-check and per-file content hashes are the freshness oracle.
+        let count = phase_source_incremental(
+            &conn,
+            repo_root,
+            &diff.unchanged,
+            &config.symbols.exclude_extensions,
+            &config.symbols.exclude_patterns,
+            &pb_sym_clone,
+            &mut ref_writer,
+            force_source_reextract,
+            config.symbols.max_file_size,
+            config.symbols.max_references_per_file,
+            &file_index.changed_packages,
+        )?;
         // Commit the refs-trustworthy flag atomically with the extraction
         // results. If a later phase (docs, meta) fails, the flag's
         // committed state still matches the committed state of

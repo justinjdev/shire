@@ -3003,3 +3003,465 @@ fn test_refs_transition_cleans_up_files_deleted_while_refs_off() {
         "call-ref to Callee must populate — the point of the refs transition"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Freshness invariants inside a REAL git repository.
+//
+// These tests exist because every earlier unit test built into a bare
+// TempDir with no `.git` directory, which is exactly the configuration in
+// which the old `.git/index` mtime gate never engaged. The production
+// behaviour — an ordinary edit in a checked-out repo — was therefore
+// completely untested.
+// ---------------------------------------------------------------------------
+
+/// `git add -A` + commit inside `repo`.
+fn git_commit_all(repo: &Path, msg: &str) {
+    let out = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo)
+        .output()
+        .expect("git add failed");
+    assert!(out.status.success(), "git add: {:?}", out);
+    let out = Command::new("git")
+        .args(["commit", "-m", msg])
+        .current_dir(repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test.com")
+        .output()
+        .expect("git commit failed");
+    assert!(out.status.success(), "git commit: {:?}", out);
+}
+
+/// Write `<repo>/<name>/package.json` plus `<repo>/<name>/src/index.ts`.
+fn write_ts_package(repo: &Path, name: &str, body: &str) {
+    let src = repo.join(name).join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        repo.join(name).join("package.json"),
+        format!(r#"{{"name": "{}", "version": "1.0.0"}}"#, name),
+    )
+    .unwrap();
+    fs::write(src.join("index.ts"), body).unwrap();
+}
+
+fn run_build(bin: &Path, repo: &Path, db: &Path) -> std::process::Output {
+    let out = Command::new(bin)
+        .args([
+            "build",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run shire build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+fn sym_count(db: &Path, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM symbols WHERE name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn sym_paths(db: &Path, name: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT file_path FROM symbols WHERE name = ?1 ORDER BY file_path")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([name], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    rows
+}
+
+/// Sleep long enough that the next build's `hashed_at` is more than the
+/// 1 s mtime margin ahead of the files written before the call.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+}
+
+fn append_line(path: &Path, line: &str) {
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(f, "{}", line).unwrap();
+}
+
+#[test]
+fn test_git_repo_indexes_unstaged_edit() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+    assert_eq!(
+        sym_count(&db, "alpha"),
+        1,
+        "baseline symbol must be indexed"
+    );
+
+    // Ordinary working-tree edit. No `git add`, so `.git/index` is untouched.
+    append_line(
+        &repo.join("pkg-a/src/index.ts"),
+        "export function delta(): number { return 4; }",
+    );
+    run_build(&bin, &repo, &db);
+    assert_eq!(
+        sym_count(&db, "delta"),
+        1,
+        "an unstaged edit must be indexed by a plain `shire build`"
+    );
+}
+
+#[test]
+fn test_git_repo_indexes_untracked_new_file() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+
+    fs::write(
+        repo.join("pkg-a/src/new.ts"),
+        "export function zeta(): number { return 0; }\n",
+    )
+    .unwrap();
+    run_build(&bin, &repo, &db);
+
+    assert_eq!(
+        sym_count(&db, "zeta"),
+        1,
+        "a new untracked source file must be indexed"
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let files: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE path = 'pkg-a/src/new.ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(files, 1, "the new file must also appear in the files table");
+}
+
+#[test]
+fn test_git_repo_discovers_new_package() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+
+    write_ts_package(
+        &repo,
+        "pkg-new",
+        "export function omega(): number { return 9; }\n",
+    );
+    run_build(&bin, &repo, &db);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let pkgs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM packages WHERE name = 'pkg-new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pkgs, 1, "a brand-new package directory must be discovered");
+    assert_eq!(sym_count(&db, "omega"), 1);
+}
+
+#[test]
+fn test_git_repo_rename_moves_symbols() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    // Make sure the source file's mtime is comfortably older than the
+    // build's `hashed_at`, so the mtime pre-check would skip the package
+    // after the (mtime-preserving) rename below.
+    settle();
+    run_build(&bin, &repo, &db);
+    assert_eq!(sym_paths(&db, "alpha"), vec!["pkg-a/src/index.ts"]);
+
+    // `rename` preserves the file's mtime: only the directory mtime and the
+    // file *set* change.
+    fs::rename(
+        repo.join("pkg-a/src/index.ts"),
+        repo.join("pkg-a/src/renamed.ts"),
+    )
+    .unwrap();
+    run_build(&bin, &repo, &db);
+
+    assert_eq!(
+        sym_paths(&db, "alpha"),
+        vec!["pkg-a/src/renamed.ts"],
+        "after a rename the symbol must point at the new path only"
+    );
+}
+
+#[test]
+fn test_git_repo_edit_immediately_after_build_is_indexed() {
+    // INDEX-V1: an edit (and `git add`) landing within a second of the
+    // previous build must not be swallowed by any timestamp margin.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+
+    // No sleep: edit + stage immediately after the build finishes.
+    append_line(
+        &repo.join("pkg-a/src/index.ts"),
+        "export function margin_sym(): number { return 2; }",
+    );
+    let out = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    run_build(&bin, &repo, &db);
+
+    assert_eq!(
+        sym_count(&db, "margin_sym"),
+        1,
+        "an edit staged <1s after the previous build must still be indexed"
+    );
+}
+
+#[test]
+fn test_linked_worktree_indexes_unstaged_edit() {
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("main");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let wt = dir.path().join("wt-feat");
+    let out = Command::new("git")
+        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "feat"])
+        .current_dir(&repo)
+        .output()
+        .expect("git worktree add failed");
+    assert!(
+        out.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A linked worktree's `.git` is a file, not a directory.
+    assert!(wt.join(".git").is_file());
+
+    let db = dir.path().join("wt.db");
+    run_build(&bin, &wt, &db);
+    assert_eq!(sym_count(&db, "alpha"), 1);
+
+    append_line(
+        &wt.join("pkg-a/src/index.ts"),
+        "export function wt_sym(): number { return 3; }",
+    );
+    run_build(&bin, &wt, &db);
+    assert_eq!(
+        sym_count(&db, "wt_sym"),
+        1,
+        "an unstaged edit in a linked worktree must be indexed"
+    );
+}
+
+#[test]
+fn test_build_recovers_from_corrupt_db() {
+    use std::io::{Seek, SeekFrom};
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+    assert_eq!(sym_count(&db, "alpha"), 1);
+
+    // Shred the schema b-tree on page 1, leaving the SQLite header intact —
+    // exactly what a SIGKILL during a MEMORY-journal build produces.
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.seek(SeekFrom::Start(100)).unwrap();
+        f.write_all(&[0xEEu8; 3000]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let out = Command::new(&bin)
+        .args([
+            "build",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build must auto-recover from a corrupt DB, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        sym_count(&db, "alpha"),
+        1,
+        "the rebuilt index must contain the symbols again"
+    );
+}
+
+#[test]
+fn test_serve_reports_corrupt_db_clearly() {
+    use std::io::{Seek, SeekFrom};
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+    {
+        let mut f = fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.seek(SeekFrom::Start(100)).unwrap();
+        f.write_all(&[0xEEu8; 3000]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let out = Command::new(&bin)
+        .args(["serve", "--db", db.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "serve on a corrupt DB must fail, not serve empty results"
+    );
+    assert!(
+        stderr.contains("shire build"),
+        "serve's corrupt-DB error must tell the user to run `shire build`, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_serve_works_on_non_wal_db() {
+    // DB-2: a DB left in rollback-journal mode (interrupted build) must
+    // still be servable — `open_readonly` must not try to write to it.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+    }
+
+    let out = Command::new(&bin)
+        .args(["serve", "--db", db.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("readonly database"),
+        "serve must not attempt to write to a read-only connection: {}",
+        stderr
+    );
+    assert!(
+        out.status.success(),
+        "serve on a healthy non-WAL DB must start: {}",
+        stderr
+    );
+}

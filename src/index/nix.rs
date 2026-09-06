@@ -90,10 +90,25 @@ fn scan_top_level_inputs(
     let mut i = 0;
     let mut depth: i32 = 0;
     let mut in_string = false;
+    let mut in_indented_string = false;
     let mut escape = false;
 
     while i < bytes.len() {
         let c = bytes[i];
+        if in_indented_string {
+            if is_indented_string_delim(bytes, i) {
+                match indented_string_escape_len(bytes, i) {
+                    Some(skip) => i += skip,
+                    None => {
+                        in_indented_string = false;
+                        i += 2;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
         if in_string {
             if escape {
                 escape = false;
@@ -103,6 +118,11 @@ fn scan_top_level_inputs(
                 in_string = false;
             }
             i += 1;
+            continue;
+        }
+        if is_indented_string_delim(bytes, i) {
+            in_indented_string = true;
+            i += 2;
             continue;
         }
         match c {
@@ -399,9 +419,24 @@ fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
     let mut depth: i32 = 0;
     let mut i = open;
     let mut in_string = false;
+    let mut in_indented_string = false;
     let mut escape = false;
     while i < bytes.len() {
         let c = bytes[i];
+        if in_indented_string {
+            if is_indented_string_delim(bytes, i) {
+                match indented_string_escape_len(bytes, i) {
+                    Some(skip) => i += skip,
+                    None => {
+                        in_indented_string = false;
+                        i += 2;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
         if in_string {
             if escape {
                 escape = false;
@@ -411,6 +446,11 @@ fn find_matching_brace(s: &str, open: usize) -> Option<usize> {
                 in_string = false;
             }
             i += 1;
+            continue;
+        }
+        if is_indented_string_delim(bytes, i) {
+            in_indented_string = true;
+            i += 2;
             continue;
         }
         match c {
@@ -435,9 +475,24 @@ fn skip_to_statement_end(s: &str, start: usize) -> usize {
     let mut i = start;
     let mut depth: i32 = 0;
     let mut in_string = false;
+    let mut in_indented_string = false;
     let mut escape = false;
     while i < bytes.len() {
         let c = bytes[i];
+        if in_indented_string {
+            if is_indented_string_delim(bytes, i) {
+                match indented_string_escape_len(bytes, i) {
+                    Some(skip) => i += skip,
+                    None => {
+                        in_indented_string = false;
+                        i += 2;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
         if in_string {
             if escape {
                 escape = false;
@@ -447,6 +502,11 @@ fn skip_to_statement_end(s: &str, start: usize) -> usize {
                 in_string = false;
             }
             i += 1;
+            continue;
+        }
+        if is_indented_string_delim(bytes, i) {
+            in_indented_string = true;
+            i += 2;
             continue;
         }
         match c {
@@ -576,9 +636,26 @@ fn strip_comments(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut i = 0;
     let mut in_string = false;
+    let mut in_indented_string = false;
     let mut escape = false;
     while i < bytes.len() {
         let c = bytes[i];
+        if in_indented_string {
+            if is_indented_string_delim(bytes, i) {
+                let skip = indented_string_escape_len(bytes, i).unwrap_or_else(|| {
+                    in_indented_string = false;
+                    2
+                });
+                for k in 0..skip {
+                    out.push(bytes[i + k] as char);
+                }
+                i += skip;
+            } else {
+                out.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
         if in_string {
             out.push(c as char);
             if escape {
@@ -589,6 +666,13 @@ fn strip_comments(source: &str) -> String {
                 in_string = false;
             }
             i += 1;
+            continue;
+        }
+        if is_indented_string_delim(bytes, i) {
+            in_indented_string = true;
+            out.push('\'');
+            out.push('\'');
+            i += 2;
             continue;
         }
         if c == b'"' {
@@ -617,6 +701,25 @@ fn strip_comments(source: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// True if `bytes[i..]` starts a Nix indented-string delimiter (`''`).
+fn is_indented_string_delim(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'\'') && bytes.get(i + 1) == Some(&b'\'')
+}
+
+/// Called when positioned at an indented-string delimiter (`bytes[i..i+2] ==
+/// "''"`) while already inside an indented string. Nix escapes `$`, a
+/// literal `''`, and arbitrary characters from within `''...''` strings as
+/// `''$`, `'''`, and `''\X` respectively — none of these end the string.
+/// Returns the number of bytes to skip (staying inside the string) for one
+/// of those escapes, or `None` if this is the closing delimiter.
+fn indented_string_escape_len(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes.get(i + 2) {
+        Some(b'$') | Some(b'\'') => Some(3),
+        Some(b'\\') => Some(if bytes.get(i + 3).is_some() { 4 } else { 3 }),
+        _ => None,
+    }
 }
 
 fn is_ident_byte(c: u8) -> bool {
@@ -1084,5 +1187,99 @@ mod tests {
         let out = strip_comments(s);
         assert!(out.contains("# not a comment"));
         assert!(!out.contains("but this is"));
+    }
+
+    #[test]
+    fn test_indented_string_brace_does_not_truncate_flake_body() {
+        // A brace inside a `''...''` indented string (a common form for
+        // `description`, `shellHook`, etc.) must not be mistaken for
+        // attrset structure by find_matching_brace / outer_attrset_body.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  description = ''
+    A demo flake. Config snippet: services.foo = { enable = true; }
+    Closing note }
+  '';
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.flake-utils.url = "github:numtide/flake-utils";
+  outputs = { self, nixpkgs, flake-utils }: { };
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "flk").unwrap();
+
+        assert_eq!(info.dependencies.len(), 2);
+        let names: Vec<&str> = info.dependencies.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"nixpkgs"));
+        assert!(names.contains(&"flake-utils"));
+    }
+
+    #[test]
+    fn test_indented_string_comment_hash_is_not_a_comment() {
+        // `#` inside a `''...''` string is literal content, not the start of
+        // a line comment — strip_comments must not eat the rest of the line.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  description = ''
+    See issue #123 for details }
+  '';
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "flk").unwrap();
+
+        assert_eq!(info.dependencies.len(), 1);
+        assert_eq!(info.dependencies[0].name, "nixpkgs");
+    }
+
+    #[test]
+    fn test_indented_string_escapes_do_not_end_the_string() {
+        // `''$` (escaped `$`) and `'''` (escaped `''`) must not be mistaken
+        // for the closing delimiter.
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+  description = ''
+    Price is ''${amount}, quote marks: '''  and a brace: }
+  '';
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+}
+"#,
+        );
+
+        let parser = FlakeNixParser;
+        let info = parser.parse(&path, "flk").unwrap();
+
+        assert_eq!(info.dependencies.len(), 1);
+        assert_eq!(info.dependencies[0].name, "nixpkgs");
+    }
+
+    #[test]
+    fn test_is_indented_string_delim() {
+        assert!(is_indented_string_delim(b"''hi", 0));
+        assert!(!is_indented_string_delim(b"'hi", 0));
+        assert!(!is_indented_string_delim(b"x", 0));
+    }
+
+    #[test]
+    fn test_indented_string_escape_len() {
+        assert_eq!(indented_string_escape_len(b"''$", 0), Some(3));
+        assert_eq!(indented_string_escape_len(b"'''", 0), Some(3));
+        assert_eq!(indented_string_escape_len(b"''\\n", 0), Some(4));
+        assert_eq!(indented_string_escape_len(b"''", 0), None);
+        assert_eq!(indented_string_escape_len(b"'' ", 0), None);
     }
 }

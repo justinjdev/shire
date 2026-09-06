@@ -138,7 +138,18 @@ fn name_anonymous_callable(n: &Node, source: &str) -> String {
         let bound_name = match parent.kind() {
             "variable_declarator" => field_text(&parent, "name", source),
             "pair" => field_text(&parent, "key", source),
-            "assignment_expression" => field_text(&parent, "left", source),
+            // `left` can be a bare identifier (`f = () => ...`) or a member
+            // expression (`this.f = () => ...`, `obj.f = () => ...`); taking
+            // its raw text verbatim would name the callable "this.f" (or
+            // "obj.f"), leaking the receiver into the enclosing-symbol path.
+            // Use only the member's final property when it is one.
+            "assignment_expression" => parent.child_by_field_name("left").and_then(|left| {
+                if left.kind() == "member_expression" {
+                    field_text(&left, "property", source)
+                } else {
+                    node_text(&left, source)
+                }
+            }),
             // JS class fields use `field_definition` (field `property`); the
             // TS grammar instead uses `public_field_definition` (field `name`).
             "field_definition" => field_text(&parent, "property", source),

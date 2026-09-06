@@ -881,6 +881,37 @@ export function helper(x) { return x; }
     );
 }
 
+#[test]
+fn test_javascript_member_assigned_arrow_uses_property_not_full_lhs() {
+    // An arrow assigned via a member expression (`this.f = ...`, `obj.f =
+    // ...`) must be named from the property alone. Taking the assignment's
+    // `left` text verbatim would name it "this.run" / "Obj.run", leaking the
+    // receiver into the enclosing-symbol path instead of just "run".
+    let source = r#"class Handler {
+  constructor() {
+    this.run = () => { helper(); };
+  }
+}
+const Obj = {};
+Obj.run = () => { helper(); };
+function helper() {}
+"#;
+    let (_syms, refs) = extract_file("js", source, Arc::from("d.js"), false, 0);
+    let mut call_refs: Vec<(usize, Option<String>)> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call && r.name == "helper")
+        .map(|r| (r.line, r.enclosing_symbol.clone()))
+        .collect();
+    call_refs.sort_by_key(|r| r.0);
+    assert_eq!(
+        call_refs,
+        vec![
+            (3, Some("Handler.constructor.run".into())),
+            (7, Some("run".into())),
+        ]
+    );
+}
+
 // ============================================================
 // Java tests (ported from java.rs)
 // ============================================================

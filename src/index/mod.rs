@@ -25,7 +25,7 @@ use ignore::WalkBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -811,6 +811,119 @@ struct BuildSummary {
     failures: Vec<(String, String)>,
 }
 
+/// If `pkg`'s computed name is already used by a *different* package path
+/// in the DB (e.g. two Gradle subprojects that share a `group` and a
+/// directory basename, so both compute the same `group:basename` name),
+/// fall back to a path-derived name so the colliding package isn't silently
+/// dropped by upsert_package's `ON CONFLICT(name)` resolution.
+fn resolve_gradle_name_collision(conn: &Connection, pkg: &mut PackageInfo) -> Result<()> {
+    let existing_path: Option<String> = conn
+        .query_row(
+            "SELECT path FROM packages WHERE name = ?1",
+            [&pkg.name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(existing_path) = existing_path
+        && existing_path != pkg.path
+    {
+        let fallback = pkg.path.replace('/', "-");
+        tracing::warn!(
+            name = %pkg.name,
+            existing_path = %existing_path,
+            new_path = %pkg.path,
+            fallback_name = %fallback,
+            "Gradle package name collision detected; falling back to a path-derived name"
+        );
+        pkg.name = fallback;
+    }
+
+    Ok(())
+}
+
+/// Find the settings.gradle directory that governs `relative_dir` — the
+/// longest known settings dir that is a prefix of `relative_dir` (or the
+/// repo root `""` when none is more specific). Used to resolve Gradle
+/// `project(':a:b')` references to a directory path.
+fn governing_gradle_settings_dir<'a>(
+    settings_dirs: &'a HashMap<String, Option<String>>,
+    relative_dir: &str,
+) -> &'a str {
+    settings_dirs
+        .keys()
+        .filter(|dir| {
+            dir.is_empty()
+                || relative_dir == dir.as_str()
+                || relative_dir.starts_with(&format!("{}/", dir))
+        })
+        .max_by_key(|dir| dir.len())
+        .map(|s| s.as_str())
+        .unwrap_or("")
+}
+
+/// Resolve Gradle `project(':a:b')` dependency references (stored as
+/// `:a:b`) to the target project's actual package name, so
+/// `recompute_is_internal`'s simple `dependency IN (SELECT name FROM
+/// packages)` check can match them. Runs over every Gradle dependency row
+/// each build — not just newly parsed ones — so it isn't sensitive to
+/// manifest processing order within a build and self-heals rows written
+/// before this resolution existed.
+fn resolve_gradle_project_dependencies(
+    conn: &Connection,
+    gradle_root_names: &HashMap<String, Option<String>>,
+) -> Result<()> {
+    let mut path_to_name: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT name, path FROM packages WHERE kind = 'gradle'")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (name, path) = row?;
+            path_to_name.insert(path, name);
+        }
+    }
+
+    let raw_refs: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT d.package, p.path, d.dependency
+             FROM dependencies d
+             JOIN packages p ON p.name = d.package
+             WHERE p.kind = 'gradle' AND d.dependency LIKE ':%'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut update_stmt = conn.prepare(
+        "UPDATE dependencies SET dependency = ?1 WHERE package = ?2 AND dependency = ?3",
+    )?;
+
+    for (owner_name, owner_path, raw_dep) in &raw_refs {
+        let settings_dir = governing_gradle_settings_dir(gradle_root_names, owner_path);
+        let project_dir = raw_dep.trim_start_matches(':').replace(':', "/");
+        let target_dir = if settings_dir.is_empty() {
+            project_dir
+        } else {
+            format!("{}/{}", settings_dir, project_dir)
+        };
+        if let Some(resolved_name) = path_to_name.get(&target_dir)
+            && resolved_name != raw_dep
+        {
+            update_stmt.execute((resolved_name, owner_name, raw_dep))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Phase 3: Parse new and changed manifests into packages.
 #[allow(clippy::type_complexity)]
 fn phase_parse(
@@ -874,6 +987,7 @@ fn phase_parse(
                     if gradle_dirs.contains(&manifest.relative_dir) {
                         pkg.metadata = Some(serde_json::json!({"gradle_workspace": true}));
                     }
+                    resolve_gradle_name_collision(conn, &mut pkg)?;
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
@@ -2591,6 +2705,7 @@ fn build_index_inner(
     let t = Instant::now();
     with_transaction(&conn, || {
         if num_added > 0 || num_changed > 0 || num_removed > 0 {
+            resolve_gradle_project_dependencies(&conn, &ws_ctx.gradle_settings.1)?;
             recompute_is_internal(&conn)?;
         }
         Ok(())
@@ -3990,5 +4105,143 @@ anyhow = "1"
         let edges = detect_boundary_edges(&conn, &files).unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].generated_package.as_deref(), Some("consumer"));
+    }
+
+    // --- MANIFESTS-1 / MANIFESTS-2: Gradle project() resolution & name collisions ---
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_matches_by_settings_dir() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('com.example:app', 'app', 'gradle'),
+                ('com.example:utils', 'shared/utils', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':shared:utils', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let mut gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        gradle_root_names.insert("".to_string(), None); // settings.gradle at repo root
+
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names).unwrap();
+        recompute_is_internal(&conn).unwrap();
+
+        let (dependency, is_internal): (String, i64) = conn
+            .query_row(
+                "SELECT dependency, is_internal FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dependency, "com.example:utils");
+        assert_eq!(is_internal, 1);
+    }
+
+    #[test]
+    fn test_resolve_gradle_project_dependencies_leaves_unresolvable_refs_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'app', 'gradle')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind, is_internal)
+             VALUES ('com.example:app', ':missing:project', 'runtime', 0)",
+            [],
+        )
+        .unwrap();
+
+        let gradle_root_names: HashMap<String, Option<String>> = HashMap::new();
+        resolve_gradle_project_dependencies(&conn, &gradle_root_names).unwrap();
+
+        let dependency: String = conn
+            .query_row(
+                "SELECT dependency FROM dependencies WHERE package = 'com.example:app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency, ":missing:project");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_falls_back_to_path_derived_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'svc1/app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "svc2/app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        assert_eq!(pkg.name, "svc2-app");
+    }
+
+    #[test]
+    fn test_resolve_gradle_name_collision_no_op_when_same_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('com.example:app', 'app', 'gradle')",
+            [],
+        )
+        .unwrap();
+
+        let mut pkg = PackageInfo {
+            name: "com.example:app".to_string(),
+            path: "app".to_string(),
+            kind: "gradle",
+            version: None,
+            description: None,
+            metadata: None,
+            dependencies: Vec::new(),
+        };
+
+        resolve_gradle_name_collision(&conn, &mut pkg).unwrap();
+
+        // Re-parsing the same package at the same path is a normal update,
+        // not a collision — the name must not change.
+        assert_eq!(pkg.name, "com.example:app");
+    }
+
+    #[test]
+    fn test_governing_gradle_settings_dir_picks_longest_prefix() {
+        let mut settings_dirs: HashMap<String, Option<String>> = HashMap::new();
+        settings_dirs.insert("".to_string(), None);
+        settings_dirs.insert("group-a".to_string(), None);
+
+        assert_eq!(
+            governing_gradle_settings_dir(&settings_dirs, "group-a/app"),
+            "group-a"
+        );
+        assert_eq!(
+            governing_gradle_settings_dir(&settings_dirs, "group-b/app"),
+            ""
+        );
     }
 }

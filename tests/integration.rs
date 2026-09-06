@@ -1435,6 +1435,19 @@ include ':app', ':lib'
     assert!(app_meta.is_some());
     let meta: serde_json::Value = serde_json::from_str(app_meta.as_deref().unwrap()).unwrap();
     assert_eq!(meta["gradle_workspace"], true);
+
+    // `project(':lib')` must resolve to the actual lib package name and be
+    // flagged internal — otherwise package_dependents/change_impact silently
+    // report no consumers for any Gradle inter-project dependency.
+    let (dep_name, is_internal): (String, i64) = conn
+        .query_row(
+            "SELECT dependency, is_internal FROM dependencies WHERE package = 'com.example:app'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(dep_name, "com.example:lib");
+    assert_eq!(is_internal, 1);
 }
 
 #[test]

@@ -1049,6 +1049,83 @@ public class Service {
 }
 
 #[test]
+fn test_java_interface_members_are_extracted_as_implicitly_public() {
+    // SYM-2 / SYM-V1: interface methods and constants carry no explicit
+    // modifier (JLS: implicitly public, and constants implicitly static
+    // final), so a query fix alone is not enough — is_visible/post_process
+    // must treat `interface_body` members as visible.
+    let source = r#"public interface Repo {
+  String NAME = "repo";
+  User findById(long id);
+  default User findOrNull(long id) { return null; }
+}
+"#;
+    let (symbols, _) = extract_file("java", source, Arc::from("Repo.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    let mut expected: Vec<(&str, SymbolKind, Option<&str>)> = vec![
+        ("Repo", SymbolKind::Interface, None),
+        ("NAME", SymbolKind::Constant, Some("Repo")),
+        ("findById", SymbolKind::Method, Some("Repo")),
+        ("findOrNull", SymbolKind::Method, Some("Repo")),
+    ];
+    expected.sort_by_key(|s| s.0);
+    assert_eq!(got, expected, "got {:?}", got);
+
+    let find_by_id = symbols.iter().find(|s| s.name == "findById").unwrap();
+    assert_eq!(find_by_id.line, 3);
+    let find_or_null = symbols.iter().find(|s| s.name == "findOrNull").unwrap();
+    assert_eq!(find_or_null.line, 4);
+}
+
+#[test]
+fn test_java_enum_methods_and_record_are_extracted() {
+    // SYM-2: enum method bodies live in `enum_body_declarations`, not
+    // `class_body`, so they need their own query pattern. Records need both
+    // a pattern for the record type itself and a `parent_symbol` fix for
+    // their (already-matching) `class_body` methods (SYM-V1).
+    let color_source = r#"public enum Color {
+  RED, GREEN;
+  public String label() { return name(); }
+}
+"#;
+    let (color_symbols, _) = extract_file("java", color_source, Arc::from("Color.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = color_symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    assert_eq!(
+        got,
+        vec![
+            ("Color", SymbolKind::Enum, None),
+            ("label", SymbolKind::Method, Some("Color")),
+        ]
+    );
+
+    let point_source = r#"public record Point(int x, int y) {
+  public int sum() { return x + y; }
+}
+"#;
+    let (point_symbols, _) = extract_file("java", point_source, Arc::from("Point.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = point_symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    assert_eq!(
+        got,
+        vec![
+            ("Point", SymbolKind::Struct, None),
+            ("sum", SymbolKind::Method, Some("Point")),
+        ]
+    );
+}
+
+#[test]
 fn test_java_call_references() {
     let source = r#"package com.example;
 

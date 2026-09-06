@@ -32,12 +32,36 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool) 
     (public, protected, private, is_static, is_final)
 }
 
+/// True if `node`'s immediate parent is an `interface_body`. Per the JLS,
+/// interface methods and constants are implicitly `public` (and constants
+/// are additionally implicitly `static final`) — idiomatic Java almost never
+/// writes those modifiers explicitly, so `check_modifiers` alone would treat
+/// every interface member as package-private and drop it.
+fn is_interface_member(node: &Node) -> bool {
+    node.parent().is_some_and(|p| p.kind() == "interface_body")
+}
+
+/// Like `check_modifiers`, but folds in the JLS-implicit modifiers for
+/// interface members described above.
+fn effective_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool) {
+    let (mut public, protected, private, mut is_static, mut is_final) =
+        check_modifiers(node, source);
+    if is_interface_member(node) {
+        public = true;
+        if node.kind() == "constant_declaration" {
+            is_static = true;
+            is_final = true;
+        }
+    }
+    (public, protected, private, is_static, is_final)
+}
+
 /// Java visibility: only public or protected symbols are visible.
 /// Private and package-private (no modifier) are skipped.
 /// Also checks ancestor class visibility — members inside a private or package-private
 /// class are not externally visible.
 fn is_visible(node: &Node, source: &str) -> bool {
-    let (public, protected, private, _, _) = check_modifiers(node, source);
+    let (public, protected, private, _, _) = effective_modifiers(node, source);
     if private || !(public || protected) {
         return false;
     }
@@ -48,7 +72,10 @@ fn is_visible(node: &Node, source: &str) -> bool {
     while let Some(n) = current {
         if matches!(
             n.kind(),
-            "class_declaration" | "interface_declaration" | "enum_declaration"
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
         ) {
             let (p_public, p_protected, p_private, _, _) = check_modifiers(&n, source);
             if p_private || !(p_public || p_protected) {
@@ -61,13 +88,15 @@ fn is_visible(node: &Node, source: &str) -> bool {
     true
 }
 
-/// For methods and fields inside a class, return the class name.
+/// For methods, fields and constants inside a class/interface/enum/record,
+/// return the enclosing type's name.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
-        "method_declaration" | "field_declaration" => {
+        "method_declaration" | "field_declaration" | "constant_declaration" => {
             let class_node = find_ancestor(node, "class_declaration")
                 .or_else(|| find_ancestor(node, "interface_declaration"))
-                .or_else(|| find_ancestor(node, "enum_declaration"))?;
+                .or_else(|| find_ancestor(node, "enum_declaration"))
+                .or_else(|| find_ancestor(node, "record_declaration"))?;
             let name_node = class_node.child_by_field_name("name")?;
             node_text(&name_node, source).map(|s| s.to_string())
         }
@@ -78,7 +107,7 @@ fn resolve_parent(node: &Node, source: &str) -> Option<String> {
 /// Build signature for Java symbols.
 fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
     match kind {
-        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => {
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Struct => {
             build_type_signature(node, source)
         }
         SymbolKind::Method | SymbolKind::Function => build_method_signature(node, source),
@@ -157,7 +186,7 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process Java symbols.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    let (public, protected, private, is_static, is_final) = check_modifiers(node, source);
+    let (public, protected, private, is_static, is_final) = effective_modifiers(node, source);
 
     // Set visibility string
     if public {
@@ -259,6 +288,7 @@ pub fn hooks() -> LanguageHooks {
                 "class_declaration",
                 "interface_declaration",
                 "enum_declaration",
+                "record_declaration",
             ],
             // Keep only literals/keywords and primitive type names — things that
             // cannot be user-defined. JDK class names like `List`, `Map`,

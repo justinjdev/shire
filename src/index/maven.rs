@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{DepInfo, DepKind, ManifestParser, NoPackageManifest, PackageInfo};
 use anyhow::{Result, anyhow};
 use quick_xml::de::from_str;
 use serde::Deserialize;
@@ -111,9 +111,10 @@ impl MavenParser {
             .unwrap_or(false);
 
         if has_modules && is_pom_packaging {
-            return Err(anyhow!(
-                "Parent/aggregator POM (has <modules> with pom packaging)"
-            ));
+            return Err(NoPackageManifest(
+                "Parent/aggregator POM (has <modules> with pom packaging)".to_string(),
+            )
+            .into());
         }
 
         // Resolve groupId: own > parent in-repo > parent declared > fallback
@@ -407,7 +408,30 @@ mod tests {
         );
 
         let parser = MavenParser;
-        assert!(parser.parse(&path, "").is_err());
+        let result = parser.parse(&path, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // An aggregator POM is a recognized "no package" outcome, not a
+        // genuine parse failure — callers must be able to tell them apart.
+        assert!(crate::index::manifest::is_no_package_marker(&err));
+    }
+
+    #[test]
+    fn test_parse_pom_no_artifact_id_is_not_a_skip_marker() {
+        let dir = TempDir::new().unwrap();
+        let path = write_manifest(
+            dir.path(),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+</project>"#,
+        );
+
+        let parser = MavenParser;
+        let err = parser.parse(&path, "libs/core").unwrap_err();
+        // Missing <artifactId> is a genuine parse failure, distinct from the
+        // aggregator-POM "no package" marker — it must still be reported.
+        assert!(!crate::index::manifest::is_no_package_marker(&err));
     }
 
     #[test]

@@ -925,16 +925,45 @@ fn resolve_gradle_project_dependencies(
 }
 
 /// Phase 3: Parse new and changed manifests into packages.
+///
+/// Returns the parsed packages, the manifests that genuinely failed to
+/// parse (for reporting), and the manifest keys of those genuine failures
+/// (so the caller can exclude them from hash storage — see MANIFESTS-6).
+/// A manifest that legitimately declares no package of its own (a Cargo
+/// virtual workspace root, a Maven aggregator POM — see
+/// [`manifest::is_no_package_marker`]) is neither a parsed package nor a
+/// failure: it's logged at debug level and its hash is still stored.
 #[allow(clippy::type_complexity)]
 fn phase_parse(
     to_parse: &[&WalkedManifest],
     conn: &Connection,
     parsers: &[Box<dyn ManifestParser>],
     ws: &WorkspaceContext,
-) -> Result<(Vec<(String, String, String)>, Vec<(String, String)>)> {
+) -> Result<(
+    Vec<(String, String, String)>,
+    Vec<(String, String)>,
+    HashSet<String>,
+)> {
     let mut parsed_packages: Vec<(String, String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut failed_keys: HashSet<String> = HashSet::new();
     let cargo_parser = cargo::CargoParser;
+
+    // Record a parse error as either a silent "no package" skip or a
+    // reported failure (also tracked by manifest key, to exclude it from
+    // hash storage).
+    let mut record_err = |manifest: &WalkedManifest, e: anyhow::Error| {
+        if manifest::is_no_package_marker(&e) {
+            tracing::debug!(
+                manifest = %manifest.abs_path.display(),
+                reason = %e,
+                "manifest declares no package of its own; skipping"
+            );
+        } else {
+            failed_keys.insert(manifest.manifest_key.clone());
+            failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+        }
+    };
 
     for manifest in to_parse {
         let filename = manifest
@@ -963,9 +992,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e),
             }
             continue;
         }
@@ -991,9 +1018,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e),
             }
             continue;
         }
@@ -1009,9 +1034,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => {
-                    failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                }
+                Err(e) => record_err(manifest, e),
             }
             continue;
         }
@@ -1026,9 +1049,7 @@ fn phase_parse(
                         let winner = upsert_package(conn, &pkg)?;
                         parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
-                    Err(e) => {
-                        failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-                    }
+                    Err(e) => record_err(manifest, e),
                 }
                 break;
             }
@@ -1046,7 +1067,7 @@ fn phase_parse(
         parsed_packages = by_path.into_values().collect();
     }
 
-    Ok((parsed_packages, failures))
+    Ok((parsed_packages, failures, failed_keys))
 }
 
 /// Phase 4: Remove packages whose manifests were deleted.
@@ -2109,7 +2130,16 @@ fn apply_config_overrides(conn: &Connection, config: &Config) -> Result<()> {
 /// Remove stale entries from manifest_hashes and source_hashes that no longer
 /// correspond to existing packages. This prevents unbounded growth when packages
 /// are renamed, moved, or removed across builds.
-fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
+///
+/// `walked_keys` is the set of manifest keys seen in the current filesystem
+/// walk. A manifest that is still on disk is never pruned here even if it
+/// has no package of its own (e.g. a Cargo virtual workspace root or a
+/// Maven aggregator POM, see MANIFESTS-12) — deleting its manifest_hashes
+/// row would make it look "new" on the next build, re-triggering a parse
+/// (and, before that fix, a re-reported failure) forever. A manifest that
+/// truly disappeared is instead pruned by phase_remove_deleted, keyed
+/// exactly by its removed manifest key.
+fn cleanup_stale_hashes(conn: &Connection, walked_keys: &HashSet<String>) -> Result<()> {
     // source_hashes: key is package name — delete if package no longer exists
     conn.execute(
         "DELETE FROM source_hashes WHERE package NOT IN (SELECT name FROM packages)",
@@ -2142,6 +2172,9 @@ fn cleanup_stale_hashes(conn: &Connection) -> Result<()> {
     let stale_keys: Vec<&str> = all_manifest_keys
         .iter()
         .filter(|key| {
+            if walked_keys.contains(key.as_str()) {
+                return false; // still present on disk this build; not stale
+            }
             let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key.as_str());
             if WORKSPACE_MANIFESTS.contains(&filename) {
                 return false; // never prune workspace manifests
@@ -2638,7 +2671,7 @@ fn build_index_inner(
     } else {
         None
     };
-    let (mut parsed_packages, failures) =
+    let (mut parsed_packages, failures, failed_manifest_keys) =
         with_transaction(&conn, || phase_parse(&to_parse, &conn, &parsers, &ws_ctx))?;
     if let Some(pb) = pb_parse {
         pb.finish_with_message(format!("Parsed {} manifests", to_parse.len()));
@@ -2714,14 +2747,27 @@ fn build_index_inner(
     sp.finish_with_message("Internals recomputed");
 
     // Phase 6: Store manifest hashes (transaction-wrapped)
+    //
+    // Manifests that genuinely failed to parse are excluded: storing their
+    // hash would make the next build see them as unchanged and skip them
+    // silently, serving stale package data with no further warning (see
+    // MANIFESTS-6). Excluding them here means their (stored) hash is left
+    // as whatever it was before this build — absent for a manifest that has
+    // never parsed successfully, or the last-good hash for one that used
+    // to — so the next build retries and re-reports the failure.
     tracing::debug!("phase 6: store manifest hashes");
     let t = Instant::now();
-    if !to_parse.is_empty() {
-        let pb = make_progress(&mp, to_parse.len() as u64, "Storing hashes");
-        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
-        pb.finish_with_message(format!("Stored {} hashes", to_parse.len()));
+    let to_store_hashes: Vec<&WalkedManifest> = to_parse
+        .iter()
+        .filter(|m| !failed_manifest_keys.contains(&m.manifest_key))
+        .copied()
+        .collect();
+    if !to_store_hashes.is_empty() {
+        let pb = make_progress(&mp, to_store_hashes.len() as u64, "Storing hashes");
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_store_hashes))?;
+        pb.finish_with_message(format!("Stored {} hashes", to_store_hashes.len()));
     } else {
-        with_transaction(&conn, || phase_store_hashes(&conn, &to_parse))?;
+        with_transaction(&conn, || phase_store_hashes(&conn, &to_store_hashes))?;
     }
     timings.push(("update-hashes", t.elapsed()));
 
@@ -3054,8 +3100,11 @@ fn build_index_inner(
     // source_hashes keys on package name, so orphans are easy to detect.
     // manifest_hashes keys on manifest path — orphans occur when packages are
     // renamed/moved; we detect them by checking if the manifest's parent directory
-    // still matches a known package path.
-    cleanup_stale_hashes(&conn)?;
+    // still matches a known package path (unless the manifest is still on disk
+    // this build — see cleanup_stale_hashes).
+    let walked_manifest_keys: HashSet<String> =
+        walked.iter().map(|m| m.manifest_key.clone()).collect();
+    cleanup_stale_hashes(&conn, &walked_manifest_keys)?;
 
     // FTS5 maintenance: incremental merge on non-full builds.
     // Skip optimize on full/forced builds — the FTS was just rebuilt from scratch.
@@ -3760,6 +3809,172 @@ anyhow = "1"
 
         // Only 1 package (member) — workspace root has no [package]
         assert_eq!(pkg_count(root), 1);
+    }
+
+    // --- MANIFESTS-12 / MANIFESTS-V1: virtual workspace roots aren't failures ---
+
+    #[test]
+    fn test_virtual_cargo_workspace_root_hash_persists_across_builds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        let member_dir = root.join("crates/a");
+        fs::create_dir_all(&member_dir).unwrap();
+        fs::write(
+            member_dir.join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+
+        let db_path = root.join(".shire/index.db");
+        let root_hash_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM manifest_hashes WHERE path = 'Cargo.toml'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let conn = db::open_readonly(&db_path).unwrap();
+        assert_eq!(
+            root_hash_count(&conn),
+            1,
+            "the virtual workspace root's hash must be stored, or it is \
+             re-parsed (and, before this fix, re-reported as a failure) \
+             every build"
+        );
+        drop(conn);
+
+        // A second, no-op build must not drop-then-re-add the root
+        // manifest's hash, and must not grow the package count.
+        build_index(root, &config, false, None).unwrap();
+        let conn = db::open_readonly(&db_path).unwrap();
+        assert_eq!(root_hash_count(&conn), 1);
+        drop(conn);
+        assert_eq!(pkg_count(root), 1);
+    }
+
+    #[test]
+    fn test_maven_aggregator_pom_is_not_a_parse_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <modules>
+        <module>auth</module>
+    </modules>
+</project>"#,
+        )
+        .unwrap();
+        let auth_dir = root.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(
+            auth_dir.join("pom.xml"),
+            r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>auth</artifactId>
+    <version>1.0.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(pkg_count(root), 1);
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        let root_hash_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM manifest_hashes WHERE path = 'pom.xml'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            root_hash_count, 1,
+            "an aggregator POM's hash must be stored so it isn't re-parsed every build"
+        );
+    }
+
+    // --- MANIFESTS-6: a manifest that fails to parse keeps the last-good package ---
+
+    #[test]
+    fn test_broken_manifest_keeps_last_good_package_and_retries_every_build() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc_dir = dir.path().join("svc");
+        fs::create_dir_all(&svc_dir).unwrap();
+        let manifest_path = svc_dir.join("package.json");
+        fs::write(
+            &manifest_path,
+            br#"{"name": "auth-service", "version": "1.0.0", "dependencies": {"express": "^4.0"}}"#,
+        )
+        .unwrap();
+
+        let config = Config::default();
+        build_index(dir.path(), &config, false, None).unwrap();
+        assert_eq!(pkg_count(dir.path()), 1);
+
+        // Corrupt the manifest (mid-edit / merge-conflict scenario).
+        fs::write(
+            &manifest_path,
+            br#"{"name": "auth-service", "version": BROKEN"#,
+        )
+        .unwrap();
+        build_index(dir.path(), &config, false, None).unwrap();
+
+        let db_path = dir.path().join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        // The last-good package/version survives untouched.
+        let version: String = conn
+            .query_row(
+                "SELECT version FROM packages WHERE name = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1.0.0");
+        let dep_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE package = 'auth-service'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dep_count, 1);
+        drop(conn);
+
+        // The broken content's hash must never have been stored — otherwise
+        // the next build would see it as unchanged and stop reporting the
+        // failure entirely.
+        let conn = db::open_readonly(&db_path).unwrap();
+        let stored_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM manifest_hashes WHERE path = 'svc/package.json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let broken_hash = crate::index::hash::hash_file(&manifest_path).unwrap();
+        assert_ne!(
+            stored_hash, broken_hash,
+            "a failed manifest's content hash must never be stored, so the next build retries it"
+        );
     }
 
     #[test]

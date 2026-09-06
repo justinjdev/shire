@@ -43,6 +43,31 @@ pub trait ManifestParser {
     fn parse(&self, manifest_path: &Path, relative_dir: &str) -> Result<PackageInfo>;
 }
 
+/// Marker for a manifest that legitimately declares no package of its own —
+/// a Cargo virtual workspace root (`[workspace]` with no `[package]`), or a
+/// Maven aggregator POM (`<packaging>pom</packaging>` with `<modules>`) —
+/// as opposed to a genuine parse failure. A parser signals this by
+/// returning `Err(NoPackageManifest(..).into())`; callers check for it with
+/// [`is_no_package_marker`] to skip the manifest silently instead of
+/// reporting a parse failure.
+#[derive(Debug)]
+pub struct NoPackageManifest(pub String);
+
+impl std::fmt::Display for NoPackageManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NoPackageManifest {}
+
+/// True if `err` is (or wraps) a [`NoPackageManifest`] marker: this "error"
+/// is actually an expected, package-less manifest and should be skipped
+/// silently rather than reported as a parse failure.
+pub fn is_no_package_marker(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NoPackageManifest>().is_some()
+}
+
 /// Fallback package name for a manifest format that has no name field of its
 /// own (e.g. a Gemfile or cpanfile).
 ///

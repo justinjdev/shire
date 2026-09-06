@@ -57,6 +57,64 @@ fn test_python_class_with_methods() {
 }
 
 #[test]
+fn test_python_decorated_functions_and_methods_are_extracted() {
+    // SYM-1: a decorated def is wrapped in `decorated_definition`, which the
+    // undecorated-only query patterns did not match at all.
+    let source = r#"from dataclasses import dataclass
+
+def plain_function(x):
+    return x
+
+@app.route("/users")
+def list_users():
+    return []
+
+@dataclass
+class User:
+    name: str
+
+    @property
+    def display_name(self):
+        return self.name
+
+    @staticmethod
+    def make():
+        return User("x")
+
+    def plain_method(self):
+        return 1
+
+    @property
+    def _hidden(self):
+        return 0
+"#;
+    let (symbols, _) = extract_file("py", source, Arc::from("app.py"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    let mut expected: Vec<(&str, SymbolKind, Option<&str>)> = vec![
+        ("plain_function", SymbolKind::Function, None),
+        ("list_users", SymbolKind::Function, None),
+        ("User", SymbolKind::Class, None),
+        ("display_name", SymbolKind::Method, Some("User")),
+        ("make", SymbolKind::Method, Some("User")),
+        ("plain_method", SymbolKind::Method, Some("User")),
+        // `_hidden` is decorated but still private inside a class — must stay excluded.
+    ];
+    expected.sort_by_key(|s| s.0);
+    assert_eq!(got, expected, "got {:?}", got);
+
+    let list_users = symbols.iter().find(|s| s.name == "list_users").unwrap();
+    assert_eq!(list_users.line, 7);
+    let display_name = symbols.iter().find(|s| s.name == "display_name").unwrap();
+    assert_eq!(display_name.line, 15);
+    let make = symbols.iter().find(|s| s.name == "make").unwrap();
+    assert_eq!(make.line, 19);
+}
+
+#[test]
 fn test_python_function_no_hints() {
     let source = r#"def greet(name):
     return f"Hello {name}"

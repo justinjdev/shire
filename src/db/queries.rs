@@ -66,12 +66,12 @@ pub const MAX_ROWS: u32 = 200;
 pub const DEFAULT_LIST_LIMIT: u32 = 100;
 
 /// Minimum length of the trailing term of a token before a `*` (FTS5
-/// phrase-prefix) is appended. `packages_fts`, `symbols_fts` and `docs_fts`
-/// carry `prefix='2,3'`, so 2- and 3-character prefixes on those resolve
-/// through the prefix index (`files_fts` has none, and a prefix query there
-/// walks a term range instead — cheap, since it only indexes paths). A
-/// 1-character prefix has no prefix index anywhere and would scan the whole
-/// term list, so single-character tokens are matched exactly instead.
+/// phrase-prefix) is appended. `packages_fts` and `docs_fts` carry
+/// `prefix='2,3'`; `symbols_fts` and `files_fts` have no prefix index, so a
+/// prefix query there walks a term range instead (benchmarked as equally
+/// fast at 53k symbols, and the index cost ~28% of the database). A
+/// 1-character prefix would scan a large share of the term list on every
+/// table, so single-character tokens are matched exactly instead.
 const MIN_PREFIX_CHARS: usize = 2;
 
 /// Clamp a caller-supplied limit into `1..=MAX_ROWS` for use in SQL.

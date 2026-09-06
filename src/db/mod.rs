@@ -64,8 +64,7 @@ pub const SYMBOLS_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_ft
     name, kind, signature, file_path, name_tokens,
     content='symbols',
     content_rowid='rowid',
-    tokenize=\"unicode61 tokenchars '_-'\",
-    prefix='2,3'
+    tokenize=\"unicode61 tokenchars '_-'\"
 );";
 
 /// Triggers keeping `symbols_fts` in sync with `symbols`. Shared by
@@ -489,7 +488,8 @@ pub fn write_references_enabled(conn: &Connection, enabled: bool) -> Result<()> 
 ///
 /// v8: `symbols.name_tokens` + `symbols_fts.name_tokens` (identifier
 /// sub-token index), and a single `symbols_fts` definition shared with the
-/// build's bulk rebuild (tokenchars `'_-'` + `prefix='2,3'`).
+/// build's bulk rebuild (tokenchars `'_-'`, no prefix index: benchmarked at
+/// 53k symbols it added ~28% to the database for no measurable query gain).
 const FTS_SCHEMA_VERSION: &str = "8";
 
 /// True when the database's derived schema matches this build.
@@ -1096,8 +1096,8 @@ mod schema_tests {
         let rebuilt = fts_sql(&conn);
         assert_eq!(created, rebuilt);
         assert!(
-            rebuilt.contains("prefix='2,3'"),
-            "prefix index kept: {rebuilt}"
+            !rebuilt.contains("prefix="),
+            "symbols_fts must not carry a prefix index: {rebuilt}"
         );
         assert!(
             rebuilt.contains("name_tokens"),
@@ -1172,7 +1172,7 @@ mod schema_tests {
             )
             .unwrap();
         assert_eq!(hits, 1, "sub-token search hits after migration");
-        // The rebuilt table is the shared definition, prefix index included.
+        // The rebuilt table is the shared definition (no prefix index).
         let sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name = 'symbols_fts'",
@@ -1180,7 +1180,7 @@ mod schema_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(sql.contains("prefix='2,3'"), "got {sql}");
+        assert!(!sql.contains("prefix="), "got {sql}");
     }
 
     /// DB-V1: a column-changing migration used to fail because

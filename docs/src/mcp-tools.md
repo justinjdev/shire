@@ -8,7 +8,7 @@ Shire exposes the following tools over the Model Context Protocol:
 |---|---|
 | `search_packages` | Search packages by name or description. Use instead of Grep for finding packages. |
 | `list_packages` | List all indexed packages, optionally filtered by kind |
-| `package_dependencies` | List a package's dependencies. Set `depth>1` for transitive graph (returns edge list with different schema). |
+| `package_dependencies` | List a package's dependencies. Set `depth>1` for transitive graph (returns edge list with different schema; `limit` caps the edge list too). |
 | `package_dependents` | Find all packages that depend on this package |
 | `search_symbols` | Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). `handle` matches `handleRequest`; `verify jwt` matches `verifyJwtToken`. Omit query with a package filter to list the start of that package in (file, line) order. Supports hybrid FTS + vector search when [RAG is enabled](./configuration.md#rag-vector-search). |
 | `get_file_symbols` | List all symbols defined in a specific file. Use instead of reading the file to understand its exports. |
@@ -32,8 +32,11 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
 - The query is split on whitespace and **every token must match** (implicit AND).
 - Each token matches by **prefix**: `handle` matches `handleRequest` and
   `handle_request`. Tokens of one character are matched exactly instead —
-  the prefix indexes cover 2- and 3-character prefixes, so a single-character
-  prefix would have to scan every term.
+  `packages_fts`, `symbols_fts` and `docs_fts` index 2- and 3-character
+  prefixes, and a single-character prefix has no index anywhere, so it would
+  have to scan every term.
+- `search_symbols` orders exact name matches first, so searching `handle`
+  never buries a symbol actually called `handle` under its own prefixes.
 - Symbol names are additionally indexed by their **sub-tokens**:
   `verifyJwtToken` is indexed as `verify`, `jwt`, `token`, so `verify jwt`,
   `jwt` and `token` all find it. This applies to symbol names only, not to

@@ -228,7 +228,12 @@ impl ShireService {
     /// this: a tool response is pasted verbatim into an LLM context window,
     /// so "no limit" is never an option.
     fn resolve_limit(requested: Option<u32>, default: u32) -> u32 {
-        requested.unwrap_or(default).clamp(1, queries::MAX_ROWS)
+        // `limit: 0` is a common client encoding for "no cap"; treat it as
+        // "use the default" rather than silently returning a single row.
+        requested
+            .filter(|n| *n > 0)
+            .unwrap_or(default)
+            .min(queries::MAX_ROWS)
     }
 
     /// Serialize rows to JSON, appending a truncation notice when the result
@@ -567,12 +572,14 @@ impl ShireService {
         match params.depth {
             Some(n) if n > 1 => {
                 let depth = n.min(20);
-                let edges =
+                let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
+                let mut edges =
                     queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
                         .map_err(|e| Self::mcp_err(e.to_string()))?;
-                let json =
-                    serde_json::to_string(&edges).map_err(|e| Self::mcp_err(e.to_string()))?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                // The graph walk is bounded only by its own MAX_EDGES; the
+                // edge list goes into a context window like any other list.
+                edges.truncate(limit as usize);
+                Self::json_result(&edges, limit, "raise `limit` or lower `depth`")
             }
             _ => {
                 let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
@@ -1447,6 +1454,32 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(len(&r), 4, "prefix query still respects limit");
+    }
+
+    /// `limit: 0` is a common client encoding for "no cap"; it must not
+    /// come back as a single row plus a "showing the first 1 results" note.
+    #[test]
+    fn test_zero_limit_falls_back_to_default() {
+        assert_eq!(ShireService::resolve_limit(Some(0), 20), 20);
+        assert_eq!(ShireService::resolve_limit(None, 20), 20);
+        assert_eq!(ShireService::resolve_limit(Some(5), 20), 5);
+        assert_eq!(
+            ShireService::resolve_limit(Some(u32::MAX), 20),
+            queries::MAX_ROWS
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), 50);
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(0),
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
     }
 
     /// A short list gets no truncation note — the note must mean something.

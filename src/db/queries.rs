@@ -66,10 +66,12 @@ pub const MAX_ROWS: u32 = 200;
 pub const DEFAULT_LIST_LIMIT: u32 = 100;
 
 /// Minimum length of the trailing term of a token before a `*` (FTS5
-/// phrase-prefix) is appended. The FTS tables carry `prefix='2,3'`, so 2- and
-/// 3-character prefixes resolve through the prefix index; a 1-character
-/// prefix has no index to use and would scan the whole term list, so
-/// single-character tokens are matched exactly instead.
+/// phrase-prefix) is appended. `packages_fts`, `symbols_fts` and `docs_fts`
+/// carry `prefix='2,3'`, so 2- and 3-character prefixes on those resolve
+/// through the prefix index (`files_fts` has none, and a prefix query there
+/// walks a term range instead — cheap, since it only indexes paths). A
+/// 1-character prefix has no prefix index anywhere and would scan the whole
+/// term list, so single-character tokens are matched exactly instead.
 const MIN_PREFIX_CHARS: usize = 2;
 
 /// Clamp a caller-supplied limit into `1..=MAX_ROWS` for use in SQL.
@@ -116,11 +118,14 @@ fn fts_match_expr(query: &str) -> Option<String> {
             part.push(c);
         }
         part.push('"');
-        // `*` applies to the *last* term of the phrase, so only append it
-        // when that term is long enough to use the prefix index.
+        // `*` applies to the *last term* of the phrase. Trailing punctuation
+        // is not part of any term (`handle*`, `handle)`, `config.` all end in
+        // the term before it), so skip it before measuring, or a user typing
+        // the FTS prefix syntax `handle*` would get an exact match instead.
         let tail = raw
             .chars()
             .rev()
+            .skip_while(|c| !(c.is_alphanumeric() || *c == '_' || *c == '-'))
             .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
             .count();
         if tail >= MIN_PREFIX_CHARS {
@@ -135,6 +140,11 @@ fn fts_match_expr(query: &str) -> Option<String> {
 }
 
 /// FTS5 search across symbol names and signatures.
+///
+/// Results are ordered exact-name-first, then by FTS rank: prefix and
+/// sub-token matching means a query for `handle` also matches
+/// `handleRequest`, and the symbol the caller actually named must not be
+/// pushed out of the `limit` window by its own prefixes.
 pub fn search_symbols(
     conn: &Connection,
     query: &str,
@@ -163,12 +173,13 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             ORDER BY rank
+             ORDER BY (s.name = ?4) DESC, rank
              LIMIT ?3",
                     vec![
                         Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
                         Box::new(pkg.to_string()),
                         Box::new(limit),
+                        Box::new(query.to_string()),
                     ],
                 )
             }
@@ -178,12 +189,13 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1 AND s.package = ?2
-             ORDER BY rank
+             ORDER BY (s.name = ?4) DESC, rank
              LIMIT ?3",
                 vec![
                     Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(pkg.to_string()),
                     Box::new(limit),
+                    Box::new(query.to_string()),
                 ],
             ),
             (None, Some(kind)) => {
@@ -194,11 +206,12 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             ORDER BY rank
+             ORDER BY (s.name = ?3) DESC, rank
              LIMIT ?2",
                     vec![
                         Box::new(fts_query) as Box<dyn rusqlite::types::ToSql>,
                         Box::new(limit),
+                        Box::new(query.to_string()),
                     ],
                 )
             }
@@ -208,11 +221,12 @@ pub fn search_symbols(
              FROM symbols_fts f
              JOIN symbols s ON s.rowid = f.rowid
              WHERE symbols_fts MATCH ?1
-             ORDER BY rank
+             ORDER BY (s.name = ?3) DESC, rank
              LIMIT ?2",
                 vec![
                     Box::new(sanitized) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(limit),
+                    Box::new(query.to_string()),
                 ],
             ),
         };
@@ -1903,6 +1917,17 @@ mod tests {
     }
 
     #[test]
+    fn test_search_symbols_ranks_exact_name_first() {
+        let conn = test_db_with_identifiers();
+        // `handle` is also a prefix of `handleRequest`; the symbol the caller
+        // named must still come first.
+        let hits = search_symbols(&conn, "handle", None, None, 20).unwrap();
+        assert_eq!(hits[0].name, "handle");
+        let hits = search_symbols(&conn, "handle", Some("auth-service"), None, 20).unwrap();
+        assert_eq!(hits[0].name, "handle");
+    }
+
+    #[test]
     fn test_search_symbols_single_char_query_is_not_a_prefix_query() {
         // A 1-character prefix has no prefix index to use (`prefix='2,3'`),
         // so it is matched as an exact token instead of scanning every term.
@@ -2028,6 +2053,11 @@ mod tests {
         assert_eq!(fts_match_expr("* handle").as_deref(), Some("\"handle\"*"));
         assert_eq!(fts_match_expr("***"), None);
         assert_eq!(fts_match_expr("   "), None);
+        // Trailing punctuation is not part of the phrase's last term, so it
+        // must not cost the token its prefix match — someone typing the FTS
+        // syntax `handle*` should still get a prefix search.
+        assert_eq!(fts_match_expr("handle*").as_deref(), Some("\"handle*\"*"));
+        assert_eq!(fts_match_expr("handle)").as_deref(), Some("\"handle)\"*"));
     }
 
     // ── MCP-1 / DB-5 / MCP-5: limits enforced in SQL ─────────────────────
@@ -2071,7 +2101,9 @@ mod tests {
                 .len(),
             MAX_ROWS as usize
         );
-        // A zero limit still returns one row rather than an empty list.
+        // The SQL floor is one row: `LIMIT 0` would return an empty list
+        // that reads as "no symbols". (The MCP layer maps a caller's
+        // `limit: 0` to the tool default before it gets here.)
         assert_eq!(
             get_package_symbols(&conn, "auth-service", None, 0)
                 .unwrap()

@@ -24,29 +24,20 @@
           inherit src;
           strictDeps = true;
 
-          buildInputs = with pkgs; [
-            openssl
-          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             pkgs.apple-sdk_15
           ];
 
           nativeBuildInputs = with pkgs; [
-            pkg-config
             git  # needed by integration tests (git init in temp dirs)
           ];
         };
 
         # Build deps separately for caching
-        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
-          cargoExtraArgs = "--no-default-features";
-        });
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         shire = craneLib.buildPackage (commonArgs // {
           inherit cargoArtifacts;
-
-          # Build without the rag feature (fastembed/ONNX) by default — it
-          # pulls heavy C++ deps that are difficult to build in the Nix sandbox.
-          cargoExtraArgs = "--no-default-features";
 
           meta = {
             description = "One index to rule them all — monorepo MCP-first indexer";

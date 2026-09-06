@@ -9,21 +9,69 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Full check + lint + test on the two host platforms we release from.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-aarch64
+
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
 
-      - name: Check
-        run: cargo check
+      - name: Format
+        run: cargo fmt --check
 
+      # No separate `cargo check`: clippy compiles the same targets.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -- --test-threads=1
+        run: cargo test --all-features -- --test-threads=1
+
+  # The other released targets are only built at tag time otherwise, so a
+  # target-specific break (e.g. c_char signedness on aarch64 Linux) would not
+  # surface until the release workflow fails.
+  cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+
+    name: check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check
+        run: cargo check --all-features --all-targets --target ${{ matrix.target }}

@@ -16,14 +16,11 @@ REPOS=(
     "rust|https://github.com/rust-lang/rust.git|1.78.0"
 )
 
-# RAG off, cross-reference index on (so bench exercises the symbol_refs path
-# even though refs are off by default). Shared across new-clone and re-use
-# code paths to avoid config drift.
+# Cross-reference index on (so bench exercises the symbol_refs path even
+# though refs are off by default). Shared across new-clone and re-use code
+# paths to avoid config drift.
 write_bench_config() {
     cat > "$1/shire.toml" <<'TOML'
-[rag]
-enabled = false
-
 [symbols]
 references_enabled = true
 TOML

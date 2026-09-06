@@ -88,7 +88,6 @@ pub struct InitOptions {
     pub use_hook: bool,
     pub db_path: String,
     pub extra_excludes: Vec<String>,
-    pub rag_enabled: bool,
     /// When true, populate the symbol_refs table for `symbol_references`,
     /// `symbol_callers`, and `symbol_callees` MCP tools. EXPERIMENTAL.
     pub refs_enabled: bool,
@@ -107,7 +106,6 @@ impl InitOptions {
             use_hook: true,
             db_path: ".shire/index.db".into(),
             extra_excludes: Vec::new(),
-            rag_enabled: false,
             refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
@@ -121,7 +119,6 @@ impl InitOptions {
             use_hook: true,
             db_path: "~/.claude/shire/{repo}/{worktree}/index.db".into(),
             extra_excludes: Vec::new(),
-            rag_enabled: false,
             refs_enabled: false,
             generate_rules: true,
             patch_claude_md: false,
@@ -183,13 +180,7 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // 5. Enable RAG vector search
-    let rag_enabled = Confirm::new()
-        .with_prompt("Enable RAG vector search?")
-        .default(false)
-        .interact()?;
-
-    // 6. Enable cross-reference index (experimental)
+    // 5. Enable cross-reference index (experimental)
     let refs_enabled = Confirm::new()
         .with_prompt(
             "Enable cross-reference index (experimental)? Adds symbol_references/callers/callees MCP tools. DB grows substantially (roughly 30%-150% depending on language mix)",
@@ -197,13 +188,13 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(false)
         .interact()?;
 
-    // 7. Generate .claude/rules/shire.md
+    // 6. Generate .claude/rules/shire.md
     let generate_rules = Confirm::new()
         .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
         .default(true)
         .interact()?;
 
-    // 8. Add Shire guidance to ~/.claude/CLAUDE.md
+    // 7. Add Shire guidance to ~/.claude/CLAUDE.md
     let patch_claude_md = Confirm::new()
         .with_prompt("Add Shire search guidance to ~/.claude/CLAUDE.md?")
         .default(true)
@@ -213,7 +204,6 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         use_hook,
         db_path,
         extra_excludes,
-        rag_enabled,
         refs_enabled,
         generate_rules,
         patch_claude_md,
@@ -255,12 +245,6 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
             .map(|e| format!("\"{}\"", escape_toml_string(e)))
             .collect();
         lines.push(format!("exclude = [{}]", quoted.join(", ")));
-        lines.push(String::new());
-    }
-
-    if opts.rag_enabled {
-        lines.push("[rag]".into());
-        lines.push("enabled = true".into());
         lines.push(String::new());
     }
 
@@ -1116,7 +1100,6 @@ mod tests {
         assert!(toml.contains("# Shire configuration"));
         assert!(toml.contains("db_path = \".shire/index.db\""));
         assert!(!toml.contains("[discovery]"));
-        assert!(!toml.contains("[rag]"));
     }
 
     #[test]
@@ -1127,7 +1110,6 @@ mod tests {
         assert!(toml.contains("{repo}"));
         assert!(toml.contains("{worktree}"));
         assert!(!toml.contains("[discovery]"));
-        assert!(!toml.contains("[rag]"));
     }
 
     #[test]
@@ -1154,23 +1136,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_config_toml_rag_enabled() {
-        let opts = InitOptions {
-            rag_enabled: true,
-            ..InitOptions::default_local()
-        };
-        let toml = generate_config_toml(&opts, false);
-        assert!(toml.contains("[rag]"));
-        assert!(toml.contains("enabled = true"));
-    }
-
-    #[test]
     fn test_generate_config_toml_all_options() {
         let opts = InitOptions {
             use_hook: false,
             db_path: "/custom/path.db".into(),
             extra_excludes: vec!["gen".into()],
-            rag_enabled: true,
             refs_enabled: true,
             generate_rules: true,
             patch_claude_md: false,
@@ -1181,8 +1151,6 @@ mod tests {
         assert!(toml.contains("db_path = \"/custom/path.db\""));
         assert!(toml.contains("[discovery]"));
         assert!(toml.contains("\"gen\""));
-        assert!(toml.contains("[rag]"));
-        assert!(toml.contains("enabled = true"));
         assert!(toml.contains("[symbols]"));
         assert!(toml.contains("references_enabled = true"));
     }

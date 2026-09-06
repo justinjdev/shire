@@ -54,8 +54,17 @@ impl ShireService {
         Some(SystemTime::from(dt))
     }
 
-    /// Check if the index is stale by comparing .git/index mtime against last_indexed.
-    /// Includes a 2-second debounce to avoid redundant rebuilds during rapid tool calls.
+    /// Decide whether to trigger an on-demand rebuild before answering.
+    ///
+    /// This is a *hint*, not a correctness oracle: the rebuild it triggers
+    /// does its own mtime and content-hash comparisons and is cheap when
+    /// nothing changed. So the bias is towards rebuilding — the Git index
+    /// mtime moving is a strong signal, and "no Git index to look at"
+    /// (a non-Git directory, a repository with nothing staged) means we
+    /// cannot tell, which must not be mistaken for "nothing changed".
+    ///
+    /// The debounce keeps that bias from turning into a rebuild per tool
+    /// call during a burst.
     fn is_stale(&self) -> bool {
         let ctx = match &self.build_ctx {
             Some(c) => c,
@@ -82,14 +91,17 @@ impl ShireService {
             return false;
         }
 
-        // Check .git/index mtime
-        let git_index = ctx.repo_root.join(".git/index");
-        match std::fs::metadata(&git_index) {
-            Ok(meta) => match meta.modified() {
+        // Resolve the real index file: in a linked worktree `.git` is a
+        // file and the index lives under <main>/.git/worktrees/<id>/, so
+        // stat'ing <root>/.git/index there always fails (INDEX-12).
+        match crate::git::index_path(&ctx.repo_root) {
+            Some(git_index) => match std::fs::metadata(&git_index).and_then(|m| m.modified()) {
                 Ok(mtime) => mtime > last,
-                Err(_) => false,
+                // Unreadable index file — unknown, so assume stale.
+                Err(_) => true,
             },
-            Err(_) => false, // no .git/index — can't determine staleness
+            // No Git index to compare against: unknown, not "unchanged".
+            None => true,
         }
     }
 
@@ -742,13 +754,43 @@ mod tests {
     }
 
     #[test]
-    fn test_is_stale_false_when_no_git_index() {
+    fn test_is_stale_true_when_no_git_index() {
+        // Without a Git index we cannot tell whether the tree moved, and
+        // "unknown" must not be served as "fresh" — a non-Git repo root
+        // would otherwise never see an on-demand rebuild again.
         let dir = tempfile::TempDir::new().unwrap();
-        // No .git/index in temp dir
         let svc = make_service_with_ctx(dir.path().to_path_buf());
-        // Set last_indexed to some time so we skip the "no DB" early return
-        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now());
-        assert!(!svc.is_stale(), "should not be stale when no .git/index");
+        // Old enough to be outside the debounce window.
+        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
+        assert!(
+            svc.is_stale(),
+            "unknown staleness must trigger a (cheap, self-checking) rebuild"
+        );
+    }
+
+    #[test]
+    fn test_is_stale_resolves_linked_worktree_index() {
+        // INDEX-12: `.git` is a file in a linked worktree, so the index has
+        // to be resolved through the gitdir pointer.
+        let dir = tempfile::TempDir::new().unwrap();
+        let main_repo = dir.path().join("main");
+        let wt_git_dir = main_repo.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_git_dir).unwrap();
+        std::fs::write(wt_git_dir.join("index"), "dummy").unwrap();
+
+        let wt = dir.path().join("feat");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}", wt_git_dir.display())).unwrap();
+
+        let svc = make_service_with_ctx(wt.clone());
+        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
+        assert!(svc.is_stale(), "a newer worktree index must read as stale");
+
+        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() + Duration::from_secs(600));
+        assert!(
+            !svc.is_stale(),
+            "an older worktree index must read as fresh — not always-stale"
+        );
     }
 
     #[test]

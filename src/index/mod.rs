@@ -1098,19 +1098,29 @@ fn single_pass_extract(
             let raw_digest: [u8; 32] = digest.into();
             let content_hash_hex = format!("{:x}", digest);
             let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let (syms, refs) = String::from_utf8(content)
-                .ok()
-                .map(|source| {
-                    let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                    symbols::extract_file(
-                        ext,
-                        &source,
-                        file_path_arc,
-                        skip_references,
-                        max_references_per_file,
-                    )
-                })
-                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            // A file with even one invalid UTF-8 byte used to be silently
+            // dropped to zero symbols/refs here (still hashed as
+            // "processed", indistinguishable from an empty file). Decode
+            // lossily instead so the rest of the file still yields symbols,
+            // and warn so the gap is visible.
+            let source = match String::from_utf8(content) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        file = %relative_path,
+                        "file is not valid UTF-8 — decoding lossily (invalid bytes replaced with U+FFFD)"
+                    );
+                    String::from_utf8_lossy(&e.into_bytes()).into_owned()
+                }
+            };
+            let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
+            let (syms, refs) = symbols::extract_file(
+                ext,
+                &source,
+                file_path_arc,
+                skip_references,
+                max_references_per_file,
+            );
             Some(FileExtractResult {
                 relative_path,
                 content_hash_hex,
@@ -1454,23 +1464,30 @@ fn phase_source_incremental(
                                     references: None,
                                 })
                             } else {
-                                // File changed or new — extract symbols and references if valid UTF-8
+                                // File changed or new — extract symbols and references.
+                                // Decode lossily on invalid UTF-8 (with a warning) rather
+                                // than silently dropping every symbol in the file — see
+                                // the sibling single-pass path above for the same fix.
                                 let ext =
                                     file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                                let (syms, refs) = String::from_utf8(content)
-                                    .ok()
-                                    .map(|source| {
-                                        let file_path_arc: Arc<str> =
-                                            Arc::from(relative_path.as_str());
-                                        symbols::extract_file(
-                                            ext,
-                                            &source,
-                                            file_path_arc,
-                                            skip_references,
-                                            max_references_per_file,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                                let source = match String::from_utf8(content) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            file = %relative_path,
+                                            "file is not valid UTF-8 — decoding lossily (invalid bytes replaced with U+FFFD)"
+                                        );
+                                        String::from_utf8_lossy(&e.into_bytes()).into_owned()
+                                    }
+                                };
+                                let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
+                                let (syms, refs) = symbols::extract_file(
+                                    ext,
+                                    &source,
+                                    file_path_arc,
+                                    skip_references,
+                                    max_references_per_file,
+                                );
                                 Some(FileResult {
                                     file_path: relative_path,
                                     content_hash,
@@ -3884,6 +3901,32 @@ anyhow = "1"
         // max_file_size=5, "abc日" would be 6 bytes, so truncated to "abc" (3 bytes at char boundary)
         assert_eq!(body, "abc");
         assert!(body.len() <= 5);
+    }
+
+    #[test]
+    fn test_single_pass_extract_recovers_symbols_from_non_utf8_file() {
+        // SYM-7: a single invalid byte anywhere in the file used to make
+        // `String::from_utf8` fail, silently dropping every symbol in the
+        // file (while still recording it as "processed" in file_hashes).
+        // Decoding lossily recovers the symbols around the bad byte instead.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pkg_dir = dir.path().join("pkg");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(
+            pkg_dir.join("bad.go"),
+            b"package main\nfunc Greet() {}\nvar s = \"\xff\xfe\"\n".as_slice(),
+        )
+        .unwrap();
+
+        let (symbols, _refs, _hash, file_hashes) =
+            single_pass_extract(dir.path(), "pkg", "go", &[], &[], true, 0, 0).unwrap();
+
+        assert_eq!(file_hashes.len(), 1, "the file should still be hashed");
+        assert!(
+            symbols.iter().any(|s| s.name == "Greet"),
+            "expected Greet to be recovered via lossy decoding, got {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

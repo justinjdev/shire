@@ -1,7 +1,7 @@
 use anyhow::Result;
+use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
@@ -113,7 +113,11 @@ pub fn all_extensions() -> Vec<&'static str> {
 }
 
 /// Walk a directory and collect source files matching the given extensions,
-/// skipping excluded directories and generated/test files.
+/// skipping excluded directories, generated/test files, and anything
+/// gitignored. Uses the same `ignore` crate (and the same `.gitignore`/
+/// `.ignore`/global-gitignore honoring) as the file-index and manifest
+/// walks in `index::mod`, so a symbol row can never point at a file that
+/// isn't also present in the `files` table (INFRA-4).
 /// `extra_skip_patterns` are user-configured patterns from shire.toml
 /// (matched as suffix or prefix against the filename).
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
@@ -130,19 +134,20 @@ pub fn walk_source_files_with_patterns(
 
     let mut files = Vec::new();
 
-    for entry in WalkDir::new(dir).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir() {
-            let name = e.file_name().to_str().unwrap_or("");
-            // Skip hidden dirs (except the root)
-            if name.starts_with('.') && e.depth() > 0 {
-                return false;
+    let walker = WalkBuilder::new(dir)
+        .hidden(true)
+        .filter_entry(move |entry| {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                let name = entry.file_name().to_str().unwrap_or("");
+                return !exclude_set.contains(name);
             }
-            return !exclude_set.contains(name);
-        }
-        true
-    }) {
+            true
+        })
+        .build();
+
+    for entry in walker {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -292,6 +297,28 @@ mod tests {
 
         let js_files = walk_source_files(dir.path(), &["js"]).unwrap();
         assert!(js_files.is_empty());
+    }
+
+    #[test]
+    fn test_walk_honours_gitignore() {
+        // INFRA-4: the symbol walker used to use `walkdir` directly, so it
+        // never consulted `.gitignore` — a symbol row could exist for a file
+        // absent from the `files` table (which IS built with a gitignore-
+        // aware `ignore::WalkBuilder`). A bare `.git` directory is enough
+        // for the `ignore` crate's git-repository detection to kick in.
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}").unwrap();
+
+        fs::create_dir_all(dir.path().join("generated")).unwrap();
+        fs::write(dir.path().join("generated/gen.rs"), "pub fn b() {}").unwrap();
+
+        let rs_files = walk_source_files(dir.path(), &["rs"]).unwrap();
+        assert_eq!(rs_files.len(), 1, "got {:?}", rs_files);
+        assert!(rs_files[0].ends_with("src/lib.rs"));
     }
 
     #[test]

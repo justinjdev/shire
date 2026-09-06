@@ -104,11 +104,7 @@ impl ServerHandler for tools::ShireService {
     }
 }
 
-pub async fn run_server(
-    db_path: &Path,
-    rag_config: &crate::config::RagConfig,
-    build_ctx: Option<BuildContext>,
-) -> Result<()> {
+pub async fn run_server(db_path: &Path, build_ctx: Option<BuildContext>) -> Result<()> {
     let conn = if db_path.exists() {
         db::open_readonly(db_path)?
     } else {
@@ -116,7 +112,7 @@ pub async fn run_server(
         // The first tool call will trigger a build and reopen the real DB.
         rusqlite::Connection::open_in_memory()?
     };
-    let service = tools::ShireService::new(conn, rag_config, build_ctx);
+    let service = tools::ShireService::new(conn, build_ctx);
     let server = service.serve(rmcp::transport::stdio()).await?;
     server.waiting().await?;
     Ok(())

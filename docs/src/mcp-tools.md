@@ -10,7 +10,7 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_packages` | List all indexed packages, optionally filtered by kind |
 | `package_dependencies` | List a package's dependencies. Set `depth>1` for transitive graph (returns edge list with different schema; `limit` caps the edge list too). |
 | `package_dependents` | Find all packages that depend on this package |
-| `search_symbols` | Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). `handle` matches `handleRequest`; `verify jwt` matches `verifyJwtToken`. Omit query with a package filter to list the start of that package in (file, line) order. Supports hybrid FTS + vector search when [RAG is enabled](./configuration.md#rag-vector-search). |
+| `search_symbols` | Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). `handle` matches `handleRequest`; `verify jwt` matches `verifyJwtToken`. Omit query with a package filter to list the start of that package in (file, line) order. |
 | `get_file_symbols` | List all symbols defined in a specific file. Use instead of reading the file to understand its exports. |
 | `search_files` | Find files by path or name. Use instead of Glob/find for locating files. Useful for "middleware", "proto files", or files in a specific directory. |
 | `search_docs` | Search documentation files by content, title, or path — returns matching docs with text snippets |

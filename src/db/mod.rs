@@ -3,7 +3,7 @@ pub mod queries;
 use anyhow::Result;
 use rusqlite::Connection;
 
-pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Connection> {
+pub fn open_or_create(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -24,13 +24,6 @@ pub fn open_or_create(path: &std::path::Path, rag_enabled: bool) -> Result<Conne
          PRAGMA mmap_size=268435456;",
     )?;
     apply_schema(&conn)?;
-
-    #[cfg(feature = "rag")]
-    if rag_enabled {
-        crate::rag::storage::init_table(&conn)?;
-    }
-
-    let _ = rag_enabled;
 
     Ok(conn)
 }
@@ -897,7 +890,7 @@ mod schema_tests {
     fn test_symbol_refs_schema_created() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -913,7 +906,7 @@ mod schema_tests {
     fn test_symbol_refs_insert_and_query() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         conn.execute(
             "INSERT INTO files (path, package, extension, size_bytes) VALUES ('src/main.rs', NULL, 'rs', 0)",
@@ -955,7 +948,7 @@ mod schema_tests {
         // missing for a stretch — verify it's created for fresh DBs.
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let count: i64 = conn
             .query_row(
@@ -972,7 +965,7 @@ mod schema_tests {
     fn test_call_ref_covering_indexes_exist() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         let callers_idx: i64 = conn
             .query_row(
@@ -999,7 +992,7 @@ mod schema_tests {
     fn test_references_enabled_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
 
         assert_eq!(
             read_references_enabled(&conn),
@@ -1153,7 +1146,7 @@ mod schema_tests {
         write_v7_db(&path);
 
         // Reopening runs the migration.
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
         assert_eq!(
             read_fts_schema_version(&conn).as_deref(),
             Some(FTS_SCHEMA_VERSION)
@@ -1192,7 +1185,7 @@ mod schema_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("v6.db");
         {
-            let conn = open_or_create(&path, false).unwrap();
+            let conn = open_or_create(&path).unwrap();
             conn.execute_batch(
                 "DROP TABLE IF EXISTS symbol_refs;
                  CREATE TABLE symbol_refs (
@@ -1213,7 +1206,7 @@ mod schema_tests {
             .unwrap();
         }
 
-        let conn = open_or_create(&path, false).expect("v6 layout must migrate, not error");
+        let conn = open_or_create(&path).expect("v6 layout must migrate, not error");
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(symbol_refs)")
             .unwrap()
@@ -1233,7 +1226,7 @@ mod schema_tests {
     fn test_schema_is_current_reports_stale_read_only_indexes() {
         let dir = tempdir().unwrap();
         let fresh = dir.path().join("fresh.db");
-        let conn = open_or_create(&fresh, false).unwrap();
+        let conn = open_or_create(&fresh).unwrap();
         assert!(schema_is_current(&conn));
 
         // An index written by an older release, opened read-only: nothing
@@ -1249,7 +1242,7 @@ mod schema_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("current.db");
         {
-            let conn = open_or_create(&path, false).unwrap();
+            let conn = open_or_create(&path).unwrap();
             conn.execute(
                 "INSERT INTO source_hashes (package, content_hash) VALUES ('p', 'h')",
                 [],
@@ -1258,7 +1251,7 @@ mod schema_tests {
         }
         // Reopening at the current version must not clear the hash tables
         // (that would force a full re-extraction on every open).
-        let conn = open_or_create(&path, false).unwrap();
+        let conn = open_or_create(&path).unwrap();
         let hashes: i64 = conn
             .query_row("SELECT COUNT(*) FROM source_hashes", [], |r| r.get(0))
             .unwrap();

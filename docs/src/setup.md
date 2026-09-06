@@ -163,6 +163,5 @@ Symbol extraction and source hashing are **parallelized** across packages and wi
 
 - **Spinners** for quick phases (discovering manifests, workspace context, recomputing internals, indexing files)
 - **Progress bars with ETAs** for longer phases (parsing manifests, extracting symbols)
-- When [RAG is enabled](./configuration.md#rag-vector-search), an **embedding progress bar** tracks file embedding in the background, displaying error messages on failure
 
 Progress bars persist after completion so you can see the full build history in your terminal. Quiet mode (used internally by the MCP server for on-demand rebuilds) hides all progress output.

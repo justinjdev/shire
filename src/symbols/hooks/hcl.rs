@@ -48,15 +48,12 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             return None;
         }
     } else if BLOCK_TYPES_ONE_LABEL.contains(&block_type.as_str()) {
-        if let Some(label) = labels.first() {
-            sym.name = label.to_string();
-            sym.kind = match block_type.as_str() {
-                "variable" | "output" => SymbolKind::Type,
-                _ => SymbolKind::Class,
-            };
-        } else {
-            return None;
-        }
+        let label = labels.first()?;
+        sym.name = label.to_string();
+        sym.kind = match block_type.as_str() {
+            "variable" | "output" => SymbolKind::Type,
+            _ => SymbolKind::Class,
+        };
     } else {
         return None;
     }

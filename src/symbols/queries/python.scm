@@ -3,6 +3,12 @@
   (function_definition
     name: (identifier) @name) @definition.function)
 
+; Top-level decorated functions
+(module
+  (decorated_definition
+    definition: (function_definition
+      name: (identifier) @name) @definition.function))
+
 ; Classes
 (class_definition
   name: (identifier) @name) @definition.class
@@ -12,6 +18,13 @@
   body: (block
     (function_definition
       name: (identifier) @name) @definition.method))
+
+; Decorated methods (functions inside class body, wrapped in a decorator)
+(class_definition
+  body: (block
+    (decorated_definition
+      definition: (function_definition
+        name: (identifier) @name) @definition.method)))
 
 ; Reference: function/method calls
 (call

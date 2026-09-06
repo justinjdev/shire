@@ -18,6 +18,7 @@ path = "src/main.rs"
 [[bin]]
 name = "autoresearch"
 path = "src/bin/autoresearch.rs"
+required-features = ["bench"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -49,9 +50,6 @@ tree-sitter-java = "0.23.5"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-ruby = "0.23.1"
 shellexpand = "3"
-fastembed = { version = "4", optional = true }
-sqlite-vec = { version = "0.1", optional = true }
-zerocopy = { version = "0.8", features = ["derive"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
@@ -87,8 +85,9 @@ tree-sitter-nix = "0.3"
 tree-sitter-nim = { git = "https://github.com/alaviss/tree-sitter-nim", rev = "3878440d9398" }
 
 [features]
-default = ["rag"]
-rag = ["dep:fastembed", "dep:sqlite-vec", "dep:zerocopy"]
+# Internal benchmarking harness (src/bin/autoresearch.rs). Off by default so
+# `cargo install shire` does not put the dev tool on users' PATH.
+bench = []
 
 [dev-dependencies]
 tempfile = "3"

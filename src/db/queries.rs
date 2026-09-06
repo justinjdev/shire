@@ -462,96 +462,6 @@ pub fn get_file_symbols(
     Ok(result)
 }
 
-/// Fetch symbols by their id (primary key). Used by hybrid search to look up
-/// vector search results. Returns results in unspecified order.
-#[allow(dead_code)]
-pub fn get_symbols_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<(i64, SymbolRow)>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT id, name, kind, signature, package, file_path, line,
-                visibility, parent_symbol, return_type, parameters
-         FROM symbols
-         WHERE id IN ({placeholders})"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            SymbolRow {
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                signature: row.get(3)?,
-                package: row.get(4)?,
-                file_path: row.get(5)?,
-                line: row.get(6)?,
-                visibility: row.get(7)?,
-                parent_symbol: row.get(8)?,
-                return_type: row.get(9)?,
-                parameters: row.get(10)?,
-            },
-        ))
-    })?;
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-/// Merge two ranked result lists using Reciprocal Rank Fusion (RRF) with k=60.
-/// Results appearing in both lists score higher. Returns merged list sorted by
-/// RRF score descending, truncated to `limit`.
-#[allow(dead_code)]
-pub fn rrf_merge(
-    fts_results: &[SymbolRow],
-    vec_results: &[SymbolRow],
-    limit: usize,
-) -> Vec<SymbolRow> {
-    use std::collections::HashMap;
-
-    type SymKey = (String, String, String, i64);
-    fn sym_key(s: &SymbolRow) -> SymKey {
-        (
-            s.name.clone(),
-            s.package.clone(),
-            s.file_path.clone(),
-            s.line,
-        )
-    }
-
-    let k = 60.0_f64;
-    let mut scores: HashMap<SymKey, f64> = HashMap::new();
-    let mut symbols: HashMap<SymKey, SymbolRow> = HashMap::new();
-
-    for (rank, sym) in fts_results.iter().enumerate() {
-        let key = sym_key(sym);
-        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
-        symbols.entry(key).or_insert_with(|| sym.clone());
-    }
-
-    for (rank, sym) in vec_results.iter().enumerate() {
-        let key = sym_key(sym);
-        *scores.entry(key.clone()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
-        symbols.entry(key).or_insert_with(|| sym.clone());
-    }
-
-    let mut scored: Vec<(SymKey, f64)> = scores.into_iter().collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    scored
-        .into_iter()
-        .take(limit)
-        .filter_map(|(key, _)| symbols.remove(&key))
-        .collect()
-}
-
 #[derive(Debug, Serialize)]
 pub struct FileRow {
     pub path: String,
@@ -1175,13 +1085,12 @@ pub fn batch_insert_references(
     let full_chunk_sql = build_multi_row_insert_sql(ROWS_PER_CHUNK, COLS_PER_ROW);
     let mut full_stmt = conn.prepare_cached(&full_chunk_sql)?;
 
-    let mut iter = resolved.chunks_exact(ROWS_PER_CHUNK);
-    for chunk in &mut iter {
+    let (full_chunks, remainder) = resolved.as_chunks::<ROWS_PER_CHUNK>();
+    for chunk in full_chunks {
         bind_and_execute_chunk(&mut full_stmt, chunk, package)?;
     }
 
     // Handle the tail (rows that didn't fit a full chunk) with a sized statement.
-    let remainder = iter.remainder();
     if !remainder.is_empty() {
         let tail_sql = build_multi_row_insert_sql(remainder.len(), COLS_PER_ROW);
         let mut tail_stmt = conn.prepare_cached(&tail_sql)?;
@@ -2621,162 +2530,6 @@ mod tests {
         assert!(edges.is_empty());
     }
 
-    fn make_symbol(name: &str, package: &str, line: i64) -> SymbolRow {
-        SymbolRow {
-            name: name.into(),
-            kind: "function".into(),
-            signature: None,
-            package: package.into(),
-            file_path: format!("src/{name}.rs"),
-            line,
-            visibility: "public".into(),
-            parent_symbol: None,
-            return_type: None,
-            parameters: None,
-        }
-    }
-
-    #[test]
-    fn test_rrf_merge_overlapping_results() {
-        let fts = vec![
-            make_symbol("alpha", "pkg-a", 10), // rank 0 in FTS
-            make_symbol("beta", "pkg-a", 20),  // rank 1 in FTS
-            make_symbol("gamma", "pkg-b", 30), // rank 2 in FTS
-        ];
-        let vec = vec![
-            make_symbol("beta", "pkg-a", 20),  // rank 0 in vec (also in FTS)
-            make_symbol("delta", "pkg-b", 40), // rank 1 in vec
-            make_symbol("alpha", "pkg-a", 10), // rank 2 in vec (also in FTS)
-        ];
-
-        let merged = rrf_merge(&fts, &vec, 50);
-        assert_eq!(merged.len(), 4);
-
-        // beta appears in both at high ranks → highest RRF score
-        // alpha appears in both → second highest
-        // Overlapping results should rank higher than single-source
-        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names[0], "beta"); // rank 0 in vec + rank 1 in FTS
-        assert_eq!(names[1], "alpha"); // rank 0 in FTS + rank 2 in vec
-        // gamma and delta are single-source, order depends on rank
-    }
-
-    #[test]
-    fn test_rrf_merge_disjoint_results() {
-        let fts = vec![
-            make_symbol("alpha", "pkg-a", 10),
-            make_symbol("beta", "pkg-a", 20),
-        ];
-        let vec = vec![
-            make_symbol("gamma", "pkg-b", 30),
-            make_symbol("delta", "pkg-b", 40),
-        ];
-
-        let merged = rrf_merge(&fts, &vec, 50);
-        assert_eq!(merged.len(), 4);
-
-        // All single-source, rank 0 items from each list tie at 1/(60+1) ≈ 0.01639
-        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
-        // Both rank-0 items tie, both rank-1 items tie
-        assert!(names.contains(&"alpha"));
-        assert!(names.contains(&"beta"));
-        assert!(names.contains(&"gamma"));
-        assert!(names.contains(&"delta"));
-    }
-
-    #[test]
-    fn test_rrf_merge_respects_limit() {
-        let fts = vec![
-            make_symbol("a", "pkg", 1),
-            make_symbol("b", "pkg", 2),
-            make_symbol("c", "pkg", 3),
-        ];
-        let vec = vec![make_symbol("d", "pkg", 4), make_symbol("e", "pkg", 5)];
-
-        let merged = rrf_merge(&fts, &vec, 3);
-        assert_eq!(merged.len(), 3);
-    }
-
-    #[test]
-    fn test_rrf_merge_empty_inputs() {
-        let fts: Vec<SymbolRow> = vec![];
-        let vec = vec![make_symbol("alpha", "pkg", 10)];
-
-        let merged = rrf_merge(&fts, &vec, 50);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "alpha");
-
-        let merged = rrf_merge(&vec, &fts, 50);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].name, "alpha");
-    }
-
-    #[test]
-    fn test_rrf_merge_both_empty() {
-        let fts: Vec<SymbolRow> = vec![];
-        let vec: Vec<SymbolRow> = vec![];
-        let merged = rrf_merge(&fts, &vec, 50);
-        assert!(merged.is_empty());
-    }
-
-    #[test]
-    fn test_get_symbols_by_ids_returns_matching() {
-        let conn = test_db_with_symbols();
-        let all_ids: Vec<i64> = conn
-            .prepare("SELECT id FROM symbols")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(!all_ids.is_empty());
-
-        let results = get_symbols_by_ids(&conn, &all_ids).unwrap();
-        assert_eq!(results.len(), all_ids.len());
-
-        for (id, sym) in &results {
-            assert!(all_ids.contains(id));
-            assert!(!sym.name.is_empty());
-            assert!(!sym.package.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_get_symbols_by_ids_empty_input() {
-        let conn = test_db_with_symbols();
-        let results = get_symbols_by_ids(&conn, &[]).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_get_symbols_by_ids_nonexistent() {
-        let conn = test_db_with_symbols();
-        let results = get_symbols_by_ids(&conn, &[99999, 99998]).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_get_symbols_by_ids_field_mapping() {
-        let conn = test_db_with_symbols();
-        let ids: Vec<i64> = conn
-            .prepare("SELECT id FROM symbols WHERE name = 'validate'")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(ids.len(), 1);
-
-        let results = get_symbols_by_ids(&conn, &ids).unwrap();
-        assert_eq!(results.len(), 1);
-        let (_, sym) = &results[0];
-        assert_eq!(sym.name, "validate");
-        assert_eq!(sym.kind, "method");
-        assert_eq!(sym.package, "auth-service");
-        assert_eq!(sym.parent_symbol.as_deref(), Some("AuthService"));
-        assert_eq!(sym.return_type.as_deref(), Some("Promise<boolean>"));
-    }
-
     #[test]
     fn test_search_docs() {
         let conn = test_db();
@@ -2934,7 +2687,7 @@ mod refs_tests {
     fn test_batch_insert_and_delete_by_file() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let mut file_ids = seed_files(&conn, &["a.rs", "b.rs"]);
 
         let refs = vec![
@@ -2979,7 +2732,7 @@ mod refs_tests {
     fn test_delete_references_for_file_unknown_path_is_noop() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t_unknown.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let mut file_ids = seed_files(&conn, &["known.rs"]);
 
         let refs = vec![ReferenceInfo {
@@ -3006,7 +2759,7 @@ mod refs_tests {
     fn test_delete_references_for_package() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("t2.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let mut file_ids = seed_files(&conn, &["x.rs", "y.rs"]);
 
         let refs_p1 = vec![ReferenceInfo {
@@ -3038,7 +2791,7 @@ mod refs_tests {
     fn test_batch_insert_references_lazy_file_id_lookup() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("lazy.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         seed_files(&conn, &["src/main.rs"]);
 
         let mut file_ids = build_file_id_map(&conn).unwrap();
@@ -3070,7 +2823,7 @@ mod refs_tests {
     fn test_query_symbol_references_filters() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("r.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["a.rs", "b.rs"]);
         let a = ids["a.rs"];
         let b = ids["b.rs"];
@@ -3105,7 +2858,7 @@ mod refs_tests {
     fn test_query_symbol_references_returns_rows_without_symbol_definition() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("r_unknown_symbol.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["ext.rs"]);
         let ext = ids["ext.rs"];
 
@@ -3136,7 +2889,7 @@ mod refs_tests {
     fn test_query_symbol_references_unicode_round_trip_nfc_and_nfd() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("r_unicode.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["unicode.rs"]);
         let file_id = ids["unicode.rs"];
 
@@ -3187,7 +2940,7 @@ mod refs_tests {
     fn test_query_symbol_callers_groups_and_counts() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("c.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["a.rs", "b.rs", "c.rs"]);
         let a = ids["a.rs"];
         let b = ids["b.rs"];
@@ -3234,7 +2987,7 @@ mod refs_tests {
     fn test_query_symbol_callees_groups() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("cee.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["a.rs"]);
         let a = ids["a.rs"];
 
@@ -3268,7 +3021,7 @@ mod refs_tests {
     fn test_query_symbol_callees_matches_qualified_enclosing() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("qual.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["a.rs"]);
         let a = ids["a.rs"];
 
@@ -3316,7 +3069,7 @@ mod refs_tests {
     fn test_query_symbol_callees_escapes_like_wildcards() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("esc.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
         let ids = seed_files(&conn, &["a.rs"]);
         let a = ids["a.rs"];
         conn.execute(
@@ -3367,7 +3120,7 @@ mod refs_tests {
     fn test_change_impact_partitions_and_traverses() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         // Packages + dep graph:
         //   api-server → config-core
@@ -3457,7 +3210,7 @@ mod refs_tests {
     fn test_change_impact_package_hint_overrides() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci2.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         for p in ["pkgA", "pkgB"] {
             seed_package(&conn, p);
@@ -3504,7 +3257,7 @@ mod refs_tests {
     fn test_change_impact_no_home_package() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci3.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         for p in ["pkg1", "pkg2"] {
             seed_package(&conn, p);
@@ -3536,7 +3289,7 @@ mod refs_tests {
     fn test_change_impact_transitive_depth_zero() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci4.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         for p in ["core", "consumer", "grandchild"] {
             seed_package(&conn, p);
@@ -3581,7 +3334,7 @@ mod refs_tests {
     fn test_change_impact_does_not_starve_bucket() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci_starve.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         seed_package(&conn, "home");
         seed_package(&conn, "consumer_z");
@@ -3639,7 +3392,7 @@ mod refs_tests {
     fn test_change_impact_skips_external_dep_edges() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("ci_ext.db");
-        let conn = open_or_create(&db_path, false).unwrap();
+        let conn = open_or_create(&db_path).unwrap();
 
         for p in ["home", "consumer", "external_collider"] {
             seed_package(&conn, p);
@@ -3693,7 +3446,7 @@ mod boundary_tests {
     #[test]
     fn test_insert_and_query_schema_consumers() {
         let dir = tempdir().unwrap();
-        let conn = open_or_create(&dir.path().join("b.db"), false).unwrap();
+        let conn = open_or_create(&dir.path().join("b.db")).unwrap();
 
         let edges = vec![
             BoundaryEdge {
@@ -3724,7 +3477,7 @@ mod boundary_tests {
     #[test]
     fn test_clear_boundary_edges() {
         let dir = tempdir().unwrap();
-        let conn = open_or_create(&dir.path().join("b2.db"), false).unwrap();
+        let conn = open_or_create(&dir.path().join("b2.db")).unwrap();
 
         let edges = vec![BoundaryEdge {
             source_path: "a.proto".into(),

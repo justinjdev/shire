@@ -19,8 +19,6 @@ pub struct Config {
     #[serde(default)]
     pub serve: ServeConfig,
     #[serde(default)]
-    pub rag: RagConfig,
-    #[serde(default)]
     pub log: LogConfig,
 }
 
@@ -114,18 +112,6 @@ fn default_doc_extensions() -> Vec<String> {
 
 fn default_doc_max_file_size() -> u64 {
     262_144 // 256 KB
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
-#[derive(Default)]
-pub struct RagConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub cache_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -776,30 +762,21 @@ requires = ["main.go"]
         assert!(rule.extensions.is_none());
     }
 
+    /// Configs written by older versions carry a `[rag]` section. The struct no
+    /// longer has that field, and `Config` does not `deny_unknown_fields`, so the
+    /// section must be ignored rather than rejected.
     #[test]
-    fn test_parse_config_with_rag() {
+    fn test_legacy_rag_section_is_ignored() {
         let toml_str = r#"
+db_path = "/local/index.db"
+
 [rag]
 enabled = true
 model = "text-embedding-3-small"
 cache_dir = "/tmp/shire-rag"
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.rag.enabled);
-        assert_eq!(config.rag.model.as_deref(), Some("text-embedding-3-small"));
-        assert_eq!(config.rag.cache_dir.as_deref(), Some("/tmp/shire-rag"));
-    }
-
-    #[test]
-    fn test_rag_config_defaults_to_disabled() {
-        let toml_str = r#"
-[discovery]
-manifests = ["package.json"]
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.rag.enabled);
-        assert!(config.rag.model.is_none());
-        assert!(config.rag.cache_dir.is_none());
+        let config: Config = toml::from_str(toml_str).expect("legacy [rag] section must parse");
+        assert_eq!(config.db_path.as_deref(), Some("/local/index.db"));
     }
 
     #[test]

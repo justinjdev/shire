@@ -53,9 +53,10 @@
 
 #### Scenario: Workspace Cargo.toml without [package]
 
-- **WHEN** a `Cargo.toml` has no `[package]` section (e.g., workspace root)
-- **THEN** parsing returns an error
-- **AND** the file is recorded as a parse failure (not indexed as a package)
+- **WHEN** a `Cargo.toml` has no `[package]` section (e.g., a virtual workspace root)
+- **THEN** it is not indexed as a package
+- **AND** it is NOT recorded as a parse failure — a virtual workspace root is an expected, valid file, distinct from a manifest that is genuinely malformed
+- **AND** its manifest hash is still stored, so it is not re-parsed on every subsequent build
 
 #### Scenario: Workspace root Cargo.toml
 

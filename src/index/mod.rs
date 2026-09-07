@@ -564,11 +564,24 @@ struct FileWalk {
     /// volume mid-remount. Their contents are *invisible*, which is not the
     /// same as absent, and the difference decides whether the `files` rows
     /// underneath them may be deleted.
+    ///
+    /// An empty string is the repo root itself: the walk can prove nothing
+    /// about anything.
     unreadable: Vec<String>,
+    /// Did the walk stop early because it hit `MAX_FILES`? Only used to word
+    /// the warning — the truncation is already recorded as a whole-tree blind
+    /// spot in `unreadable`.
+    capped: bool,
 }
 
 /// Walk the repo and collect all files with metadata.
 fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
+    walk_files_capped(repo_root, config, MAX_FILES)
+}
+
+/// [`walk_files`] with an explicit cap, so the truncation path is testable
+/// without materialising half a million files.
+fn walk_files_capped(repo_root: &Path, config: &Config, max_files: usize) -> Result<FileWalk> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
     let walker = ignore_walk_builder(repo_root)
@@ -634,12 +647,15 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
                 size_bytes,
             });
 
-            if guard.len() >= MAX_FILES {
-                tracing::warn!(
-                    max = MAX_FILES,
-                    "file tree walk capped at maximum file count"
-                );
-                capped.store(true, std::sync::atomic::Ordering::Relaxed);
+            if guard.len() >= max_files {
+                // One warning per build, not one per worker that raced to the
+                // limit.
+                if !capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        max = max_files,
+                        "file tree walk capped at maximum file count"
+                    );
+                }
                 return ignore::WalkState::Quit;
             }
 
@@ -647,9 +663,24 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
         })
     });
 
+    let capped = capped.load(std::sync::atomic::Ordering::Relaxed);
+    let mut unreadable = normalize_unreadable_roots(unreadable.into_inner().unwrap());
+    if capped {
+        // A truncated walk stopped at an arbitrary point in a
+        // nondeterministic traversal order: it saw *some* of the tree and
+        // knows nothing about the rest, which is exactly the state
+        // `unreadable` describes. Recording the repo root as the blind spot
+        // makes the cap inherit every rule already written for one — no
+        // deletions from a walk that cannot prove absence, and no file-tree
+        // hash stored for a partial walk (INDEX-3-2). Without it, each build
+        // kept a different arbitrary subset and churned the rows in between.
+        unreadable = vec![String::new()];
+    }
+
     Ok(FileWalk {
         files: files.into_inner().unwrap(),
-        unreadable: normalize_unreadable_roots(unreadable.into_inner().unwrap()),
+        unreadable,
+        capped,
     })
 }
 
@@ -2579,6 +2610,7 @@ fn phase_index_files(
     let FileWalk {
         files: walked_files,
         unreadable,
+        capped,
     } = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
@@ -2687,6 +2719,19 @@ fn phase_index_files(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
             [&current_hash],
         )?;
+    } else if capped {
+        tracing::warn!(
+            max = MAX_FILES,
+            files = walked_files.len(),
+            "file walk stopped at the file-count cap — the tree was only partly \
+             seen, so no file-tree hash is stored and nothing outside the walked \
+             set is treated as deleted"
+        );
+        eprintln!(
+            "Warning: stopped walking the file tree at {MAX_FILES} files. The index \
+             covers only part of this repository; exclude directories in shire.toml \
+             (discovery.exclude) to bring it under the cap."
+        );
     } else {
         tracing::warn!(
             unreadable = unreadable.len(),
@@ -5683,6 +5728,66 @@ anyhow = "1"
             manifest_walk.unreadable
         );
         assert_eq!(manifest_walk.manifests.len(), 1);
+    }
+
+    #[test]
+    fn test_a_capped_walk_is_a_blind_spot() {
+        // INDEX-3-2: hitting MAX_FILES truncates the walk at an arbitrary
+        // point of a nondeterministic traversal, so it proves nothing about
+        // what is absent. Before this it produced neither an unreadable entry
+        // nor any other marker, so `incremental_upsert_files` deleted every
+        // row outside the truncated set and a `file_tree_hash` was stored for
+        // a partial walk — each build keeping (and churning) a different
+        // arbitrary subset.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        for i in 0..10 {
+            fs::write(
+                root.join("src").join(format!("f{i}.ts")),
+                "export const a = 1;\n",
+            )
+            .unwrap();
+        }
+
+        let walk = walk_files_capped(root, &Config::default(), 3).unwrap();
+
+        assert!(walk.capped, "the walk must record that it stopped early");
+        assert!(
+            walk.files.len() < 10,
+            "a capped walk must not enumerate the whole tree: {}",
+            walk.files.len()
+        );
+        assert_eq!(
+            walk.unreadable,
+            vec![String::new()],
+            "a capped walk is blind to the whole tree, so nothing may be \
+             treated as deleted and no file-tree hash may be stored"
+        );
+        assert!(
+            is_under_unreadable("src/f0.ts", &walk.unreadable),
+            "every path must fall inside the blind spot"
+        );
+    }
+
+    #[test]
+    fn test_an_uncapped_walk_is_not_a_blind_spot() {
+        // The neighbour: a walk that finished under the cap sees the whole
+        // tree, so deletions and the file-tree hash must still work.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.join("b.ts"), "export const b = 2;\n").unwrap();
+
+        let walk = walk_files_capped(root, &Config::default(), 1000).unwrap();
+
+        assert!(!walk.capped);
+        assert!(
+            walk.unreadable.is_empty(),
+            "a complete walk has no blind spots: {:?}",
+            walk.unreadable
+        );
+        assert_eq!(walk.files.len(), 2);
     }
 
     #[test]

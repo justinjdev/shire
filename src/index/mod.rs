@@ -84,12 +84,23 @@ fn ignore_walk_builder(root: &Path) -> WalkBuilder {
     builder
 }
 
+/// What one manifest walk saw.
+struct ManifestWalk {
+    manifests: Vec<WalkedManifest>,
+    /// Repo-relative paths the walk could not read (or whose manifest could
+    /// not be hashed) this time. A manifest under one of them is *invisible*,
+    /// not deleted — see `FileWalk::unreadable`, and
+    /// `build_index_inner`'s use of this list to hold back
+    /// `phase_remove_deleted`.
+    unreadable: Vec<String>,
+}
+
 /// Walk the repo and collect manifest paths with content hashes.
 fn walk_manifests(
     repo_root: &Path,
     config: &Config,
     parsers: &[Box<dyn ManifestParser>],
-) -> Result<Vec<WalkedManifest>> {
+) -> Result<ManifestWalk> {
     let mut manifest_filenames: HashSet<&str> = parsers.iter().map(|p| p.filename()).collect();
     // go.work provides workspace context, not packages — but must be walked
     manifest_filenames.insert("go.work");
@@ -118,12 +129,26 @@ fn walk_manifests(
 
     // Collect manifest paths first (parallel walk)
     let manifest_paths = std::sync::Mutex::new(Vec::new());
+    let unreadable = std::sync::Mutex::new(Vec::new());
+    let repo_root_ref = repo_root;
 
     walker.run(|| {
         Box::new(|entry| {
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
+                Err(e) => {
+                    // Remember where the walk went blind: a manifest under an
+                    // unreadable directory is missing from this walk but very
+                    // much still on disk, and `phase_remove_deleted` would
+                    // otherwise delete its package outright.
+                    if let Some(rel) = blind_spot(&e, repo_root_ref) {
+                        tracing::warn!(path = %rel, error = %e, "manifest walk could not read a path");
+                        if let Ok(mut guard) = unreadable.lock() {
+                            guard.push(rel);
+                        }
+                    }
+                    return ignore::WalkState::Continue;
+                }
             };
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
@@ -142,7 +167,8 @@ fn walk_manifests(
 
     // Hash manifests in parallel (file reads + SHA-256)
     let paths = manifest_paths.into_inner().unwrap();
-    let manifests: Vec<WalkedManifest> = paths
+    let mut unreadable = unreadable.into_inner().unwrap();
+    let hashed: Vec<Result<WalkedManifest, String>> = paths
         .into_par_iter()
         .filter_map(|file_path| {
             let filename = file_path.file_name()?.to_str()?.to_string();
@@ -156,17 +182,41 @@ fn walk_manifests(
             } else {
                 format!("{}/{}", relative_dir, filename)
             };
-            let content_hash = hash::hash_file(&file_path).ok()?;
-            Some(WalkedManifest {
+            // A manifest that is on disk but cannot be read is invisible for
+            // this build, exactly like one under an unreadable directory —
+            // never a deletion.
+            let content_hash = match hash::hash_file(&file_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        manifest = %manifest_key,
+                        error = %e,
+                        "manifest could not be hashed; treating it as unreadable, not removed"
+                    );
+                    return Some(Err(manifest_key));
+                }
+            };
+            Some(Ok(WalkedManifest {
                 abs_path: file_path,
                 relative_dir,
                 manifest_key,
                 content_hash,
-            })
+            }))
         })
         .collect();
 
-    Ok(manifests)
+    let mut manifests = Vec::with_capacity(hashed.len());
+    for entry in hashed {
+        match entry {
+            Ok(m) => manifests.push(m),
+            Err(key) => unreadable.push(key),
+        }
+    }
+
+    Ok(ManifestWalk {
+        manifests,
+        unreadable,
+    })
 }
 
 /// Load stored manifest hashes from the DB.
@@ -549,18 +599,11 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
                     // Remember *where* the walk went blind. Everything under
                     // that path is unknown for this build, not deleted — see
                     // `FileWalk::unreadable`.
-                    if let Some(path) = walk_error_path(&e) {
-                        let rel = path
-                            .strip_prefix(repo_root_ref)
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .to_string();
+                    if let Some(rel) = blind_spot(&e, repo_root_ref) {
                         tracing::warn!(path = %rel, error = %e, "file walk could not read a path");
                         if let Ok(mut guard) = unreadable.lock() {
                             guard.push(rel);
                         }
-                    } else {
-                        tracing::warn!(error = %e, "file walk error with no path");
                     }
                     return ignore::WalkState::Continue;
                 }
@@ -610,6 +653,38 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
     })
 }
 
+/// The repo-relative path a walk error makes this build blind to, or `None`
+/// when the walk can still see everything there.
+///
+/// Only an *I/O* error means blindness: a directory that could not be read
+/// hides whatever is under it, and the rows for those paths must be preserved
+/// rather than treated as deletions. The other errors `ignore` reports are
+/// about the ignore rules themselves — a git-valid but globset-invalid
+/// pattern such as `a{b` in a committed `.gitignore` (which the source walker
+/// warns about and keeps going past), a symlink loop — and the walk still
+/// enumerates the tree. Treating those as blind spots would freeze deletions
+/// and suppress the file-tree hash for every repo with one typo in its
+/// `.gitignore`.
+fn blind_spot(err: &ignore::Error, repo_root: &Path) -> Option<String> {
+    if !err.is_io() {
+        tracing::warn!(error = %err, "walk error (not an I/O error; the tree is still visible)");
+        return None;
+    }
+    let Some(path) = walk_error_path(err) else {
+        // An I/O error naming no path: the scope is unknown, and guessing
+        // "nothing" is the dangerous guess. Treat the whole tree as blind —
+        // deletions wait for a build that can see.
+        tracing::warn!(error = %err, "I/O walk error with no path — treating the walk as incomplete");
+        return Some(String::new());
+    };
+    Some(
+        path.strip_prefix(repo_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
 /// The path an `ignore` walk error is about, dug out of whatever wrappers the
 /// crate put around it (`WithPath` inside `WithDepth`, and so on). `None` for
 /// an error that names no path — which the caller must treat as "scope
@@ -640,6 +715,25 @@ fn is_under_unreadable(path: &str, unreadable: &[String]) -> bool {
                 && path.starts_with(root.as_str())
                 && path.as_bytes()[root.len()] == b'/')
     })
+}
+
+/// Drop from `removed` every manifest key under a path the manifest walk could
+/// not read, returning how many were held back.
+///
+/// A manifest that is merely invisible must not be treated as deleted:
+/// `phase_remove_deleted` would take its package, symbols, references and
+/// dependency edges with it, and permanently — the next successful walk sees an
+/// unchanged content hash, never re-parses the manifest, and so never puts them
+/// back. Preserving the package's `files` rows (see `FileWalk::unreadable`) is
+/// worth nothing without this: the package row is what `symbol_refs`,
+/// `symbols` and `dependencies` all hang off.
+fn hold_back_unreadable_removals(removed: &mut Vec<String>, unreadable: &[String]) -> usize {
+    if unreadable.is_empty() {
+        return 0;
+    }
+    let before = removed.len();
+    removed.retain(|key| !is_under_unreadable(key, unreadable));
+    before - removed.len()
 }
 
 /// Associate files with their owning package using longest-prefix matching.
@@ -1180,10 +1274,7 @@ fn phase_parse(
             .unwrap_or("");
 
         // Skip context-only files — they provide workspace context, not packages
-        if filename == "go.work"
-            || filename == "settings.gradle"
-            || filename == "settings.gradle.kts"
-        {
+        if is_context_only_manifest(filename) {
             continue;
         }
 
@@ -1277,6 +1368,23 @@ fn phase_parse(
     Ok((parsed_packages, failures, failed_keys))
 }
 
+/// Manifests that are walked for workspace context but never produce a package
+/// of their own (`phase_parse` skips them outright).
+///
+/// They matter to [`phase_remove_deleted`]: they share a directory with the
+/// manifest that *does* own the package there (`settings.gradle` next to
+/// `build.gradle`, `go.work` next to a root `go.mod`), so deleting one must
+/// remove nothing but its own hash row. Treating it like an unknown manifest
+/// and falling back to a path-only delete would take the real package with
+/// it — permanently, since the surviving manifest's content hash has not
+/// changed and it is never re-parsed.
+fn is_context_only_manifest(filename: &str) -> bool {
+    matches!(
+        filename,
+        "go.work" | "settings.gradle" | "settings.gradle.kts"
+    )
+}
+
 /// The `packages.kind` a manifest filename produces, for every manifest a
 /// parser can turn into a package.
 ///
@@ -1352,7 +1460,11 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             Some((dir, file)) => (dir, file),
             None => ("", manifest_key.as_str()),
         };
-        delete_packages_at_path(conn, relative_dir, manifest_kind_for_filename(filename))?;
+        // A context-only manifest never owned a package, so it takes none with
+        // it — only its own hash row goes.
+        if !is_context_only_manifest(filename) {
+            delete_packages_at_path(conn, relative_dir, manifest_kind_for_filename(filename))?;
+        }
         conn.execute(
             "DELETE FROM manifest_hashes WHERE path = ?1",
             [manifest_key.as_str()],
@@ -2500,11 +2612,24 @@ fn phase_index_files(
         crate::db::queries::batch_insert_boundary_edges(conn, &boundary_edges)?;
     }
 
-    // Store the new file-tree hash so the next build can short-circuit here.
-    conn.execute(
-        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
-        [&current_hash],
-    )?;
+    // Store the new file-tree hash so the next build can short-circuit here —
+    // but only when the walk actually saw the whole tree. The hash is computed
+    // from what was walked, while the `files` table also holds the rows kept
+    // for paths that could not be read; storing a hash that describes neither
+    // would let a later walk that reproduces it short-circuit past a genuine
+    // deletion inside the once-unreadable directory, stranding the row.
+    if unreadable.is_empty() {
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
+            [&current_hash],
+        )?;
+    } else {
+        tracing::warn!(
+            unreadable = unreadable.len(),
+            "file walk was incomplete — not storing a file-tree hash, so the next \
+             build re-checks the tree instead of short-circuiting"
+        );
+    }
 
     Ok(FileIndexResult {
         num_files,
@@ -2755,10 +2880,6 @@ fn cleanup_stale_hashes(conn: &Connection, walked_keys: &HashSet<String>) -> Res
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Workspace-only manifests (go.work, settings.gradle, etc.) don't produce
-    // packages but must be kept for workspace context and cached walks.
-    const WORKSPACE_MANIFESTS: &[&str] = &["go.work", "settings.gradle", "settings.gradle.kts"];
-
     let stale_keys: Vec<&str> = all_manifest_keys
         .iter()
         .filter(|key| {
@@ -2766,8 +2887,10 @@ fn cleanup_stale_hashes(conn: &Connection, walked_keys: &HashSet<String>) -> Res
                 return false; // still present on disk this build; not stale
             }
             let filename = key.rsplit_once('/').map(|(_, f)| f).unwrap_or(key.as_str());
-            if WORKSPACE_MANIFESTS.contains(&filename) {
-                return false; // never prune workspace manifests
+            // Workspace-only manifests don't produce packages but must be kept
+            // for workspace context and cached walks.
+            if is_context_only_manifest(filename) {
+                return false;
             }
             let parent_dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
             !known_paths.contains(parent_dir)
@@ -3026,8 +3149,14 @@ pub fn build_index(
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    let extract_failures =
-        build_index_inner(repo_root, config, force, db_override, true, LockWait::Wait)?;
+    let extract_failures = build_index_inner(
+        repo_root,
+        config,
+        force,
+        db_override,
+        true,
+        LockWait::Wait(lock::LOCK_TIMEOUT),
+    )?;
     if !extract_failures.is_empty() {
         anyhow::bail!(
             "{} package(s) could not be indexed: {}",
@@ -3052,17 +3181,51 @@ pub fn build_index(
 /// rebuild on every single tool call.
 ///
 /// If another build already holds the build lock this returns without
-/// building: the build in flight is doing the same work, and these callers
-/// are triggered again anyway (the next tool call past the debounce window,
-/// the next rebuild signal).
+/// building: the build in flight is doing the same work, and this caller (the
+/// MCP server's per-tool-call check) comes round again on the next tool call
+/// past the debounce window. Callers whose trigger is *not* repeated must use
+/// [`build_index_quiet_waiting`] instead.
 pub fn build_index_quiet(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
+    build_index_quiet_with(repo_root, config, force, db_override, LockWait::Skip)
+}
+
+/// [`build_index_quiet`], but waits for a competing build instead of skipping
+/// it.
+///
+/// For callers that get one shot at the work: the watch daemon, whose trigger
+/// is a specific batch of file changes that a build already in flight may have
+/// started too early to see (skipping would leave that edit unindexed until
+/// the next one arrives), and `serve`'s startup recovery from a corrupt index,
+/// which has nothing to serve until a build has actually run.
+pub fn build_index_quiet_waiting(
+    repo_root: &Path,
+    config: &Config,
+    force: bool,
+    db_override: Option<&Path>,
+) -> Result<()> {
+    build_index_quiet_with(
+        repo_root,
+        config,
+        force,
+        db_override,
+        LockWait::Wait(lock::LOCK_TIMEOUT),
+    )
+}
+
+fn build_index_quiet_with(
+    repo_root: &Path,
+    config: &Config,
+    force: bool,
+    db_override: Option<&Path>,
+    lock_wait: LockWait,
+) -> Result<()> {
     let extract_failures =
-        build_index_inner(repo_root, config, force, db_override, false, LockWait::Skip)?;
+        build_index_inner(repo_root, config, force, db_override, false, lock_wait)?;
     if !extract_failures.is_empty() {
         tracing::warn!(
             packages = extract_failures.len(),
@@ -3216,7 +3379,10 @@ fn build_index_inner(
     tracing::debug!("phase 1: walk manifests");
     let sp = make_spinner(&mp, "Discovering manifests…");
     let t = Instant::now();
-    let walked = walk_manifests(repo_root, config, &parsers)?;
+    let ManifestWalk {
+        manifests: walked,
+        unreadable: unreadable_manifest_dirs,
+    } = walk_manifests(repo_root, config, &parsers)?;
     timings.push(("walk", t.elapsed()));
     sp.finish_with_message(format!("Discovered {} manifests", walked.len()));
 
@@ -3238,7 +3404,16 @@ fn build_index_inner(
     let sp = make_spinner(&mp, "Diffing manifests…");
     let t = Instant::now();
     let stored_hashes = load_stored_hashes(&conn)?;
-    let diff = diff_manifests(&walked, &stored_hashes);
+    let mut diff = diff_manifests(&walked, &stored_hashes);
+    // A manifest the walk could not see is unknown, not gone.
+    let held_back = hold_back_unreadable_removals(&mut diff.removed, &unreadable_manifest_dirs);
+    if held_back > 0 {
+        tracing::warn!(
+            manifests = held_back,
+            "manifests under a path this build could not read were left in the \
+             index rather than removed"
+        );
+    }
     let is_full_build = stored_hashes.is_empty();
 
     let to_parse: Vec<&WalkedManifest> = diff
@@ -5137,6 +5312,83 @@ anyhow = "1"
     }
 
     #[test]
+    fn test_phase_remove_deleted_spares_the_package_of_a_context_only_manifest() {
+        // `settings.gradle`/`settings.gradle.kts`/`go.work` never own a
+        // package — they sit next to the manifest that does. Falling back to
+        // the path-only delete for them removed the real package, and
+        // permanently: `build.gradle`'s content hash is unchanged, so it is
+        // never re-parsed and the package never comes back.
+        for context_only in ["settings.gradle", "settings.gradle.kts", "go.work"] {
+            let conn = Connection::open_in_memory().unwrap();
+            crate::db::create_schema_for_test(&conn);
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('app', 'app', 'gradle')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line) \
+                 VALUES ('app', 'Main', 'class', 'app/Main.java', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO manifest_hashes (path, content_hash) VALUES \
+                 ('app/build.gradle', 'h1'), (?1, 'h2')",
+                [format!("app/{context_only}")],
+            )
+            .unwrap();
+
+            phase_remove_deleted(&conn, &[format!("app/{context_only}")]).unwrap();
+
+            assert_eq!(
+                package_names(&conn),
+                vec!["app".to_string()],
+                "removing {context_only} must not delete the package in its directory"
+            );
+            let symbols: i64 = conn
+                .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(symbols, 1, "{context_only}: its symbols must survive");
+            // Its own hash row still goes, so the next build re-discovers it.
+            let hashes: Vec<String> = conn
+                .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(hashes, vec!["app/build.gradle".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_hold_back_unreadable_removals_keeps_invisible_manifests() {
+        // A manifest under a directory the walk could not read is missing from
+        // this build's walk, not deleted from disk. Letting it reach
+        // `phase_remove_deleted` destroys the package, its symbols, its refs
+        // and its dependency edges — and no later build restores them, since
+        // the manifest's content hash never changed.
+        let mut removed = vec![
+            "a/package.json".to_string(),
+            "a/nested/go.mod".to_string(),
+            "b/package.json".to_string(),
+        ];
+
+        let held = hold_back_unreadable_removals(&mut removed, &["a".to_string()]);
+
+        assert_eq!(held, 2);
+        assert_eq!(removed, vec!["b/package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_hold_back_unreadable_removals_is_a_no_op_for_a_complete_walk() {
+        let mut removed = vec!["a/package.json".to_string()];
+        assert_eq!(hold_back_unreadable_removals(&mut removed, &[]), 0);
+        assert_eq!(removed, vec!["a/package.json".to_string()]);
+    }
+
+    #[test]
     fn test_resolve_gradle_name_collision_disambiguates_when_fallback_also_collides() {
         // A nested `team-b/app` colliding on name with `team-a/app` falls back
         // to the path-derived name "team-b-app" — but a THIRD, unrelated flat
@@ -5207,7 +5459,9 @@ anyhow = "1"
         let db = root.join("index.db");
         let config = Config::default();
 
-        let held = lock::acquire(&db, lock::LockWait::Wait).unwrap().unwrap();
+        let held = lock::acquire(&db, lock::LockWait::Wait(lock::LOCK_TIMEOUT))
+            .unwrap()
+            .unwrap();
         build_index_quiet(root, &config, false, Some(&db)).unwrap();
         assert!(
             !db.exists(),
@@ -5226,15 +5480,26 @@ anyhow = "1"
     #[test]
     fn test_build_index_reports_a_lock_it_could_not_take() {
         // The CLI is answering a human or CI, so a build that did not happen
-        // is an error, not a silent success.
+        // is an error, not a silent success. The production budget is minutes
+        // (a build is what is being waited on), so the wait is shortened here
+        // rather than sat through.
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         concurrent_build_fixture(root);
         let db = root.join("index.db");
 
-        let _held = lock::acquire(&db, lock::LockWait::Wait).unwrap().unwrap();
-        let err = build_index(root, &Config::default(), false, Some(&db))
-            .expect_err("a build that never ran must not report success");
+        let _held = lock::acquire(&db, lock::LockWait::Wait(lock::LOCK_TIMEOUT))
+            .unwrap()
+            .unwrap();
+        let err = build_index_inner(
+            root,
+            &Config::default(),
+            false,
+            Some(&db),
+            true,
+            lock::LockWait::Wait(Duration::from_millis(200)),
+        )
+        .expect_err("a build that never ran must not report success");
 
         assert!(
             format!("{err:#}").contains("another shire build is already running"),
@@ -5314,6 +5579,49 @@ anyhow = "1"
     }
 
     #[test]
+    fn test_an_invalid_gitignore_pattern_is_not_a_blind_spot() {
+        // A git-valid but globset-invalid pattern (`a{b`) makes `ignore`
+        // report an error while still walking the whole tree. Treating that as
+        // an unreadable path would freeze every deletion in the repo and stop
+        // the file-tree hash from ever being stored — for one typo in a
+        // committed .gitignore.
+        // `ignore` surfaces ignore-file parse errors from strict ancestors of
+        // the walk root, so the bad pattern goes one level above it — the
+        // shape a linked worktree or a nested repo root produces.
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "a{b\n").unwrap();
+        let root = &dir.path().join("repo");
+        fs::create_dir_all(root).unwrap();
+        fs::write(root.join(".gitignore"), "a{b\n").unwrap();
+        fs::write(root.join("kept.ts"), "export function kept() {}\n").unwrap();
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            br#"{"name": "p", "version": "1"}"#,
+        )
+        .unwrap();
+
+        let walk = walk_files(root, &Config::default()).unwrap();
+        assert!(
+            walk.unreadable.is_empty(),
+            "a bad ignore pattern is not blindness: {:?}",
+            walk.unreadable
+        );
+        assert!(walk.files.iter().any(|f| f.relative_path == "kept.ts"));
+
+        let parsers: Vec<Box<dyn ManifestParser>> = vec![Box::new(npm::NpmParser)];
+        let manifest_walk = walk_manifests(root, &Config::default(), &parsers).unwrap();
+        assert!(
+            manifest_walk.unreadable.is_empty(),
+            "same for the manifest walk: {:?}",
+            manifest_walk.unreadable
+        );
+        assert_eq!(manifest_walk.manifests.len(), 1);
+    }
+
+    #[test]
     fn test_walk_files_still_honours_the_committed_gitignore() {
         // The other half of the contract: a `.gitignore` is committed, every
         // collaborator shares it, and it still applies.
@@ -5348,7 +5656,9 @@ anyhow = "1"
         .unwrap();
 
         let parsers: Vec<Box<dyn ManifestParser>> = vec![Box::new(npm::NpmParser)];
-        let walked = walk_manifests(root, &Config::default(), &parsers).unwrap();
+        let walked = walk_manifests(root, &Config::default(), &parsers)
+            .unwrap()
+            .manifests;
 
         assert_eq!(
             walked.iter().map(|m| &m.manifest_key).collect::<Vec<_>>(),

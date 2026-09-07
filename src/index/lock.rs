@@ -23,10 +23,18 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long a builder waits for a competing builder before giving up. Same
-/// budget as [`crate::db::BUSY_TIMEOUT`], so waiting for the lock and waiting
-/// for the SQLite writer behave alike.
-const LOCK_TIMEOUT: Duration = crate::db::BUSY_TIMEOUT;
+/// How long a builder waits for a competing builder before giving up.
+///
+/// Deliberately *not* [`crate::db::BUSY_TIMEOUT`]: that budget covers one
+/// SQLite write, whereas what is being waited on here is an entire build.
+/// A first build of a large monorepo — or any build the watch daemon kicks
+/// off — routinely runs for minutes, so a seconds-long budget would make
+/// `shire build` fail with "another shire build is already running" every
+/// time the daemon (or a parallel CI step) happened to be indexing, even
+/// though waiting would have succeeded. The cap exists only so a builder
+/// stuck behind a wedged peer eventually reports the conflict instead of
+/// hanging forever.
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How often to retry while waiting. `flock` can block natively, but that
 /// gives no way to time out, and a builder that hangs forever behind a stuck
@@ -36,13 +44,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// What to do when another build already holds the lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockWait {
-    /// Wait up to [`LOCK_TIMEOUT`], then fail — the CLI, where a human or CI
-    /// asked for a build and must be told if it did not happen.
-    Wait,
-    /// Give up immediately and let the caller skip the build — a long-running
-    /// process (the MCP server, the watch daemon) whose next trigger will come
-    /// round again anyway, and whose whole purpose is served by the build that
-    /// is already running.
+    /// Wait up to this long, then fail — the CLI and the watch daemon, where
+    /// the build was asked for and must either happen or be reported.
+    /// [`LOCK_TIMEOUT`] is the budget everything outside tests uses.
+    Wait(Duration),
+    /// Give up immediately and let the caller skip the build — only for a
+    /// caller whose trigger comes round again by itself (the MCP server's
+    /// per-tool-call staleness check), and whose whole purpose is served by
+    /// the build already running. A caller that gets one shot at a specific
+    /// batch of changes must use `Wait`, or those changes are simply lost.
     Skip,
 }
 
@@ -90,7 +100,10 @@ pub fn acquire(db_path: &Path, wait: LockWait) -> Result<Option<BuildLock>> {
         .open(&path)
         .with_context(|| format!("Failed to open build lock {}", path.display()))?;
 
-    let deadline = Instant::now() + LOCK_TIMEOUT;
+    let deadline = match wait {
+        LockWait::Wait(timeout) => Instant::now() + timeout,
+        LockWait::Skip => Instant::now(),
+    };
     loop {
         match try_lock(&file) {
             Ok(true) => {
@@ -127,14 +140,20 @@ pub fn acquire(db_path: &Path, wait: LockWait) -> Result<Option<BuildLock>> {
 #[cfg(unix)]
 fn try_lock(file: &std::fs::File) -> Result<bool> {
     use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if code == libc::EWOULDBLOCK || code == libc::EINTR => Ok(false),
-        _ => Err(err.into()),
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK => Ok(false),
+            // A signal interrupted the call; nobody else necessarily holds the
+            // lock. Reporting that as "held" would make `LockWait::Skip` drop a
+            // build that could have run, so retry instead.
+            Some(code) if code == libc::EINTR => continue,
+            _ => Err(err.into()),
+        };
     }
 }
 
@@ -161,7 +180,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join(".shire").join("index.db");
 
-        let held = acquire(&db, LockWait::Wait)
+        let held = acquire(&db, LockWait::Wait(LOCK_TIMEOUT))
             .unwrap()
             .expect("first builder");
         // A separate open file description, i.e. what a second process gets.
@@ -181,16 +200,16 @@ mod tests {
     fn a_waiting_builder_fails_rather_than_hanging_forever() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("index.db");
-        let _held = acquire(&db, LockWait::Wait).unwrap().unwrap();
+        let _held = acquire(&db, LockWait::Wait(LOCK_TIMEOUT)).unwrap().unwrap();
 
+        // A deliberately tiny budget: the real one is minutes long, because a
+        // build is what is being waited on.
+        let budget = Duration::from_millis(200);
         let start = Instant::now();
-        let err = acquire(&db, LockWait::Wait)
+        let err = acquire(&db, LockWait::Wait(budget))
             .expect_err("a lock held past the timeout must be reported, not waited on forever");
 
-        assert!(
-            start.elapsed() >= LOCK_TIMEOUT,
-            "it must actually wait first"
-        );
+        assert!(start.elapsed() >= budget, "it must actually wait first");
         assert!(
             format!("{err:#}").contains("another shire build is already running"),
             "the error must name the cause: {err:#}"
@@ -201,10 +220,10 @@ mod tests {
     fn a_waiting_builder_proceeds_once_the_holder_finishes() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("index.db");
-        let held = acquire(&db, LockWait::Wait).unwrap().unwrap();
+        let held = acquire(&db, LockWait::Wait(LOCK_TIMEOUT)).unwrap().unwrap();
 
         let db2 = db.clone();
-        let waiter = std::thread::spawn(move || acquire(&db2, LockWait::Wait));
+        let waiter = std::thread::spawn(move || acquire(&db2, LockWait::Wait(LOCK_TIMEOUT)));
         std::thread::sleep(Duration::from_millis(150));
         drop(held);
 

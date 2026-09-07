@@ -1295,6 +1295,27 @@ impl RefQueryBuilder {
         self.params.push(Box::new(value.to_string()));
     }
 
+    /// `AND ({column} IS NULL OR {column} NOT IN (?, ?, …))`. An empty list
+    /// excludes nothing rather than rendering the syntax error `IN ()`. The
+    /// NULL arm is load-bearing: SQL's `NOT IN` is unknown for NULL, and a
+    /// ref whose package could not be attributed must not be dropped by a
+    /// filter about other packages.
+    fn exclude_in(&mut self, column: &str, values: &[String]) {
+        if values.is_empty() {
+            return;
+        }
+        self.sql
+            .push_str(&format!(" AND ({column} IS NULL OR {column} NOT IN ("));
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                self.sql.push(',');
+            }
+            self.sql.push('?');
+            self.params.push(Box::new(v.clone()));
+        }
+        self.sql.push_str("))");
+    }
+
     fn build_with_order_and_limit(
         mut self,
         order_by: &str,
@@ -1303,6 +1324,188 @@ impl RefQueryBuilder {
         self.sql.push_str(&format!(" {order_by} LIMIT ?"));
         self.params.push(Box::new(limit));
         (self.sql, self.params)
+    }
+}
+
+/// How a `name` argument was matched against the reference index.
+///
+/// `symbol_refs.name` is always a bare identifier, while callers routinely
+/// pass the dot-qualified form: `AuthService.login` is what
+/// `enclosing_symbol` reports and what the `reference_audit` prompt tells a
+/// model to feed back in. The qualifier is not noise — `symbols.parent_symbol`
+/// stores exactly it — so it can say *which* `login` was meant, instead of
+/// being dropped and answering for every symbol of that name.
+///
+/// What the index can do with that is bounded. A ref row records the name and
+/// the package the reference was *written in*, never the type it resolves to,
+/// so the qualifier cannot filter refs directly. What it can do is attribute
+/// them: a `login` written inside a package that defines its own `login` on a
+/// different type belongs to that package's method, not to this one. Those
+/// packages are excluded ([`RefNameMatch::excluded_packages`]); every other
+/// package is kept, because a cross-package call site is exactly what these
+/// tools exist to find. Two same-named methods on different types *in one
+/// package* still merge — the tool descriptions say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefNameMatch {
+    /// The name the returned rows were matched on: the argument itself, or
+    /// its last dot-separated segment.
+    pub matched_name: String,
+    /// The packages defining the qualified symbol. Empty when the name
+    /// carried no qualifier that resolved.
+    pub defined_in: Vec<String>,
+    /// Packages whose own same-named symbol claims their references, so their
+    /// rows were left out. Empty when the name carried no qualifier that
+    /// resolved, or nothing competes with it.
+    pub excluded_packages: Vec<String>,
+    /// The qualifier was dropped because no indexed symbol carries it, so the
+    /// rows are every symbol with that bare name, on any type in any package.
+    pub qualifier_dropped: bool,
+}
+
+impl RefNameMatch {
+    /// The rows matched the argument as given.
+    fn literal(name: &str) -> Self {
+        Self {
+            matched_name: name.to_string(),
+            defined_in: Vec::new(),
+            excluded_packages: Vec::new(),
+            qualifier_dropped: false,
+        }
+    }
+
+    /// `Q.n` resolved through `symbols.parent_symbol`: rows matched on `n`,
+    /// minus the packages that define an `n` of their own.
+    fn qualified(target: QualifiedTarget<'_>) -> Self {
+        Self {
+            matched_name: target.bare.to_string(),
+            defined_in: target.defined_in,
+            excluded_packages: target.competing,
+            qualifier_dropped: false,
+        }
+    }
+
+    /// `Q.n` where no symbol `n` has parent `Q`: rows matched on bare `n`.
+    fn dropped(bare: &str) -> Self {
+        Self {
+            matched_name: bare.to_string(),
+            defined_in: Vec::new(),
+            excluded_packages: Vec::new(),
+            qualifier_dropped: true,
+        }
+    }
+
+    /// Whether the rows were matched on something other than `requested`.
+    /// Callers surface the difference rather than answering a question the
+    /// caller did not ask as if it were the one they did.
+    pub fn is_rewritten(&self, requested: &str) -> bool {
+        self.matched_name != requested
+    }
+}
+
+/// How many packages a qualifier lookup considers. A name defined in more
+/// packages than this keeps the ones defining the qualified symbol (they sort
+/// first) and simply competes with fewer — the cap can only widen an answer,
+/// never narrow it wrongly, and it keeps the generated `IN (...)` list away
+/// from SQLite's bound-parameter ceiling.
+const MAX_QUALIFIER_PACKAGES: i64 = 64;
+
+/// A dot-qualified name resolved against the symbol table.
+struct QualifiedTarget<'a> {
+    /// The bare identifier `symbol_refs` is keyed on.
+    bare: &'a str,
+    /// Packages defining `bare` under this qualifier.
+    defined_in: Vec<String>,
+    /// Packages defining a `bare` of their own under some other parent, and
+    /// not this one.
+    competing: Vec<String>,
+}
+
+/// Resolve a dot-qualified `name`: the bare identifier, the packages that
+/// define it under the qualifier, and the packages whose own same-named
+/// symbol competes for its references.
+///
+/// The qualifier compared is the *last* segment of the head: `parent_symbol`
+/// holds one immediate parent (`Inner`), while an `enclosing_symbol` a caller
+/// pastes back can be a whole chain (`Outer.Inner.run`).
+///
+/// `Ok(None)` — `name` carries no usable qualifier. A `Some` whose
+/// `defined_in` is empty — it does, but no symbol matches it.
+fn qualified_target<'a>(conn: &Connection, name: &'a str) -> Result<Option<QualifiedTarget<'a>>> {
+    let Some((head, bare)) = name.rsplit_once('.') else {
+        return Ok(None);
+    };
+    if bare.is_empty() {
+        return Ok(None);
+    }
+    let qualifier = head.rsplit('.').next().unwrap_or(head);
+    if qualifier.is_empty() {
+        return Ok(None);
+    }
+    // One indexed pass over `idx_symbols_name`, grouped by package: whether
+    // each package defines *this* symbol decides which list it lands in, and
+    // ordering the defining packages first makes the cap harmless.
+    let mut stmt = conn.prepare_cached(
+        // `IS` rather than `=`: a plain function has a NULL `parent_symbol`,
+        // and `NULL = 'A'` is NULL, which would make the whole aggregate NULL
+        // and drop the package from both lists.
+        "SELECT package, MAX(parent_symbol IS ?2) AS defines_target FROM symbols \
+         WHERE name = ?1 GROUP BY package \
+         ORDER BY defines_target DESC, package LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![bare, qualifier, MAX_QUALIFIER_PACKAGES],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+    )?;
+    let mut defined_in = Vec::new();
+    let mut competing = Vec::new();
+    for (package, defines_target) in collect_rows(rows) {
+        if defines_target {
+            defined_in.push(package);
+        } else {
+            competing.push(package);
+        }
+    }
+    defined_in.sort();
+    competing.sort();
+    Ok(Some(QualifiedTarget {
+        bare,
+        defined_in,
+        competing,
+    }))
+}
+
+/// Run a name-keyed ref query, resolving a dot-qualified `name` the way
+/// [`RefNameMatch`] describes: the literal name first (an `import` ref such
+/// as `os.path` really is named that), then the qualifier through
+/// `symbols.parent_symbol`, and only then the bare segment on its own.
+///
+/// `run(name, excluded)` performs the underlying query, skipping refs written
+/// in `excluded` packages.
+fn resolve_ref_query<T>(
+    conn: &Connection,
+    name: &str,
+    mut run: impl FnMut(&str, &[String]) -> Result<Vec<T>>,
+) -> Result<(Vec<T>, RefNameMatch)> {
+    let rows = run(name, &[])?;
+    if !rows.is_empty() {
+        return Ok((rows, RefNameMatch::literal(name)));
+    }
+    let Some(target) = qualified_target(conn, name)? else {
+        return Ok((rows, RefNameMatch::literal(name)));
+    };
+    if !target.defined_in.is_empty() {
+        let rows = run(target.bare, &target.competing)?;
+        return Ok((rows, RefNameMatch::qualified(target)));
+    }
+    // Nothing indexed carries the qualifier (a type from a language without
+    // symbol extraction, a stale index, a hand-written name). Fall back to
+    // the bare segment, and record that the answer is now the wider one.
+    let bare_rows = run(target.bare, &[])?;
+    if bare_rows.is_empty() {
+        // An empty result must keep reporting the name the caller asked for.
+        Ok((bare_rows, RefNameMatch::literal(name)))
+    } else {
+        Ok((bare_rows, RefNameMatch::dropped(target.bare)))
     }
 }
 
@@ -1316,35 +1519,19 @@ pub fn query_symbol_references(
     Ok(query_symbol_references_resolved(conn, name, kind, package, limit)?.0)
 }
 
-/// [`query_symbol_references`], plus the name the rows were actually matched
-/// on: `name` itself, or its last dot-separated segment when the qualified
-/// form matched nothing and the segment did. `change_impact` needs that —
-/// keying its home-package lookup off the raw argument would resolve a
-/// different symbol than the refs it is partitioning.
-fn query_symbol_references_resolved<'a>(
+/// [`query_symbol_references`], plus how the name was matched — which
+/// `change_impact` needs (its home package must come from the symbol the rows
+/// describe) and which the MCP layer reports so a rewritten name is visible.
+pub fn query_symbol_references_resolved(
     conn: &Connection,
-    name: &'a str,
+    name: &str,
     kind: Option<&str>,
     package: Option<&str>,
     limit: i64,
-) -> Result<(Vec<ReferenceRow>, &'a str)> {
-    let rows = query_symbol_references_exact(conn, name, kind, package, limit)?;
-    if !rows.is_empty() {
-        return Ok((rows, name));
-    }
-    match unqualified_name(name) {
-        Some(bare) => {
-            let bare_rows = query_symbol_references_exact(conn, bare, kind, package, limit)?;
-            // Only a fallback that found something renames the query; an
-            // empty result must keep reporting the name the caller asked for.
-            if bare_rows.is_empty() {
-                Ok((bare_rows, name))
-            } else {
-                Ok((bare_rows, bare))
-            }
-        }
-        None => Ok((rows, name)),
-    }
+) -> Result<(Vec<ReferenceRow>, RefNameMatch)> {
+    resolve_ref_query(conn, name, |n, excluded| {
+        query_symbol_references_exact(conn, n, kind, package, excluded, limit)
+    })
 }
 
 fn query_symbol_references_exact(
@@ -1352,6 +1539,7 @@ fn query_symbol_references_exact(
     name: &str,
     kind: Option<&str>,
     package: Option<&str>,
+    excluded_packages: &[String],
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
     let mut qb = RefQueryBuilder::new(
@@ -1365,6 +1553,7 @@ fn query_symbol_references_exact(
     if let Some(p) = package {
         qb.filter("r.package", p);
     }
+    qb.exclude_in("r.package", excluded_packages);
     let (sql, params) = qb.build_with_order_and_limit("ORDER BY f.path, r.line", limit);
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
@@ -1390,21 +1579,6 @@ pub struct CallerRow {
     pub call_sites: i64,
 }
 
-/// The bare identifier at the end of a dot-qualified name, or `None` when the
-/// name has no qualifier.
-///
-/// `symbol_refs.enclosing_symbol` is dot-qualified (`AuthService.login`) while
-/// `symbol_refs.name` is always a bare identifier, so a value the caller read
-/// out of `enclosing_symbol` — which is exactly what the `reference_audit`
-/// prompt tells a model to feed back into `symbol_callers` — never matches a
-/// ref name. Name-keyed ref queries retry once with this segment when the
-/// qualified form found nothing, which keeps the indexed equality lookup
-/// first and never widens a query that already matched.
-fn unqualified_name(name: &str) -> Option<&str> {
-    let (_, tail) = name.rsplit_once('.')?;
-    if tail.is_empty() { None } else { Some(tail) }
-}
-
 /// Escape the LIKE wildcards in a user-supplied string so it can be used as
 /// a literal inside a `LIKE ... ESCAPE '\\'` pattern.
 fn escape_like(s: &str) -> String {
@@ -1424,22 +1598,29 @@ pub fn query_symbol_callers(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
-    let rows = query_symbol_callers_exact(conn, name, package, limit)?;
-    if !rows.is_empty() {
-        return Ok(rows);
-    }
-    // The caller may have passed a value read out of `enclosing_symbol`
-    // (`AuthService.login`); ref names are bare, so retry with the segment.
-    match unqualified_name(name) {
-        Some(bare) => query_symbol_callers_exact(conn, bare, package, limit),
-        None => Ok(rows),
-    }
+    Ok(query_symbol_callers_resolved(conn, name, package, limit)?.0)
+}
+
+/// [`query_symbol_callers`], plus how the name was matched. A caller pasting
+/// back a dot-qualified `caller_name` (`AuthService.login`) gets the callers
+/// of *that* method where the qualifier is indexed, and is told when it was
+/// not — see [`RefNameMatch`].
+pub fn query_symbol_callers_resolved(
+    conn: &Connection,
+    name: &str,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<CallerRow>, RefNameMatch)> {
+    resolve_ref_query(conn, name, |n, excluded| {
+        query_symbol_callers_exact(conn, n, package, excluded, limit)
+    })
 }
 
 fn query_symbol_callers_exact(
     conn: &Connection,
     name: &str,
     package: Option<&str>,
+    excluded_packages: &[String],
     limit: i64,
 ) -> Result<Vec<CallerRow>> {
     // Aggregate over `symbol_refs` first (grouping by `file_id`, not joined
@@ -1455,6 +1636,20 @@ fn query_symbol_callers_exact(
     if let Some(p) = package {
         sql.push_str(" AND r.package = ?");
         params.push(Box::new(p.to_string()));
+    }
+    // Packages whose own same-named symbol claims their call sites — see
+    // `RefNameMatch`. A NULL package is never excluded by a filter about
+    // other packages.
+    if !excluded_packages.is_empty() {
+        sql.push_str(" AND (r.package IS NULL OR r.package NOT IN (");
+        for (i, pkg) in excluded_packages.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            params.push(Box::new(pkg.clone()));
+        }
+        sql.push_str("))");
     }
     sql.push_str(
         " GROUP BY r.enclosing_symbol, r.file_id, r.package \
@@ -1564,9 +1759,9 @@ pub struct ChangeImpactSummary {
     /// `counts_capped` says the ref scan hit [`MAX_REFS_SCANNED`].
     pub cross_package_count: usize,
     /// The ref scan hit [`MAX_REFS_SCANNED`], so the two counts above are
-    /// floors rather than totals. Only reachable for a symbol referenced more
-    /// than 10 000 times — which is exactly the case where a model most needs
-    /// to know the number is not the whole story.
+    /// floors rather than totals. Only reachable for a symbol referenced
+    /// more than 10 000 times — which is exactly the case where a model most
+    /// needs to know the number is not the whole story.
     pub counts_capped: bool,
     /// Unique packages that contain cross-package references. Computed from
     /// the full ref set before truncation — this is the authoritative list
@@ -1579,9 +1774,25 @@ pub struct ChangeImpactSummary {
     pub transitive_package_count: usize,
 }
 
+/// `#[serde(skip_serializing_if)]` predicate: leave a `false` flag out of the
+/// payload entirely rather than spending a line of context on a non-event.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeImpact {
     pub symbol: String,
+    /// The name the references were actually matched on, when it differs from
+    /// `symbol` — `A.run` is answered through refs named `run`, since the ref
+    /// index stores bare names. Absent when `symbol` matched as given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_name: Option<String>,
+    /// The qualifier in `symbol` matched no indexed symbol and was dropped:
+    /// the refs below are every symbol with that bare name, on any type in
+    /// any package, and `home_package` is a guess among them.
+    #[serde(skip_serializing_if = "is_false")]
+    pub qualifier_dropped: bool,
     /// The package where the symbol is defined. `None` when the symbol is not
     /// in the `symbols` table and no `package` hint was given — in that case
     /// every ref falls into `cross_package_impact`.
@@ -1640,13 +1851,18 @@ pub fn change_impact(
     // argument: a dotted name that matched refs literally (an `import` ref
     // such as `os.path`) must not pick up the package of some unrelated
     // symbol called `path`.
-    let (all_refs, effective_name) =
+    let (all_refs, matched) =
         query_symbol_references_resolved(conn, name, None, None, MAX_REFS_SCANNED)?;
     let counts_capped = all_refs.len() as i64 >= MAX_REFS_SCANNED;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
-        None => resolve_home_package(conn, effective_name)?,
+        // The qualifier resolved, so the home package is the package that
+        // defines *this* symbol — not whichever same-named symbol happens to
+        // sort first. (A qualified name defined in several packages keeps the
+        // same first-by-name tiebreak, over a much smaller set.)
+        None if !matched.defined_in.is_empty() => matched.defined_in.first().cloned(),
+        None => resolve_home_package(conn, &matched.matched_name)?,
     };
 
     let mut direct_impact: Vec<ReferenceRow> = Vec::new();
@@ -1667,10 +1883,8 @@ pub fn change_impact(
         }
     }
 
-    // Capture the counts before truncation — users need to see the real blast
-    // radius even when we cap the returned rows for display. These count
-    // every ref *scanned*, which is every ref there is unless the scan itself
-    // stopped at MAX_REFS_SCANNED (`counts_capped`).
+    // Capture true counts before truncation — users need to see the real
+    // blast radius even when we cap the returned rows for display.
     let direct_count = direct_impact.len();
     let cross_package_count = cross_package_impact.len();
 
@@ -1737,6 +1951,10 @@ pub fn change_impact(
 
     Ok(ChangeImpact {
         symbol: name.to_string(),
+        matched_name: matched
+            .is_rewritten(name)
+            .then(|| matched.matched_name.clone()),
+        qualifier_dropped: matched.qualifier_dropped,
         home_package,
         direct_impact,
         cross_package_impact,
@@ -3531,6 +3749,255 @@ mod refs_tests {
         assert_eq!(impact.home_package.as_deref(), Some("home"));
         assert_eq!(impact.direct_impact.len(), 1);
         assert_eq!(impact.cross_package_impact.len(), 1);
+    }
+
+    /// Seed the fixture the qualified-name tests share: two packages, each
+    /// defining a `run` method on a different type, and refs to `run` in
+    /// both. `admin-panel` sorts before `billing`, so a bare-name home
+    /// lookup picks the wrong one.
+    fn seed_two_runs(conn: &Connection) -> HashMap<String, i64> {
+        seed_package(conn, "admin-panel");
+        seed_package(conn, "billing");
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, parent_symbol) \
+             VALUES ('billing', 'run', 'method', 'billing/core.py', 10, 'A'), \
+                    ('admin-panel', 'run', 'method', 'admin/panel.py', 4, 'B')",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(conn, &["billing/core.py", "admin/panel.py"]);
+        let (bill, admin) = (ids["billing/core.py"], ids["admin/panel.py"]);
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {bill}, 20, 'billing', 'A.other'), \
+                        ('run', 'call', {bill}, 25, 'billing', 'boot'), \
+                        ('run', 'call', {admin}, 8, 'admin-panel', 'boot_b')"
+            ),
+            [],
+        )
+        .unwrap();
+        ids
+    }
+
+    /// A qualified name carries the one piece of information that tells two
+    /// same-named methods apart, and `symbols.parent_symbol` stores exactly
+    /// it. Dropping it made `A.run`, `B.run` and `run` answer identically.
+    #[test]
+    fn test_qualified_name_scopes_callers_to_the_defining_package() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("scope.db")).unwrap();
+        seed_two_runs(&conn);
+
+        let names = |name: &str| {
+            let mut n: Vec<String> = query_symbol_callers(&conn, name, None, 100)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.caller_name)
+                .collect();
+            n.sort();
+            n
+        };
+        assert_eq!(
+            names("A.run"),
+            vec!["A.other", "boot"],
+            "callers of A.run must exclude boot_b, which calls B.run"
+        );
+        assert_eq!(names("B.run"), vec!["boot_b"]);
+        // The bare name is unchanged: it asks about every `run`.
+        assert_eq!(names("run"), vec!["A.other", "boot", "boot_b"]);
+
+        // The rewrite is reported, with where the symbol lives and which
+        // packages were attributed to their own `run`.
+        let (_, matched) = query_symbol_callers_resolved(&conn, "A.run", None, 100).unwrap();
+        assert_eq!(matched.matched_name, "run");
+        assert_eq!(matched.defined_in, vec!["billing".to_string()]);
+        assert_eq!(matched.excluded_packages, vec!["admin-panel".to_string()]);
+        assert!(!matched.qualifier_dropped);
+        assert!(matched.is_rewritten("A.run"));
+        // A bare name is not a rewrite.
+        let (_, bare) = query_symbol_callers_resolved(&conn, "run", None, 100).unwrap();
+        assert!(!bare.is_rewritten("run"));
+
+        // A `package` filter is still applied on top.
+        assert!(
+            query_symbol_callers(&conn, "A.run", Some("admin-panel"), 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            query_symbol_callers(&conn, "A.run", Some("billing"), 100)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// The qualifier attributes references, it does not confine them to the
+    /// defining package: a call site in a package with no `run` of its own is
+    /// the cross-package caller these tools exist to surface, and dropping it
+    /// would report a refactor as safe when it is not.
+    #[test]
+    fn test_qualified_name_keeps_cross_package_references() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("cross.db")).unwrap();
+        seed_two_runs(&conn);
+        // `api` calls something named `run` and defines no `run` at all.
+        seed_package(&conn, "api");
+        let ids = seed_files(&conn, &["api/client.py"]);
+        let api = ids["api/client.py"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {api}, 3, 'api', 'sync'), \
+                        ('run', 'call', {api}, 4, NULL, 'unattributed')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let mut callers: Vec<String> = query_symbol_callers(&conn, "A.run", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.caller_name)
+            .collect();
+        callers.sort();
+        assert_eq!(
+            callers,
+            vec!["A.other", "boot", "sync", "unattributed"],
+            "cross-package and unattributed call sites survive; only \
+             admin-panel's own `run` is attributed away"
+        );
+
+        let impact = change_impact(&conn, "A.run", None, 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("billing"));
+        assert_eq!(impact.direct_impact.len(), 2);
+        assert_eq!(
+            impact.summary.affected_packages,
+            vec!["api".to_string()],
+            "the api call site is real cross-package blast radius"
+        );
+        assert_eq!(impact.cross_package_impact.len(), 2, "api + unattributed");
+    }
+
+    /// The same scoping for `symbol_references`, and the home package
+    /// `change_impact` partitions on comes from the resolved symbol — not
+    /// from whichever same-named symbol sorts first.
+    #[test]
+    fn test_qualified_name_scopes_references_and_change_impact() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("scope2.db")).unwrap();
+        seed_two_runs(&conn);
+
+        let refs = query_symbol_references(&conn, "A.run", None, None, 100).unwrap();
+        let pkgs: Vec<Option<String>> = refs.iter().map(|r| r.package.clone()).collect();
+        assert_eq!(
+            pkgs,
+            vec![Some("billing".into()), Some("billing".into())],
+            "refs to A.run must stay inside the package defining it"
+        );
+
+        let impact = change_impact(&conn, "A.run", None, 1, 100).unwrap();
+        assert_eq!(
+            impact.home_package.as_deref(),
+            Some("billing"),
+            "home package comes from the symbol the qualifier names"
+        );
+        assert_eq!(impact.direct_impact.len(), 2);
+        assert!(impact.cross_package_impact.is_empty());
+        assert_eq!(impact.matched_name.as_deref(), Some("run"));
+        assert!(!impact.qualifier_dropped);
+        assert!(!impact.summary.counts_capped);
+
+        let other = change_impact(&conn, "B.run", None, 1, 100).unwrap();
+        assert_eq!(other.home_package.as_deref(), Some("admin-panel"));
+        assert_eq!(other.direct_impact.len(), 1);
+        assert!(other.cross_package_impact.is_empty());
+    }
+
+    /// A qualifier no indexed symbol carries still falls back to the bare
+    /// segment — the behaviour a pasted `enclosing_symbol` relies on — but
+    /// the wider answer is flagged instead of passing for an exact one.
+    #[test]
+    fn test_unknown_qualifier_falls_back_and_says_so() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("fallback.db")).unwrap();
+        seed_two_runs(&conn);
+
+        let (rows, matched) =
+            query_symbol_callers_resolved(&conn, "Mystery.run", None, 100).unwrap();
+        assert_eq!(rows.len(), 3, "falls back to every `run`");
+        assert_eq!(matched.matched_name, "run");
+        assert!(matched.qualifier_dropped);
+        assert!(matched.defined_in.is_empty());
+        assert!(matched.excluded_packages.is_empty());
+
+        let impact = change_impact(&conn, "Mystery.run", None, 1, 100).unwrap();
+        assert!(impact.qualifier_dropped);
+        assert_eq!(impact.matched_name.as_deref(), Some("run"));
+
+        // Nothing to fall back to keeps reporting the name that was asked for.
+        let (rows, matched) = query_symbol_callers_resolved(&conn, "A.nope", None, 100).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(matched.matched_name, "A.nope");
+        assert!(!matched.qualifier_dropped);
+    }
+
+    /// A multi-level `enclosing_symbol` (`Outer.Inner.run`) resolves on its
+    /// immediate parent, which is what `symbols.parent_symbol` stores.
+    #[test]
+    fn test_qualified_target_uses_the_immediate_parent() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("nested.db")).unwrap();
+        seed_two_runs(&conn);
+        let target = |n: &str| {
+            qualified_target(&conn, n)
+                .unwrap()
+                .map(|t| (t.bare.to_string(), t.defined_in, t.competing))
+        };
+        assert_eq!(
+            target("Outer.A.run"),
+            Some((
+                "run".into(),
+                vec!["billing".to_string()],
+                vec!["admin-panel".to_string()]
+            )),
+            "a chained enclosing symbol resolves on its immediate parent"
+        );
+        // A package whose only `run` is a plain function (NULL parent) still
+        // competes: `NULL = 'A'` is NULL, and a dropped row would silently
+        // stop excluding it.
+        seed_package(&conn, "cli");
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('cli', 'run', 'function', 'cli/main.rs', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            target("A.run"),
+            Some((
+                "run".into(),
+                vec!["billing".to_string()],
+                vec!["admin-panel".to_string(), "cli".to_string()]
+            ))
+        );
+
+        assert_eq!(target("run"), None, "a bare name has no qualifier");
+        assert_eq!(target("trailing."), None);
+        assert_eq!(
+            target("Zed.run"),
+            Some((
+                "run".into(),
+                vec![],
+                vec![
+                    "admin-panel".to_string(),
+                    "billing".to_string(),
+                    "cli".to_string()
+                ]
+            )),
+            "an unknown qualifier defines nothing"
+        );
     }
 
     /// Not every dot is a namespace separator: an `import` ref carries the

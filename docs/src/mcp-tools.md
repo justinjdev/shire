@@ -17,10 +17,10 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
 | `explore` | Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
-| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based — same-name symbols across different packages are merged. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` falls back to its last segment when nothing matches it exactly. |
-| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` with no exact match falls back to its last segment. Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
+| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` is resolved through `symbols.parent_symbol`, and references written in packages that define their own symbol of that name are left out — see [Qualified names](#qualified-names). |
+| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` is resolved through the type that defines the method (see [Qualified names](#qualified-names)). Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 | `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, first_file, first_line, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
-| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
+| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it; same name-based-match caveat as `symbol_references`. |
 | `schema_consumers` | Find all files generated from a schema file (e.g. `.proto`). Returns generated file paths and their packages. Use to understand the blast radius of a schema change. |
 | `generated_from` | Find the source schema file that generated a given file. Use to trace a generated file (e.g. `user.pb.go`) back to its source proto. |
 
@@ -52,6 +52,38 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
 - Matching is by identifier, not regex or substring: `andleRequ` finds nothing.
 - Operators in a query (`OR`, `NEAR`, `*`, `-`, `column:`) are treated as
   literal text, not as FTS5 syntax.
+
+### Qualified names
+
+`symbol_references`, `symbol_callers` and `change_impact` take a symbol name.
+The reference index stores **bare** names (`run`), while `enclosing_symbol` /
+`caller_name` come back dot-qualified (`AuthService.run`) and are meant to be
+fed straight back in. A qualified name is resolved in three steps:
+
+1. **Literally.** Some refs really are dot-named — an `import` of `os.path`.
+   If the name matches refs as given, that is the answer.
+2. **Through the qualifier.** Otherwise the last segment before the dot is
+   looked up in `symbols.parent_symbol`: `A.run` finds the symbols named `run`
+   whose parent is `A`, which is where the symbol lives. A reference row
+   records the name and the package it was *written in*, never the type it
+   resolves to, so the qualifier cannot filter references directly — what it
+   can do is attribute them. A `run` written inside a package that defines its
+   own `run` on some other type belongs to that package's method, so those
+   packages are left out; every other package is kept, because a cross-package
+   call site is exactly what these tools exist to find.
+3. **Bare, and flagged.** If no indexed symbol carries that qualifier, the
+   qualifier is dropped and the bare name is matched on its own.
+
+Whenever the rows were matched on a name other than the one passed, the result
+carries `matched_name` (the name actually matched), `matched_note` (what that
+means) and, for step 2, `defined_in` and `excluded_packages`. `change_impact`
+reports `matched_name` plus `qualifier_dropped`, and takes its `home_package`
+from the resolved symbol.
+
+What this cannot do is separate two same-named methods **inside one package**:
+with only the bare name recorded, `A.run` and `B.run` in the same package still
+merge, and both are reported. Pass `package` to narrow the answer; use Grep
+when the distinction has to be exact.
 
 ### Result limits
 

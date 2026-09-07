@@ -45,6 +45,19 @@
   (method_declaration
     name: (identifier) @name) @definition.method)
 
+; Enum constants (e.g. `RED` and `GREEN` in `enum Color { RED, GREEN; }`) —
+; implicitly public static final, see effective_modifiers in java.rs.
+(enum_body
+  (enum_constant
+    name: (identifier) @name) @definition.constant)
+
+; Fields inside enum bodies (filtered to public static final constants in
+; post_process, same as class_body fields above).
+(enum_body_declarations
+  (field_declaration
+    declarator: (variable_declarator
+      name: (identifier) @name)) @definition.constant)
+
 ; Reference: method calls
 (method_invocation
   name: (identifier) @name) @reference.call

@@ -282,6 +282,16 @@ pub fn search_symbols(
     Ok(result)
 }
 
+/// Case-insensitive equality that folds the way the `unicode61` tokenizer
+/// does. `eq_ignore_ascii_case` alone leaves a non-ASCII identifier out: FTS
+/// finds `Élève` for the query `élève`, and an ASCII-only comparison then
+/// discards it, so the exactly-named symbol goes missing from its own search.
+/// The ASCII test runs first because it needs no allocation and covers
+/// nearly every identifier.
+fn eq_case_folded(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+}
+
 /// Make sure a symbol named exactly like the query is in the result, and
 /// first.
 ///
@@ -307,10 +317,7 @@ fn promote_exact_name(
     }
     // FTS matching folds case, so the promotion has to as well: an LLM
     // querying `config` for a type called `Config` must still get it.
-    if let Some(pos) = result
-        .iter()
-        .position(|r| r.name.eq_ignore_ascii_case(name))
-    {
+    if let Some(pos) = result.iter().position(|r| eq_case_folded(&r.name, name)) {
         if pos > 0 {
             let exact = result.remove(pos);
             result.insert(0, exact);
@@ -360,7 +367,7 @@ fn promote_exact_name(
     let mut rows = rows
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|r: &SymbolRow| r.name.eq_ignore_ascii_case(name));
+        .filter(|r: &SymbolRow| eq_case_folded(&r.name, name));
     if let Some(exact) = rows.next() {
         result.insert(0, exact);
         result.truncate(limit as usize);
@@ -2103,6 +2110,37 @@ mod tests {
         let conn = test_db_with_identifiers();
         let hits = search_symbols(&conn, "authmiddleware", None, None, 5).unwrap();
         assert_eq!(hits[0].name, "AuthMiddleware");
+    }
+
+    /// The tokenizer folds Unicode case, so the promotion has to as well —
+    /// with an ASCII-only comparison `Élève` was found by the confirm lookup
+    /// and then discarded, and fell out of the result window entirely.
+    #[test]
+    fn test_search_symbols_exact_name_promotion_folds_non_ascii_case() {
+        let conn = test_db();
+        for i in 0..20 {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'function', 'services/auth/src/a.ts', ?2, ?1)",
+                rusqlite::params![format!("élève_helper{i:02}"), i as i64],
+            )
+            .unwrap();
+        }
+        // Long signature so bm25 ranks this row last: the promotion, not the
+        // ranking, is what has to put it in a 3-row window.
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, name_tokens)
+             VALUES ('auth-service', 'Élève', 'class', ?1, 'services/auth/src/z.ts', 99, 'élève')",
+            [format!("class Élève {}", "pad ".repeat(200))],
+        )
+        .unwrap();
+
+        let hits = search_symbols(&conn, "élève", None, None, 3).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            hits[0].name, "Élève",
+            "exact non-ASCII name must be promoted"
+        );
     }
 
     #[test]

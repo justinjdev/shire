@@ -162,8 +162,34 @@ pub fn walk_source_files_with_excludes(
         })
         .build();
 
+    // Dedup warnings: a malformed ignore file can otherwise produce one
+    // warning per directory visited under it.
+    let mut warned_ignore_errors: HashSet<String> = HashSet::new();
+
     for entry in walker {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // A git-valid but globset-invalid pattern in a parent
+                // .gitignore (brace alternation, a trailing backslash, an
+                // inverted char-class range) makes `ignore::Walk` surface a
+                // hard `Err` on the very first `next()` — because the
+                // symbol walker is rooted at each *package* directory,
+                // this used to abort extraction for every non-root package
+                // over a single typo in the repo's root .gitignore
+                // (SYMBOLS-2-1). Log once per distinct error and keep
+                // walking, matching the policy the file/manifest walks in
+                // `index::mod` already use (`Err(_) => WalkState::Continue`).
+                let msg = e.to_string();
+                if warned_ignore_errors.insert(msg.clone()) {
+                    tracing::warn!(
+                        error = %msg,
+                        "skipping invalid ignore-file entry while walking source files"
+                    );
+                }
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -420,6 +446,30 @@ mod tests {
 
         let exclude = vec!["third_party".to_string()];
         let files = walk_source_files_with_excludes(dir.path(), &["rs"], &[], &exclude).unwrap();
+        assert_eq!(files.len(), 1, "got {:?}", files);
+        assert!(files[0].ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_walk_survives_invalid_gitignore_pattern_in_parent() {
+        // SYMBOLS-2-1: `ignore::Walk` surfaces ignore-file *parse* errors
+        // from strict ancestors of the walk root as a hard `Err` on the
+        // first `next()`. A brace-alternation pattern like `a{b` is
+        // perfectly legal to git (git's fnmatch has no brace alternation)
+        // but is rejected by the `globset` crate `ignore` uses to compile
+        // it. Since the symbol walker is rooted at each *package*
+        // directory (not the repo root), a bad pattern in the repo's own
+        // root .gitignore used to abort extraction for every non-root
+        // package. It must be logged and skipped, never propagated.
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".gitignore"), "a{b\n").unwrap();
+
+        let pkg = root.path().join("pkg");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::write(pkg.join("src/lib.rs"), "pub fn a() {}").unwrap();
+
+        let files = walk_source_files(&pkg, &["rs"]).unwrap();
         assert_eq!(files.len(), 1, "got {:?}", files);
         assert!(files[0].ends_with("src/lib.rs"));
     }

@@ -61,11 +61,27 @@ list-returning tool is bounded:
 |---|---|---|
 | `search_symbols`, `search_packages`, `search_files`, `search_docs` | 20 | 200 |
 | `get_file_symbols`, `list_package_files`, `list_packages`, `package_dependencies`, `package_dependents`, `schema_consumers`, `generated_from` | 100 | 200 |
-| `symbol_references`, `symbol_callers`, `symbol_callees`, `change_impact` | 100 | 1000 |
+| `symbol_references`, `symbol_callers`, `symbol_callees`, `change_impact` | 100 | 200 |
 
-The limit is applied in SQL. When a result fills the limit exactly, the
-response carries a second text block saying so, with a hint for narrowing the
-query — a capped list is never presented as a complete one.
+`limit: 0` means "use the default", not "one row". The limit is applied in
+SQL, and one row beyond it is fetched to tell a page that was cut from a list
+that merely ends there.
+
+A complete result is the bare JSON array. A truncated one is a single JSON
+object instead:
+
+```json
+{"results": [...], "truncated": true, "limit": 20, "max": 200, "note": "showing the first 20 results …"}
+```
+
+so a capped list is never presented as a complete one, and a client that
+concatenates the result's text blocks still gets parseable JSON. (At
+`limit` = 200 the extra row cannot be fetched, so a result that fills the
+ceiling is always reported as truncated.)
+
+`change_impact` returns an object rather than a list; when a bucket is capped
+it gains the same `truncated` / `limit` / `max` / `note` fields, and its
+`summary` carries the true counts either way.
 
 ### When to use Shire vs Grep/Glob
 

@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
 use std::path::Path;
 
@@ -58,11 +58,14 @@ impl ManifestParser for GoParser {
             }
         }
 
+        // A go.mod with no `module` line still has to name its package —
+        // the empty string is a join key other tables carry.
         let name = module_path
             .as_deref()
             .and_then(|p| p.rsplit('/').next())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| relative_dir.replace('/', "-"));
+            .unwrap_or_else(|| manifest::fallback_name(manifest_path, relative_dir));
 
         let description = module_path.clone();
 
@@ -217,5 +220,31 @@ require (
             .find(|d| d.name == "golang.org/x/sync")
             .unwrap();
         assert_eq!(sync.version_req.as_deref(), Some("v0.5.0"));
+    }
+
+    #[test]
+    fn test_root_go_mod_without_a_module_line_uses_the_repo_dir_name() {
+        // MANIFESTS-2-4: no `module` directive, at the repo root.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("go.mod");
+        std::fs::write(&path, b"go 1.22\n").unwrap();
+
+        let info = GoParser.parse(&path, "").unwrap();
+
+        assert_eq!(info.name, dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(info.path, "");
+    }
+
+    #[test]
+    fn test_nested_go_mod_without_a_module_line_keeps_the_path_derived_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("services/api");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("go.mod");
+        std::fs::write(&path, b"go 1.22\n").unwrap();
+
+        let info = GoParser.parse(&path, "services/api").unwrap();
+
+        assert_eq!(info.name, "services-api");
     }
 }

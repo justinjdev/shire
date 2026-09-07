@@ -17,6 +17,7 @@ src/
 │   ├── custom_discovery.rs # Config-driven custom package discovery
 │   ├── manifest.rs  # ManifestParser trait
 │   ├── hash.rs      # SHA-256 content hashing for incremental builds
+│   ├── lock.rs      # Cross-process build lock (flock on <db_path>.lock)
 │   ├── ref_writer.rs # Cross-reference write strategy threaded through the build phases
 │   ├── npm.rs       # package.json parser (workspace: protocol)
 │   ├── go.rs        # go.mod parser
@@ -54,6 +55,19 @@ src/
 └── bin/
     └── autoresearch.rs # Benchmark harness, gated behind the non-default `bench` feature
 ```
+
+## What an incremental build re-reads
+
+A build re-hashes a package's source files when any of them changes **mtime,
+size, or path**. Between them those cover the ordinary cases: an editor save
+moves the mtime, a rename or a new/deleted file moves the path set, and a
+restore that rewinds an mtime is still caught if the size differs.
+
+One case is not covered: an edit that keeps the file's size *and* its mtime.
+That is what `cp -p`/`install -p` out of a build cache, `rsync -a`, a `tar -x`
+restore and some patch tools do. Nothing on disk distinguishes it from an
+untouched file without reading every byte of the repo on every build, so
+shire does not try — run `shire build --force` after one.
 
 ## symbol_refs table
 

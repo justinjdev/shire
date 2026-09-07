@@ -297,8 +297,13 @@ pub async fn run_daemon(root: PathBuf, config: Config, db_override: Option<PathB
                 let build_db = db_override.clone();
 
                 tracing::info!("triggering rebuild");
+                // Waits for a competing build rather than skipping: this
+                // trigger names a specific batch of file changes, and a build
+                // already in flight may have started before they landed. A
+                // skipped rebuild would leave that edit unindexed until the
+                // next one arrives, with nothing to re-arm from.
                 let result = tokio::task::spawn_blocking(move || {
-                    index::build_index_quiet(
+                    index::build_index_quiet_waiting(
                         &build_root,
                         &build_config,
                         false,

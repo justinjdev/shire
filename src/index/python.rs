@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
 use std::path::Path;
 
@@ -15,11 +15,16 @@ impl ManifestParser for PythonParser {
 
         let project = doc.get("project");
 
+        // A repo-root pyproject.toml carrying only tool configuration
+        // (`[tool.ruff]`, `[tool.black]`, a Poetry-only file) has no
+        // `[project] name`, and is very common — without a fallback every
+        // symbol in the package is filed under the empty string.
         let name = project
             .and_then(|p| p.get("name"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| relative_dir.replace('/', "-"));
+            .unwrap_or_else(|| manifest::fallback_name(manifest_path, relative_dir));
 
         let version = project
             .and_then(|p| p.get("version"))
@@ -264,5 +269,33 @@ requires = ["setuptools"]
             parse_pep508("typing-extensions>=4.0; python_version<\"3.11\""),
             ("typing-extensions".to_string(), Some(">=4.0".to_string()))
         );
+    }
+
+    #[test]
+    fn test_root_pyproject_without_a_project_name_uses_the_repo_dir_name() {
+        // MANIFESTS-2-4: a tooling-only root pyproject.toml (`[tool.ruff]`,
+        // Poetry-only, …) declares no `[project] name`. This is the exact
+        // fixture the finding was filed against.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("pyproject.toml");
+        std::fs::write(&path, b"[tool.ruff]\nline-length = 100\n").unwrap();
+
+        let info = PythonParser.parse(&path, "").unwrap();
+
+        assert_eq!(info.name, dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(info.path, "");
+    }
+
+    #[test]
+    fn test_nested_pyproject_without_a_project_name_keeps_the_path_derived_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("services/ml");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("pyproject.toml");
+        std::fs::write(&path, b"[tool.black]\nline-length = 88\n").unwrap();
+
+        let info = PythonParser.parse(&path, "services/ml").unwrap();
+
+        assert_eq!(info.name, "services-ml");
     }
 }

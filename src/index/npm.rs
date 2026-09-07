@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, PackageInfo};
 use anyhow::Result;
 use std::path::Path;
 
@@ -13,10 +13,14 @@ impl ManifestParser for NpmParser {
         let content = std::fs::read_to_string(manifest_path)?;
         let json: serde_json::Value = serde_json::from_str(&content)?;
 
+        // A package.json with no `name` (private roots, tooling-only
+        // manifests) must still get a usable one: it is the join key
+        // `symbols.package` and `dependencies.package` carry.
         let name = json["name"]
             .as_str()
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| relative_dir.replace('/', "-"));
+            .unwrap_or_else(|| manifest::fallback_name(manifest_path, relative_dir));
 
         let version = json["version"].as_str().map(|s| s.to_string());
         let description = json["description"].as_str().map(|s| s.to_string());
@@ -180,5 +184,45 @@ mod tests {
         let info = parser.parse(&path, "packages/unnamed").unwrap();
 
         assert_eq!(info.name, "packages-unnamed");
+    }
+
+    #[test]
+    fn test_root_package_json_without_a_name_uses_the_repo_dir_name() {
+        // MANIFESTS-2-4: a private/tooling-only root package.json has no
+        // `name`, and `relative_dir.replace('/', "-")` is "" at the root —
+        // an empty package name is the join key symbols and dependencies
+        // carry, so it must never be produced.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("package.json");
+        std::fs::write(&path, br#"{"private": true, "version": "1.0.0"}"#).unwrap();
+
+        let info = NpmParser.parse(&path, "").unwrap();
+
+        assert_eq!(info.name, dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(info.path, "", "the path column still keys the repo root");
+    }
+
+    #[test]
+    fn test_root_package_json_with_an_empty_name_uses_the_repo_dir_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("package.json");
+        std::fs::write(&path, br#"{"name": "", "version": "1.0.0"}"#).unwrap();
+
+        let info = NpmParser.parse(&path, "").unwrap();
+
+        assert!(!info.name.is_empty());
+    }
+
+    #[test]
+    fn test_nested_package_json_without_a_name_keeps_the_path_derived_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("services/api");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("package.json");
+        std::fs::write(&path, br#"{"version": "1.0.0"}"#).unwrap();
+
+        let info = NpmParser.parse(&path, "services/api").unwrap();
+
+        assert_eq!(info.name, "services-api");
     }
 }

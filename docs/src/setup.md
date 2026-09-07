@@ -111,7 +111,10 @@ Shire speaks standard MCP over stdio. Any client that supports MCP can connect:
 shire serve --db /path/to/repo/.shire/index.db
 ```
 
-Use `--root` to enable on-demand reindexing (before each query the server checks whether the index may be stale and rebuilds if so):
+Use `--root` to enable on-demand reindexing. Before answering a query the
+server re-checks the working tree — at most once per `serve.debounce_s`
+window (default 5 seconds) — by running an incremental build, so unstaged
+edits are picked up without any hook:
 
 ```sh
 shire serve --root /path/to/repo

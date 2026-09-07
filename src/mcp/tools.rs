@@ -262,6 +262,11 @@ impl ShireService {
     /// truncated one serializes as `{"results": [...], "truncated": true,
     /// ...}` — one content block either way, so concatenating a tool result's
     /// text blocks still yields parseable JSON.
+    ///
+    /// `narrow_hint` says how to make the result *smaller* (a filter, a
+    /// tighter query); the "raise `limit`" half of the advice is added here,
+    /// and only when raising it can actually help — see
+    /// [`Self::truncation_advice`].
     fn json_result<T: serde::Serialize>(
         rows: &[T],
         limit: u32,
@@ -282,13 +287,14 @@ impl ShireService {
                 max: queries::MAX_ROWS,
                 note: format!(
                     "showing the first {limit} results (limit={limit}, max {max}). \
-                     {more} — {narrow_hint}.",
+                     {more} — {advice}.",
                     max = queries::MAX_ROWS,
                     more = if over_limit {
                         "More exist"
                     } else {
                         "`limit` is at the ceiling, so more may exist"
-                    }
+                    },
+                    advice = Self::truncation_advice(limit, narrow_hint)
                 ),
             })
         } else {
@@ -296,6 +302,28 @@ impl ShireService {
         }
         .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// What to tell the model to do about a truncated result.
+    ///
+    /// "Raise `limit`" is only advice while there is headroom: at
+    /// `MAX_ROWS` [`Self::resolve_limit`] clamps a bigger request straight
+    /// back down, so a model that follows it spends a second call to receive
+    /// the identical rows and the identical note. Past the ceiling the only
+    /// way forward is to narrow.
+    fn truncation_advice(limit: u32, narrow_hint: &str) -> String {
+        let max = queries::MAX_ROWS;
+        if limit >= max {
+            if narrow_hint.is_empty() {
+                format!("`limit` cannot go above {max}, so narrow the request instead")
+            } else {
+                format!("`limit` cannot go above {max}; {narrow_hint}")
+            }
+        } else if narrow_hint.is_empty() {
+            format!("raise `limit` (max {max})")
+        } else {
+            format!("raise `limit` (max {max}) or {narrow_hint}")
+        }
     }
 
     pub(crate) fn mcp_err(detail: String) -> ErrorData {
@@ -530,11 +558,7 @@ impl ShireService {
         let limit = Self::resolve_limit(params.limit, 20);
         let results = queries::search_packages(&conn, &params.query, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -557,7 +581,7 @@ impl ShireService {
                 // The graph walk is bounded only by its own MAX_EDGES; the
                 // edge list goes into a context window like any other list.
                 edges.truncate(Self::probe_limit(limit) as usize);
-                Self::json_result(&edges, limit, "raise `limit` or lower `depth`")
+                Self::json_result(&edges, limit, "lower `depth`")
             }
             _ => {
                 let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
@@ -568,7 +592,7 @@ impl ShireService {
                     Self::probe_limit(limit),
                 )
                 .map_err(|e| Self::mcp_err(e.to_string()))?;
-                Self::json_result(&results, limit, "raise `limit`")
+                Self::json_result(&results, limit, "")
             }
         }
     }
@@ -584,7 +608,7 @@ impl ShireService {
         let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
         let results = queries::package_dependents(&conn, &params.name, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit`")
+        Self::json_result(&results, limit, "")
     }
 
     #[tool(description = "List all indexed packages, optionally filtered by kind")]
@@ -599,7 +623,7 @@ impl ShireService {
         let results =
             queries::list_packages(&conn, params.kind.as_deref(), Self::probe_limit(limit))
                 .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
+        Self::json_result(&results, limit, "filter by `kind`")
     }
 
     #[tool(
@@ -637,7 +661,7 @@ impl ShireService {
                 &results,
                 limit,
                 "this is the start of the package in (file, line) order; \
-                 narrow with `kind` or `get_file_symbols`, or raise `limit`",
+                 narrow with `kind` or `get_file_symbols`",
             );
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -651,11 +675,7 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -676,7 +696,7 @@ impl ShireService {
             Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
+        Self::json_result(&results, limit, "filter by `kind`")
     }
 
     #[tool(
@@ -697,7 +717,7 @@ impl ShireService {
             Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `extension`")
+        Self::json_result(&results, limit, "filter by `extension`")
     }
 
     #[tool(description = "Index build metadata: timestamp, git commit, counts")]
@@ -734,11 +754,7 @@ impl ShireService {
             Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -764,11 +780,7 @@ impl ShireService {
             Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -836,7 +848,7 @@ impl ShireService {
             i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit` or filter by `package`/`kind`")
+        Self::json_result(&rows, limit, "filter by `package`/`kind`")
     }
 
     #[tool(
@@ -860,7 +872,7 @@ impl ShireService {
             i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit` or filter by `package`")
+        Self::json_result(&rows, limit, "filter by `package`")
     }
 
     #[tool(
@@ -884,7 +896,7 @@ impl ShireService {
             i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit` or filter by `package`")
+        Self::json_result(&rows, limit, "filter by `package`")
     }
 
     #[tool(
@@ -941,8 +953,9 @@ impl ShireService {
                 serde_json::Value::from(format!(
                     "each impact bucket is capped at {limit} rows (max {max}); \
                      `summary.direct_count` and `summary.cross_package_count` are true \
-                     totals, but {transitive} — raise `limit` or pass `package`.",
+                     totals, but {transitive} — {advice}.",
                     max = queries::MAX_ROWS,
+                    advice = Self::truncation_advice(limit, "pass `package`"),
                     transitive = if transitive_capped {
                         "the transitive walk stopped at the cap, so \
                          `summary.transitive_package_count` is a floor, \
@@ -970,7 +983,7 @@ impl ShireService {
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
         let rows = queries::query_schema_consumers(&conn, &args.path, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit`")
+        Self::json_result(&rows, limit, "")
     }
 
     #[tool(
@@ -986,7 +999,7 @@ impl ShireService {
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
         let rows = queries::query_generated_from(&conn, &args.path, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit`")
+        Self::json_result(&rows, limit, "")
     }
 }
 
@@ -1730,6 +1743,12 @@ mod tests {
         assert_eq!(result_rows(&r).len(), queries::MAX_ROWS as usize);
         let note = truncation_note(&r).expect("ceiling is still flagged");
         assert!(note.contains("may exist"), "got {note}");
+        // …and it must not send the model back for an identical second call:
+        // `resolve_limit` clamps anything above the ceiling straight down.
+        assert!(
+            !note.contains("raise `limit`"),
+            "advice at the ceiling must not be to raise it: {note}"
+        );
 
         // Below the ceiling the probe row is real proof.
         let r = svc
@@ -1741,6 +1760,7 @@ mod tests {
             .unwrap();
         let note = truncation_note(&r).expect("truncated");
         assert!(note.contains("More exist"), "got {note}");
+        assert!(note.contains("raise `limit`"), "got {note}");
     }
 
     /// A complete list gets no truncation note — the note must mean

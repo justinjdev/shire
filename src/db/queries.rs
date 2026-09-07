@@ -1294,13 +1294,37 @@ pub fn query_symbol_references(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
+    Ok(query_symbol_references_resolved(conn, name, kind, package, limit)?.0)
+}
+
+/// [`query_symbol_references`], plus the name the rows were actually matched
+/// on: `name` itself, or its last dot-separated segment when the qualified
+/// form matched nothing and the segment did. `change_impact` needs that —
+/// keying its home-package lookup off the raw argument would resolve a
+/// different symbol than the refs it is partitioning.
+fn query_symbol_references_resolved<'a>(
+    conn: &Connection,
+    name: &'a str,
+    kind: Option<&str>,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<ReferenceRow>, &'a str)> {
     let rows = query_symbol_references_exact(conn, name, kind, package, limit)?;
     if !rows.is_empty() {
-        return Ok(rows);
+        return Ok((rows, name));
     }
     match unqualified_name(name) {
-        Some(bare) => query_symbol_references_exact(conn, bare, kind, package, limit),
-        None => Ok(rows),
+        Some(bare) => {
+            let bare_rows = query_symbol_references_exact(conn, bare, kind, package, limit)?;
+            // Only a fallback that found something renames the query; an
+            // empty result must keep reporting the name the caller asked for.
+            if bare_rows.is_empty() {
+                Ok((bare_rows, name))
+            } else {
+                Ok((bare_rows, bare))
+            }
+        }
+        None => Ok((rows, name)),
     }
 }
 
@@ -1549,21 +1573,9 @@ pub struct ChangeImpact {
 fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>> {
     let mut stmt = conn
         .prepare_cached("SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1")?;
-    let mut lookup = |n: &str| -> Result<Option<String>> {
-        let mut rows = stmt.query_map([n], |row| row.get::<_, String>(0))?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
-    };
-    if let Some(pkg) = lookup(name)? {
-        return Ok(Some(pkg));
-    }
-    // `symbols.name` is bare, so a qualified name (`AuthService.login`, the
-    // form `enclosing_symbol` reports) resolves through its last segment —
-    // otherwise every ref would be classified as cross-package.
-    match unqualified_name(name) {
-        Some(bare) => lookup(bare),
+    let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
         None => Ok(None),
     }
 }
@@ -1591,11 +1603,19 @@ pub fn change_impact(
     // and BFS under-reports blast radius. The safety cap keeps memory
     // bounded for pathologically-called symbols.
     const MAX_REFS_SCANNED: i64 = 10_000;
-    let all_refs = query_symbol_references(conn, name, None, None, MAX_REFS_SCANNED)?;
+    // `symbols.name` is bare, so a qualified argument (`AuthService.login`,
+    // the form `enclosing_symbol` reports) has to resolve through its last
+    // segment or every ref lands in the cross-package bucket. The home
+    // package is looked up under the name the *refs* matched, never the raw
+    // argument: a dotted name that matched refs literally (an `import` ref
+    // such as `os.path`) must not pick up the package of some unrelated
+    // symbol called `path`.
+    let (all_refs, effective_name) =
+        query_symbol_references_resolved(conn, name, None, None, MAX_REFS_SCANNED)?;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
-        None => resolve_home_package(conn, name)?,
+        None => resolve_home_package(conn, effective_name)?,
     };
 
     let mut direct_impact: Vec<ReferenceRow> = Vec::new();
@@ -3436,6 +3456,46 @@ mod refs_tests {
         assert_eq!(impact.home_package.as_deref(), Some("home"));
         assert_eq!(impact.direct_impact.len(), 1);
         assert_eq!(impact.cross_package_impact.len(), 1);
+    }
+
+    /// Not every dot is a namespace separator: an `import` ref carries the
+    /// module path as its name (`os.path`, `helper.rb`). Such a name matches
+    /// refs literally, so the home-package lookup must key on it — falling
+    /// back to `path` would hand `change_impact` the package of an unrelated
+    /// symbol and reclassify cross-package refs as direct.
+    #[test]
+    fn test_change_impact_does_not_borrow_a_home_package_for_a_dotted_ref_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("dotted.db");
+        let conn = open_or_create(&db_path).unwrap();
+        seed_package(&conn, "away");
+        seed_package(&conn, "unrelated");
+        // A symbol named after the dotted name's last segment, in a package
+        // that has nothing to do with the import.
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('unrelated', 'path', 'function', 'unrelated/p.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["away/b.rs"]);
+        let b = ids["away/b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('os.path', 'import', {b}, 1, 'away', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "os.path", None, 1, 100).unwrap();
+        assert_eq!(
+            impact.home_package, None,
+            "a literally-matched dotted name has no home package"
+        );
+        assert_eq!(impact.cross_package_impact.len(), 1);
+        assert!(impact.direct_impact.is_empty());
     }
 
     /// LIKE wildcards in the queried name must be literal, or `_ogin` would

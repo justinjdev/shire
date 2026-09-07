@@ -78,7 +78,8 @@ so a capped list is never presented as a complete one, and a client that
 concatenates the result's text blocks still gets parseable JSON. (At
 `limit` = 200 the extra row cannot be fetched, so a result that fills the
 ceiling is always flagged, with a `note` saying more rows *may* exist rather
-than that they do.)
+than that they do — and the `note` then asks for a narrower request rather
+than a bigger `limit`, which is already clamped at 200.)
 
 `change_impact` returns an object rather than a list; when a bucket is capped
 it gains the same `truncated` / `limit` / `max` / `note` fields.

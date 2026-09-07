@@ -116,8 +116,9 @@ pub fn all_extensions() -> Vec<&'static str> {
 /// skipping excluded directories, generated/test files, and anything
 /// gitignored. Uses the same `ignore` crate (and the same `.gitignore`/
 /// `.ignore`/global-gitignore honoring) as the file-index and manifest
-/// walks in `index::mod`, so a symbol row can never point at a file that
-/// isn't also present in the `files` table (INFRA-4).
+/// walks in `index::mod`. A symbol row can point at a file absent from the
+/// `files` table if the caller's `exclude_dirs` don't match what the file
+/// walk in `index::mod` excludes — see `walk_source_files_with_excludes`.
 /// `extra_skip_patterns` are user-configured patterns from shire.toml
 /// (matched as suffix or prefix against the filename).
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
@@ -129,8 +130,24 @@ pub fn walk_source_files_with_patterns(
     extensions: &[&str],
     extra_skip_patterns: &[String],
 ) -> Result<Vec<PathBuf>> {
+    walk_source_files_with_excludes(dir, extensions, extra_skip_patterns, &[])
+}
+
+/// Like `walk_source_files_with_patterns`, but also skips directories named
+/// in `exclude_dirs` (in addition to the hardcoded `EXCLUDED_DIRS`) — this
+/// is meant to be `config.discovery.exclude`, the same list the file walk
+/// in `index::mod` uses, so a directory excluded from `files` (e.g.
+/// `third_party`, `build`, `.gradle`) is also excluded from symbol
+/// extraction (SYMBOLS-2-3).
+pub fn walk_source_files_with_excludes(
+    dir: &Path,
+    extensions: &[&str],
+    extra_skip_patterns: &[String],
+    exclude_dirs: &[String],
+) -> Result<Vec<PathBuf>> {
     let ext_set: HashSet<&str> = extensions.iter().copied().collect();
-    let exclude_set: HashSet<&str> = EXCLUDED_DIRS.iter().copied().collect();
+    let mut exclude_set: HashSet<String> = EXCLUDED_DIRS.iter().map(|s| s.to_string()).collect();
+    exclude_set.extend(exclude_dirs.iter().cloned());
 
     let mut files = Vec::new();
 
@@ -381,5 +398,29 @@ mod tests {
         assert!(!PROTO_GENERATED_SUFFIXES.is_empty());
         assert!(PROTO_GENERATED_SUFFIXES.contains(&".pb.go"));
         assert!(PROTO_GENERATED_SUFFIXES.contains(&"_pb2.py"));
+    }
+
+    #[test]
+    fn test_walk_honours_discovery_exclude_dirs() {
+        // SYMBOLS-2-3: the file walk (index::mod) excludes directories
+        // named in `discovery.exclude` (e.g. `third_party`, `build`,
+        // `.gradle`), but the symbol walker only knew about its own
+        // hardcoded `EXCLUDED_DIRS`, which doesn't include those —
+        // producing symbol rows for files that have no `files` row.
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn kept() {}").unwrap();
+
+        fs::create_dir_all(dir.path().join("third_party")).unwrap();
+        fs::write(
+            dir.path().join("third_party/vendored.rs"),
+            "pub fn vendored() {}",
+        )
+        .unwrap();
+
+        let exclude = vec!["third_party".to_string()];
+        let files = walk_source_files_with_excludes(dir.path(), &["rs"], &[], &exclude).unwrap();
+        assert_eq!(files.len(), 1, "got {:?}", files);
+        assert!(files[0].ends_with("src/lib.rs"));
     }
 }

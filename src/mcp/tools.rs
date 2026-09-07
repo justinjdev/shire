@@ -932,10 +932,11 @@ impl ShireService {
         impact.direct_impact.truncate(limit as usize);
         impact.cross_package_impact.truncate(limit as usize);
         impact.transitive_impact.truncate(limit as usize);
-        // `direct_count`/`cross_package_count` are true totals; the
-        // transitive count is not (the walk stops at the cap), so keep it
-        // consistent with the rows actually returned — `truncated` is what
-        // says more exist.
+        // `direct_count`/`cross_package_count` are totals up to the ref scan
+        // cap (`summary.counts_capped` says whether it was hit); the
+        // transitive count is not a total at all (the walk stops at the cap),
+        // so keep it consistent with the rows actually returned — `truncated`
+        // is what says more exist.
         impact.summary.transitive_package_count = impact.transitive_impact.len();
         let mut value = serde_json::to_value(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
         if let Some(obj) = value.as_object_mut()
@@ -948,10 +949,17 @@ impl ShireService {
                 "note".into(),
                 serde_json::Value::from(format!(
                     "each impact bucket is capped at {limit} rows (max {max}); \
-                     `summary.direct_count` and `summary.cross_package_count` are true \
-                     totals, but {transitive} — {advice}.",
+                     `summary.direct_count` and `summary.cross_package_count` count \
+                     every ref scanned, {capped}, but {transitive} — {advice}.",
                     max = queries::MAX_ROWS,
                     advice = Self::truncation_advice(limit, "pass `package`"),
+                    capped = if impact.summary.counts_capped {
+                        "and the scan stopped at its 10000-reference cap, so \
+                         both are floors (`summary.counts_capped`)"
+                    } else {
+                        "which stops at 10000 references \
+                         (`summary.counts_capped` is false, so both are totals)"
+                    },
                     transitive = if transitive_capped {
                         "the transitive walk stopped at the cap, so \
                          `summary.transitive_package_count` is a floor, \
@@ -1370,7 +1378,19 @@ mod tests {
         assert_eq!(v["direct_impact"].as_array().unwrap().len(), 2);
         assert_eq!(v["summary"]["direct_count"], 5);
         assert_eq!(v["truncated"], serde_json::Value::Bool(true));
-        assert!(v["note"].as_str().unwrap().contains("summary"));
+        let note = v["note"].as_str().unwrap();
+        assert!(note.contains("summary"));
+        // The counts are totals only up to the ref-scan cap, and the note is
+        // what a model reads before trusting them.
+        assert_eq!(v["summary"]["counts_capped"], false);
+        assert!(
+            note.contains("10000 references"),
+            "the scan cap belongs in the note: {note}"
+        );
+        assert!(
+            !note.contains("are true totals"),
+            "the counts are not unconditional totals: {note}"
+        );
 
         // Not truncated: no marker, and `limit: 0` is the tool default, not
         // a one-row answer.

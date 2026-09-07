@@ -1555,12 +1555,19 @@ pub struct TransitiveImpact {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeImpactSummary {
-    /// Total same-package refs (may exceed `direct_impact.len()` when the
-    /// returned rows were truncated to `per_bucket_limit`).
+    /// Same-package refs (may exceed `direct_impact.len()` when the returned
+    /// rows were truncated to `per_bucket_limit`). A total, unless
+    /// `counts_capped` says the ref scan hit [`MAX_REFS_SCANNED`].
     pub direct_count: usize,
-    /// Total cross-package refs (may exceed `cross_package_impact.len()`
-    /// when the returned rows were truncated to `per_bucket_limit`).
+    /// Cross-package refs (may exceed `cross_package_impact.len()` when the
+    /// returned rows were truncated to `per_bucket_limit`). A total, unless
+    /// `counts_capped` says the ref scan hit [`MAX_REFS_SCANNED`].
     pub cross_package_count: usize,
+    /// The ref scan hit [`MAX_REFS_SCANNED`], so the two counts above are
+    /// floors rather than totals. Only reachable for a symbol referenced more
+    /// than 10 000 times — which is exactly the case where a model most needs
+    /// to know the number is not the whole story.
+    pub counts_capped: bool,
     /// Unique packages that contain cross-package references. Computed from
     /// the full ref set before truncation — this is the authoritative list
     /// of directly affected packages.
@@ -1599,6 +1606,11 @@ fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>>
     }
 }
 
+/// Safety cap on the refs `change_impact` scans before partitioning. A symbol
+/// with more references than this yields counts that are floors, flagged as
+/// `summary.counts_capped`.
+pub const MAX_REFS_SCANNED: i64 = 10_000;
+
 /// Compute the transitive impact of changing a symbol by combining the
 /// cross-reference index with the dependency graph.
 ///
@@ -1621,7 +1633,6 @@ pub fn change_impact(
     // the other bucket gets zero rows — affected_packages is incomplete
     // and BFS under-reports blast radius. The safety cap keeps memory
     // bounded for pathologically-called symbols.
-    const MAX_REFS_SCANNED: i64 = 10_000;
     // `symbols.name` is bare, so a qualified argument (`AuthService.login`,
     // the form `enclosing_symbol` reports) has to resolve through its last
     // segment or every ref lands in the cross-package bucket. The home
@@ -1631,6 +1642,7 @@ pub fn change_impact(
     // symbol called `path`.
     let (all_refs, effective_name) =
         query_symbol_references_resolved(conn, name, None, None, MAX_REFS_SCANNED)?;
+    let counts_capped = all_refs.len() as i64 >= MAX_REFS_SCANNED;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
@@ -1655,8 +1667,10 @@ pub fn change_impact(
         }
     }
 
-    // Capture true counts before truncation — users need to see the real
-    // blast radius even when we cap the returned rows for display.
+    // Capture the counts before truncation — users need to see the real blast
+    // radius even when we cap the returned rows for display. These count
+    // every ref *scanned*, which is every ref there is unless the scan itself
+    // stopped at MAX_REFS_SCANNED (`counts_capped`).
     let direct_count = direct_impact.len();
     let cross_package_count = cross_package_impact.len();
 
@@ -1716,6 +1730,7 @@ pub fn change_impact(
     let summary = ChangeImpactSummary {
         direct_count,
         cross_package_count,
+        counts_capped,
         affected_packages,
         transitive_package_count: transitive_impact.len(),
     };

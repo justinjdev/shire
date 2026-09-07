@@ -84,9 +84,12 @@ than a bigger `limit`, which is already clamped at 200.)
 
 `change_impact` returns an object rather than a list; when a bucket is capped
 it gains the same `truncated` / `limit` / `max` / `note` fields.
-`summary.direct_count` and `summary.cross_package_count` are true totals
-either way, but `summary.transitive_package_count` is not: the reverse-dep
-walk stops at `limit`, so a capped result reports a floor.
+`summary.direct_count` and `summary.cross_package_count` count every reference
+scanned rather than only the rows returned — but the scan itself stops at
+10 000 references, so they are totals only while `summary.counts_capped` is
+false; when it is true they are floors. `summary.transitive_package_count` is
+never a total: the reverse-dep walk stops at `limit`, so a capped result
+reports a floor.
 
 ### Index freshness under `serve --root`
 

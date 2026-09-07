@@ -1334,6 +1334,7 @@ fn single_pass_extract(
     _pkg_kind: &str,
     exclude_extensions: &[String],
     exclude_patterns: &[String],
+    exclude_dirs: &[String],
     skip_references: bool,
     max_file_size: u64,
     max_references_per_file: usize,
@@ -1361,10 +1362,11 @@ fn single_pass_extract(
             !exclude_extensions.contains(&with_dot)
         })
         .collect();
-    let source_files = symbols::walker::walk_source_files_with_patterns(
+    let source_files = symbols::walker::walk_source_files_with_excludes(
         &package_dir,
         &extensions,
         exclude_patterns,
+        exclude_dirs,
     )?;
 
     if source_files.is_empty() {
@@ -1496,6 +1498,7 @@ fn phase_extract_symbols(
     parsed_packages: &[(String, String, String)],
     exclude_extensions: &[String],
     exclude_patterns: &[String],
+    exclude_dirs: &[String],
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
     ref_writer: &mut RefWriter,
@@ -1517,6 +1520,7 @@ fn phase_extract_symbols(
                 pkg_kind,
                 exclude_extensions,
                 exclude_patterns,
+                exclude_dirs,
                 skip_references,
                 max_file_size,
                 max_references_per_file,
@@ -1765,6 +1769,7 @@ fn phase_source_incremental(
     unchanged: &[&WalkedManifest],
     exclude_extensions: &[String],
     exclude_patterns: &[String],
+    exclude_dirs: &[String],
     progress: &Option<Arc<ProgressBar>>,
     ref_writer: &mut RefWriter,
     force_source_reextract: bool,
@@ -1840,10 +1845,11 @@ fn phase_source_incremental(
 
                     // One walk, used both by the staleness pre-check and by
                     // the hash pass below.
-                    let source_files = match symbols::walker::walk_source_files_with_patterns(
+                    let source_files = match symbols::walker::walk_source_files_with_excludes(
                         &package_dir,
                         &extensions,
                         exclude_patterns,
+                        exclude_dirs,
                     ) {
                         Ok(files) => files,
                         Err(e) => {
@@ -3286,6 +3292,7 @@ fn build_index_inner(
             &parsed_packages,
             &config.symbols.exclude_extensions,
             &config.symbols.exclude_patterns,
+            &config.discovery.exclude,
             &pb_sym_clone,
             is_full_build || force,
             &mut ref_writer,
@@ -3300,6 +3307,7 @@ fn build_index_inner(
             &diff.unchanged,
             &config.symbols.exclude_extensions,
             &config.symbols.exclude_patterns,
+            &config.discovery.exclude,
             &pb_sym_clone,
             &mut ref_writer,
             force_source_reextract,
@@ -4520,7 +4528,7 @@ anyhow = "1"
         // `Extracted` as authoritative and deletes every symbol, reference
         // and file hash the package has.
         let dir = tempfile::TempDir::new().unwrap();
-        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], true, 0, 0)
+        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], &[], true, 0, 0)
             .err()
             .expect("a vanished package directory must not look like an empty package");
         assert!(
@@ -4544,7 +4552,8 @@ anyhow = "1"
         )
         .unwrap();
 
-        let extract = single_pass_extract(dir.path(), "pkg", "go", &[], &[], true, 0, 0).unwrap();
+        let extract =
+            single_pass_extract(dir.path(), "pkg", "go", &[], &[], &[], true, 0, 0).unwrap();
 
         assert_eq!(
             extract.file_hashes.len(),

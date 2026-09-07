@@ -323,32 +323,73 @@ async fn main() -> Result<()> {
 /// file (see the SQLite file format spec).
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
-/// Open `path` refusing to follow a trailing symlink (O_NOFOLLOW on unix), returning
-/// `Ok(None)` for a missing file and `Err` for a symlink or any other open failure.
-/// Centralizes the "don't follow a symlink" pattern used for both the main db file and
-/// its `-wal`/`-shm` sidecars (the sidecar paths are just as attacker-nameable as
-/// `db_path` itself, being derived from it by string concatenation).
+/// Open `path` refusing to follow a trailing symlink (O_NOFOLLOW on unix) and refusing
+/// to block on a FIFO with no writer (O_NONBLOCK — opening a FIFO read-only can
+/// otherwise hang forever waiting for a writer that will never arrive, a DoS via a
+/// hostile `db_path`), returning `Ok(None)` for a missing file and `Err` for a symlink,
+/// a non-regular file (FIFO, device, socket, directory), or any other open failure.
+/// Centralizes this pattern for both the main db file and its `-wal`/`-shm` sidecars
+/// (the sidecar paths are just as attacker-nameable as `db_path` itself, being derived
+/// from it by string concatenation).
 fn open_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
     #[cfg(unix)]
     let opened = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
     };
     #[cfg(not(unix))]
     let opened = std::fs::File::open(path);
 
-    match opened {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    let file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => anyhow::bail!(
             "{} is a symlink, not a plain file. Remove it by hand if that's intentional.",
             path.display()
         ),
-        Err(e) => Err(e).with_context(|| format!("Failed to open {}", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", path.display())),
+    };
+
+    // O_NONBLOCK only prevents the *open* from hanging on a FIFO; a FIFO that does
+    // have a writer would still open successfully, so its type must be checked
+    // explicitly. This also gives directories, devices, and sockets a clear refusal
+    // instead of relying on read_exact() failing downstream for some of them.
+    #[cfg(unix)]
+    {
+        let meta = file
+            .metadata()
+            .with_context(|| format!("Failed to stat {}", path.display()))?;
+        if !meta.is_file() {
+            let kind = describe_unix_file_type(&meta.file_type());
+            anyhow::bail!(
+                "{} is not a regular file ({kind}). Refusing to treat it as a database.",
+                path.display()
+            );
+        }
+    }
+
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn describe_unix_file_type(ft: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if ft.is_dir() {
+        "a directory"
+    } else if ft.is_fifo() {
+        "a FIFO"
+    } else if ft.is_socket() {
+        "a socket"
+    } else if ft.is_char_device() {
+        "a character device"
+    } else if ft.is_block_device() {
+        "a block device"
+    } else {
+        "not a regular file"
     }
 }
 
@@ -385,25 +426,54 @@ fn looks_like_shire_db(path: &Path) -> bool {
     .is_ok()
 }
 
+/// Canonicalize `dir` only if it is, itself, a real directory rather than a symlink
+/// (`lstat`, not `stat`). Used for the two locations shire manages: a repo tracked in
+/// git can commit `.shire` (not normally gitignored by shire itself) as a *symlink* to
+/// anywhere — e.g. a browser profile directory — and naively canonicalizing
+/// `root.join(".shire")` in that case would follow it, making "is this path under
+/// `.shire`" trivially true for wherever the symlink points, defeating the whole
+/// location check. Refusing to trust a symlinked `.shire`/`~/.claude/shire` at all
+/// closes that: `starts_with` against a path that failed to resolve here can never
+/// match.
+fn canonical_managed_dir(dir: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    std::fs::canonicalize(dir).ok()
+}
+
 /// Is `db_path` somewhere shire itself manages — `<repo_root>/.shire/` or
 /// `~/.claude/shire/`? Used only as a fallback for a database that fails the
 /// `shire_meta` identity check because it's corrupt (which a real, crashed shire index
 /// can be — `shire build` auto-cleans a corrupt DB it finds), not as a way to accept an
 /// unidentified file from an arbitrary location.
+///
+/// Checks the canonicalized *parent directory* of `db_path`, not `db_path` itself:
+/// `O_NOFOLLOW` in `open_no_follow` only guards the final path component, so a symlink
+/// planted at any ancestor directory (`<repo>/.shire/index.db` where `.shire` — or any
+/// directory above it — is a symlink) would otherwise reach an arbitrary location
+/// while still superficially "being under root". Canonicalizing the full parent
+/// resolves every symlink along the way, so the comparison is against where the file
+/// actually, physically lives.
 fn is_in_managed_location(db_path: &Path, root: &Path) -> bool {
-    let Ok(canon) = std::fs::canonicalize(db_path) else {
+    let Some(parent) = db_path.parent() else {
+        return false;
+    };
+    let Ok(canon_parent) = std::fs::canonicalize(parent) else {
         return false;
     };
 
-    if let Ok(repo_shire) = std::fs::canonicalize(root.join(".shire"))
-        && canon.starts_with(&repo_shire)
+    if let Some(repo_shire) = canonical_managed_dir(&root.join(".shire"))
+        && canon_parent.starts_with(&repo_shire)
     {
         return true;
     }
 
     if let Ok(home) = std::env::var("HOME")
-        && let Ok(claude_shire) = std::fs::canonicalize(PathBuf::from(home).join(".claude/shire"))
-        && canon.starts_with(&claude_shire)
+        && let Some(claude_shire) =
+            canonical_managed_dir(&PathBuf::from(home).join(".claude/shire"))
+        && canon_parent.starts_with(&claude_shire)
     {
         return true;
     }
@@ -592,6 +662,78 @@ mod tests {
             victim.exists(),
             "corrupt file outside any managed location must survive"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_index_db_refuses_a_symlinked_dot_shire_directory() {
+        // A malicious repo can commit `.shire` itself as a symlink to any directory
+        // (e.g. a browser profile dir). O_NOFOLLOW on the final path component alone
+        // wouldn't catch this — the location fallback must not trust a symlinked
+        // `.shire` at all, or "under root/.shire" becomes trivially true for wherever
+        // the symlink points.
+        let repo_root = tempfile::TempDir::new().unwrap();
+        let victim_dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(victim_dir.path(), repo_root.path().join(".shire")).unwrap();
+        let victim_db = victim_dir.path().join("index.db");
+        write_corrupt_sqlite_like_file(&victim_db);
+        // Reached via the symlinked ".shire" — same physical file as victim_db.
+        let db_via_symlinked_shire = repo_root.path().join(".shire").join("index.db");
+
+        let result = remove_index_db(&db_via_symlinked_shire, repo_root.path());
+
+        assert!(
+            result.is_err(),
+            "a symlinked .shire must not grant the location-fallback exemption"
+        );
+        assert!(
+            victim_db.exists(),
+            "the file reached through the symlinked .shire must survive"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_index_db_refuses_a_symlinked_ancestor_of_dot_shire() {
+        // Same attack, one level further up: a symlinked directory anywhere in
+        // db_path's ancestry (not necessarily named ".shire") reaching outside the
+        // repo entirely.
+        let repo_root = tempfile::TempDir::new().unwrap();
+        let victim_dir = tempfile::TempDir::new().unwrap();
+        let link = repo_root.path().join("linked_parent");
+        std::os::unix::fs::symlink(victim_dir.path(), &link).unwrap();
+        let victim_db = victim_dir.path().join("index.db");
+        write_corrupt_sqlite_like_file(&victim_db);
+        let db_via_link = link.join("index.db");
+
+        let result = remove_index_db(&db_via_link, repo_root.path());
+
+        assert!(result.is_err());
+        assert!(victim_db.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_index_db_hangs_on_neither_open_nor_removal_of_a_fifo() {
+        // A FIFO with no writer would hang a plain `open()` for reading forever;
+        // O_NONBLOCK on the open plus a regular-file check must refuse it immediately
+        // instead. Run with a timeout via the test harness's own default (no manual
+        // sleep needed) — this test failing to complete at all is the failure mode.
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo_root = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo_root.path().join(".shire")).unwrap();
+        let fifo_path = dir.path().join("index.db");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let result = remove_index_db(&fifo_path, repo_root.path());
+
+        assert!(
+            result.is_err(),
+            "a FIFO must be refused, not opened as a db"
+        );
+        assert!(fifo_path.exists(), "the FIFO itself must survive");
     }
 
     #[test]

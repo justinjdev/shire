@@ -49,7 +49,10 @@ impl ServerHandler for tools::ShireService {
                  | Check what X depends on | `package_dependencies` | Reading manifests |\n\n\
                  ## Fall back to Grep/Glob when\n\n\
                  - Searching for literal strings, log messages, or error text inside function bodies\n\
-                 - Shire indexes definitions, not implementations — use Grep for content within functions"
+                 - Shire indexes definitions, not implementations — use Grep for content within functions\n\
+                 - You need regex or substring matching: search tools match identifiers by prefix \
+                 (and by camelCase/snake_case sub-token for symbol names), so `handle` finds \
+                 `handleRequest` but `andleRequ` finds nothing"
                     .into(),
             ),
         }
@@ -103,7 +106,27 @@ impl ServerHandler for tools::ShireService {
 
 pub async fn run_server(db_path: &Path, build_ctx: Option<BuildContext>) -> Result<()> {
     let conn = if db_path.exists() {
-        db::open_readonly(db_path)?
+        match db::open_readonly(db_path) {
+            Ok(conn) => conn,
+            // A corrupt index is a derived artifact, never a source of
+            // truth: in on-demand mode rebuild it rather than dead-ending
+            // the MCP client; in read-only mode say plainly what to run.
+            Err(e) if db::error_is_corruption(&e) => match &build_ctx {
+                Some(ctx) => {
+                    tracing::warn!(%e, "index database is corrupt — rebuilding");
+                    eprintln!("warning: index database is corrupt — rebuilding it");
+                    crate::index::build_index_quiet(
+                        &ctx.repo_root,
+                        &ctx.config,
+                        false,
+                        Some(&ctx.db_path),
+                    )?;
+                    db::open_readonly(db_path)?
+                }
+                None => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
     } else {
         // On-demand mode with no DB yet — create an in-memory placeholder.
         // The first tool call will trigger a build and reopen the real DB.

@@ -125,6 +125,11 @@ pub fn all_extensions() -> Vec<&'static str> {
 /// `walk_source_files_with_excludes`.
 /// `extra_skip_patterns` are user-configured patterns from shire.toml
 /// (matched as suffix or prefix against the filename).
+///
+/// Errors on an I/O failure anywhere in the walk (an unreadable directory, a
+/// root that vanished): a partial list would be read by callers as "these
+/// files were deleted". A malformed ignore file is warned about and walked
+/// past — see `walk_source_files_with_excludes`.
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
     walk_source_files_with_patterns(dir, extensions, &[])
 }
@@ -179,8 +184,28 @@ pub fn walk_source_files_with_excludes(
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
+            Err(e) if e.is_io() => {
+                // The walk went *blind* here: a directory it could not read
+                // hides whatever is under it, which is not the same as that
+                // directory being empty. Returning the short file list
+                // instead would make the caller
+                // (`single_pass_extract`/`phase_source_incremental`) treat
+                // every file under it as deleted and wipe the package's
+                // symbols, references and file hashes — with a normal
+                // summary and exit code 0 (INDEX-3-1/WW-3-1). Fail instead,
+                // so the package keeps the rows it already has and the
+                // build reports it. This is the same split
+                // `index::mod::blind_spot` makes for the file walk.
+                return Err(anyhow::anyhow!(
+                    "could not walk source files under {}: {}",
+                    dir.display(),
+                    e
+                ));
+            }
             Err(e) => {
-                // A git-valid but globset-invalid pattern in a parent
+                // Everything else `ignore` reports is about the ignore rules
+                // themselves, and the tree is still fully visible: a
+                // git-valid but globset-invalid pattern in a parent
                 // .gitignore (brace alternation, a trailing backslash, an
                 // inverted char-class range) makes `ignore::Walk` surface a
                 // hard `Err` on the very first `next()` — because the
@@ -189,7 +214,7 @@ pub fn walk_source_files_with_excludes(
                 // over a single typo in the repo's root .gitignore
                 // (SYMBOLS-2-1). Log once per distinct error and keep
                 // walking, matching the policy the file/manifest walks in
-                // `index::mod` already use (`Err(_) => WalkState::Continue`).
+                // `index::mod` already use.
                 let msg = e.to_string();
                 if warned_ignore_errors.insert(msg.clone()) {
                     tracing::warn!(
@@ -525,5 +550,78 @@ mod tests {
             files
         );
         assert!(files[0].ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_walk_reports_a_missing_root_instead_of_an_empty_list() {
+        // INDEX-3-1/WW-3-1: `ignore::Walk` surfaces I/O failures through the
+        // same `Result` as ignore-file parse errors. Swallowing them makes an
+        // unreadable (or vanished) tree indistinguishable from an empty one,
+        // and the callers in `index::mod` read an empty list as "every file
+        // under here was deleted" — wiping the package's symbols, references
+        // and file hashes with exit code 0.
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("not-there");
+
+        let err = walk_source_files(&missing, &["rs"])
+            .expect_err("an unwalkable root must be an error, not an empty file list");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not walk source files"),
+            "the error must name the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_walk_reports_an_unreadable_subdirectory() {
+        // The same blind spot one directory down: the package itself is
+        // readable, so it is still re-checked, but a subtree is not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // chmod is a no-op for root, so this can only be exercised as an
+            // unprivileged user.
+            if unsafe { libc::geteuid() } == 0 {
+                eprintln!("skipping: running as root, chmod 000 does not deny access");
+                return;
+            }
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let src = dir.path().join("src");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("lib.rs"), "pub fn a() {}").unwrap();
+            let locked = dir.path().join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            fs::write(locked.join("hidden.rs"), "pub fn b() {}").unwrap();
+
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let result = walk_source_files(dir.path(), &["rs"]);
+            // Restore before asserting so the TempDir can always clean up.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let err = result
+                .expect_err("an unreadable subdirectory must be an error, not a short file list");
+            assert!(
+                format!("{err:#}").contains("could not walk source files"),
+                "got {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_ignore_pattern_is_not_a_blind_spot() {
+        // The other half of the split: an ignore-file *parse* error leaves the
+        // tree fully visible, so it must stay a warn-and-continue (SYMBOLS-2-1)
+        // rather than becoming an error now that I/O failures are one.
+        let root = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".gitignore"), "a{b\n").unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "pub fn a() {}").unwrap();
+
+        let files = walk_source_files(root.path(), &["rs"])
+            .expect("a malformed ignore pattern must not fail the walk");
+        assert_eq!(files.len(), 1, "got {:?}", files);
     }
 }

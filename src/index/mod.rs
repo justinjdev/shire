@@ -746,12 +746,20 @@ fn blind_spot(err: &ignore::Error, repo_root: &Path) -> Option<String> {
         tracing::warn!(error = %err, "I/O walk error with no path — treating the walk as incomplete");
         return Some(String::new());
     };
-    Some(
-        path.strip_prefix(repo_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string(),
-    )
+    let Ok(relative) = path.strip_prefix(repo_root) else {
+        // The error is about something outside the walk root — `ignore` reads
+        // the ancestor `.gitignore` files too, so an unreadable `~/.gitignore`
+        // lands here. It hides nothing *inside* the tree, and recording it
+        // would both add a root that can never match a repo-relative path and
+        // stop the file-tree hash from ever being stored again.
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "I/O walk error outside the repository root — the tree itself is still visible"
+        );
+        return None;
+    };
+    Some(relative.to_string_lossy().to_string())
 }
 
 /// The path an `ignore` walk error is about, dug out of whatever wrappers the
@@ -799,9 +807,18 @@ fn normalize_unreadable_roots(mut roots: Vec<String>) -> Vec<String> {
     if roots.len() < 2 {
         return roots;
     }
-    roots.sort_unstable();
+    // Plain byte order does NOT put a covering root immediately before
+    // everything it covers: every byte below `/` (`a-b`, `a.b`, …) sorts
+    // between `a` and `a/c`, so `a` stops being the last kept root before
+    // `a/c` is reached and the redundant child survives the reduction.
+    // Ordering as if the separator were NUL — which cannot occur in a path —
+    // restores that property; equality (hence `dedup`) is unaffected.
+    fn segment_order_key(path: &str) -> impl Iterator<Item = u8> + '_ {
+        path.bytes().map(|b| if b == b'/' { 0 } else { b })
+    }
+    roots.sort_unstable_by(|a, b| segment_order_key(a).cmp(segment_order_key(b)));
     roots.dedup();
-    // Sorted order puts a covering root immediately before everything it
+    // With that order a covering root sits immediately before everything it
     // covers, so one pass keeping only paths not covered by the last kept
     // root is enough.
     let mut kept: Vec<String> = Vec::with_capacity(roots.len());
@@ -6601,6 +6618,61 @@ mod incremental_signal_tests {
         assert!(is_under_unreadable("p1/src/deep/x.ts", &roots));
         assert!(is_under_unreadable("p10/x.ts", &roots));
         assert!(!is_under_unreadable("p2/b/x.ts", &roots));
+    }
+
+    #[test]
+    fn test_normalize_unreadable_roots_collapses_past_a_lower_sorting_sibling() {
+        // Every byte below `/` (`-`, `.`, `+`, …) sorts between a root and
+        // its children in plain byte order, so a plain sort would leave `a`
+        // no longer the last kept root by the time `a/c` is reached and the
+        // redundant child would survive the reduction.
+        let roots = normalize_unreadable_roots(vec![
+            "a/c".to_string(),
+            "a-b".to_string(),
+            "a".to_string(),
+            "a.d".to_string(),
+            "a/c/deep".to_string(),
+        ]);
+        assert_eq!(
+            roots,
+            vec!["a".to_string(), "a-b".to_string(), "a.d".to_string()],
+            "`a` must still swallow `a/c` even though `a-b` sorts between them"
+        );
+        assert!(is_under_unreadable("a/c/deep/x.ts", &roots));
+        assert!(is_under_unreadable("a-b/x.ts", &roots));
+        assert!(!is_under_unreadable("a-bc/x.ts", &roots));
+    }
+
+    #[test]
+    fn test_blind_spot_ignores_an_error_outside_the_repository_root() {
+        // `ignore` reads ancestor .gitignore files, so an unreadable
+        // `~/.gitignore` surfaces as an I/O error whose path is outside the
+        // walk root. It hides nothing inside the tree, and recording it
+        // would add a root that can never match a repo-relative path while
+        // permanently suppressing the file-tree hash.
+        let err = ignore::Error::WithPath {
+            path: std::path::PathBuf::from("/home/dev/.gitignore"),
+            err: Box::new(ignore::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+        };
+        assert_eq!(blind_spot(&err, Path::new("/home/dev/repo")), None);
+    }
+
+    #[test]
+    fn test_blind_spot_reports_a_path_inside_the_repository_root() {
+        let err = ignore::Error::WithPath {
+            path: std::path::PathBuf::from("/home/dev/repo/pkg/src"),
+            err: Box::new(ignore::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+        };
+        assert_eq!(
+            blind_spot(&err, Path::new("/home/dev/repo")),
+            Some("pkg/src".to_string())
+        );
     }
 
     #[test]

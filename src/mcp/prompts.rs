@@ -199,9 +199,14 @@ For each unique `enclosing_symbol` returned in the `call` results, call
 `symbol_callers` with `name=<enclosing_symbol>` AND `package="{package_arg}"`
 to walk the call chain one level higher. Pass the value verbatim — it is
 dot-qualified for methods (`AuthService.login`) and `symbol_callers` resolves
-that form. Keep the package filter on every
-hop — it's what prevents unrelated same-named functions in other packages
-from contaminating the blast radius.
+that form through the type that defines the method. Check `matched_name` in
+the response: when it is present the rows were matched on the bare method
+name, with call sites in packages that define their own method of that name
+left out — or, if `matched_note` says the qualifier was dropped, with nothing
+left out at all, in which case treat callers of a same-named method as
+unconfirmed. Keep the
+package filter on every hop — it's what prevents unrelated same-named
+functions in other packages from contaminating the blast radius.
 
 Repeat for any new enclosing symbols if the chain is shallow (≤ 3 hops).
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 /// `serve --root` on-demand rebuilds, several worktrees possibly sharing one
 /// db_path), and SQLite's default is 0 — the first collision fails instantly
 /// with "database is locked".
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Message appended to corruption errors that we could not repair
 /// automatically (read-only paths).

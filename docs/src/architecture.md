@@ -17,6 +17,7 @@ src/
 │   ├── custom_discovery.rs # Config-driven custom package discovery
 │   ├── manifest.rs  # ManifestParser trait
 │   ├── hash.rs      # SHA-256 content hashing for incremental builds
+│   ├── lock.rs      # Cross-process build lock (flock on <db_path>.lock)
 │   ├── ref_writer.rs # Cross-reference write strategy threaded through the build phases
 │   ├── npm.rs       # package.json parser (workspace: protocol)
 │   ├── go.rs        # go.mod parser

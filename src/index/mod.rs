@@ -5,6 +5,7 @@ pub mod go_work;
 pub mod gradle;
 pub mod gradle_settings;
 pub mod hash;
+pub mod lock;
 pub mod manifest;
 pub mod maven;
 pub mod nix;
@@ -23,6 +24,7 @@ use crate::symbols::walker::PROTO_GENERATED_SUFFIXES;
 use anyhow::Result;
 use ignore::WalkBuilder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use lock::LockWait;
 use manifest::{ManifestParser, PackageInfo};
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
@@ -3013,7 +3015,8 @@ pub fn build_index(
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    let extract_failures = build_index_inner(repo_root, config, force, db_override, true)?;
+    let extract_failures =
+        build_index_inner(repo_root, config, force, db_override, true, LockWait::Wait)?;
     if !extract_failures.is_empty() {
         anyhow::bail!(
             "{} package(s) could not be indexed: {}",
@@ -3036,13 +3039,19 @@ pub fn build_index(
 /// `Err` as "the rebuild did not happen" — `ShireService::maybe_rebuild`
 /// would then keep serving the pre-rebuild connection and re-run a full
 /// rebuild on every single tool call.
+///
+/// If another build already holds the build lock this returns without
+/// building: the build in flight is doing the same work, and these callers
+/// are triggered again anyway (the next tool call past the debounce window,
+/// the next rebuild signal).
 pub fn build_index_quiet(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    let extract_failures = build_index_inner(repo_root, config, force, db_override, false)?;
+    let extract_failures =
+        build_index_inner(repo_root, config, force, db_override, false, LockWait::Skip)?;
     if !extract_failures.is_empty() {
         tracing::warn!(
             packages = extract_failures.len(),
@@ -3091,6 +3100,7 @@ fn build_index_inner(
     force: bool,
     db_override: Option<&Path>,
     progress: bool,
+    lock_wait: LockWait,
 ) -> Result<Vec<(String, String)>> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
@@ -3105,6 +3115,16 @@ fn build_index_inner(
         p.to_path_buf()
     } else {
         crate::config::resolve_db_path_with_info(config, repo_root, &wt_info)?
+    };
+
+    // Serialize builds across processes for the whole pipeline. Two builders
+    // that both read `is_full_build` from an empty `manifest_hashes` before
+    // either commits will both insert without deleting, doubling every symbol
+    // (see `lock`). Taken before the DB is even opened, so nothing is written
+    // by a builder that turns out to have lost the race.
+    let _build_lock = match lock::acquire(&db_path, lock_wait)? {
+        Some(guard) => guard,
+        None => return Ok(Vec::new()),
     };
 
     // Seed from main worktree's DB if this is a new linked-worktree build.
@@ -5139,6 +5159,113 @@ anyhow = "1"
         assert_ne!(pkg.name, "com.example:app");
         assert_ne!(pkg.name, "team-b-app");
         assert_eq!(pkg.name, "team-b-app-2");
+    }
+
+    // --- INDEX-2-4: builds are serialized across processes ---
+
+    /// A small multi-package fixture: three npm packages, one source file each.
+    fn concurrent_build_fixture(root: &std::path::Path) {
+        for name in ["a", "b", "c"] {
+            let src = root.join(name).join("src");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(
+                root.join(name).join("package.json"),
+                format!(r#"{{"name": "{name}", "version": "1.0.0"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                src.join("index.ts"),
+                format!("export function fn_{name}(): number {{ return 1; }}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_build_index_quiet_skips_while_another_build_holds_the_lock() {
+        // The MCP server and the watch daemon must not pile a second builder
+        // onto one that is already running: the build in flight is doing the
+        // same work, and two builders against a fresh DB both take the
+        // insert-only full-build path and double every symbol.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        concurrent_build_fixture(root);
+        let db = root.join("index.db");
+        let config = Config::default();
+
+        let held = lock::acquire(&db, lock::LockWait::Wait).unwrap().unwrap();
+        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        assert!(
+            !db.exists(),
+            "a skipped build must not touch the database at all"
+        );
+
+        drop(held);
+        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        let conn = db::open_readonly(&db).unwrap();
+        let packages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(packages, 3, "and the next one must build normally");
+    }
+
+    #[test]
+    fn test_build_index_reports_a_lock_it_could_not_take() {
+        // The CLI is answering a human or CI, so a build that did not happen
+        // is an error, not a silent success.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        concurrent_build_fixture(root);
+        let db = root.join("index.db");
+
+        let _held = lock::acquire(&db, lock::LockWait::Wait).unwrap().unwrap();
+        let err = build_index(root, &Config::default(), false, Some(&db))
+            .expect_err("a build that never ran must not report success");
+
+        assert!(
+            format!("{err:#}").contains("another shire build is already running"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_two_concurrent_builds_do_not_double_symbols() {
+        // Both builders read `is_full_build` from an empty `manifest_hashes`
+        // and both insert without deleting, so every symbol lands twice —
+        // observed once in ~25 attempts before the lock, and never detected
+        // or repaired afterwards. With the lock they run one after the other.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        concurrent_build_fixture(root);
+        let db = root.join("index.db");
+        let config = Config::default();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| build_index(root, &config, false, Some(&db)));
+            let second = scope.spawn(|| build_index(root, &config, false, Some(&db)));
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let conn = db::open_readonly(&db).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT package, name, file_path, line FROM symbols)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total, distinct,
+            "concurrent builds must not leave duplicate symbol rows"
+        );
+        let fts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, total, "the FTS index must match the symbols table");
     }
 
     // --- INFRA-2-1: the walks must depend only on committed ignore files ---

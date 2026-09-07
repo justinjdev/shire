@@ -37,9 +37,12 @@ If no daemon is listening at that root, this prints a warning to stderr and stil
 ## Signal a rebuild from a Claude Code hook
 
 Reads JSON from stdin. The repo root is resolved by walking up from the hook's `cwd` to
-the nearest ancestor containing `shire.toml`, a `.shire/` directory, or `.git` — so a
-session launched in a package subdirectory of a monorepo still reaches the daemon's
-socket at the repo root:
+the nearest ancestor containing `shire.toml` or `.git` — so a session launched in a
+package subdirectory of a monorepo still reaches the daemon's socket at the repo root. A
+bare `.shire/` directory does **not** count as a marker: shire creates `.shire/logs`
+under any directory it is pointed at, so treating it as a marker would let a stray
+`.shire` left behind by a one-off `shire build --root <subdir>` silently divert future
+lookups to that subdirectory instead of the real repo root:
 
 ```sh
 shire rebuild --stdin
@@ -50,6 +53,18 @@ shire rebuild --stdin
 ```sh
 shire watch --root /path/to/repo --stop
 ```
+
+Sends SIGTERM and waits up to 5s for the process to actually exit before removing its
+PID/socket files. The daemon only handles SIGTERM between rebuilds, so a slow or
+uninterruptible rebuild can outlast that wait — if it does, `--stop` exits non-zero and
+prints the daemon's PID rather than reporting success while it is still running; its
+PID/socket files are left in place, and retrying (or checking `--status`) is safe.
+
+The daemon is identified as shire's own by its executable — an exact match, a basename
+starting with `shire` (a versioned install like `shire-v0.7`, a renamed download), or the
+exact same file as the `shire` binary currently invoking `--stop`/`--status` — so a
+renamed or versioned binary is recognized correctly rather than being refused and having
+its live socket deleted out from under it.
 
 ## Smart filtering
 

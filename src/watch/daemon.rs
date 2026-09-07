@@ -91,15 +91,58 @@ fn read_proc_state(pid: u32) -> Option<char> {
     text.trim().chars().next()
 }
 
-/// Whether `pid` is currently a live (non-zombie) process whose command line looks like
-/// a `shire watch --foreground` daemon. This is the ownership check used before signalling
-/// a PID read from `.shire/watch.pid`: PIDs are reused aggressively after a reboot, and the
-/// pid file can outlive the process it once named (crash, SIGKILL, reboot), so `kill -0`
-/// alone is not enough to know it is safe to signal.
+/// Whether an executable's basename (from `/proc/<pid>/exe` or `ps -o comm=`) is shire's
+/// own binary. Handles the Linux kernel's `readlink(/proc/<pid>/exe)` appending
+/// `" (deleted)"` when the on-disk binary was replaced/removed after exec (e.g. an
+/// upgrade while the daemon kept running) — that's still shire, just an older copy.
+fn exe_basename_is_shire(name: &str) -> bool {
+    name.trim_end_matches(" (deleted)") == "shire"
+}
+
+#[cfg(target_os = "linux")]
+fn read_exe_basename(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    link.file_name()?.to_str().map(str::to_string)
+}
+
+/// Fallback for non-Linux Unixes (macOS): `ps -o comm=` gives the full executable path
+/// there (unlike Linux's truncated `comm`), so take its basename.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_exe_basename(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(str::to_string)
+}
+
+/// Whether `pid` is currently a live (non-zombie) process, whose *executable* is shire's
+/// own binary, whose command line looks like a `shire watch --foreground` daemon. This
+/// is the ownership check used before signalling a PID read from `.shire/watch.pid`:
+/// PIDs are reused aggressively after a reboot, and the pid file can outlive the process
+/// it once named (crash, SIGKILL, reboot), so `kill -0` alone is not enough to know it is
+/// safe to signal. The executable check specifically closes a spoofing gap the cmdline
+/// check alone left open: any process that happens to carry the bare argv tokens "watch"
+/// and "--foreground" — e.g. `some-other-daemon --foreground` with a subcommand named
+/// `watch`, or a deliberately crafted invocation — would otherwise pass.
 fn is_shire_watch_pid(pid: u32) -> bool {
     match read_cmdline(pid) {
         Some(args) if cmdline_looks_like_shire_watch(&args) => {
-            !matches!(read_proc_state(pid), Some('Z'))
+            let exe_is_shire = read_exe_basename(pid)
+                .as_deref()
+                .is_some_and(exe_basename_is_shire);
+            exe_is_shire && !matches!(read_proc_state(pid), Some('Z'))
         }
         _ => false,
     }
@@ -374,6 +417,38 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("failed to spawn sleep");
+        assert!(!is_shire_watch_pid(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn exe_basename_is_shire_matches_only_shire() {
+        assert!(exe_basename_is_shire("shire"));
+        // Linux appends this when the on-disk binary was replaced/removed after exec.
+        assert!(exe_basename_is_shire("shire (deleted)"));
+        assert!(!exe_basename_is_shire("python3"));
+        assert!(!exe_basename_is_shire("sleep"));
+        assert!(!exe_basename_is_shire("shire-something-else"));
+        assert!(!exe_basename_is_shire(""));
+    }
+
+    #[test]
+    fn is_shire_watch_pid_false_for_spoofed_argv_on_a_foreign_executable() {
+        // Reproduces a false-positive found in review: a process whose argv happens to
+        // contain the bare tokens "watch" and "--foreground" (satisfying
+        // cmdline_looks_like_shire_watch on its own) but whose actual executable is not
+        // shire must still be rejected — otherwise any process launched with those two
+        // tokens anywhere in its arguments could be killed as if it were the daemon.
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import time; time.sleep(300)",
+                "watch",
+                "--foreground",
+            ])
+            .spawn()
+            .expect("failed to spawn python3 (expected to be present on CI runners)");
         assert!(!is_shire_watch_pid(child.id()));
         let _ = child.kill();
         let _ = child.wait();

@@ -197,7 +197,9 @@ Record the counts per kind and the packages that contain them.
 
 For each unique `enclosing_symbol` returned in the `call` results, call
 `symbol_callers` with `name=<enclosing_symbol>` AND `package="{package_arg}"`
-to walk the call chain one level higher. Keep the package filter on every
+to walk the call chain one level higher. Pass the value verbatim — it is
+dot-qualified for methods (`AuthService.login`) and `symbol_callers` resolves
+that form. Keep the package filter on every
 hop — it's what prevents unrelated same-named functions in other packages
 from contaminating the blast radius.
 

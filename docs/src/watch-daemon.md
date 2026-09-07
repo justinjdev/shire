@@ -60,11 +60,12 @@ uninterruptible rebuild can outlast that wait — if it does, `--stop` exits non
 prints the daemon's PID rather than reporting success while it is still running; its
 PID/socket files are left in place, and retrying (or checking `--status`) is safe.
 
-The daemon is identified as shire's own by its executable — an exact match, a basename
-starting with `shire` (a versioned install like `shire-v0.7`, a renamed download), or the
-exact same file as the `shire` binary currently invoking `--stop`/`--status` — so a
-renamed or versioned binary is recognized correctly rather than being refused and having
-its live socket deleted out from under it.
+The daemon is identified as shire's own by its executable — an exact basename match, a
+basename starting with `shire-` (a versioned install like `shire-v0.7`, a renamed
+download), or the exact same file as the `shire` binary currently invoking
+`--stop`/`--status` — so a renamed or versioned binary is recognized correctly rather
+than being refused and having its live socket deleted out from under it, while an
+unrelated binary that merely happens to start with "shire" is not.
 
 ## Smart filtering
 

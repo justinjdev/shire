@@ -117,11 +117,15 @@ fn read_proc_state(pid: u32) -> Option<char> {
 /// Whether an executable path plausibly belongs to shire's own binary. Two ways to
 /// pass:
 ///
-/// 1. Its basename starts with `shire` (`shire`, `shire-v0.7`, `shire-0.6.2`, ...) —
-///    covers a versioned install, a release tarball's binary renamed on download, or a
-///    copy kept side by side during an upgrade. Does not require the file to exist on
-///    disk, so it still works after the on-disk binary was replaced (see the
-///    `" (deleted)"` handling below).
+/// 1. Its basename is exactly `shire`, or starts with `shire-` (`shire-v0.7`,
+///    `shire-0.6.2`, ...) — covers a versioned install, a release tarball's binary
+///    renamed on download, or a copy kept side by side during an upgrade. Does not
+///    require the file to exist on disk, so it still works after the on-disk binary was
+///    replaced (see the `" (deleted)"` handling below). Deliberately requires the `-`
+///    separator rather than a bare prefix match: without it, an unrelated binary that
+///    merely happens to start with "shire" (e.g. a `shire-metrics-exporter` tool from an
+///    unrelated codebase) would be misidentified as shire's own daemon if its PID were
+///    ever reused for one after a crash/reboot.
 /// 2. It resolves (after canonicalization) to the exact same file as this process's own
 ///    `std::env::current_exe()` — covers a wrapper name that doesn't start with `shire`
 ///    at all, so long as it truly is the same binary that would be spawned by
@@ -137,7 +141,7 @@ fn exe_path_is_shire(raw: &str) -> bool {
     let candidate = Path::new(trimmed);
 
     if let Some(name) = candidate.file_name().and_then(|f| f.to_str())
-        && name.starts_with("shire")
+        && (name == "shire" || name.starts_with("shire-"))
     {
         return true;
     }
@@ -171,7 +175,7 @@ enum ExeCheck {
 }
 
 #[cfg(target_os = "linux")]
-fn read_exe_basename(pid: u32) -> ExeCheck {
+fn read_exe_path(pid: u32) -> ExeCheck {
     match std::fs::read_link(format!("/proc/{pid}/exe")) {
         Ok(link) => match link.to_str() {
             Some(path) => ExeCheck::Path(path.to_string()),
@@ -184,7 +188,7 @@ fn read_exe_basename(pid: u32) -> ExeCheck {
 /// Fallback for non-Linux Unixes (macOS): `ps -o comm=` gives the full executable path
 /// there (unlike Linux's truncated `comm`).
 #[cfg(all(unix, not(target_os = "linux")))]
-fn read_exe_basename(pid: u32) -> ExeCheck {
+fn read_exe_path(pid: u32) -> ExeCheck {
     let out = match Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()
@@ -238,7 +242,7 @@ fn check_pid_ownership(pid: u32) -> PidOwnership {
     if !cmdline_matches {
         return PidOwnership::NotShire;
     }
-    let exe = read_exe_basename(pid);
+    let exe = read_exe_path(pid);
     let is_zombie = matches!(read_proc_state(pid), Some('Z'));
     ownership_from_checks(exe, is_zombie)
 }
@@ -621,6 +625,12 @@ mod tests {
         assert!(!exe_path_is_shire("/usr/bin/python3"));
         assert!(!exe_path_is_shire("/bin/sleep"));
         assert!(!exe_path_is_shire(""));
+        // An unrelated binary that merely *starts with* "shire" (no separator) must
+        // not be misidentified as shire's own daemon — otherwise a reused PID from a
+        // crashed daemon could later match a completely different long-running
+        // process from an unrelated tool and get signalled as if it were shire.
+        assert!(!exe_path_is_shire("/usr/bin/shireling"));
+        assert!(!exe_path_is_shire("/opt/bin/shirecheck"));
     }
 
     #[test]

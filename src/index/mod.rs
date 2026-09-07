@@ -1053,7 +1053,7 @@ fn phase_parse(
                 // `packages.path`, and a path-only delete would drop its package
                 // too — permanently, since that manifest's hash is unchanged and
                 // it will not be re-parsed on the next build.
-                if let Some(kind) = no_package_manifest_kind(filename) {
+                if let Some(kind) = manifest_kind_for_filename(filename) {
                     delete_packages_at_path(conn, &manifest.relative_dir, Some(kind))?;
                 }
             } else {
@@ -1168,28 +1168,32 @@ fn phase_parse(
     Ok((parsed_packages, failures, failed_keys))
 }
 
-/// Remove any package row at `path`, along with its dependencies, symbols,
-/// and hash caches. Shared by `phase_remove_deleted` (manifest disappeared
-/// from disk) and `phase_parse`'s `NoPackageManifest` handling (the manifest
-/// is still on disk but no longer declares a package there — e.g. a leaf
-/// crate whose `Cargo.toml` was converted into a virtual workspace root).
-fn delete_package_at_path(conn: &Connection, path: &str) -> Result<()> {
-    delete_packages_at_path(conn, path, None)
-}
-
-/// The package kind a `NoPackageManifest` result belongs to, derived from the
-/// manifest's filename.
+/// The `packages.kind` a manifest filename produces, for every manifest a
+/// parser can turn into a package.
 ///
-/// Only manifests that can report [`manifest::NoPackageManifest`] need an
-/// entry here. The kind scopes the stale-row cleanup below: several manifests
-/// of different ecosystems can live in one directory (a repo root holding both
-/// a virtual-workspace `Cargo.toml` and a real `package.json`, say), and they
-/// all share the same `packages.path`, so a path-only delete would wipe the
-/// sibling ecosystem's package.
-fn no_package_manifest_kind(filename: &str) -> Option<&'static str> {
+/// This scopes every path-keyed package deletion. Manifests of different
+/// ecosystems routinely share one directory — a repo root holding a
+/// virtual-workspace `Cargo.toml` next to a real `package.json`, an
+/// aggregator `pom.xml` next to a `build.gradle`, a Go service with a JS
+/// front end — and they all share the same `packages.path`. A path-only
+/// delete therefore removes whichever ecosystem's package happens to occupy
+/// the directory, and removes it *permanently*: the surviving manifest's
+/// content hash has not changed, so it is never re-parsed and the package
+/// never comes back.
+///
+/// `None` for a filename no parser claims, where the caller has no choice
+/// but to fall back to a path-only delete.
+fn manifest_kind_for_filename(filename: &str) -> Option<&'static str> {
     match filename {
+        "package.json" => Some("npm"),
+        "go.mod" => Some("go"),
         "Cargo.toml" => Some("cargo"),
+        "pyproject.toml" => Some("python"),
         "pom.xml" => Some("maven"),
+        "build.gradle" | "build.gradle.kts" => Some("gradle"),
+        "cpanfile" => Some("perl"),
+        "Gemfile" => Some("ruby"),
+        "flake.nix" => Some("nix"),
         _ => None,
     }
 }
@@ -1227,13 +1231,19 @@ fn delete_packages_at_path(conn: &Connection, path: &str, kind: Option<&str>) ->
 }
 
 /// Phase 4: Remove packages whose manifests were deleted.
+///
+/// Scoped to the removed manifest's own ecosystem, for the reason spelled
+/// out on [`manifest_kind_for_filename`]: deleting a `Cargo.toml` from a
+/// directory that also holds a `package.json` must not take the npm package
+/// with it. Custom-discovery packages and manifests no parser claims fall
+/// back to the path-only delete, which is what they had before.
 fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
     for manifest_key in removed {
-        let relative_dir = manifest_key
-            .rsplit_once('/')
-            .map(|(dir, _)| dir)
-            .unwrap_or("");
-        delete_package_at_path(conn, relative_dir)?;
+        let (relative_dir, filename) = match manifest_key.rsplit_once('/') {
+            Some((dir, file)) => (dir, file),
+            None => ("", manifest_key.as_str()),
+        };
+        delete_packages_at_path(conn, relative_dir, manifest_kind_for_filename(filename))?;
         conn.execute(
             "DELETE FROM manifest_hashes WHERE path = ?1",
             [manifest_key.as_str()],
@@ -4834,6 +4844,152 @@ anyhow = "1"
         assert_eq!(pkg.name, "com.example:app");
     }
 
+    /// Seed one npm package at the repo root with a symbol and a dependency,
+    /// as a repo root holding both a `package.json` and a virtual-workspace
+    /// `Cargo.toml` produces: `packages.path` is UNIQUE, so the directory
+    /// holds exactly one package row and it belongs to npm.
+    fn seed_root_npm_package(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('root-js', '', 'npm')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('root-js', 'indexFn', 'function', 'index.js', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dependencies (package, dependency, dep_kind) \
+             VALUES ('root-js', 'react', 'runtime')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_hashes (path, content_hash) \
+             VALUES ('Cargo.toml', 'h1'), ('package.json', 'h2')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn package_names(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT name FROM packages ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_phase_remove_deleted_spares_a_sibling_ecosystems_package() {
+        // MANIFESTS-2-1: deleting the repo root's package-LESS Cargo.toml
+        // used to delete whatever package occupied that directory — here the
+        // npm one, whose package.json is still on disk with an unchanged
+        // hash, so it is never re-parsed and never comes back.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        seed_root_npm_package(&conn);
+
+        phase_remove_deleted(&conn, &["Cargo.toml".to_string()]).unwrap();
+
+        assert_eq!(
+            package_names(&conn),
+            vec!["root-js".to_string()],
+            "removing a Cargo.toml must not delete the npm package at the same path"
+        );
+        let symbols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE package = 'root-js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(symbols, 1, "its symbols must survive too");
+        let deps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE package = 'root-js'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deps, 1, "and its dependency edges");
+        // The removed manifest's own hash row is still dropped, so the next
+        // build does not think it is still known.
+        let hashes: Vec<String> = conn
+            .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(hashes, vec!["package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_phase_remove_deleted_removes_its_own_ecosystems_package() {
+        // The other half: the manifest that actually owns the package still
+        // takes it with it, along with its symbols and dependencies.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        seed_root_npm_package(&conn);
+
+        phase_remove_deleted(&conn, &["package.json".to_string()]).unwrap();
+
+        assert!(package_names(&conn).is_empty());
+        let symbols: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols, 0);
+        let deps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dependencies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deps, 0);
+    }
+
+    #[test]
+    fn test_phase_remove_deleted_scopes_a_nested_manifest_by_directory() {
+        // The kind scoping must not lose the directory scoping: a removed
+        // `services/api/go.mod` deletes the Go package in that directory and
+        // nothing anywhere else.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES
+                ('api', 'services/api', 'go'),
+                ('api-ui', 'services/api/ui', 'npm'),
+                ('other', 'services/other', 'go')",
+            [],
+        )
+        .unwrap();
+
+        phase_remove_deleted(&conn, &["services/api/go.mod".to_string()]).unwrap();
+
+        assert_eq!(
+            package_names(&conn),
+            vec!["api-ui".to_string(), "other".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_phase_remove_deleted_falls_back_to_path_for_an_unknown_manifest() {
+        // A custom-discovery marker (or any filename no parser claims) has no
+        // ecosystem to scope by, and keeps the pre-existing path-only delete.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('svc', 'svc', 'custom')",
+            [],
+        )
+        .unwrap();
+
+        phase_remove_deleted(&conn, &["svc/OWNERS".to_string()]).unwrap();
+
+        assert!(package_names(&conn).is_empty());
+    }
+
     #[test]
     fn test_resolve_gradle_name_collision_disambiguates_when_fallback_also_collides() {
         // A nested `team-b/app` colliding on name with `team-a/app` falls back
@@ -4949,6 +5105,71 @@ anyhow = "1"
             .collect::<std::result::Result<_, _>>()
             .unwrap();
         assert_eq!(names, vec!["web-root".to_string()], "got {names:?}");
+    }
+
+    #[test]
+    fn test_deleting_a_virtual_workspace_manifest_keeps_the_sibling_npm_package() {
+        // MANIFESTS-2-1, end to end: `rm Cargo.toml` from a directory that
+        // also holds a package.json used to take the npm package, its
+        // symbols and its dependencies with it — and permanently, because
+        // package.json's hash is unchanged so it is never re-parsed. Three
+        // builds: the loss only became visible on the build after the one
+        // that caused it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("package.json"),
+            br#"{"name": "web-root", "version": "1.0.0", "dependencies": {"react": "^18"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        fs::write(
+            root.join("index.js"),
+            "export function rootFn() { return 1; }\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let db_path = root.join(".shire/index.db");
+
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(pkg_count(root), 1, "build 1 indexes the npm package");
+
+        fs::remove_file(root.join("Cargo.toml")).unwrap();
+
+        for build in 2..=3 {
+            build_index(root, &config, false, None).unwrap();
+            let conn = db::open_readonly(&db_path).unwrap();
+            let names: Vec<String> = conn
+                .prepare("SELECT name FROM packages ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                names,
+                vec!["web-root".to_string()],
+                "build {build}: removing the package-less Cargo.toml must not \
+                 delete the npm package sharing its directory"
+            );
+            let symbols: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM symbols WHERE package = 'web-root'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(symbols > 0, "build {build}: its symbols must survive");
+            let deps: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM dependencies WHERE package = 'web-root'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(deps, 1, "build {build}: its dependency edges must survive");
+        }
     }
 
     // --- MANIFESTS-18: unit tests for the cross-package context collectors ---

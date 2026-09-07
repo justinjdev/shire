@@ -33,32 +33,53 @@ fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
     default_new_mode
 }
 
-/// Write `content` to `tmp_path`, creating (or truncating, if one was left over from a
-/// prior failed write) it with `mode` applied at creation time via O_CREAT's own mode
-/// argument — not via a later `chmod`. A later chmod leaves a window, between the
-/// default-mode create and the chmod, where the file sits at whatever `0o666 & !umask`
-/// produces; under a permissive umask (e.g. 0) that's world-writable, however briefly,
-/// for a file that may hold credentials. Since `rename()` preserves the *source* file's
-/// mode, the final path is never more permissive than `mode` either, at any point.
+/// Write `content` to `path`, creating it fresh with `mode` applied at creation time.
+///
+/// Never follows a symlink at `path` and never writes through whatever's already
+/// there. `path` is often a predictable name (a `.tmp` sibling of a config file, or a
+/// plain project file like shire.toml) that a hostile repo can commit ahead of time as
+/// a symlink pointing outside the repo — or as a dangling symlink — and have this
+/// function write through it (attacker-controlled content, in the .gitignore case) to
+/// an arbitrary user-writable location. Any pre-existing entry at `path` (always
+/// something *we* own — a stale temp file, or the file we're about to (re)create) is
+/// removed first; `remove_file` never follows a symlink for removal, so this can't be
+/// redirected into deleting something else. The file is then created with
+/// `O_CREAT|O_EXCL` (`create_new`) plus `O_NOFOLLOW`: if something reappears at `path`
+/// between the remove and the create — a symlink replanted in that narrow window, or a
+/// concurrent process — the create fails with `AlreadyExists`/`ELOOP` rather than
+/// following it or overwriting it, and that is a hard error here, not a silent retry.
 #[cfg(unix)]
-fn write_with_mode(tmp_path: &Path, content: &str, mode: u32) -> Result<()> {
+fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
+    // Best-effort: clear whatever's there so create_new below starts from a clean
+    // slate. Not fatal by itself (e.g. permission denied) — a real problem surfaces as
+    // create_new failing next.
+    let _ = fs::remove_file(path);
+
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
-        .open(tmp_path)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Failed to create {} — a file or symlink reappeared there, or a \
+                 concurrent process is racing this write",
+                path.display()
+            )
+        })?;
     f.write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn write_with_mode(tmp_path: &Path, content: &str, _mode: u32) -> Result<()> {
-    fs::write(tmp_path, content).with_context(|| format!("Failed to write {}", tmp_path.display()))
+fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 /// Installs shire MCP entries for supported CLIs and editors.
@@ -1669,5 +1690,89 @@ mod tests {
 
         let registered = 0usize;
         assert!(!dry_run && !failures.is_empty() && registered == 0);
+    }
+
+    // --- round-2 escalation: write_with_mode must never follow a symlink at its
+    // target path (a hostile repo committing e.g. mcp.json.tmp as a symlink) ---
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_removes_a_symlinked_target_and_writes_a_fresh_file() {
+        // The symlink at `target` is always something *we* own at that path (a stale
+        // temp file's worth of trust) — it's removed and a brand-new regular file is
+        // created in its place, so the write succeeds and the attacker's redirection
+        // is discarded entirely, rather than just refused.
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim_outside_repo");
+        std::fs::write(&victim, "original content").unwrap();
+        let target = dir.path().join("mcp.json.tmp");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        write_with_mode(&target, "attacker-controlled or generated content", 0o600).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original content",
+            "the former symlink target must be completely untouched"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a real file"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "attacker-controlled or generated content"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_removes_a_dangling_symlink_and_writes_a_fresh_file() {
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside_repo_dir");
+        fs::create_dir_all(&outside).unwrap();
+        let dangling_target = outside.join("shire.toml");
+        let link = dir.path().join("shire.toml");
+        std::os::unix::fs::symlink(&dangling_target, &link).unwrap();
+
+        write_with_mode(&link, "# generated shire.toml", 0o600).unwrap();
+
+        assert!(
+            !dangling_target.exists(),
+            "must not create the file at the symlink's target"
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "# generated shire.toml");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_replaces_a_stale_leftover_tmp_file_freshly() {
+        // A pre-planted (or crash-leftover) world-writable tmp file at the exact
+        // target path must not have its mode or inode reused — the new file is always
+        // created fresh at the requested mode.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claude.json.tmp");
+        fs::write(&path, "stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_with_mode(&path, "fresh content", 0o600).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fresh content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_succeeds_normally_with_no_pre_existing_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fresh.json.tmp");
+        write_with_mode(&path, "hello", 0o600).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
     }
 }

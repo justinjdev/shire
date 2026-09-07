@@ -43,6 +43,7 @@ fn connect_if_not_symlink(root: &Path) -> Option<std::os::unix::net::UnixStream>
 
 /// Split a raw `/proc/<pid>/cmdline` buffer (NUL-separated arguments) into owned strings.
 /// Pure and independent of the filesystem so it can be unit-tested directly.
+#[cfg(any(target_os = "linux", test))]
 fn parse_cmdline(raw: &[u8]) -> Vec<String> {
     raw.split(|&b| b == 0)
         .filter(|s| !s.is_empty())
@@ -61,6 +62,7 @@ fn cmdline_looks_like_shire_watch(args: &[String]) -> bool {
 /// name field (2nd field, in parens) may itself contain spaces or parens, so we look for
 /// the *last* `)` and take the first whitespace-separated token after it — matching the
 /// documented `/proc/[pid]/stat` format (see `man 5 proc`).
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_state(raw: &str) -> Option<char> {
     let close = raw.rfind(')')?;
     raw[close + 1..].split_whitespace().next()?.chars().next()

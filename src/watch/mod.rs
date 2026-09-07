@@ -136,6 +136,15 @@ pub fn send_rebuild(root: &Path, files: Vec<PathBuf>) -> Result<()> {
         );
         return Ok(());
     }
+    if daemon::is_symlink(&sock) {
+        // Refuse to connect through it — e.g. planted to point at another repo's live
+        // socket — rather than reaching whatever daemon it actually names.
+        eprintln!(
+            "Warning: {} is a symlink; refusing to connect through it.",
+            sock.display()
+        );
+        return Ok(());
+    }
 
     let msg = RebuildMessage { files };
     let mut payload = serde_json::to_string(&msg).context("failed to serialize rebuild message")?;

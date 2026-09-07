@@ -10,14 +10,35 @@ pub fn sock_path(root: &Path) -> PathBuf {
     root.join(".shire/watch.sock")
 }
 
-/// Read and parse `.shire/watch.pid`. Returns `None` if the file is missing or does not
-/// contain a valid PID.
+/// Whether `path` is itself a symlink (`lstat`, not `stat` — this must not follow it).
+/// Used to refuse acting on `.shire/watch.pid` or `.shire/watch.sock` if either is a
+/// symlink: a hostile or careless repo could plant one pointing at another repo's pid
+/// file or live socket, and reading/connecting through it would let a command meant
+/// for *this* repo affect that other one instead.
+pub fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Read and parse `.shire/watch.pid`. Returns `None` if the file is missing, is itself
+/// a symlink (never trusted), or does not contain a valid PID.
 fn read_pid_file(root: &Path) -> Option<u32> {
-    std::fs::read_to_string(pid_path(root))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    let path = pid_path(root);
+    if is_symlink(&path) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Connect to `.shire/watch.sock` for `root`, refusing to follow it if the path is
+/// itself a symlink (e.g. planted to point at another repo's live socket).
+fn connect_if_not_symlink(root: &Path) -> Option<std::os::unix::net::UnixStream> {
+    let sock = sock_path(root);
+    if is_symlink(&sock) {
+        return None;
+    }
+    std::os::unix::net::UnixStream::connect(&sock).ok()
 }
 
 /// Split a raw `/proc/<pid>/cmdline` buffer (NUL-separated arguments) into owned strings.
@@ -99,52 +120,103 @@ fn exe_basename_is_shire(name: &str) -> bool {
     name.trim_end_matches(" (deleted)") == "shire"
 }
 
+/// Result of checking a process's executable identity.
+enum ExeCheck {
+    /// The executable's basename was read successfully.
+    Basename(String),
+    /// Could not be determined — most commonly `/proc/<pid>/exe` returning EACCES
+    /// because the process is owned by another user (reading it requires the same
+    /// permission as a ptrace attach). Callers must not treat this the same as a
+    /// confirmed mismatch: we simply don't know.
+    Unverifiable,
+}
+
 #[cfg(target_os = "linux")]
-fn read_exe_basename(pid: u32) -> Option<String> {
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    link.file_name()?.to_str().map(str::to_string)
+fn read_exe_basename(pid: u32) -> ExeCheck {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(link) => match link.file_name().and_then(|f| f.to_str()) {
+            Some(name) => ExeCheck::Basename(name.to_string()),
+            None => ExeCheck::Unverifiable,
+        },
+        Err(_) => ExeCheck::Unverifiable,
+    }
 }
 
 /// Fallback for non-Linux Unixes (macOS): `ps -o comm=` gives the full executable path
 /// there (unlike Linux's truncated `comm`), so take its basename.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn read_exe_basename(pid: u32) -> Option<String> {
-    let out = Command::new("ps")
+fn read_exe_basename(pid: u32) -> ExeCheck {
+    let out = match Command::new("ps")
         .args(["-o", "comm=", "-p", &pid.to_string()])
         .output()
-        .ok()?;
+    {
+        Ok(o) => o,
+        Err(_) => return ExeCheck::Unverifiable,
+    };
     if !out.status.success() {
-        return None;
+        return ExeCheck::Unverifiable;
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return ExeCheck::Unverifiable;
     }
-    Path::new(trimmed)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .map(str::to_string)
+    match Path::new(trimmed).file_name().and_then(|f| f.to_str()) {
+        Some(name) => ExeCheck::Basename(name.to_string()),
+        None => ExeCheck::Unverifiable,
+    }
 }
 
-/// Whether `pid` is currently a live (non-zombie) process, whose *executable* is shire's
-/// own binary, whose command line looks like a `shire watch --foreground` daemon. This
-/// is the ownership check used before signalling a PID read from `.shire/watch.pid`:
-/// PIDs are reused aggressively after a reboot, and the pid file can outlive the process
-/// it once named (crash, SIGKILL, reboot), so `kill -0` alone is not enough to know it is
-/// safe to signal. The executable check specifically closes a spoofing gap the cmdline
-/// check alone left open: any process that happens to carry the bare argv tokens "watch"
-/// and "--foreground" — e.g. `some-other-daemon --foreground` with a subcommand named
+/// Result of checking whether a PID is safe to signal (and whether its state files are
+/// safe to treat as stale and remove).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidOwnership {
+    /// Confirmed: live, non-zombie, executable is shire, cmdline matches
+    /// `watch --foreground`.
+    Owned,
+    /// Confirmed NOT an owned shire watch daemon — cmdline doesn't match, it's a
+    /// zombie, or the process no longer exists at all. Safe to treat as stale.
+    NotShire,
+    /// The cmdline matched, but the executable identity could not be verified
+    /// (typically the process is owned by another user, so `/proc/<pid>/exe` is not
+    /// readable). Must NOT be signalled, and — unlike `NotShire` — its pid/socket
+    /// files must NOT be deleted either: we don't have enough information to call
+    /// them stale, and the process may well be a live daemon another user started.
+    Unverifiable,
+}
+
+/// Whether `pid` is safe to signal as a shire watch daemon, and (when it isn't) whether
+/// its state files are safe to clean up. This is the ownership check used before
+/// signalling a PID read from `.shire/watch.pid`: PIDs are reused aggressively after a
+/// reboot, and the pid file can outlive the process it once named (crash, SIGKILL,
+/// reboot), so `kill -0` alone is not enough to know it is safe to signal. The
+/// executable check specifically closes a spoofing gap the cmdline check alone left
+/// open: any process that happens to carry the bare argv tokens "watch" and
+/// "--foreground" — e.g. `some-other-daemon --foreground` with a subcommand named
 /// `watch`, or a deliberately crafted invocation — would otherwise pass.
-fn is_shire_watch_pid(pid: u32) -> bool {
-    match read_cmdline(pid) {
-        Some(args) if cmdline_looks_like_shire_watch(&args) => {
-            let exe_is_shire = read_exe_basename(pid)
-                .as_deref()
-                .is_some_and(exe_basename_is_shire);
-            exe_is_shire && !matches!(read_proc_state(pid), Some('Z'))
-        }
-        _ => false,
+fn check_pid_ownership(pid: u32) -> PidOwnership {
+    let Some(args) = read_cmdline(pid) else {
+        return PidOwnership::NotShire;
+    };
+    let cmdline_matches = cmdline_looks_like_shire_watch(&args);
+    if !cmdline_matches {
+        return PidOwnership::NotShire;
+    }
+    let exe = read_exe_basename(pid);
+    let is_zombie = matches!(read_proc_state(pid), Some('Z'));
+    ownership_from_checks(exe, is_zombie)
+}
+
+/// Pure decision logic for `check_pid_ownership`, factored out so the tri-state result
+/// — including the `Unverifiable` case, which is otherwise only reachable via a real
+/// cross-user process — can be exercised directly in unit tests. Assumes the cmdline
+/// match has already been confirmed by the caller.
+fn ownership_from_checks(exe: ExeCheck, is_zombie: bool) -> PidOwnership {
+    match exe {
+        ExeCheck::Unverifiable => PidOwnership::Unverifiable,
+        ExeCheck::Basename(name) if !exe_basename_is_shire(&name) => PidOwnership::NotShire,
+        ExeCheck::Basename(_) if is_zombie => PidOwnership::NotShire,
+        ExeCheck::Basename(_) => PidOwnership::Owned,
     }
 }
 
@@ -154,12 +226,16 @@ fn is_shire_watch_pid(pid: u32) -> bool {
 /// listener can accept connections (this also catches a daemon that died mid-startup
 /// before writing anything else, e.g. a bind failure). Falls back to the PID file plus
 /// an ownership + zombie check, for the brief window between the daemon process starting
-/// and it finishing its bind.
+/// and it finishing its bind. A PID whose ownership can't be verified (belongs to
+/// another user) is conservatively treated as running, rather than assumed stale.
 pub fn is_running(root: &Path) -> bool {
-    if std::os::unix::net::UnixStream::connect(sock_path(root)).is_ok() {
+    if connect_if_not_symlink(root).is_some() {
         return true;
     }
-    read_pid_file(root).is_some_and(is_shire_watch_pid)
+    match read_pid_file(root) {
+        Some(pid) => !matches!(check_pid_ownership(pid), PidOwnership::NotShire),
+        None => false,
+    }
 }
 
 /// Start the daemon by re-exec'ing this binary with `watch --foreground`.
@@ -242,6 +318,16 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
 /// still reports the daemon as running.
 pub fn stop_daemon(root: &Path) -> Result<()> {
     let pid_file = pid_path(root);
+
+    if is_symlink(&pid_file) {
+        eprintln!(
+            "Warning: {} is a symlink; refusing to read or act on it (it could point at \
+             another repo's pid file).",
+            pid_file.display()
+        );
+        return Ok(());
+    }
+
     let contents = match std::fs::read_to_string(&pid_file) {
         Ok(c) => c,
         Err(_) => return Ok(()), // No PID file, nothing to stop
@@ -256,19 +342,34 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
         }
     };
 
-    if !is_shire_watch_pid(pid) {
-        // The PID either doesn't exist, is a zombie, or belongs to some unrelated
-        // process (pid reuse after a reboot/crash is common — see WATCH-1). Signalling
-        // it would risk killing something else entirely, so refuse; the pid file is no
-        // longer trustworthy either way, so drop it (and any stale socket) rather than
-        // leaving it to be misread by a future stop/clean.
-        eprintln!(
-            "Warning: PID {pid} in {} does not look like a shire watch daemon; not signalling it. Removing stale state.",
-            pid_file.display()
-        );
-        let _ = std::fs::remove_file(&pid_file);
-        let _ = std::fs::remove_file(sock_path(root));
-        return Ok(());
+    match check_pid_ownership(pid) {
+        PidOwnership::NotShire => {
+            // The PID either doesn't exist, is a zombie, or belongs to some unrelated
+            // process (pid reuse after a reboot/crash is common — see WATCH-1).
+            // Signalling it would risk killing something else entirely, so refuse; the
+            // pid file is no longer trustworthy either way, so drop it (and any stale
+            // socket) rather than leaving it to be misread by a future stop/clean.
+            eprintln!(
+                "Warning: PID {pid} in {} does not look like a shire watch daemon; not signalling it. Removing stale state.",
+                pid_file.display()
+            );
+            let _ = std::fs::remove_file(&pid_file);
+            let _ = std::fs::remove_file(sock_path(root));
+            return Ok(());
+        }
+        PidOwnership::Unverifiable => {
+            // Unlike NotShire, this must NOT be treated as stale: the process may well
+            // be a live, legitimate shire daemon started by another user, and deleting
+            // its state files out from under it would orphan it and let a later
+            // `shire watch` start a duplicate.
+            eprintln!(
+                "Warning: PID {pid} in {} appears to belong to another user (its executable \
+                 could not be verified); not signalling it, and leaving its state files alone.",
+                pid_file.display()
+            );
+            return Ok(());
+        }
+        PidOwnership::Owned => {}
     }
 
     // Send SIGTERM
@@ -280,7 +381,7 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
 
     let mut exited = false;
     for _ in 0..50 {
-        if !is_shire_watch_pid(pid) {
+        if !matches!(check_pid_ownership(pid), PidOwnership::Owned) {
             exited = true;
             break;
         }
@@ -301,29 +402,57 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
 pub fn print_status(root: &Path) {
     let pid_file = pid_path(root);
     let sock = sock_path(root);
+
+    if is_symlink(&pid_file) {
+        println!("root:      {}", root.display());
+        println!(
+            "pid file:  {} (symlink — refusing to read it)",
+            pid_file.display()
+        );
+        println!("socket:    {}", sock.display());
+        println!("status:    cannot verify (pid file is a symlink)");
+        return;
+    }
+
     let pid = read_pid_file(root);
-    let pid_owned = pid.is_some_and(is_shire_watch_pid);
-    let socket_live = std::os::unix::net::UnixStream::connect(&sock).is_ok();
+    let ownership = pid.map(check_pid_ownership);
+    let sock_is_symlink = is_symlink(&sock);
+    let socket_live = !sock_is_symlink && std::os::unix::net::UnixStream::connect(&sock).is_ok();
 
     println!("root:      {}", root.display());
     println!("pid file:  {}", pid_file.display());
-    match pid {
-        Some(p) if pid_owned => println!("pid:       {p} (looks like a shire watch daemon)"),
-        Some(p) => println!("pid:       {p} (does NOT look like a shire watch daemon)"),
-        None => println!("pid:       (no pid file)"),
+    match (pid, ownership) {
+        (Some(p), Some(PidOwnership::Owned)) => {
+            println!("pid:       {p} (looks like a shire watch daemon)")
+        }
+        (Some(p), Some(PidOwnership::Unverifiable)) => {
+            println!("pid:       {p} (belongs to another user — cannot verify)")
+        }
+        (Some(p), _) => println!("pid:       {p} (does NOT look like a shire watch daemon)"),
+        (None, _) => println!("pid:       (no pid file)"),
     }
-    println!("socket:    {}", sock.display());
+    if sock_is_symlink {
+        println!(
+            "socket:    {} (symlink — refusing to connect through it)",
+            sock.display()
+        );
+    } else {
+        println!("socket:    {}", sock.display());
+    }
     println!("listening: {}", if socket_live { "yes" } else { "no" });
 
-    let status = match (socket_live, pid_owned) {
-        (true, true) => "running",
-        (true, false) => {
+    let status = match (socket_live, ownership) {
+        (true, Some(PidOwnership::Owned)) => "running",
+        (true, _) => {
             "a process is listening on the socket, but the pid file doesn't match a known shire daemon"
         }
-        (false, true) => {
+        (false, Some(PidOwnership::Owned)) => {
             "pid looks like a shire watch daemon, but it is not answering on its socket (starting up, or stuck)"
         }
-        (false, false) => "not running",
+        (false, Some(PidOwnership::Unverifiable)) => {
+            "pid belongs to another user and is not answering on its socket — cannot verify"
+        }
+        (false, _) => "not running",
     };
     println!("status:    {status}");
 }
@@ -412,14 +541,26 @@ mod tests {
     // `/proc` layout details beyond what the parsers above already cover directly.
 
     #[test]
-    fn is_shire_watch_pid_false_for_unrelated_process() {
+    fn check_pid_ownership_not_shire_for_unrelated_process() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("failed to spawn sleep");
-        assert!(!is_shire_watch_pid(child.id()));
+        assert_eq!(check_pid_ownership(child.id()), PidOwnership::NotShire);
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn check_pid_ownership_not_shire_for_dead_pid() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("failed to spawn true");
+        let pid = child.id();
+        let _ = child.wait();
+        // Give the kernel a moment to fully reap it in CI environments.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(check_pid_ownership(pid), PidOwnership::NotShire);
     }
 
     #[test]
@@ -433,8 +574,59 @@ mod tests {
         assert!(!exe_basename_is_shire(""));
     }
 
+    // --- ownership_from_checks: pure tri-state decision logic ---
+    //
+    // The Unverifiable case is only reachable in practice via a real process owned by
+    // another uid (which needs privilege-dropping tooling not reliably available in
+    // every CI environment), so it's tested here directly against the decision
+    // function rather than via a live process.
+
     #[test]
-    fn is_shire_watch_pid_false_for_spoofed_argv_on_a_foreign_executable() {
+    fn ownership_owned_when_exe_matches_and_not_zombie() {
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Basename("shire".into()), false),
+            PidOwnership::Owned
+        );
+    }
+
+    #[test]
+    fn ownership_not_shire_when_exe_is_not_shire() {
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Basename("python3".into()), false),
+            PidOwnership::NotShire
+        );
+    }
+
+    #[test]
+    fn ownership_not_shire_for_zombie_even_with_matching_exe() {
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Basename("shire".into()), true),
+            PidOwnership::NotShire
+        );
+    }
+
+    #[test]
+    fn ownership_unverifiable_when_exe_identity_cannot_be_read() {
+        // Reproduces the round-2 finding: /proc/<pid>/exe returning EACCES (a daemon
+        // owned by another uid) must not collapse into "not shire" — that led
+        // stop_daemon to delete pid/socket state files out from under a live daemon
+        // it simply couldn't verify.
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Unverifiable, false),
+            PidOwnership::Unverifiable
+        );
+        // Even a reported zombie state shouldn't override "can't verify" — if we
+        // can't read the exe, we can't fully trust other cross-user /proc reads either;
+        // this function receives is_zombie already resolved, but Unverifiable must win
+        // outright regardless of that input.
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Unverifiable, true),
+            PidOwnership::Unverifiable
+        );
+    }
+
+    #[test]
+    fn check_pid_ownership_not_shire_for_spoofed_argv_on_a_foreign_executable() {
         // Reproduces a false-positive found in review: a process whose argv happens to
         // contain the bare tokens "watch" and "--foreground" (satisfying
         // cmdline_looks_like_shire_watch on its own) but whose actual executable is not
@@ -449,21 +641,9 @@ mod tests {
             ])
             .spawn()
             .expect("failed to spawn python3 (expected to be present on CI runners)");
-        assert!(!is_shire_watch_pid(child.id()));
+        assert_eq!(check_pid_ownership(child.id()), PidOwnership::NotShire);
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    #[test]
-    fn is_shire_watch_pid_false_for_dead_pid() {
-        let mut child = std::process::Command::new("true")
-            .spawn()
-            .expect("failed to spawn true");
-        let pid = child.id();
-        let _ = child.wait();
-        // Give the kernel a moment to fully reap it in CI environments.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!is_shire_watch_pid(pid));
     }
 
     #[test]
@@ -524,5 +704,68 @@ mod tests {
 
         let _ = victim.kill();
         let _ = victim.wait();
+    }
+
+    // --- symlinked pid file / socket (round-2 finding) ---
+
+    #[test]
+    fn read_pid_file_ignores_a_symlinked_pid_file() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir_a.path().join(".shire")).unwrap();
+        std::fs::create_dir_all(dir_c.path().join(".shire")).unwrap();
+        std::fs::write(pid_path(dir_a.path()), "12345").unwrap();
+        std::os::unix::fs::symlink(pid_path(dir_a.path()), pid_path(dir_c.path())).unwrap();
+
+        assert!(read_pid_file(dir_c.path()).is_none());
+    }
+
+    #[test]
+    fn stop_daemon_refuses_a_symlinked_pid_file() {
+        // Repo C's watch.pid symlinked to repo A's real, live pid file must not let
+        // `shire watch --stop --root C` reach (and signal) A's daemon.
+        let dir_a = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir_a.path().join(".shire")).unwrap();
+        std::fs::create_dir_all(dir_c.path().join(".shire")).unwrap();
+
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        std::fs::write(pid_path(dir_a.path()), victim.id().to_string()).unwrap();
+        std::os::unix::fs::symlink(pid_path(dir_a.path()), pid_path(dir_c.path())).unwrap();
+
+        stop_daemon(dir_c.path()).unwrap();
+
+        assert!(
+            victim.try_wait().unwrap().is_none(),
+            "the process behind repo A's pid file must survive"
+        );
+        assert!(
+            pid_path(dir_a.path()).exists(),
+            "repo A's real pid file must be untouched"
+        );
+        assert!(
+            is_symlink(&pid_path(dir_c.path())),
+            "the symlink itself is left alone, not deleted as if it were stale state"
+        );
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    #[test]
+    fn connect_if_not_symlink_refuses_a_symlinked_socket() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_c = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir_a.path().join(".shire")).unwrap();
+        std::fs::create_dir_all(dir_c.path().join(".shire")).unwrap();
+
+        let listener = std::os::unix::net::UnixListener::bind(sock_path(dir_a.path())).unwrap();
+        std::os::unix::fs::symlink(sock_path(dir_a.path()), sock_path(dir_c.path())).unwrap();
+
+        assert!(connect_if_not_symlink(dir_c.path()).is_none());
+        drop(listener);
     }
 }

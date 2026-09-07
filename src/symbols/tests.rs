@@ -1168,6 +1168,8 @@ fn test_java_enum_methods_and_record_are_extracted() {
         got,
         vec![
             ("Color", SymbolKind::Enum, None),
+            ("GREEN", SymbolKind::Constant, Some("Color")),
+            ("RED", SymbolKind::Constant, Some("Color")),
             ("label", SymbolKind::Method, Some("Color")),
         ]
     );
@@ -1189,6 +1191,83 @@ fn test_java_enum_methods_and_record_are_extracted() {
             ("sum", SymbolKind::Method, Some("Point")),
         ]
     );
+}
+
+#[test]
+fn test_java_enum_constants_and_fields_are_extracted() {
+    // SYMBOLS-2-6: enum constants (`RED`, `GREEN`) and enum-body fields
+    // (`LABEL_COUNT`) were the one gap left after SYM-2 added enum methods —
+    // both are implicitly public static final and must come through as
+    // Constant symbols, exactly like class/interface constants do.
+    let source = r#"public enum Color {
+  RED, GREEN;
+  public static final int LABEL_COUNT = 2;
+  private int code; // not public+static+final — must be dropped
+  public String label() { return name(); }
+}
+"#;
+    let (symbols, _) = extract_file("java", source, Arc::from("Color.java"), true, 0);
+    let mut got: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.parent_symbol.as_deref()))
+        .collect();
+    got.sort_by_key(|s| s.0);
+    assert_eq!(
+        got,
+        vec![
+            ("Color", SymbolKind::Enum, None),
+            ("GREEN", SymbolKind::Constant, Some("Color")),
+            ("LABEL_COUNT", SymbolKind::Constant, Some("Color")),
+            ("RED", SymbolKind::Constant, Some("Color")),
+            ("label", SymbolKind::Method, Some("Color")),
+        ]
+    );
+
+    let by_name = |n: &str| symbols.iter().find(|s| s.name == n).unwrap();
+    assert_eq!(
+        by_name("RED").signature.as_deref(),
+        Some("public static final Color RED")
+    );
+    assert_eq!(
+        by_name("LABEL_COUNT").signature.as_deref(),
+        Some("public static final int LABEL_COUNT")
+    );
+}
+
+#[test]
+fn test_java_constructor_refs_attribute_to_enclosing_type_not_a_phantom_constructor_scope() {
+    // SYMBOLS-2-6: a constructor is never itself a symbol, and its `name`
+    // field is always identical to its enclosing type's name — so a call
+    // inside an ordinary constructor used to double up as "Point.Point"
+    // while a record's *compact* constructor (never in the ancestor list at
+    // all) attributed only to "Point", with no way to tell the two apart.
+    // Dropping constructor kinds from `enclosing_ancestors` makes both
+    // attribute uniformly to the enclosing type.
+    let source = r#"class Point {
+  Point(int x) {
+    validate(x);
+  }
+}
+"#;
+    let (_syms, refs) = extract_file("java", source, Arc::from("Point.java"), false, 0);
+    let call = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "validate")
+        .expect("validate() call must be captured");
+    assert_eq!(call.enclosing_symbol.as_deref(), Some("Point"));
+
+    let record_source = r#"public record Box(int x) {
+  public Box {
+    validate(x);
+  }
+}
+"#;
+    let (_syms, refs) = extract_file("java", record_source, Arc::from("Box.java"), false, 0);
+    let call = refs
+        .iter()
+        .find(|r| r.kind == ReferenceKind::Call && r.name == "validate")
+        .expect("compact constructor's validate() call must be captured");
+    assert_eq!(call.enclosing_symbol.as_deref(), Some("Box"));
 }
 
 #[test]

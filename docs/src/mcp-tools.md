@@ -17,10 +17,10 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_package_files` | List all files in a package, optionally filtered by extension. Use instead of Glob for listing package contents. |
 | `explore` | Explore a concept across the codebase — searches packages, symbols, files, and documentation semantically. Use as the first tool when investigating unfamiliar code or broad topics like "authentication" or "error handling". Returns a structured context map organized by package. |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
-| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based — same-name symbols across different packages are merged. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` falls back to its last segment when nothing matches it exactly. |
-| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` with no exact match falls back to its last segment. Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
+| `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` is resolved through `symbols.parent_symbol`, and references written in packages that define their own symbol of that name are left out — see [Qualified names](#qualified-names). |
+| `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` is resolved through the type that defines the method (see [Qualified names](#qualified-names)). Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 | `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, first_file, first_line, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
-| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
+| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it and reports `excluded_packages`; when the name is defined in more than one package the response also carries `defined_in` and a `home_package_note` saying the home package was a choice among them. Same name-based-match caveat as `symbol_references`. |
 | `schema_consumers` | Find all files generated from a schema file (e.g. `.proto`). Returns generated file paths and their packages. Use to understand the blast radius of a schema change. |
 | `generated_from` | Find the source schema file that generated a given file. Use to trace a generated file (e.g. `user.pb.go`) back to its source proto. |
 
@@ -42,8 +42,9 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
   for text inside a signature). `search_files` matches the path,
   `search_packages` the package name, description and path, and `search_docs`
   the doc title, body and path.
-- `search_symbols` orders exact name matches first, so searching `handle`
-  never buries a symbol actually called `handle` under its own prefixes.
+- `search_symbols` orders exact name matches first, so searching `handle` —
+  or `handle*`, or a pasted `handle.` — never buries a symbol actually called
+  `handle` under its own prefixes.
 - Symbol names are additionally indexed by their **sub-tokens**:
   `verifyJwtToken` is indexed as `verify`, `jwt`, `token`, so `verify jwt`,
   `jwt` and `token` all find it. This applies to symbol names only, not to
@@ -51,6 +52,74 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
 - Matching is by identifier, not regex or substring: `andleRequ` finds nothing.
 - Operators in a query (`OR`, `NEAR`, `*`, `-`, `column:`) are treated as
   literal text, not as FTS5 syntax.
+
+### Qualified names
+
+`symbol_references`, `symbol_callers` and `change_impact` take a symbol name.
+The reference index stores **bare** names (`run`), while `enclosing_symbol` /
+`caller_name` come back dot-qualified (`AuthService.run`) and are meant to be
+fed straight back in. A qualified name is resolved in three steps:
+
+1. **Literally.** Some refs really are dot-named — an `import` of `os.path`.
+   If the name matches refs as given, that is the answer.
+2. **Through the qualifier.** Otherwise the last segment before the dot is
+   looked up in `symbols.parent_symbol`: `A.run` finds the symbols named `run`
+   whose parent is `A`, which is where the symbol lives. A reference row
+   records the name and the package it was *written in*, never the type it
+   resolves to, so the qualifier cannot filter references directly — what it
+   can do is attribute them. A `run` written inside a package that defines its
+   own `run` on some other type belongs to that package's method, so those
+   packages are left out; every other package is kept, because a cross-package
+   call site is exactly what these tools exist to find.
+3. **Bare, and flagged.** If no indexed symbol carries that qualifier, the
+   qualifier is dropped and the bare name is matched on its own.
+
+Whenever the rows were matched on a name other than the one passed, the result
+carries `matched_name` (the name actually matched), `matched_note` (what that
+means) and, for step 2, `defined_in` and `excluded_packages`. Because those
+fields need somewhere to live, a rewritten name always returns the single
+object form described under [Result limits](#result-limits) — `results` plus
+the match fields — even when nothing was truncated. `change_impact` already
+returns an object, and gains `matched_name`, `qualifier_dropped` and
+`excluded_packages`; it takes its `home_package` from the resolved symbol.
+
+`excluded_packages` is worth reading before acting on a `change_impact`
+answer: those packages were left out of `direct_impact`,
+`cross_package_impact`, `summary.affected_packages` and the reverse-dep walk
+seeded from it, so a call site in one of them is blast radius the qualifier
+chose to attribute elsewhere. The list names every package that defines a
+symbol of that name, not only the ones that turned out to reference it — most
+entries will have had nothing to drop. `summary.excluded_ref_count` is the
+number that matters: how many references those packages actually held. When it
+is not zero, re-run with the bare name to see them.
+
+A `package` filter is applied on top of the resolution, so asking for a
+qualified name *and* a package that step 2 excluded is a contradiction and
+returns nothing — `excluded_packages` in the response is what says why. In
+`change_impact`, where `package` is a home-package hint rather than a filter,
+the same combination empties `direct_impact` by construction (that package's
+references were attributed to its own symbol), and `home_package_note` says
+so.
+
+### Which package is `home_package`
+
+`change_impact` splits references into `direct_impact` and
+`cross_package_impact` by comparing each reference's package against
+`home_package`, so that one value decides the whole answer. It is the
+`package` argument when given, and otherwise the first — by name — of the
+packages defining the resolved symbol. When there is more than one, that
+first is a tiebreak, not a fact, and the response says so:
+
+- `defined_in` lists every package defining the symbol (present only when
+  there is more than one, and narrowed to the definitions under the qualifier
+  for a qualified name).
+- `home_package_note` explains what was chosen and how to choose differently
+  — pass `package` to make one of the others the home package.
+
+What this cannot do is separate two same-named methods **inside one package**:
+with only the bare name recorded, `A.run` and `B.run` in the same package still
+merge, and both are reported. Pass `package` to narrow the answer; use Grep
+when the distinction has to be exact.
 
 ### Result limits
 
@@ -67,8 +136,9 @@ list-returning tool is bounded:
 SQL, and one row beyond it is fetched to tell a page that was cut from a list
 that merely ends there.
 
-A complete result is the bare JSON array. A truncated one is a single JSON
-object instead:
+A complete result is the bare JSON array. A truncated one — or, for the
+reference tools, one whose name was rewritten (see
+[Qualified names](#qualified-names)) — is a single JSON object instead:
 
 ```json
 {"results": [...], "truncated": true, "limit": 20, "max": 200, "note": "showing the first 20 results …"}
@@ -83,9 +153,12 @@ than a bigger `limit`, which is already clamped at 200.)
 
 `change_impact` returns an object rather than a list; when a bucket is capped
 it gains the same `truncated` / `limit` / `max` / `note` fields.
-`summary.direct_count` and `summary.cross_package_count` are true totals
-either way, but `summary.transitive_package_count` is not: the reverse-dep
-walk stops at `limit`, so a capped result reports a floor.
+`summary.direct_count` and `summary.cross_package_count` count every reference
+scanned rather than only the rows returned — but the scan itself stops at
+10 000 references, so they are totals only while `summary.counts_capped` is
+false; when it is true they are floors. `summary.transitive_package_count` is
+never a total: the reverse-dep walk stops at `limit`, so a capped result
+reports a floor.
 
 ### Index freshness under `serve --root`
 

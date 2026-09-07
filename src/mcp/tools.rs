@@ -268,6 +268,24 @@ impl ShireService {
         limit: u32,
         narrow_hint: &str,
     ) -> Result<CallToolResult, ErrorData> {
+        Self::json_result_matched(rows, limit, narrow_hint, None, "")
+    }
+
+    /// [`Self::json_result`] for the name-keyed reference tools, which also
+    /// have to say *which name* the rows answer for.
+    ///
+    /// A dot-qualified argument is matched through the bare segment the ref
+    /// index stores, so `A.run` is answered by rows named `run`. Silently
+    /// returning them is how `A.run` and `B.run` used to produce the same
+    /// answer; the envelope names the substitution instead, and says how far
+    /// the qualifier narrowed it.
+    fn json_result_matched<T: serde::Serialize>(
+        rows: &[T],
+        limit: u32,
+        narrow_hint: &str,
+        matched: Option<&queries::RefNameMatch>,
+        requested: &str,
+    ) -> Result<CallToolResult, ErrorData> {
         // A probe row we actually saw proves more rows exist. At the ceiling
         // there is no room for one, so a full result only *may* have been
         // cut — say so rather than asserting a truncation we cannot see.
@@ -275,29 +293,97 @@ impl ShireService {
         let at_ceiling = limit >= queries::MAX_ROWS && rows.len() as u32 >= limit;
         let truncated = over_limit || at_ceiling;
         let shown = &rows[..rows.len().min(limit as usize)];
-        let json = if truncated {
-            serde_json::to_string(&TruncatedList {
-                results: shown,
-                truncated: true,
-                limit,
-                max: queries::MAX_ROWS,
-                note: format!(
-                    "showing the first {limit} results (limit={limit}, max {max}). \
-                     {more} — {advice}.",
-                    max = queries::MAX_ROWS,
-                    more = if over_limit {
-                        "More exist"
-                    } else {
-                        "`limit` is at the ceiling, so more may exist"
-                    },
-                    advice = Self::truncation_advice(limit, narrow_hint)
-                ),
-            })
-        } else {
-            serde_json::to_string(shown)
+        let capped = truncated.then(|| TruncatedList {
+            results: shown,
+            truncated: true,
+            limit,
+            max: queries::MAX_ROWS,
+            note: format!(
+                "showing the first {limit} results (limit={limit}, max {max}). \
+                 {more} — {advice}.",
+                max = queries::MAX_ROWS,
+                more = if over_limit {
+                    "More exist"
+                } else {
+                    "`limit` is at the ceiling, so more may exist"
+                },
+                advice = Self::truncation_advice(limit, narrow_hint)
+            ),
+        });
+        // Only a rewritten name needs the envelope; a name matched as given
+        // keeps serializing as the bare array (or the truncation object) it
+        // always was — straight to text, with no `Value` round-trip on the
+        // path every other tool takes.
+        let Some(m) = matched.filter(|m| m.is_rewritten(requested)) else {
+            let json = match &capped {
+                Some(t) => serde_json::to_string(t),
+                None => serde_json::to_string(shown),
+            }
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        };
+        // A truncation object already has a `results` key to hang the match
+        // fields off; a bare array has to be wrapped in one first.
+        let mut obj = match &capped {
+            Some(t) => match serde_json::to_value(t).map_err(|e| Self::mcp_err(e.to_string()))? {
+                serde_json::Value::Object(o) => o,
+                other => serde_json::Map::from_iter([("results".to_string(), other)]),
+            },
+            None => {
+                let results =
+                    serde_json::to_value(shown).map_err(|e| Self::mcp_err(e.to_string()))?;
+                serde_json::Map::from_iter([("results".to_string(), results)])
+            }
+        };
+        obj.insert(
+            "matched_name".into(),
+            serde_json::Value::from(m.matched_name.clone()),
+        );
+        obj.insert(
+            "matched_note".into(),
+            serde_json::Value::from(Self::match_note(m, requested)),
+        );
+        if !m.defined_in.is_empty() {
+            obj.insert(
+                "defined_in".into(),
+                serde_json::Value::from(m.defined_in.clone()),
+            );
         }
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        if !m.excluded_packages.is_empty() {
+            obj.insert(
+                "excluded_packages".into(),
+                serde_json::Value::from(m.excluded_packages.clone()),
+            );
+        }
+        let json = serde_json::to_string(&serde_json::Value::Object(obj))
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Plain-language version of [`queries::RefNameMatch`] for a tool result.
+    fn match_note(m: &queries::RefNameMatch, requested: &str) -> String {
+        let bare = &m.matched_name;
+        if m.qualifier_dropped {
+            format!(
+                "no indexed symbol named `{bare}` sits under the qualifier in \
+                 `{requested}`, so the qualifier was dropped: these rows are every \
+                 `{bare}`, on any type in any package. Pass `package` to narrow."
+            )
+        } else if m.excluded_packages.is_empty() {
+            format!(
+                "references store bare names, so `{requested}` was matched as \
+                 `{bare}` (defined in `defined_in`). Another `{bare}` on a \
+                 different type in the same package would be included too."
+            )
+        } else {
+            format!(
+                "references store bare names, so `{requested}` was matched as \
+                 `{bare}` (defined in `defined_in`), minus the packages that \
+                 define a `{bare}` of their own (`excluded_packages`). Another \
+                 `{bare}` on a different type in the same package would be \
+                 included too."
+            )
+        }
     }
 
     /// What to tell the model to do about a truncated result.
@@ -812,7 +898,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and the dot-qualified enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
+        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and the dot-qualified enclosing symbol. A dot-qualified `name` (`AuthService.login`) is resolved through the type that defines it: references written in packages that define their own `login` are attributed to those and left out, every other package is kept. References store bare names, so a second `login` on a different type in the *same* package is still included. Whenever the rows were matched on a different name the result says so in `matched_name`/`matched_note`. Otherwise matching is by name only, so two same-named symbols in one package cannot be distinguished."
     )]
     fn symbol_references(
         &self,
@@ -836,7 +922,7 @@ impl ShireService {
             ))]));
         }
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
-        let rows = queries::query_symbol_references(
+        let (rows, matched) = queries::query_symbol_references_resolved(
             &conn,
             &args.name,
             args.kind.as_deref(),
@@ -844,11 +930,17 @@ impl ShireService {
             i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "filter by `package`/`kind`")
+        Self::json_result_matched(
+            &rows,
+            limit,
+            "filter by `package`/`kind`",
+            Some(&matched),
+            &args.name,
+        )
     }
 
     #[tool(
-        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward. `caller_name` is dot-qualified for methods (`AuthService.login`) and can be passed straight back in as `name`: a qualified name with no exact match falls back to its last segment."
+        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward. `caller_name` is dot-qualified for methods (`AuthService.login`) and can be passed straight back in as `name`: the qualifier is resolved through the type that defines the method, and call sites in packages that define their own method of that name are attributed to those and left out. Call sites record bare names, so another method of that name on a different type in the *same* package is still included; if no indexed symbol carries the qualifier it is dropped and the wider answer is flagged. Either way `matched_name`/`matched_note` say which name the rows answer for."
     )]
     fn symbol_callers(
         &self,
@@ -861,14 +953,20 @@ impl ShireService {
             return Ok(disabled);
         }
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
-        let rows = queries::query_symbol_callers(
+        let (rows, matched) = queries::query_symbol_callers_resolved(
             &conn,
             &args.name,
             args.package.as_deref(),
             i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "filter by `package`")
+        Self::json_result_matched(
+            &rows,
+            limit,
+            "filter by `package`",
+            Some(&matched),
+            &args.name,
+        )
     }
 
     #[tool(
@@ -896,7 +994,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
+        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name, `excluded_packages` names the packages whose own same-named symbol claimed their references, and `summary.excluded_ref_count` says how many rows that hid — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name when the count is not zero. `home_package` decides the direct/cross split; when the symbol is defined in more than one package the response carries `defined_in` (all of them) and `home_package_note` saying the home package was chosen among them — pass `package` to pick another, and read that note too when a `package` hint sits in `excluded_packages` and leaves `direct_impact` empty by construction. Same name-based-match caveat as symbol_references."
     )]
     fn change_impact(
         &self,
@@ -932,10 +1030,11 @@ impl ShireService {
         impact.direct_impact.truncate(limit as usize);
         impact.cross_package_impact.truncate(limit as usize);
         impact.transitive_impact.truncate(limit as usize);
-        // `direct_count`/`cross_package_count` are true totals; the
-        // transitive count is not (the walk stops at the cap), so keep it
-        // consistent with the rows actually returned — `truncated` is what
-        // says more exist.
+        // `direct_count`/`cross_package_count` are totals up to the ref scan
+        // cap (`summary.counts_capped` says whether it was hit); the
+        // transitive count is not a total at all (the walk stops at the cap),
+        // so keep it consistent with the rows actually returned — `truncated`
+        // is what says more exist.
         impact.summary.transitive_package_count = impact.transitive_impact.len();
         let mut value = serde_json::to_value(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
         if let Some(obj) = value.as_object_mut()
@@ -948,10 +1047,23 @@ impl ShireService {
                 "note".into(),
                 serde_json::Value::from(format!(
                     "each impact bucket is capped at {limit} rows (max {max}); \
-                     `summary.direct_count` and `summary.cross_package_count` are true \
-                     totals, but {transitive} — {advice}.",
+                     `summary.direct_count` and `summary.cross_package_count` count \
+                     every ref scanned, {capped}, but {transitive} — {advice}.",
                     max = queries::MAX_ROWS,
                     advice = Self::truncation_advice(limit, "pass `package`"),
+                    capped = if impact.summary.counts_capped {
+                        format!(
+                            "and the scan stopped at its {scan}-reference cap, so both \
+                             are floors (`summary.counts_capped`)",
+                            scan = queries::MAX_REFS_SCANNED
+                        )
+                    } else {
+                        format!(
+                            "which stops at {scan} references (`summary.counts_capped` \
+                             is false, so both are totals)",
+                            scan = queries::MAX_REFS_SCANNED
+                        )
+                    },
                     transitive = if transitive_capped {
                         "the transitive walk stopped at the cap, so \
                          `summary.transitive_package_count` is a floor, \
@@ -1404,6 +1516,206 @@ mod tests {
             _ => panic!("expected text content"),
         };
         assert!(text.contains("Cross-reference index is disabled"));
+    }
+
+    /// A service with `A.run` in `billing` and `B.run` in `admin-panel`,
+    /// plus a `run` call site in each package.
+    fn service_with_two_runs(dir: &std::path::Path) -> ShireService {
+        let path = dir.join("runs.db");
+        {
+            let conn = crate::db::open_or_create(&path).unwrap();
+            crate::db::write_references_enabled(&conn, true).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) \
+                 VALUES ('admin-panel','admin','python'),('billing','billing','python')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, parent_symbol) \
+                 VALUES ('billing','run','method','billing/core.py',10,'A'), \
+                        ('admin-panel','run','method','admin/panel.py',4,'B')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes) \
+                 VALUES ('billing/core.py','billing','py',0),('admin/panel.py','admin-panel','py',0)",
+                [],
+            )
+            .unwrap();
+            let id = |p: &str| -> i64 {
+                conn.query_row("SELECT id FROM files WHERE path = ?1", [p], |r| r.get(0))
+                    .unwrap()
+            };
+            let (bill, admin) = (id("billing/core.py"), id("admin/panel.py"));
+            conn.execute(
+                &format!(
+                    "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                     VALUES ('run','call',{bill},20,'billing','boot'), \
+                            ('run','call',{admin},8,'admin-panel','boot_b')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        let conn = crate::db::open_or_create(&path).unwrap();
+        ShireService::new(conn, None)
+    }
+
+    /// `symbol_callers("A.run")` used to answer with every `run` in the
+    /// index, `B.run`'s callers included, and say nothing about it. The
+    /// qualifier now scopes the answer to the package defining `A.run`, and
+    /// the result names the bare name the rows were matched on.
+    #[test]
+    fn test_reference_tools_report_a_qualified_name_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_two_runs(dir.path());
+
+        let callers = |name: &str| {
+            svc.symbol_callers(Parameters(SymbolCallersArgs {
+                name: name.into(),
+                package: None,
+                limit: None,
+            }))
+            .unwrap()
+        };
+
+        let r = callers("A.run");
+        let rows = result_rows(&r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["caller_name"], "boot");
+        let v: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(v["matched_name"], "run");
+        assert_eq!(v["defined_in"], serde_json::json!(["billing"]));
+        assert_eq!(v["excluded_packages"], serde_json::json!(["admin-panel"]));
+        assert!(
+            v["matched_note"].as_str().unwrap().contains("bare names"),
+            "got {v}"
+        );
+
+        let rows = result_rows(&callers("B.run"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["caller_name"], "boot_b");
+
+        // A bare name is answered as before — a plain JSON array, no envelope.
+        let text = result_text(&callers("run"));
+        assert!(
+            text.starts_with('['),
+            "bare name keeps the array shape: {text}"
+        );
+        assert_eq!(result_rows(&callers("run")).len(), 2);
+
+        // An unresolvable qualifier still falls back, and says it widened.
+        let v: serde_json::Value =
+            serde_json::from_str(&result_text(&callers("Mystery.run"))).unwrap();
+        assert_eq!(v["results"].as_array().unwrap().len(), 2);
+        assert!(
+            v["matched_note"]
+                .as_str()
+                .unwrap()
+                .contains("qualifier was dropped"),
+            "got {v}"
+        );
+        assert!(v.get("defined_in").is_none());
+        assert!(v.get("excluded_packages").is_none());
+
+        // References carry the same resolution.
+        let r = svc
+            .symbol_references(Parameters(SymbolRefsArgs {
+                name: "A.run".into(),
+                kind: None,
+                package: None,
+                limit: None,
+            }))
+            .unwrap();
+        let rows = result_rows(&r);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["package"], "billing");
+
+        // And `change_impact` partitions against the right home package.
+        let r = svc
+            .change_impact(Parameters(ChangeImpactArgs {
+                name: "A.run".into(),
+                package: None,
+                transitive_depth: Some(1),
+                limit: None,
+            }))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(v["symbol"], "A.run");
+        assert_eq!(v["matched_name"], "run");
+        assert_eq!(v["home_package"], "billing");
+        assert_eq!(v["summary"]["direct_count"], 1);
+        assert_eq!(v["summary"]["cross_package_count"], 0);
+        assert_eq!(v["summary"]["counts_capped"], false);
+        assert_eq!(v["excluded_packages"], serde_json::json!(["admin-panel"]));
+        assert_eq!(v["summary"]["excluded_ref_count"], 1);
+        assert!(
+            v.get("qualifier_dropped").is_none(),
+            "flag is off, so absent"
+        );
+    }
+
+    /// The tool payload carries the home-package disclosure, not just the
+    /// library struct: an ambiguous `home_package` decides the direct/cross
+    /// split, and a model reading the JSON has to see the alternatives.
+    #[test]
+    fn test_change_impact_payload_discloses_an_ambiguous_home_package() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_two_runs(dir.path());
+        {
+            let conn = svc.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('payments','payments','python')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, parent_symbol) \
+                 VALUES ('payments','run','method','payments/job.py',3,'A')",
+                [],
+            )
+            .unwrap();
+        }
+        let impact = |name: &str, package: Option<&str>| -> serde_json::Value {
+            let r = svc
+                .change_impact(Parameters(ChangeImpactArgs {
+                    name: name.into(),
+                    package: package.map(str::to_string),
+                    transitive_depth: Some(1),
+                    limit: None,
+                }))
+                .unwrap();
+            serde_json::from_str(&result_text(&r)).expect("valid JSON")
+        };
+
+        let v = impact("A.run", None);
+        assert_eq!(v["home_package"], "billing");
+        assert_eq!(v["defined_in"], serde_json::json!(["billing", "payments"]));
+        assert!(
+            v["home_package_note"]
+                .as_str()
+                .expect("note")
+                .contains("payments"),
+            "got {v}"
+        );
+
+        // A hint the qualifier excluded explains its own empty bucket.
+        let v = impact("A.run", Some("admin-panel"));
+        assert_eq!(v["summary"]["direct_count"], 0);
+        assert!(
+            v["home_package_note"]
+                .as_str()
+                .expect("note")
+                .contains("excluded_packages"),
+            "got {v}"
+        );
+
+        // Unambiguous: neither field is spent on a non-event.
+        let v = impact("B.run", None);
+        assert!(v.get("defined_in").is_none(), "got {v}");
+        assert!(v.get("home_package_note").is_none(), "got {v}");
     }
 
     /// End-to-end: wire a minimal symbol + refs + dep graph through the

@@ -65,14 +65,40 @@ fn argv0_looks_like_shire(args: &[String]) -> bool {
 /// `root`, compared either verbatim or after canonicalizing the argument (the argument
 /// itself might not exist any more or might not be canonicalizable, e.g. mid-deletion —
 /// in that case only the verbatim comparison can match).
+///
+/// On Linux, `/proc/<pid>/cmdline` preserves the original NUL-separated argv, so the
+/// `--root` value is always exactly one element of `args` regardless of what it
+/// contains. The macOS fallback (`read_cmdline`) instead parses `ps -o command=`'s
+/// space-joined text back into tokens via `split_whitespace()`, which loses the fact
+/// that a value containing a space (e.g. `--root "/Users/me/my repo"`) was ever one
+/// argument — it comes back as two consecutive tokens. To tolerate that without
+/// requiring shell-level quoting information this doesn't have, for each `--root`
+/// token this tries re-joining an increasing run of the tokens that follow it with a
+/// single space, checking the joined string against `root` (verbatim, then
+/// canonicalized) at every length rather than only ever the very next token. Matching
+/// requires an exact equality at some length, never a prefix match, so joining too few
+/// or too many tokens simply fails to match instead of falsely succeeding.
 fn args_contain_root(args: &[String], root: &Path) -> bool {
-    args.windows(2).any(|pair| {
-        pair[0] == "--root"
-            && (Path::new(&pair[1]) == root
-                || std::fs::canonicalize(&pair[1])
+    for (i, arg) in args.iter().enumerate() {
+        if arg != "--root" {
+            continue;
+        }
+        let mut joined = String::new();
+        for token in &args[i + 1..] {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(token);
+            if Path::new(&joined) == root
+                || std::fs::canonicalize(&joined)
                     .map(|c| c == root)
-                    .unwrap_or(false))
-    })
+                    .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a parsed argv looks like `shire watch --root <root> --foreground` (in any
@@ -148,21 +174,23 @@ fn read_proc_state(pid: u32) -> Option<char> {
 /// Whether an executable path plausibly belongs to shire's own binary. Two ways to
 /// pass:
 ///
-/// 1. Its basename is exactly `shire`, or starts with `shire-` (`shire-v0.7`,
-///    `shire-0.6.2`, ...) — covers a versioned install, a release tarball's binary
-///    renamed on download, or a copy kept side by side during an upgrade. Does not
-///    require the file to exist on disk, so it still works after the on-disk binary was
-///    replaced (see the `" (deleted)"` handling below). Deliberately requires the `-`
-///    separator rather than a bare prefix match: without it, an unrelated binary whose
-///    name merely *starts with* "shire" with no separator at all (e.g. `shireling` or
-///    `shirecheck`, as opposed to a hyphenated `shire-<something>`) would be
-///    misidentified as shire's own daemon if its PID were ever reused for one after a
-///    crash/reboot. Note this does NOT rule out a same-uid tool that happens to be
-///    named `shire-<anything>` (e.g. `shire-metrics-exporter`) — that residual case is
-///    left to the separate cmdline check in `check_pid_ownership`, which additionally
-///    requires argv[0] to itself look like shire and a `--root` argument naming this
-///    exact repository, alongside the literal argv tokens "watch" and "--foreground"
-///    (WW-3-3).
+/// 1. Its basename is exactly `shire`, or starts with `shire-` or `shire.`
+///    (`shire-v0.7`, `shire-0.6.2`, `shire.old` — the last from a manual
+///    `mv shire shire.old && cp new shire`-style in-place upgrade, which a shell
+///    completion or backup convention names with a `.` rather than a `-`) — covers a
+///    versioned install, a release tarball's binary renamed on download, or a copy kept
+///    side by side during an upgrade. Does not require the file to exist on disk, so it
+///    still works after the on-disk binary was replaced (see the `" (deleted)"` handling
+///    below). Deliberately requires a `-` or `.` separator rather than a bare prefix
+///    match: without it, an unrelated binary whose name merely *starts with* "shire"
+///    with no separator at all (e.g. `shireling` or `shirecheck`) would be misidentified
+///    as shire's own daemon if its PID were ever reused for one after a crash/reboot.
+///    Note this does NOT rule out a same-uid tool that happens to be named
+///    `shire-<anything>`/`shire.<anything>` (e.g. `shire-metrics-exporter`) — that
+///    residual case is left to the separate cmdline check in `check_pid_ownership`,
+///    which additionally requires argv[0] to itself look like shire and a `--root`
+///    argument naming this exact repository, alongside the literal argv tokens "watch"
+///    and "--foreground" (WW-3-3).
 /// 2. It resolves (after canonicalization) to the exact same file as this process's own
 ///    `std::env::current_exe()` — covers a wrapper name that doesn't start with `shire`
 ///    at all, so long as it truly is the same binary that would be spawned by
@@ -171,17 +199,17 @@ fn read_proc_state(pid: u32) -> Option<char> {
 /// Handles the Linux kernel's `readlink(/proc/<pid>/exe)` appending `" (deleted)"` when
 /// the on-disk binary was replaced/removed after exec (e.g. an in-place upgrade of a
 /// renamed install while the daemon kept running) — that's still shire, just an older
-/// copy. The basename heuristic above already covers a `shire`/`shire-*`-named install;
-/// for a wrapper name that doesn't match it, the identity fallback below still applies —
-/// see `canonical_dir_and_name` for why it compares directory+basename rather than the
-/// full canonicalized path a live file would allow.
+/// copy. The basename heuristic above already covers a `shire`/`shire-*`/`shire.*`-named
+/// install; for a wrapper name that doesn't match it, the identity fallback below still
+/// applies — see `canonical_dir_and_name` for why it compares directory+basename rather
+/// than the full canonicalized path a live file would allow.
 fn exe_path_is_shire(raw: &str) -> bool {
     let deleted = raw.ends_with(" (deleted)");
     let trimmed = raw.trim_end_matches(" (deleted)");
     let candidate = Path::new(trimmed);
 
     if let Some(name) = candidate.file_name().and_then(|f| f.to_str())
-        && (name == "shire" || name.starts_with("shire-"))
+        && (name == "shire" || name.starts_with("shire-") || name.starts_with("shire."))
     {
         return true;
     }
@@ -489,9 +517,23 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
     let pid = match contents.trim().parse::<u32>() {
         Ok(p) => p,
         Err(_) => {
-            // Invalid PID file, clean up
+            // Invalid (unparseable) PID file. There's no PID to check ownership of, but
+            // that doesn't make the socket file safe to remove unconditionally: a
+            // corrupted pid file next to a socket a real daemon is still listening on
+            // (e.g. a crash or a concurrent writer truncated only the pid file) would
+            // otherwise get its live socket deleted right along with the garbage pid
+            // file. Probe it first, and keep it if something answers.
             let _ = std::fs::remove_file(&pid_file);
-            let _ = std::fs::remove_file(sock_path(root));
+            if connect_if_not_symlink(root).is_none() {
+                let _ = std::fs::remove_file(sock_path(root));
+            } else {
+                eprintln!(
+                    "Warning: {} contained an unparseable pid, but something is still \
+                     listening on {} — leaving the socket file in place.",
+                    pid_file.display(),
+                    sock_path(root).display()
+                );
+            }
             return Ok(());
         }
     };
@@ -535,10 +577,15 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
             return Ok(());
         }
         StopAction::RefuseAndKeep => {
-            // NotShire but the socket is live: same "don't touch it" treatment as
-            // Unverifiable, just a different reason — see the comment above `socket_live`.
-            eprintln!(
-                "Warning: PID {pid} in {} does not look like a shire watch daemon, but \
+            // NotShire but the socket is live: same "don't touch its state" treatment
+            // as Unverifiable, but reported as a *failure* rather than a quiet Ok(()) —
+            // unlike Unverifiable (which may just be another user's legitimate daemon
+            // we simply can't introspect), here the caller asked to stop a demonstrably
+            // live listener and nothing was actually stopped. Returning Ok(()) would
+            // let a `shire watch --stop && rm -rf .shire`-style script see rc=0 and
+            // proceed to delete `.shire` out from under a daemon that is still running.
+            anyhow::bail!(
+                "PID {pid} in {} does not look like a shire watch daemon, but \
                  something is still listening on {} — it may be a live daemon this process \
                  simply could not positively identify (a different shire binary than the one \
                  that started it, or the same install replaced in place while it kept \
@@ -547,7 +594,6 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
                 pid_file.display(),
                 sock_path(root).display()
             );
-            return Ok(());
         }
         StopAction::Signal => {}
     }
@@ -731,6 +777,38 @@ mod tests {
     }
 
     #[test]
+    fn args_contain_root_reconstructs_a_space_split_root_from_a_ps_style_command_line() {
+        // Simulates the macOS fallback: read_cmdline() for non-Linux targets parses
+        // `ps -o command=`'s single space-joined string back into tokens via
+        // split_whitespace(), so a --root value that itself contains a space (a real,
+        // common macOS path like "/Users/me/my repo") comes back as two consecutive
+        // tokens instead of one.
+        let fake_ps_line = "/usr/bin/shire watch --root /Users/me/my repo --foreground";
+        let args: Vec<String> = fake_ps_line
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert!(args_contain_root(&args, Path::new("/Users/me/my repo")));
+        assert!(cmdline_looks_like_shire_watch(
+            &args,
+            Path::new("/Users/me/my repo")
+        ));
+    }
+
+    #[test]
+    fn args_contain_root_does_not_match_a_different_root_via_the_reconstruction() {
+        let fake_ps_line = "/usr/bin/shire watch --root /Users/me/my repo --foreground";
+        let args: Vec<String> = fake_ps_line
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        // None of the joined prefixes of the tokens following --root ("/Users/me/my",
+        // "/Users/me/my repo", "/Users/me/my repo --foreground", ...) equal this
+        // unrelated root, so it must not match.
+        assert!(!args_contain_root(&args, Path::new("/Users/me/other repo")));
+    }
+
+    #[test]
     fn proc_stat_state_parses_simple_comm() {
         assert_eq!(
             parse_proc_stat_state("1234 (shire) S 1 1234 1234 0 -1 4194304"),
@@ -800,6 +878,10 @@ mod tests {
         // side-by-side upgrade copy must still be recognized as shire's own binary.
         assert!(exe_path_is_shire("/opt/shire-v0.7/shire-v0.7"));
         assert!(exe_path_is_shire("/opt/bin/shire-0.6.2"));
+        // A manual `mv shire shire.old && cp new shire` in-place upgrade leaves the
+        // still-running old daemon's exe link resolving to "shire.old" — a `.`
+        // separator must be accepted just like the hyphenated form above.
+        assert!(exe_path_is_shire("/opt/bin/shire.old"));
         assert!(!exe_path_is_shire("/usr/bin/python3"));
         assert!(!exe_path_is_shire("/bin/sleep"));
         assert!(!exe_path_is_shire(""));
@@ -1066,6 +1148,9 @@ mod tests {
         // ownership verification, but something is still listening on the socket —
         // stop_daemon must not delete the pid/socket files in that case, unlike the
         // genuinely-stale case covered by `stop_daemon_refuses_to_signal_unrelated_process`.
+        // It must also report this as a failure (not a quiet Ok(())), so a
+        // `stop && rm -rf .shire`-style script doesn't proceed as if the daemon were
+        // actually stopped.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".shire")).unwrap();
 
@@ -1079,7 +1164,10 @@ mod tests {
             .expect("failed to spawn sleep");
         std::fs::write(pid_path(dir.path()), victim.id().to_string()).unwrap();
 
-        stop_daemon(dir.path()).expect("stop_daemon should not error");
+        assert!(
+            stop_daemon(dir.path()).is_err(),
+            "stop_daemon must report failure when it can't verify a still-live socket"
+        );
 
         assert!(
             victim.try_wait().unwrap().is_none(),
@@ -1104,6 +1192,45 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".shire")).unwrap();
         assert!(stop_daemon(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn stop_daemon_keeps_a_live_socket_when_the_pid_file_is_unparseable() {
+        // A corrupted/truncated pid file (e.g. a crash or a concurrent writer) next to
+        // a socket a real daemon is still listening on must not have that socket
+        // deleted just because the pid it's paired with couldn't be parsed.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".shire")).unwrap();
+        std::fs::write(pid_path(dir.path()), "not-a-pid").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(sock_path(dir.path())).unwrap();
+
+        assert!(stop_daemon(dir.path()).is_ok());
+
+        assert!(
+            !pid_path(dir.path()).exists(),
+            "the unparseable pid file itself is still garbage and should be removed"
+        );
+        assert!(
+            sock_path(dir.path()).exists(),
+            "the socket must be kept while something is still listening on it"
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn stop_daemon_removes_a_dead_socket_when_the_pid_file_is_unparseable() {
+        // The existing, simpler case: a leftover socket *file* with nothing listening
+        // on it (no live UnixListener bound) really is stale and safe to remove
+        // alongside the unparseable pid file.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".shire")).unwrap();
+        std::fs::write(pid_path(dir.path()), "not-a-pid").unwrap();
+        std::fs::write(sock_path(dir.path()), "").unwrap();
+
+        assert!(stop_daemon(dir.path()).is_ok());
+
+        assert!(!pid_path(dir.path()).exists());
+        assert!(!sock_path(dir.path()).exists());
     }
 
     #[test]

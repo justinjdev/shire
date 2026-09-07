@@ -61,8 +61,9 @@ prints the daemon's PID rather than reporting success while it is still running;
 PID/socket files are left in place, and retrying (or checking `--status`) is safe.
 
 The daemon is identified as shire's own by its executable — an exact basename match, a
-basename starting with `shire-` (a versioned install like `shire-v0.7`, a renamed
-download), or the exact same file as the `shire` binary currently invoking
+basename starting with `shire-` or `shire.` (a versioned install like `shire-v0.7`, a
+renamed download, or a manual `mv shire shire.old && cp new shire`-style in-place
+upgrade), or the exact same file as the `shire` binary currently invoking
 `--stop`/`--status` (including after an in-place upgrade replaces that file while the
 daemon is still running, so long as it's still at the same install path) — so a renamed
 or versioned binary is recognized correctly, while an unrelated binary whose name merely
@@ -79,6 +80,11 @@ answering, its pid/socket files are left alone and nothing is signalled, rather 
 treated as stale and deleted out from under a process that is demonstrably still running.
 `shire clean` inherits the same caution and refuses (non-zero exit, nothing removed)
 rather than removing `.shire` while such a daemon is alive.
+
+One residual case has no automatic recovery: if the repository directory itself is
+renamed while the daemon is running, the `--root` recorded in its own argv no longer
+matches the (now different) path passed to `--stop`, so shire refuses to signal it —
+stop it directly instead with `kill $(cat .shire/watch.pid)`.
 
 ## Smart filtering
 

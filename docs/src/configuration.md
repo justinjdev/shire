@@ -33,6 +33,17 @@ name = "legacy-auth"
 description = "Deprecated auth service — do not add new dependencies"
 ```
 
+## File discovery and `.gitignore`
+
+The manifest walk, the file index, and symbol extraction all skip:
+
+- Directories named in `discovery.exclude`
+- Anything matched by a committed `.gitignore` or `.ignore` file, at the repo root or in any nested directory
+
+They deliberately do **not** honor a developer's personal global gitignore (`git config core.excludesFile`) or the untracked, per-clone `.git/info/exclude` — only files checked into the repo affect what gets indexed, so the index is the same for every collaborator and in CI regardless of local git configuration.
+
+A malformed pattern in a `.gitignore` (one `git` accepts but the `ignore` crate's glob compiler rejects — e.g. brace alternation, a trailing backslash) is logged as a warning and otherwise ignored; it never aborts a build.
+
 ## Config precedence
 
 Config is resolved in this order, with **no merging** — the first one found is used whole, and none of the others are read:

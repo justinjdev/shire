@@ -137,7 +137,9 @@ fn refuse_message(path: &Path, verdict: &guard::RemovalVerdict) -> String {
     format!(
         "refusing to delete and rebuild {}: {what}, and it is not under a location \
          shire manages (<repo>/.shire/ or ~/.claude/shire/). Check shire.toml's \
-         db_path (or --db) — shire will not overwrite a file it did not create",
+         db_path (or --db) — shire will not overwrite a file it did not create. \
+         If this really is a shire index that has been damaged, delete it by hand \
+         and run the build again",
         path.display()
     )
 }

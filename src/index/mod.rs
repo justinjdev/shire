@@ -2411,7 +2411,27 @@ fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    let files: Vec<(String, Option<String>, String, u64)> = conn
+    let files = load_indexed_files(conn)?;
+
+    let edges = detect_boundary_edges(conn, &files)?;
+    if !edges.is_empty() {
+        tracing::debug!(edges = edges.len(), "backfill: boundary edges detected");
+        crate::db::queries::batch_insert_boundary_edges(conn, &edges)?;
+    }
+    Ok(())
+}
+
+/// A row of the `files` table in the shape the file-index and boundary-edge
+/// code passes around: (path, package, extension, size_bytes).
+type IndexedFile = (String, Option<String>, String, u64);
+
+/// Every row of the `files` table in the shape `detect_boundary_edges` takes.
+///
+/// This is the *indexed* file set, which is not the same as the walked one
+/// when a walk went blind: `incremental_upsert_files` deliberately keeps the
+/// rows under an unreadable path, and they are still served.
+fn load_indexed_files(conn: &Connection) -> Result<Vec<IndexedFile>> {
+    let files = conn
         .prepare("SELECT path, package, extension, size_bytes FROM files")?
         .query_map([], |row| {
             Ok((
@@ -2422,13 +2442,7 @@ fn backfill_boundary_edges_if_needed(conn: &Connection) -> Result<()> {
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-
-    let edges = detect_boundary_edges(conn, &files)?;
-    if !edges.is_empty() {
-        tracing::debug!(edges = edges.len(), "backfill: boundary edges detected");
-        crate::db::queries::batch_insert_boundary_edges(conn, &edges)?;
-    }
-    Ok(())
+    Ok(files)
 }
 
 struct FileIndexResult {
@@ -2603,10 +2617,27 @@ fn phase_index_files(
     changed_packages.extend(read_pending_source_recheck(conn));
     write_pending_source_recheck(conn, &changed_packages)?;
 
-    // Detect proto→generated boundary edges from the walked file set.
-    // Runs after file upsert so package associations are current.
+    // Detect proto→generated boundary edges. Runs after the file upsert so
+    // package associations are current.
+    //
+    // Sourced from the *indexed* file set, not the walked one, whenever the
+    // walk went blind: `validated_files` is missing exactly the rows the
+    // upsert preserved, so clearing the table and re-detecting from it would
+    // drop those packages' edges — and permanently. No file-tree hash is
+    // stored for an incomplete walk, so once the directory is readable again
+    // the tree hashes back to its pre-incident value, `phase_index_files`
+    // short-circuits at the top, and `backfill_boundary_edges_if_needed`
+    // declines to rebuild a table that still holds every *other* package's
+    // edges.
     crate::db::queries::clear_boundary_edges(conn)?;
-    let boundary_edges = detect_boundary_edges(conn, &validated_files)?;
+    let indexed_files;
+    let edge_source: &[IndexedFile] = if unreadable.is_empty() {
+        &validated_files
+    } else {
+        indexed_files = load_indexed_files(conn)?;
+        &indexed_files
+    };
+    let boundary_edges = detect_boundary_edges(conn, edge_source)?;
     if !boundary_edges.is_empty() {
         tracing::debug!(edges = boundary_edges.len(), "boundary edges detected");
         crate::db::queries::batch_insert_boundary_edges(conn, &boundary_edges)?;
@@ -6248,6 +6279,50 @@ mod incremental_signal_tests {
             refs, 1,
             "a transiently unreadable directory must not destroy the package's references"
         );
+    }
+
+    #[test]
+    fn test_boundary_edges_survive_a_walk_that_missed_their_package() {
+        // `phase_index_files` clears `boundary_edges` and re-detects them on
+        // every non-short-circuiting build. Re-detecting from the *walked*
+        // files alone drops the edges of a package the walk could not read —
+        // and permanently: no file-tree hash is stored for an incomplete
+        // walk, so the next build (with the directory readable again) hashes
+        // back to its pre-incident value, short-circuits, and
+        // `backfill_boundary_edges_if_needed` declines because the table
+        // still holds the other packages' edges. Detecting from the indexed
+        // file set instead keeps them.
+        let conn = files_db();
+        let proto = (
+            "a/api.proto".to_string(),
+            Some("a".to_string()),
+            "proto".to_string(),
+            10u64,
+        );
+        let generated = (
+            "a/api.pb.go".to_string(),
+            Some("a".to_string()),
+            "go".to_string(),
+            20u64,
+        );
+        incremental_upsert_files(&conn, &[proto, generated], &[]).unwrap();
+
+        // A build during which `a/` could not be read: its rows are preserved
+        // but nothing in `a/` was walked.
+        incremental_upsert_files(&conn, &[], &["a".to_string()]).unwrap();
+
+        assert!(
+            detect_boundary_edges(&conn, &[]).unwrap().is_empty(),
+            "sanity: the walked file set on its own knows nothing about them"
+        );
+        let edges = detect_boundary_edges(&conn, &load_indexed_files(&conn).unwrap()).unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "the preserved rows must still yield the proto→generated edge"
+        );
+        assert_eq!(edges[0].source_path, "a/api.proto");
+        assert_eq!(edges[0].generated_path, "a/api.pb.go");
     }
 
     #[test]

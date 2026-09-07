@@ -3372,7 +3372,7 @@ pub fn build_index(
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    let extract_failures = build_index_inner(
+    let (_, extract_failures) = build_index_inner(
         repo_root,
         config,
         force,
@@ -3403,17 +3403,20 @@ pub fn build_index(
 /// would then keep serving the pre-rebuild connection and re-run a full
 /// rebuild on every single tool call.
 ///
-/// If another build already holds the build lock this returns without
-/// building: the build in flight is doing the same work, and this caller (the
-/// MCP server's per-tool-call check) comes round again on the next tool call
-/// past the debounce window. Callers whose trigger is *not* repeated must use
+/// If another build already holds the build lock this returns
+/// [`BuildOutcome::Skipped`] without building: the build in flight is doing
+/// the same work, and this caller (the MCP server's per-tool-call check) comes
+/// round again on the next tool call past the debounce window. The caller must
+/// tell the two apart — treating a skip as a completed rebuild leaves the
+/// stale-index timestamp untouched and so re-triggers on every call
+/// (INDEX-3-5). Callers whose trigger is *not* repeated must use
 /// [`build_index_quiet_waiting`] instead.
 pub fn build_index_quiet(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
-) -> Result<()> {
+) -> Result<BuildOutcome> {
     build_index_quiet_with(repo_root, config, force, db_override, LockWait::Skip)
 }
 
@@ -3438,6 +3441,8 @@ pub fn build_index_quiet_waiting(
         db_override,
         LockWait::Wait(lock::LOCK_TIMEOUT),
     )
+    // `Wait` never skips, so there is no outcome to report.
+    .map(|_| ())
 }
 
 fn build_index_quiet_with(
@@ -3446,8 +3451,8 @@ fn build_index_quiet_with(
     force: bool,
     db_override: Option<&Path>,
     lock_wait: LockWait,
-) -> Result<()> {
-    let extract_failures =
+) -> Result<BuildOutcome> {
+    let (outcome, extract_failures) =
         build_index_inner(repo_root, config, force, db_override, false, lock_wait)?;
     if !extract_failures.is_empty() {
         tracing::warn!(
@@ -3455,7 +3460,7 @@ fn build_index_quiet_with(
             "some packages could not be indexed; their previously indexed rows were kept"
         );
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Restores the DB to a servable state when `build_index_inner` returns,
@@ -3488,6 +3493,21 @@ impl Drop for BuildGuard<'_> {
     }
 }
 
+/// Whether a build actually ran.
+///
+/// A build that was skipped because a competing builder held the lock looks
+/// exactly like a successful one to its caller unless it says so: the MCP
+/// server logged "index rebuilt", re-read the unchanged `indexed_at`, and so
+/// found the index stale again on the very next tool call — the per-call
+/// rebuild storm the debounce exists to prevent (INDEX-3-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOutcome {
+    /// The build ran to completion and committed.
+    Built,
+    /// Another build held the lock and this one was asked to skip.
+    Skipped,
+}
+
 /// Returns the packages whose symbol extraction failed outright. Their
 /// previously indexed rows were left untouched; it is up to the caller to
 /// decide whether that is fatal (see `build_index` vs `build_index_quiet`).
@@ -3498,7 +3518,7 @@ fn build_index_inner(
     db_override: Option<&Path>,
     progress: bool,
     lock_wait: LockWait,
-) -> Result<Vec<(String, String)>> {
+) -> Result<(BuildOutcome, Vec<(String, String)>)> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
     let mp = if progress {
@@ -3521,7 +3541,7 @@ fn build_index_inner(
     // by a builder that turns out to have lost the race.
     let _build_lock = match lock::acquire(&db_path, lock_wait)? {
         Some(guard) => guard,
-        None => return Ok(Vec::new()),
+        None => return Ok((BuildOutcome::Skipped, Vec::new())),
     };
 
     // Seed from main worktree's DB if this is a new linked-worktree build.
@@ -4004,7 +4024,7 @@ fn build_index_inner(
     // everything above is already committed, so turning a committed build
     // into an `Err` would make in-process callers believe no rebuild
     // happened. `build_index` turns this into a non-zero exit for the CLI.
-    Ok(summary.extract_failures)
+    Ok((BuildOutcome::Built, summary.extract_failures))
 }
 
 /// Detect proto→generated-code boundary edges from walked files.
@@ -5784,14 +5804,21 @@ anyhow = "1"
         let held = lock::acquire(&db, lock::LockWait::Wait(lock::LOCK_TIMEOUT))
             .unwrap()
             .unwrap();
-        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        assert_eq!(
+            build_index_quiet(root, &config, false, Some(&db)).unwrap(),
+            BuildOutcome::Skipped,
+            "a skipped build must report itself as skipped, not as a rebuild"
+        );
         assert!(
             !db.exists(),
             "a skipped build must not touch the database at all"
         );
 
         drop(held);
-        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        assert_eq!(
+            build_index_quiet(root, &config, false, Some(&db)).unwrap(),
+            BuildOutcome::Built
+        );
         let conn = db::open_readonly(&db).unwrap();
         let packages: i64 = conn
             .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))

@@ -325,7 +325,7 @@ pub struct DependentsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {
-    /// Filter by package kind: "npm", "go", "cargo", "python", "maven", "gradle", "perl", "ruby"
+    /// Filter by package kind: "npm", "go", "cargo", "python", "maven", "gradle", "perl", "ruby", "nix"
     pub kind: Option<String>,
     /// Max results (default 100, max 200)
     pub limit: Option<u32>,

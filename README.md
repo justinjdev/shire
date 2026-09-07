@@ -179,7 +179,7 @@ This creates:
 shire init --global --no-hook
 ```
 
-With `--no-hook`, the MCP server starts with `--root .` and checks whether the index is stale before each query by comparing `.git/index` mtime against the last build timestamp. If stale, it rebuilds automatically. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
+With `--no-hook`, the MCP server starts with `--root .` and checks before each query whether the index may be stale (the Git index's mtime against the last build, resolved through the gitdir pointer in a linked worktree; "can't tell" counts as stale). If so it rebuilds — the rebuild itself compares file mtimes and SHA-256 content hashes, so it is cheap when nothing changed and correct when something did. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
 
 **Per-repo setup** — for project-level config (creates `shire.toml` and `.claude/settings.local.json`):
 
@@ -242,16 +242,25 @@ Add to your `claude_desktop_config.json`:
 
 ### Watch daemon
 
-`shire watch` starts a background daemon that auto-rebuilds the index when files change. It uses Unix domain socket IPC with configurable debounce (default 2s).
+`shire watch` starts a background daemon that rebuilds the index whenever a rebuild
+signal arrives — from the Claude Code `PostToolUse` hook or a manual `shire rebuild`. It
+does not watch the filesystem itself; edits made outside Claude Code are only picked up
+once something signals a rebuild. It uses Unix domain socket IPC with configurable
+debounce (default 2s). See [Watch Daemon](docs/src/watch-daemon.md) for details,
+including the `--status` flag and troubleshooting log locations.
 
 ```sh
 # Start the daemon (idempotent — safe to call multiple times)
 shire watch --root /path/to/repo
 
+# Check whether it's running
+shire watch --root /path/to/repo --status
+
 # Signal a rebuild manually
 shire rebuild --root /path/to/repo
 
-# Signal a rebuild from a Claude Code hook (reads JSON from stdin, uses cwd as repo root)
+# Signal a rebuild from a Claude Code hook (reads JSON from stdin; the repo root is
+# resolved by walking up from cwd to the nearest shire.toml/.shire/.git)
 shire rebuild --stdin
 
 # Stop the daemon

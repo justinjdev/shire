@@ -1,4 +1,3 @@
-use crate::symbols::walker;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -33,38 +32,74 @@ pub fn hash_bytes_hex(data: &[u8]) -> String {
     format!("{:x}", digest)
 }
 
-/// Check if any source file in a package directory has been modified since the given timestamp.
-/// Returns `true` if any file has a newer mtime (meaning hash computation is needed).
-/// Returns `true` on any error (conservative fallback).
-/// Short-circuits on the first newer file found.
-pub fn has_newer_source_files(repo_root: &Path, package_path: &str, since: SystemTime) -> bool {
-    let package_dir = repo_root.join(package_path);
-    if !package_dir.is_dir() {
-        return false;
+/// Why a package's source tree looks like it may have changed since the last
+/// per-file hash pass (or that it demonstrably has not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStaleness {
+    /// Nothing on disk suggests a change — the per-file hash pass can be skipped.
+    Unchanged,
+    /// At least one source file has an mtime newer than the last hash pass.
+    MtimeNewer,
+    /// The set of source files on disk differs from the set the DB recorded
+    /// (a rename, an addition, a deletion, or a file that failed to read
+    /// during an earlier build).
+    FileSetChanged,
+}
+
+/// Decide whether a package's per-file hash pass can be skipped, given the
+/// source files found by one directory walk.
+///
+/// Two independent signals, because neither alone is sufficient:
+///
+/// * mtimes catch ordinary edits, but a rename (`mv a.ts b.ts`), a `cp -p`,
+///   a tar/rsync restore or a `git checkout` all preserve mtimes;
+/// * the on-disk path set compared against the paths the DB recorded catches
+///   exactly those cases, costs nothing beyond the walk the caller already
+///   did, and — crucially — makes it impossible for a package to be skipped
+///   *forever*: any divergence between disk and DB forces the full hash pass,
+///   which then rewrites both.
+///
+/// `source_files` must be the same file set the caller would hash (same
+/// extension filter and skip patterns), otherwise the set comparison would
+/// report a permanent, spurious difference.
+pub fn package_source_staleness(
+    repo_root: &Path,
+    source_files: &[std::path::PathBuf],
+    since: SystemTime,
+    stored_file_hashes: &std::collections::HashMap<String, String>,
+) -> SourceStaleness {
+    // Paths are unique within a walk, so equal lengths + full containment
+    // is set equality.
+    if source_files.len() != stored_file_hashes.len() {
+        return SourceStaleness::FileSetChanged;
     }
-
-    let extensions = walker::all_extensions();
-    let source_files = match walker::walk_source_files(&package_dir, &extensions) {
-        Ok(files) => files,
-        Err(_) => return true, // conservative: assume changed on error
-    };
-
-    // Use 1-second margin to handle low-resolution filesystem timestamps (e.g. HFS+)
-    let margin = std::time::Duration::from_secs(1);
-    let since_with_margin = since.checked_sub(margin).unwrap_or(since);
-
-    for file_path in &source_files {
-        match std::fs::metadata(file_path).and_then(|m| m.modified()) {
-            Ok(mtime) => {
-                if mtime > since_with_margin {
-                    return true;
-                }
-            }
-            Err(_) => return true, // conservative: assume changed on error
+    for file_path in source_files {
+        let relative = file_path
+            .strip_prefix(repo_root)
+            .unwrap_or(file_path)
+            .to_string_lossy();
+        if !stored_file_hashes.contains_key(relative.as_ref()) {
+            return SourceStaleness::FileSetChanged;
         }
     }
 
-    false
+    // Use a 1-second margin on the conservative side (subtract, never add)
+    // to tolerate low-resolution filesystem timestamps.
+    let margin = std::time::Duration::from_secs(1);
+    let since_with_margin = since.checked_sub(margin).unwrap_or(since);
+
+    for file_path in source_files {
+        match std::fs::metadata(file_path).and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                if mtime > since_with_margin {
+                    return SourceStaleness::MtimeNewer;
+                }
+            }
+            Err(_) => return SourceStaleness::MtimeNewer, // conservative: assume changed
+        }
+    }
+
+    SourceStaleness::Unchanged
 }
 
 #[cfg(test)]
@@ -152,52 +187,92 @@ mod tests {
         assert!(!hash.is_empty());
     }
 
-    #[test]
-    fn test_has_newer_source_files_no_newer() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
-        // Use a timestamp in the future — no files should be newer
+    fn stored(paths: &[&str]) -> HashMap<String, String> {
+        paths
+            .iter()
+            .map(|p| (p.to_string(), "hash".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_staleness_unchanged_when_old_and_set_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("lib.rs");
+        std::fs::write(&f, "pub fn hello() {}").unwrap();
         let future = SystemTime::now() + std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(dir.path(), "", future));
+        assert_eq!(
+            package_source_staleness(dir.path(), &[f], future, &stored(&["lib.rs"])),
+            SourceStaleness::Unchanged
+        );
     }
 
     #[test]
-    fn test_has_newer_source_files_has_newer() {
+    fn test_staleness_detects_newer_mtime() {
         let dir = tempfile::TempDir::new().unwrap();
-
-        // Use a timestamp in the past — file should be newer
+        let f = dir.path().join("lib.rs");
+        std::fs::write(&f, "pub fn hello() {}").unwrap();
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        std::fs::write(dir.path().join("lib.rs"), "pub fn hello() {}").unwrap();
-
-        assert!(has_newer_source_files(dir.path(), "", past));
+        assert_eq!(
+            package_source_staleness(dir.path(), &[f], past, &stored(&["lib.rs"])),
+            SourceStaleness::MtimeNewer
+        );
     }
 
     #[test]
-    fn test_has_newer_source_files_empty_dir() {
+    fn test_staleness_detects_rename_with_preserved_mtime() {
+        // INDEX-3: `mv a.rs b.rs` keeps the file's mtime, so an mtime-only
+        // pre-check skips the package forever. The path-set comparison must
+        // catch it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let renamed = dir.path().join("b.rs");
+        std::fs::write(&renamed, "pub fn hello() {}").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            package_source_staleness(dir.path(), &[renamed], future, &stored(&["a.rs"])),
+            SourceStaleness::FileSetChanged
+        );
+    }
+
+    #[test]
+    fn test_staleness_detects_added_and_removed_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "pub fn a() {}").unwrap();
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        // one extra file on disk
+        assert_eq!(
+            package_source_staleness(dir.path(), std::slice::from_ref(&a), future, &stored(&[])),
+            SourceStaleness::FileSetChanged
+        );
+        // one extra file in the DB
+        assert_eq!(
+            package_source_staleness(dir.path(), &[a], future, &stored(&["a.rs", "b.rs"])),
+            SourceStaleness::FileSetChanged
+        );
+    }
+
+    #[test]
+    fn test_staleness_empty_package_is_unchanged() {
         let dir = tempfile::TempDir::new().unwrap();
         let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        // No source files — nothing is newer
-        assert!(!has_newer_source_files(dir.path(), "", past));
+        assert_eq!(
+            package_source_staleness(dir.path(), &[], past, &HashMap::new()),
+            SourceStaleness::Unchanged
+        );
     }
 
     #[test]
-    fn test_has_newer_source_files_nonexistent_dir() {
-        let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(
-            Path::new("/nonexistent/dir"),
-            "",
-            past
-        ));
-    }
-
-    #[test]
-    fn test_has_newer_source_files_ignores_non_matching_extensions() {
+    fn test_staleness_missing_file_is_conservative() {
         let dir = tempfile::TempDir::new().unwrap();
-        // Write a .txt file (not a cargo source extension) — should be ignored
-        std::fs::write(dir.path().join("readme.txt"), "hello").unwrap();
-
-        let past = SystemTime::now() - std::time::Duration::from_secs(60);
-        assert!(!has_newer_source_files(dir.path(), "", past));
+        let ghost: PathBuf = dir.path().join("ghost.rs");
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        // Set matches the DB but the file cannot be stat'd — never skip.
+        assert_eq!(
+            package_source_staleness(dir.path(), &[ghost], future, &stored(&["ghost.rs"])),
+            SourceStaleness::MtimeNewer
+        );
     }
 }

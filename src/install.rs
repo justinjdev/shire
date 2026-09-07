@@ -18,32 +18,48 @@ enum RegStatus {
     Failed(String),
 }
 
-/// Copy `path`'s current permission bits onto `tmp_path`, if `path` exists. Used before
-/// an atomic rename-into-place so rewriting a config file doesn't silently drop its mode
-/// to the process umask (rename() preserves the *source* file's mode, i.e. the temp
-/// file's, not the destination's). A no-op (and not an error) when `path` doesn't exist
-/// yet or its permissions can't be read.
+/// Mode to (re)write `path` with: its current mode if it exists, otherwise
+/// `default_new_mode`.
 #[cfg(unix)]
-fn preserve_mode(path: &Path, tmp_path: &Path) {
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(tmp_path, meta.permissions());
-    }
-}
-
-#[cfg(not(unix))]
-fn preserve_mode(_path: &Path, _tmp_path: &Path) {}
-
-/// Set `path`'s permission bits to `mode`, best-effort. Used for brand-new files that
-/// carry credentials (e.g. a freshly created ~/.claude.json) so they start at a
-/// restrictive mode instead of whatever the process umask would otherwise leave.
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
+fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(default_new_mode)
 }
 
 #[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
+fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
+    default_new_mode
+}
+
+/// Write `content` to `tmp_path`, creating (or truncating, if one was left over from a
+/// prior failed write) it with `mode` applied at creation time via O_CREAT's own mode
+/// argument — not via a later `chmod`. A later chmod leaves a window, between the
+/// default-mode create and the chmod, where the file sits at whatever `0o666 & !umask`
+/// produces; under a permissive umask (e.g. 0) that's world-writable, however briefly,
+/// for a file that may hold credentials. Since `rename()` preserves the *source* file's
+/// mode, the final path is never more permissive than `mode` either, at any point.
+#[cfg(unix)]
+fn write_with_mode(tmp_path: &Path, content: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(tmp_path)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_with_mode(tmp_path: &Path, content: &str, _mode: u32) -> Result<()> {
+    fs::write(tmp_path, content).with_context(|| format!("Failed to write {}", tmp_path.display()))
+}
 
 /// Installs shire MCP entries for supported CLIs and editors.
 ///
@@ -493,10 +509,9 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
     match upsert_json_mcp(&claude_json, "mcpServers", "shire", entry, force) {
         Ok(UpsertResult::Created) => {
             // ~/.claude.json routinely carries oauth/account metadata and
-            // mcpServers env blocks; match Claude Code's own default of 0600
-            // for a file we just created (there was no existing mode to
-            // preserve).
-            set_mode(&claude_json, 0o600);
+            // mcpServers env blocks; upsert_json_mcp creates a brand-new file at 0600
+            // (matching Claude Code's own default) via write_with_mode/target_mode,
+            // applied at creation time rather than a later chmod.
             println!("  Added mcpServers.shire to ~/.claude.json");
             Registration {
                 tool: "Claude Code",
@@ -685,9 +700,7 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
 
     // Atomic write via temp file
     let tmp_path = config_file.with_extension("toml.tmp");
-    fs::write(&tmp_path, &output)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    preserve_mode(config_file, &tmp_path);
+    write_with_mode(&tmp_path, &output, target_mode(config_file, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, config_file) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -761,8 +774,7 @@ fn remove_codex_mcp(dry_run: bool) {
 
     let output = toml::to_string_pretty(&doc).unwrap_or_default();
     let tmp_path = config_file.with_extension("toml.tmp");
-    if fs::write(&tmp_path, &output).is_ok() {
-        preserve_mode(&config_file, &tmp_path);
+    if write_with_mode(&tmp_path, &output, target_mode(&config_file, 0o600)).is_ok() {
         if fs::rename(&tmp_path, &config_file).is_ok() {
             println!("  Removed MCP section");
         } else {
@@ -945,8 +957,8 @@ fn remove_editor_mcp(
     servers.remove("shire");
     if let Ok(out) = serde_json::to_string_pretty(&Value::Object(root)) {
         let tmp_path = config_path.with_extension("json.tmp");
-        if fs::write(&tmp_path, format!("{}\n", out)).is_ok() {
-            preserve_mode(config_path, &tmp_path);
+        let mode = target_mode(config_path, 0o600);
+        if write_with_mode(&tmp_path, &format!("{out}\n"), mode).is_ok() {
             if fs::rename(&tmp_path, config_path).is_ok() {
                 println!("  Removed shire");
             } else {
@@ -1140,9 +1152,7 @@ fn upsert_json_mcp(
 
     // Atomic write via temp file
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{}\n", output))
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    preserve_mode(path, &tmp_path);
+    write_with_mode(&tmp_path, &format!("{output}\n"), target_mode(path, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -1481,10 +1491,10 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn upsert_json_mcp_does_not_force_a_mode_on_new_files() {
-        // Only ~/.claude.json gets forced to 0600 on creation (handled by the caller,
-        // register_claude_code_file); the shared upsert helper itself should leave a
-        // brand-new file at whatever the process umask produced.
+    fn upsert_json_mcp_creates_new_files_at_0600() {
+        // Every new file these helpers create defaults to 0600 (applied at creation,
+        // not via a later chmod, so there's no permissive-umask window) — not just
+        // ~/.claude.json specifically.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
@@ -1500,9 +1510,41 @@ mod tests {
         .unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        // fs::write's default create mode is 0o666 & !umask; assert it's *not* forced to
-        // 0o600, without hardcoding a specific umask-dependent value.
-        assert_ne!(mode, 0o600);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_new_file_is_never_more_permissive_than_0600_even_under_umask_0() {
+        // Regression for the transient-window finding: under a permissive umask, a
+        // plain fs::write()-then-chmod sequence exposes the temp file (and, if chmod
+        // ran after rename, briefly the final path) at 0o666. Creating the temp file
+        // with an explicit mode from the start must not be affected by umask at all
+        // for a request this restrictive (0o600 has no group/other bits for umask to
+        // clear, and an explicit mode is never *widened* beyond what was requested).
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        // SAFETY: umask is process-global state; this test restores it immediately
+        // after the write it's testing, and other tests in this binary don't depend
+        // on a specific umask value.
+        let old_umask = unsafe { libc::umask(0) };
+        let result = upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        );
+        unsafe {
+            libc::umask(old_umask);
+        }
+        result.unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be exactly 0600 even under umask 0");
     }
 
     #[test]

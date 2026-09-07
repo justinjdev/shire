@@ -3499,3 +3499,214 @@ fn serve_and_call(bin: &Path, db: &Path, query: &str) -> std::process::Output {
     child.stdin.take();
     child.wait_with_output().expect("serve did not exit")
 }
+
+// --- watch daemon: PID ownership across a renamed binary (WATCHCLI-2-1) ---
+//
+// Uses a short-path fixture (tempfile::TempDir already resolves under `/tmp`) since a
+// Unix domain socket path is capped at `SUN_LEN` (~108 bytes on Linux).
+#[cfg(unix)]
+mod watch_daemon_ownership {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn cargo_bin() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_shire"))
+    }
+
+    /// Copy the built `shire` binary to `dest` under a name that does NOT start with
+    /// "shire" at all, so recognizing it as shire's own daemon can only succeed via the
+    /// current_exe()-identity fallback, not the basename-starts-with-"shire" check.
+    fn copy_renamed_binary(dest: &std::path::Path) {
+        fs::copy(cargo_bin(), dest).expect("failed to copy shire binary");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(dest).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(dest, perms).unwrap();
+    }
+
+    fn pid_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cond()
+    }
+
+    /// WATCHCLI-2-1: a shire binary whose filename doesn't start with "shire" must
+    /// still be recognized as the daemon's own executable, so `--stop` actually stops
+    /// it instead of refusing to signal it and deleting its socket/pid files out from
+    /// under a daemon left running forever.
+    #[test]
+    fn stop_recognizes_and_stops_a_daemon_running_under_a_renamed_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("shire.toml"), "").unwrap();
+
+        let renamed = root.join("totally-different-name");
+        copy_renamed_binary(&renamed);
+
+        let start_status = Command::new(&renamed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .status()
+            .expect("failed to run watch (start)");
+        assert!(start_status.success(), "starting the daemon should succeed");
+
+        let pid_file = root.join(".shire/watch.pid");
+        let sock_file = root.join(".shire/watch.sock");
+        assert!(
+            wait_until(|| sock_file.exists(), Duration::from_secs(5)),
+            "daemon never created its socket"
+        );
+
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .expect("pid file should exist")
+            .trim()
+            .parse()
+            .expect("pid file should contain a valid pid");
+        assert!(
+            pid_alive(pid),
+            "daemon pid should be alive right after starting"
+        );
+
+        // `--status`, run through the same renamed binary, must recognize its own
+        // daemon rather than reporting "does NOT look like a shire watch daemon".
+        let status_out = Command::new(&renamed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--status")
+            .output()
+            .expect("failed to run watch --status");
+        let status_text = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status_text.contains("looks like a shire watch daemon"),
+            "status should recognize the renamed binary's own daemon: {status_text}"
+        );
+
+        let stop_status = Command::new(&renamed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--stop")
+            .status()
+            .expect("failed to run watch --stop");
+        assert!(
+            stop_status.success(),
+            "stop should succeed for a daemon running under a renamed binary"
+        );
+
+        assert!(
+            wait_until(|| !pid_alive(pid), Duration::from_secs(5)),
+            "renamed daemon should have been stopped, not orphaned with its socket deleted"
+        );
+        assert!(
+            !pid_file.exists(),
+            "pid file should be cleaned up after a confirmed stop"
+        );
+        assert!(
+            !sock_file.exists(),
+            "socket file should be cleaned up after a confirmed stop"
+        );
+    }
+
+    /// WATCHCLI-2-2: `--stop` must not report success when the daemon is still alive
+    /// after the wait times out (e.g. busy inside an uninterruptible rebuild). SIGSTOP
+    /// stands in for "busy": from `stop_daemon`'s point of view it looks identical to a
+    /// daemon that received SIGTERM but hasn't gotten around to handling it yet — alive,
+    /// non-zombie, cmdline and exe both still matching.
+    #[test]
+    fn stop_reports_failure_and_keeps_state_when_daemon_does_not_exit_in_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("shire.toml"), "").unwrap();
+
+        let bin = cargo_bin();
+        let start_status = Command::new(&bin)
+            .args(["watch", "--root"])
+            .arg(root)
+            .status()
+            .expect("failed to run watch (start)");
+        assert!(start_status.success());
+
+        let pid_file = root.join(".shire/watch.pid");
+        let sock_file = root.join(".shire/watch.sock");
+        assert!(
+            wait_until(|| sock_file.exists(), Duration::from_secs(5)),
+            "daemon never created its socket"
+        );
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGSTOP);
+        }
+
+        let start = Instant::now();
+        let stop_output = Command::new(&bin)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--stop")
+            .output()
+            .expect("failed to run watch --stop");
+        let elapsed = start.elapsed();
+
+        // Assert on the still-stopped process's state *before* resuming it: the
+        // daemon's own graceful-shutdown path (run when it wakes up and finally
+        // processes the pending SIGTERM) removes its pid/socket files itself, which
+        // would otherwise race these assertions and make the test flaky.
+        let result = std::panic::catch_unwind(|| {
+            assert!(
+                elapsed >= Duration::from_secs(4),
+                "stop should have waited out the ~5s timeout, took {elapsed:?}"
+            );
+            assert!(
+                !stop_output.status.success(),
+                "stop must exit non-zero when the daemon did not actually stop"
+            );
+            let stderr = String::from_utf8_lossy(&stop_output.stderr);
+            assert!(
+                stderr.contains(&pid.to_string()),
+                "stop's failure message should name the pid: {stderr}"
+            );
+            assert!(pid_alive(pid), "the daemon should still be alive");
+            assert!(
+                pid_file.exists(),
+                "pid file must be left in place when the stop timed out"
+            );
+            assert!(
+                sock_file.exists(),
+                "socket file must be left in place when the stop timed out"
+            );
+        });
+
+        // Always resume the stopped process, so a failed assertion above doesn't leak
+        // a permanently-stopped process, then re-raise.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGCONT);
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+
+        // Now actually stop it (already resumed above via SIGCONT).
+        let real_stop = Command::new(&bin)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--stop")
+            .status()
+            .unwrap();
+        assert!(real_stop.success());
+        assert!(wait_until(|| !pid_alive(pid), Duration::from_secs(5)));
+    }
+}

@@ -438,7 +438,7 @@ pub struct SymbolRefsArgs {
     /// Optional package filter
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -450,7 +450,7 @@ pub struct SymbolCallersArgs {
     /// Optional: restrict callers to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -462,7 +462,7 @@ pub struct SymbolCalleesArgs {
     /// Optional: restrict to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -480,7 +480,7 @@ pub struct ChangeImpactArgs {
     /// 0..=10. Use 0 to skip transitive analysis entirely.
     #[serde(default)]
     pub transitive_depth: Option<u32>,
-    /// Max results per bucket (default 100, clamped 1..=1000)
+    /// Max results per bucket (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -893,20 +893,32 @@ impl ShireService {
         }
         let depth = args.transitive_depth.unwrap_or(2).min(10);
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
-        let impact = queries::change_impact(
+        // Buckets are filled with the probe row too: `summary` proves whether
+        // the two ref buckets were cut, but nothing counts the transitive
+        // walk, which simply stops at the cap — so a complete list of exactly
+        // `limit` packages would otherwise be reported as truncated.
+        let mut impact = queries::change_impact(
             &conn,
             &args.name,
             args.package.as_deref(),
             depth,
-            i64::from(limit),
+            i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
         // The payload is an object, not a list, so the truncation marker goes
-        // on it as extra fields. `summary` carries the true totals; the
-        // transitive walk stops at the same per-bucket cap.
-        let truncated = impact.summary.direct_count > impact.direct_impact.len()
-            || impact.summary.cross_package_count > impact.cross_package_impact.len()
-            || impact.transitive_impact.len() as u32 >= limit;
+        // on it as extra fields. `summary` carries the true totals.
+        let over = |n: usize| n as u32 > limit || (limit >= queries::MAX_ROWS && n as u32 >= limit);
+        let truncated = impact.summary.direct_count as u32 > limit
+            || impact.summary.cross_package_count as u32 > limit
+            || over(impact.transitive_impact.len());
+        impact.direct_impact.truncate(limit as usize);
+        impact.cross_package_impact.truncate(limit as usize);
+        impact.transitive_impact.truncate(limit as usize);
+        // `direct_count`/`cross_package_count` are true totals; the
+        // transitive count is not (the walk stops at the cap), so keep it
+        // consistent with the rows actually returned — `truncated` is what
+        // says more exist.
+        impact.summary.transitive_package_count = impact.transitive_impact.len();
         let mut value = serde_json::to_value(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
         if let Some(obj) = value.as_object_mut()
             && truncated

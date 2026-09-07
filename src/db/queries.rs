@@ -157,6 +157,29 @@ fn fts_match_expr(query: &str) -> Option<String> {
 /// as the explicit `kind:"..."` filter appended for the `kind` argument.)
 const SYMBOL_MATCH_COLUMNS: &str = "{name name_tokens}";
 
+/// The same scope for an index that predates the `name_tokens` column.
+const SYMBOL_MATCH_COLUMNS_LEGACY: &str = "{name}";
+
+/// The column scope to use against *this* database.
+///
+/// `name_tokens` arrived with FTS schema v8, and a read-only connection never
+/// migrates (only `open_or_create` does), so `shire serve` can be pointed at
+/// an index written by an older release. Naming a column the table does not
+/// have is a hard FTS5 error ("no such column: name_tokens"), which would
+/// turn the documented graceful degradation — search still works, it just
+/// misses sub-token matches — into a failing `search_symbols`/`explore`. The
+/// probe is a cached no-op prepare on a current index.
+fn symbol_match_columns(conn: &Connection) -> &'static str {
+    if conn
+        .prepare_cached("SELECT name_tokens FROM symbols_fts LIMIT 0")
+        .is_ok()
+    {
+        SYMBOL_MATCH_COLUMNS
+    } else {
+        SYMBOL_MATCH_COLUMNS_LEGACY
+    }
+}
+
 /// Restrict an FTS5 expression to a column set: `{a b} : (expr)`.
 ///
 /// The parentheses are load-bearing: in `{a b} : "x"* "y"*` the filter binds
@@ -185,7 +208,7 @@ pub fn search_symbols(
         return Ok(Vec::new());
     }
     let sanitized = match fts_match_expr(query) {
-        Some(expr) => column_scoped(SYMBOL_MATCH_COLUMNS, &expr),
+        Some(expr) => column_scoped(symbol_match_columns(conn), &expr),
         None => return Ok(Vec::new()),
     };
     let limit = clamp_limit(limit);
@@ -287,9 +310,17 @@ pub fn search_symbols(
 /// finds `Élève` for the query `élève`, and an ASCII-only comparison then
 /// discards it, so the exactly-named symbol goes missing from its own search.
 /// The ASCII test runs first because it needs no allocation and covers
-/// nearly every identifier.
+/// nearly every identifier — and when both sides are ASCII its answer is
+/// final, so a *non*-match allocates nothing either. That matters: this runs
+/// once per returned row, and a mismatch is the common case.
 fn eq_case_folded(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if a.is_ascii() && b.is_ascii() {
+        return false;
+    }
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// Make sure a symbol named exactly like the query is in the result, and
@@ -2225,6 +2256,48 @@ mod tests {
         // …and the identifier itself still matches, by prefix and exactly.
         assert_eq!(names("conf"), vec!["Config"]);
         assert_eq!(names("Config"), vec!["Config"]);
+    }
+
+    /// An index written before FTS schema v8 has no `name_tokens` column, and
+    /// a read-only `serve` never migrates it. Naming a missing column in the
+    /// MATCH is a hard FTS5 error ("no such column: name_tokens"), so scoping
+    /// has to fall back to `{name}` — search degrades to whole-name matching
+    /// instead of failing outright, which is what the startup warning
+    /// promises.
+    #[test]
+    fn test_search_symbols_works_against_a_pre_v8_symbols_fts() {
+        let conn = test_db_with_identifiers();
+        // Recreate `symbols_fts` with the v7 column list, then rebuild it
+        // from the (unchanged) `symbols` content table.
+        conn.execute_batch(
+            "DROP TABLE symbols_fts;
+             CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                 name, kind, signature, file_path,
+                 content='symbols',
+                 content_rowid='rowid',
+                 tokenize=\"unicode61 tokenchars '_'\"
+             );
+             INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');",
+        )
+        .unwrap();
+        assert_eq!(symbol_match_columns(&conn), SYMBOL_MATCH_COLUMNS_LEGACY);
+
+        let names = |q: &str| -> Vec<String> {
+            search_symbols(&conn, q, None, None, 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // Whole-name prefix matching still works…
+        assert!(names("verify").contains(&"verifyJwtToken".to_string()));
+        assert_eq!(names("AuthMiddleware"), vec!["AuthMiddleware"]);
+        // …and paths/signatures are still out of scope.
+        assert!(names("middleware").is_empty(), "matched via file_path");
+        assert!(names("export").is_empty(), "matched via signature");
+        // The kind filter composes with the legacy scope too.
+        let hits = search_symbols(&conn, "handle", None, Some("method"), 20).unwrap();
+        assert!(hits.iter().all(|h| h.kind == "method"), "got {hits:?}");
     }
 
     /// Column scoping composes with the `kind:` filter and with multi-token

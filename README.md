@@ -54,6 +54,7 @@ Point it at a monorepo. It discovers every package, maps their dependency relati
 | `build.gradle` / `build.gradle.kts` | gradle | `settings.gradle` project inclusion |
 | `cpanfile` | perl | `requires` / `on 'test'` blocks |
 | `Gemfile` | ruby | `gem` / `group :test` blocks |
+| `flake.nix` | nix | `inputs` attrset (dotted and block forms) |
 
 ## Install
 
@@ -119,6 +120,7 @@ shire uninstall         # remove from all tools
 | | `--config <PATH>` | Config file path (default: `./shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `watch` | `--root <DIR>` | Repository root (default: `.`) |
 | | `--stop` | Stop the running daemon |
+| | `--status` | Print whether the daemon is running (pid, socket, liveness) and exit |
 | | `--db <PATH>` | Database path (overrides `shire.toml`) |
 | | `--config <PATH>` | Config file path (default: `<root>/shire.toml`, falls back to `~/.claude/shire.toml`) |
 | `rebuild` | `--root <DIR>` | Repository root (default: `.`) |
@@ -127,11 +129,15 @@ shire uninstall         # remove from all tools
 | `init` | `--root <DIR>` | Project root (default: `.`) |
 | | `--global` | Set up global config in `~/.claude/` |
 | | `--no-hook` | Use on-demand reindexing instead of PostToolUse hooks |
+| | `-y`, `--yes` | Skip interactive prompts and use defaults |
 | `install` | | Register shire as an MCP server with all detected AI tools |
 | | `--dry-run` | Show what would be done without making changes |
 | | `--force` | Overwrite existing registrations (useful after binary path changes) |
 | `uninstall` | | Remove shire MCP registration from all detected AI tools |
 | | `--dry-run` | Show what would be done without making changes |
+| `clean` | `--root <DIR>` | Repository root (default: `.`) |
+| | `--db <PATH>` | Database path (overrides `shire.toml`) |
+| | `--config <PATH>` | Config file path (default: `<root>/shire.toml`) |
 
 The index is written to `.shire/index.db` inside the repo root by default. You can override this with `--db` on the build command or `db_path` in `shire.toml` (see [Configuration](#configuration)). Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are also tracked: if source files change without a manifest change, symbols are re-extracted automatically. An **mtime pre-check** skips SHA-256 computation entirely for packages whose source files haven't been touched since the last build. File indexing is also incremental — a file-tree hash detects structural changes, skipping Phase 9 entirely when no files have been added, removed, or resized. Symbol extraction and source hashing are **parallelized** across packages using rayon for multi-core throughput. All database writes use **batched multi-row INSERTs** within explicit transactions for maximum SQLite throughput. A per-phase **timing breakdown** is printed to stderr after each build. The server reads from this database in read-only mode.
 
@@ -145,11 +151,17 @@ The index is written to `.shire/index.db` inside the repo root by default. You c
 | `package_dependents` | Find all packages that depend on this package |
 | `search_symbols` | Search symbols by name or signature; omit query with a package filter to list all symbols in that package |
 | `get_file_symbols` | List all symbols defined in a specific file |
+| `search_files` | Find files by path or name (prefix match on path tokens) |
+| `search_docs` | Search documentation files by content, title, or path |
 | `list_package_files` | List all files in a package, optionally filtered by extension |
+| `explore` | Search packages, symbols, files, and docs for a concept — returns a structured context map |
 | `index_status` | Index build metadata: timestamp, git commit, counts |
 | `symbol_references` | Find all references to a symbol by name (call, type, import, impl) |
 | `symbol_callers` | List all callers of a function or method |
 | `symbol_callees` | List what a function calls (outbound call graph) |
+| `change_impact` | Blast-radius analysis: cross-references + dependency graph for a symbol (requires `symbols.references_enabled`) |
+| `schema_consumers` | Find files generated from a schema file (e.g. `.proto`) |
+| `generated_from` | Find the source schema file that generated a given file |
 
 ### MCP prompts
 
@@ -181,7 +193,7 @@ shire init --global --no-hook
 
 With `--no-hook`, the MCP server starts with `--root .` and checks before each query whether the index may be stale (the Git index's mtime against the last build, resolved through the gitdir pointer in a linked worktree; "can't tell" counts as stale). If so it rebuilds — the rebuild itself compares file mtimes and SHA-256 content hashes, so it is cheap when nothing changed and correct when something did. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
 
-**Per-repo setup** — for project-level config (creates `shire.toml` and `.claude/settings.local.json`):
+**Per-repo setup** — for project-level config (creates `shire.toml`, `.mcp.json` with the `shire` MCP entry, and, in hook mode, a `PostToolUse` hook in `.claude/settings.json` plus `.claude/rules/shire.md`):
 
 ```sh
 cd /path/to/repo
@@ -195,7 +207,7 @@ Config is resolved with a fallback chain: `./shire.toml` → `~/.claude/shire.to
 <details>
 <summary>Manual setup</summary>
 
-Add to `~/.claude/settings.json` (global) or `.claude/settings.local.json` (per-repo):
+Add an `mcpServers.shire` entry to `~/.claude.json` (global) or `.mcp.json` (per-repo):
 
 ```json
 {
@@ -208,7 +220,7 @@ Add to `~/.claude/settings.json` (global) or `.claude/settings.local.json` (per-
 }
 ```
 
-To keep the index fresh during a session, add a `PostToolUse` hook:
+To keep the index fresh during a session, add a `PostToolUse` hook to `~/.claude/settings.json` (global) or `.claude/settings.json` (per-repo):
 
 ```json
 {
@@ -267,7 +279,7 @@ shire rebuild --stdin
 shire watch --root /path/to/repo --stop
 ```
 
-Smart filtering avoids unnecessary rebuilds: Edit/Write tools check file extension relevance and repo boundary; Bash commands are filtered against a denylist of known read-only commands (`ls`, `git status`, `cargo test`, etc.) — unknown commands default to rebuild.
+Smart filtering avoids unnecessary rebuilds: Edit/Write tools check file extension relevance and repo boundary; Bash commands are checked against an allowlist of known read-only commands (`ls`, `git status`, `cargo test`, etc.) that skip the rebuild — unknown commands default to rebuild.
 
 ## Configuration
 
@@ -279,7 +291,7 @@ Drop a `shire.toml` in the repo root to customize behavior. Without a local conf
 db_path = "~/.claude/shire/{repo}/index.db"
 
 [discovery]
-manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile"]
+manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile", "flake.nix"]
 exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire", ".gradle", "build"]
 
 # Skip symbol extraction for specific file types
@@ -345,49 +357,15 @@ All queries return in **under 2ms**, most under 0.3ms. See [Performance](https:/
 
 ## Architecture
 
-```
-src/
-├── main.rs          # CLI (clap): build, serve, watch, rebuild subcommands
-├── config.rs        # shire.toml parsing
-├── db/
-│   ├── mod.rs       # SQLite schema, open/create
-│   └── queries.rs   # FTS search, dependency graph BFS, listing
-├── index/
-│   ├── mod.rs       # Walk + incremental index orchestrator
-│   ├── custom_discovery.rs # Config-driven custom package discovery
-│   ├── manifest.rs  # ManifestParser trait
-│   ├── hash.rs      # SHA-256 content hashing for incremental builds
-│   ├── npm.rs       # package.json parser (workspace: protocol)
-│   ├── go.rs        # go.mod parser
-│   ├── go_work.rs   # go.work parser (workspace use directives)
-│   ├── cargo.rs     # Cargo.toml parser (workspace dep resolution)
-│   ├── python.rs    # pyproject.toml parser
-│   ├── maven.rs     # pom.xml parser (parent POM inheritance)
-│   ├── gradle.rs    # build.gradle / build.gradle.kts parser
-│   ├── gradle_settings.rs # settings.gradle parser (project inclusion)
-│   ├── perl.rs      # cpanfile parser (requires, on 'test')
-│   └── ruby.rs      # Gemfile parser (gem, group blocks)
-├── symbols/
-│   ├── mod.rs       # Symbol types, kind-agnostic extraction orchestrator
-│   ├── walker.rs    # Source file discovery (extension filtering, excludes)
-│   ├── typescript.rs # TS/JS extractor (tree-sitter)
-│   ├── go.rs        # Go extractor (tree-sitter)
-│   ├── rust_lang.rs # Rust extractor (tree-sitter)
-│   ├── python.rs    # Python extractor (tree-sitter)
-│   ├── proto.rs     # Protobuf extractor (tree-sitter)
-│   ├── java.rs      # Java extractor (tree-sitter)
-│   ├── kotlin.rs    # Kotlin extractor (tree-sitter)
-│   ├── perl.rs      # Perl extractor (regex-based)
-│   └── ruby.rs      # Ruby extractor (tree-sitter)
-├── mcp/
-│   ├── mod.rs       # MCP server setup (rmcp, stdio transport)
-│   ├── tools.rs     # 17 tool handlers
-│   └── prompts.rs   # 2 prompt templates (explore, reference_audit)
-└── watch/
-    ├── mod.rs       # Daemon event loop (UDS listener, debounce, rebuild)
-    ├── daemon.rs    # Process management (start/stop/is_running via PID)
-    └── protocol.rs  # Hook input parsing, Bash read-only denylist
-```
+Rust CLI (`main.rs`, subcommands: build, serve, watch, rebuild, init, install, uninstall, clean) dispatching into:
+
+- **`index/`** — manifest discovery and parsing (one `ManifestParser` impl per ecosystem), incremental build orchestration
+- **`symbols/`** — tree-sitter-based symbol and cross-reference extraction, plus a `cobol.rs` regex fallback
+- **`db/`** — SQLite schema, FTS5 search, dependency-graph queries
+- **`mcp/`** — the MCP server (17 tools, 2 prompts) served over stdio
+- **`watch/`** — the Unix-only background rebuild daemon
+
+See [Architecture](https://justinjdev.github.io/shire/architecture.html) for the full annotated source tree and the `symbol_refs` schema.
 
 ## License
 

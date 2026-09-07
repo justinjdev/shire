@@ -69,6 +69,45 @@ restore and some patch tools do. Nothing on disk distinguishes it from an
 untouched file without reading every byte of the repo on every build, so
 shire does not try — run `shire build --force` after one.
 
+## When a walk cannot see the whole tree
+
+Both walks a build makes — the repo-wide file walk and the per-package source
+walk — distinguish "this is not there" from "I could not look". The difference
+decides whether rows may be deleted.
+
+An **unreadable path** (a directory whose permissions changed, a network share
+that blipped, a container volume mid-remount) is recorded as a blind spot. Rows
+under it are kept rather than deleted, no file-tree hash is stored (so the next
+build re-checks the tree instead of short-circuiting), and a package whose
+source walk failed keeps every symbol, reference and file hash it already had.
+`shire build` reports that package and exits non-zero; the watch daemon and the
+MCP server's on-demand rebuild only log it, because the build itself committed.
+
+Hitting the **500,000-file cap** is the same thing: the walk stopped partway
+through a nondeterministic traversal, so it is treated as a blind spot over the
+whole tree — nothing is deleted, no file-tree hash is stored, and the build
+prints a warning naming the cap. Exclude directories in `discovery.exclude` to
+bring a repository back under it.
+
+A malformed pattern in a committed `.gitignore` is *not* a blind spot: the
+`ignore` crate reports it as an error but still walks the whole tree, so it is
+warned about once and skipped.
+
+## The build lock
+
+Every build holds an advisory `flock` on `<db_path>.lock` for its whole run, so
+two builders cannot both take the insert-only full-build path and double every
+symbol. `shire build` and the watch daemon wait for a competing build (up to
+`index::lock::LOCK_TIMEOUT`, minutes rather than seconds) and then report the
+conflict; the MCP server's per-tool-call rebuild skips instead and logs it,
+since its trigger comes round again.
+
+`shire clean` takes the same lock before removing anything, and refuses with
+"a shire build is running" rather than deleting a database out from under a
+build. The `<db_path>.lock` file itself is left in place — it is an empty
+sidecar like `-wal`/`-shm`, and unlinking it while a builder holds a lock on
+that inode is what would let a second builder take the lock at the same path.
+
 ## symbol_refs table
 
 The `symbol_refs` table stores cross-reference records extracted alongside symbol definitions. Each row captures a reference to a named symbol:

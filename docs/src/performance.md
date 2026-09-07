@@ -26,6 +26,15 @@ Build time scales roughly linearly with symbol count. The pipeline is paralleliz
 
 Incremental builds are significantly faster -- only packages with changed source files are re-extracted, and an mtime pre-check skips SHA-256 computation entirely for untouched packages.
 
+> **2026-09-07:** The table above predates two behavior changes not yet re-benchmarked
+> end to end. (1) Incremental builds now always scan the working tree directly instead
+> of relying on `.git/index`, so unstaged edits are indexed on the next build — this adds
+> a fixed per-build walk cost. Measured on turborepo: a no-op incremental build went from
+> 33ms to 173ms, a one-file incremental build from 298ms to 170ms, and a full rebuild
+> from 1,769ms to 1,558ms. (2) `search_symbols` now matches by prefix and against
+> identifier sub-tokens (e.g. `verify jwt` matches `verifyJwtToken`) rather than exact
+> substring, which changes result sets but was not separately benchmarked for latency.
+
 ## Query performance
 
 Median latency over 100 iterations per query:

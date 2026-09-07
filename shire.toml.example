@@ -15,4 +15,3 @@ exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party"]
 # [[packages]]
 # name = "legacy-auth"
 # description = "Legacy auth service - deprecated, use auth-service instead"
-# tags = ["deprecated"]

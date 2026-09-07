@@ -7,14 +7,15 @@ Drop a `shire.toml` in the repo root to customize behavior:
 db_path = "/path/to/custom/index.db"
 
 [discovery]
-manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile"]
+manifests = ["package.json", "go.mod", "go.work", "Cargo.toml", "pyproject.toml", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "cpanfile", "Gemfile", "flake.nix"]
 exclude = ["node_modules", "vendor", "dist", ".build", "target", "third_party", ".shire", ".gradle", "build"]
 
 # Symbol extraction
 [symbols]
 exclude_extensions = [".proto", ".pl"]
+exclude_patterns = []       # file name patterns to skip (suffix match, e.g. "_generated.go"; or prefix, e.g. "zz_generated.")
 references_enabled = false  # EXPERIMENTAL, default false — see below
-max_file_size = 2097152     # 0 = disabled (default); set to e.g. 2097152 for 2 MiB cap
+max_file_size = 0           # 0 = disabled (default); set to e.g. 2097152 for 2 MiB cap
 max_references_per_file = 10000  # 0 = unlimited; default 10000 — caps cross-references per file
 
 # Documentation indexing
@@ -22,11 +23,26 @@ max_references_per_file = 10000  # 0 = unlimited; default 10000 — caps cross-r
 extensions = [".md", ".rst", ".txt", ".adoc"]
 max_file_size = 262144  # 256 KB — files larger than this are truncated
 
+# MCP server on-demand rebuild
+[serve]
+debounce_s = 5  # minimum seconds between rebuild checks during MCP tool call bursts
+
 # Override package descriptions
 [[packages]]
 name = "legacy-auth"
 description = "Deprecated auth service — do not add new dependencies"
 ```
+
+## Config precedence
+
+Config is resolved in this order, with **no merging** — the first one found is used whole, and none of the others are read:
+
+1. `--config <PATH>` — explicit path, must exist
+2. `./shire.toml` — repo-root config
+3. `~/.claude/shire.toml` — global config (created by `shire init --global`)
+4. Built-in defaults
+
+Because the fallback is whole-file replacement rather than a merge, a local `shire.toml` containing only `db_path` discards every other setting in `~/.claude/shire.toml` (excludes, custom discovery rules, etc.) rather than layering on top of it.
 
 ## Watch daemon
 

@@ -28,7 +28,7 @@ The index is ready. Claude Code will automatically use it via the MCP server.
 
 `shire init` creates `~/.claude/rules/shire.md` with guidance on when to use Shire tools vs Grep/Glob. This helps Claude Code default to Shire for codebase searches, so you spend fewer tool calls on broad exploration.
 
-The file is only written once — if it already exists, `shire init` leaves it untouched, so your customizations are preserved.
+If it already exists, `shire init` leaves it untouched — with one exception: turning on the cross-reference index (`symbols.references_enabled`) for a repo that already has a rules file appends the extra reference-tools guidance in place, so your other customizations are preserved.
 
 ### CLAUDE.md integration
 
@@ -56,7 +56,7 @@ To create a `shire.toml` in the current repo instead of globally:
 shire init
 ```
 
-This generates a local config file with commented-out defaults you can customize, and writes the MCP server config to `.mcp.json`. If the `db_path` points to a local directory (e.g., `.shire/index.db`), it offers to add that directory to `.gitignore`.
+This generates a minimal `shire.toml` (just `db_path`; everything else uses built-in defaults — see [Configuration](./configuration.md)), writes the MCP server config to `.mcp.json`, and (in hook mode) a `PostToolUse` hook to `.claude/settings.json` plus `.claude/rules/shire.md`. If the `db_path` points to a local directory (e.g., `.shire/index.db`), it offers to add that directory to `.gitignore`.
 
 ### Manual setup
 
@@ -116,6 +116,28 @@ Use `--root` to enable on-demand reindexing (before each query the server checks
 ```sh
 shire serve --root /path/to/repo
 ```
+
+## Editor registration
+
+For editors and CLIs other than Claude Code, `shire install` registers the built shire
+binary as an MCP server with every supported tool it finds on the machine: Claude Code
+(via the `claude` CLI, falling back to file patching), Codex CLI, Cursor, Windsurf,
+Gemini CLI, VS Code, and Zed. It writes the current binary's absolute path (via
+`std::env::current_exe`) rather than a bare `shire`, so registrations keep working even
+if the tool that launches them doesn't inherit your shell's `PATH`.
+
+```sh
+shire install             # register with every detected tool
+shire install --dry-run   # show what would change without writing anything
+shire install --force     # overwrite existing registrations (e.g. after moving the binary)
+
+shire uninstall           # remove shire's registration from every detected tool
+shire uninstall --dry-run
+```
+
+`install`/`uninstall` only touch each tool's own MCP config file (or the tool's own CLI,
+for Claude Code and Codex); they do not create or modify `shire.toml`, PostToolUse hooks,
+or the rules file — use `shire init` for those.
 
 ## CLI reference
 

@@ -29,7 +29,7 @@
 #### Scenario: Default manifests
 
 - **WHEN** `[discovery].manifests` is not specified
-- **THEN** defaults to: `package.json`, `go.mod`, `go.work`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`, `settings.gradle.kts`
+- **THEN** defaults to: `package.json`, `go.mod`, `go.work`, `Cargo.toml`, `pyproject.toml`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`, `settings.gradle.kts`, `cpanfile`, `Gemfile`, `flake.nix`
 
 ### Requirement: Package overrides
 
@@ -52,16 +52,16 @@ The `shire init` and `shire init --global` commands SHALL accept a `--no-hook` f
 
 - **WHEN** `shire init --no-hook` is invoked
 - **THEN** `shire.toml` SHALL be created (or skipped if exists)
-- **AND** `.claude/settings.local.json` SHALL be patched with `mcpServers.shire` using args `["serve", "--root", "."]`
-- **AND** no PostToolUse hook SHALL be added
+- **AND** `.mcp.json` SHALL be patched with `mcpServers.shire` using args `["serve", "--root", "."]`
+- **AND** no PostToolUse hook SHALL be added, and `.claude/settings.json` SHALL NOT be written
 - **AND** next-step instructions SHALL reflect the no-hook setup
 
 #### Scenario: Global init with --no-hook
 
 - **WHEN** `shire init --global --no-hook` is invoked
 - **THEN** `~/.claude/shire.toml` SHALL be created (or skipped if exists)
-- **AND** `~/.claude/settings.json` SHALL be patched with `mcpServers.shire` using args `["serve", "--root", "."]`
-- **AND** no PostToolUse hook SHALL be added
+- **AND** `~/.claude.json` SHALL be patched with `mcpServers.shire` using args `["serve", "--root", "."]`
+- **AND** no PostToolUse hook SHALL be added, and `~/.claude/settings.json` SHALL NOT be written
 
 #### Scenario: Init without --no-hook (default)
 

@@ -60,6 +60,26 @@ The limit is applied in SQL. When a result fills the limit exactly, the
 response carries a second text block saying so, with a hint for narrowing the
 query — a capped list is never presented as a complete one.
 
+### Index freshness under `serve --root`
+
+With `--root` the server reindexes on demand. Before answering a tool call it
+checks how long ago the index was last built: inside the `serve.debounce_s`
+window (default 5 seconds) it answers straight from the current index, and
+outside it, it runs an incremental build first and answers from the result.
+
+That build is the only freshness oracle — it compares the repo's file tree,
+per-package mtimes and per-file content hashes itself, and costs on the order
+of 60-200 ms when nothing has changed. So an ordinary working-tree edit is
+picked up on the first tool call more than `serve.debounce_s` after it, with
+no need to stage anything: `git add` and `.git/index` play no part.
+
+Raise `serve.debounce_s` to trade freshness for fewer rebuilds during bursts
+of tool calls; lower it for a repo where builds are cheap and edits frequent.
+
+Without `--root` (plain `shire serve --db …`) the server is strictly
+read-only and never rebuilds — refresh the index with `shire build`, the
+watch daemon, or the `PostToolUse` hook.
+
 ### When to use Shire vs Grep/Glob
 
 | Task | Use | Not |

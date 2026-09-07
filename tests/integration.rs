@@ -3464,6 +3464,108 @@ fn test_serve_works_on_non_wal_db() {
     );
 }
 
+#[test]
+fn test_serve_root_reindexes_an_unstaged_edit_in_a_git_repo() {
+    // INDEX-2-1: `serve --root` used to decide staleness from the `.git/index`
+    // mtime alone. An ordinary edit never writes that file, so inside a Git
+    // repository the server answered from the index it started with, forever.
+    // The only freshness mechanism now is the debounce window: once it has
+    // elapsed, the incremental build runs and decides for itself.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkga",
+        "export function alphaOne(): number { return 1; }\n",
+    );
+    // Keep the test quick: re-check the tree one second after the last build.
+    fs::write(repo.join("shire.toml"), "[serve]\ndebounce_s = 1\n").unwrap();
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+
+    use std::process::Stdio;
+    let mut child = Command::new(&bin)
+        .args([
+            "serve",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn shire serve --root");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        // Before the edit: the symbol does not exist yet.
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_symbols","arguments":{{"query":"zebraServe"}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // An UNSTAGED working-tree edit: nothing touches .git/index.
+        let src = repo.join("pkga").join("src").join("index.ts");
+        let mut body = fs::read_to_string(&src).unwrap();
+        body.push_str("export function zebraServe(): number { return 9; }\n");
+        fs::write(&src, body).unwrap();
+
+        // Past the debounce window, the next tool call must re-check the tree.
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"search_symbols","arguments":{{"query":"zebraServe"}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    // Let the rebuild + answer land before EOF cancels the session.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    child.stdin.take();
+    let out = child.wait_with_output().expect("serve did not exit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let line_with = |id: &str| -> String {
+        stdout
+            .lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no response {id} in stdout={stdout} stderr={stderr}"))
+            .to_string()
+    };
+
+    assert!(
+        !line_with(r#""id":2"#).contains("zebraServe"),
+        "the symbol must not exist before the edit: {}",
+        line_with(r#""id":2"#)
+    );
+    assert!(
+        line_with(r#""id":3"#).contains("zebraServe"),
+        "an unstaged edit must be indexed after the debounce window; \
+         stdout={stdout} stderr={stderr}"
+    );
+}
+
 /// Run `shire serve --db <db>`, drive a full MCP handshake plus one
 /// `search_symbols` call over stdio, and return the finished process output.
 fn serve_and_call(bin: &Path, db: &Path, query: &str) -> std::process::Output {

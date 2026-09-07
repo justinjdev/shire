@@ -85,15 +85,23 @@ impl ShireService {
 
     /// Decide whether to trigger an on-demand rebuild before answering.
     ///
-    /// This is a *hint*, not a correctness oracle: the rebuild it triggers
-    /// does its own mtime and content-hash comparisons and is cheap when
-    /// nothing changed. So the bias is towards rebuilding — the Git index
-    /// mtime moving is a strong signal, and "no Git index to look at"
-    /// (a non-Git directory, a repository with nothing staged) means we
-    /// cannot tell, which must not be mistaken for "nothing changed".
+    /// There is exactly one mechanism here: once the debounce window has
+    /// elapsed since the last index, re-check the working tree by running
+    /// the incremental build. The build is its own freshness oracle — it
+    /// compares file-tree hashes, per-package mtimes and per-file content
+    /// hashes — and costs tens to a couple of hundred milliseconds when
+    /// nothing changed, so "run it and let it decide" is both correct and
+    /// cheap.
     ///
-    /// The debounce keeps that bias from turning into a rebuild per tool
-    /// call during a burst.
+    /// Nothing cheaper is consulted first. The obvious candidate, the Git
+    /// index mtime, was exactly wrong for this job: an ordinary edit to a
+    /// tracked file never touches `.git/index`, so gating on it froze the
+    /// served index at server start for the whole life of the process
+    /// (INDEX-2-1) — while a *non*-Git directory, where the signal is
+    /// simply absent, rebuilt correctly.
+    ///
+    /// The debounce keeps this from turning into a rebuild per tool call
+    /// during a burst.
     fn is_stale(&self) -> bool {
         let ctx = match &self.build_ctx {
             Some(c) => c,
@@ -103,34 +111,22 @@ impl ShireService {
         let last = self.last_indexed.lock().ok().and_then(|g| *g);
 
         // No existing index — definitely stale
-        if last.is_none() {
+        let Some(last) = last else {
             return true;
-        }
-        let last = last.unwrap();
+        };
 
-        // Debounce: skip stale check if last rebuild completed within the debounce
-        // window (default 5s, configurable via serve.debounce_s in shire.toml).
-        // Prevents redundant rebuilds during rapid tool call bursts. No changes are
-        // lost — the next check after the window expires triggers a rebuild that
-        // reads current file state.
-        let debounce_s = ctx.config.serve.debounce_s;
-        if let Ok(elapsed) = last.elapsed()
-            && elapsed < std::time::Duration::from_secs(debounce_s)
-        {
-            return false;
-        }
-
-        // Resolve the real index file: in a linked worktree `.git` is a
-        // file and the index lives under <main>/.git/worktrees/<id>/, so
-        // stat'ing <root>/.git/index there always fails (INDEX-12).
-        match crate::git::index_path(&ctx.repo_root) {
-            Some(git_index) => match std::fs::metadata(&git_index).and_then(|m| m.modified()) {
-                Ok(mtime) => mtime > last,
-                // Unreadable index file — unknown, so assume stale.
-                Err(_) => true,
-            },
-            // No Git index to compare against: unknown, not "unchanged".
-            None => true,
+        // Debounce: skip the re-check if the last index completed within the
+        // debounce window (default 5s, configurable via serve.debounce_s in
+        // shire.toml). Prevents redundant rebuilds during rapid tool call
+        // bursts. No changes are lost — the first check after the window
+        // expires runs a build that reads current file state.
+        let debounce = std::time::Duration::from_secs(ctx.config.serve.debounce_s);
+        match last.elapsed() {
+            Ok(elapsed) => elapsed >= debounce,
+            // `indexed_at` is in the future (clock skew, or a DB built on
+            // another machine): the window cannot be measured, and "unknown"
+            // must not be served as "fresh".
+            Err(_) => true,
         }
     }
 
@@ -903,10 +899,33 @@ mod tests {
     }
 
     #[test]
+    fn test_is_stale_true_after_debounce_window_in_a_git_repo() {
+        // INDEX-2-1: an ordinary working-tree edit never touches
+        // `.git/index`, so a Git repository whose index file is old (or
+        // never written) must still be re-checked once the debounce window
+        // has passed. Gating on the Git index mtime froze `serve --root` at
+        // the index it started with.
+        let dir = tempfile::TempDir::new().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        // A Git index that is *older* than the last build: under the old
+        // oracle this read as "nothing changed", forever.
+        std::fs::write(git_dir.join("index"), "dummy").unwrap();
+
+        let svc = make_service_with_ctx(dir.path().to_path_buf());
+        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
+
+        assert!(
+            svc.is_stale(),
+            "past the debounce window the working tree must be re-checked, \
+             whatever .git/index says"
+        );
+    }
+
+    #[test]
     fn test_is_stale_true_when_no_git_index() {
-        // Without a Git index we cannot tell whether the tree moved, and
-        // "unknown" must not be served as "fresh" — a non-Git repo root
-        // would otherwise never see an on-demand rebuild again.
+        // A non-Git directory is treated exactly like a Git one: the build
+        // itself is the freshness oracle.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = make_service_with_ctx(dir.path().to_path_buf());
         // Old enough to be outside the debounce window.
@@ -918,60 +937,30 @@ mod tests {
     }
 
     #[test]
-    fn test_is_stale_resolves_linked_worktree_index() {
-        // INDEX-12: `.git` is a file in a linked worktree, so the index has
-        // to be resolved through the gitdir pointer.
+    fn test_is_stale_false_inside_debounce_window() {
+        // The one thing that suppresses a re-check: a build that finished
+        // less than `serve.debounce_s` ago.
         let dir = tempfile::TempDir::new().unwrap();
-        let main_repo = dir.path().join("main");
-        let wt_git_dir = main_repo.join(".git").join("worktrees").join("feat");
-        std::fs::create_dir_all(&wt_git_dir).unwrap();
-        std::fs::write(wt_git_dir.join("index"), "dummy").unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("index"), "dummy").unwrap();
 
-        let wt = dir.path().join("feat");
-        std::fs::create_dir(&wt).unwrap();
-        std::fs::write(wt.join(".git"), format!("gitdir: {}", wt_git_dir.display())).unwrap();
+        let svc = make_service_with_ctx(dir.path().to_path_buf());
+        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now());
+        assert!(
+            !svc.is_stale(),
+            "a rebuild inside the debounce window must not trigger another"
+        );
+    }
 
-        let svc = make_service_with_ctx(wt.clone());
-        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
-        assert!(svc.is_stale(), "a newer worktree index must read as stale");
-
+    #[test]
+    fn test_is_stale_true_when_indexed_at_is_in_the_future() {
+        // Clock skew (or a DB built on another machine) makes the window
+        // unmeasurable; "unknown" must not be served as "fresh".
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = make_service_with_ctx(dir.path().to_path_buf());
         *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() + Duration::from_secs(600));
-        assert!(
-            !svc.is_stale(),
-            "an older worktree index must read as fresh — not always-stale"
-        );
-    }
-
-    #[test]
-    fn test_is_stale_false_when_git_index_older() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let git_dir = dir.path().join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        let git_index = git_dir.join("index");
-        std::fs::write(&git_index, "dummy").unwrap();
-        // Set last_indexed to future so git index is "older"
-        let svc = make_service_with_ctx(dir.path().to_path_buf());
-        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() + Duration::from_secs(60));
-        assert!(
-            !svc.is_stale(),
-            "should not be stale when .git/index is older than last_indexed"
-        );
-    }
-
-    #[test]
-    fn test_is_stale_true_when_git_index_newer() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let git_dir = dir.path().join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        let git_index = git_dir.join("index");
-        std::fs::write(&git_index, "dummy").unwrap();
-        // Set last_indexed to past so git index is "newer"
-        let svc = make_service_with_ctx(dir.path().to_path_buf());
-        *svc.last_indexed.lock().unwrap() = Some(SystemTime::now() - Duration::from_secs(60));
-        assert!(
-            svc.is_stale(),
-            "should be stale when .git/index is newer than last_indexed"
-        );
+        assert!(svc.is_stale(), "an unmeasurable window must read as stale");
     }
 
     #[test]

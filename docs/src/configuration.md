@@ -25,7 +25,7 @@ max_file_size = 262144  # 256 KB — files larger than this are truncated
 
 # MCP server on-demand rebuild
 [serve]
-debounce_s = 5  # minimum seconds between rebuild checks during MCP tool call bursts
+debounce_s = 5  # `serve --root` re-checks the working tree at most this often
 
 # Override package descriptions
 [[packages]]

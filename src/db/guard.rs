@@ -250,14 +250,26 @@ pub fn classify_for_removal(db_path: &Path, root: Option<&Path>) -> Result<Remov
 /// * a missing `db_path` is fine — that is every first build;
 /// * a zero-length file is fine — SQLite opens one as a brand-new empty
 ///   database, and an interrupted first build can leave one behind;
-/// * so is a SQLite database with no objects at all, or one holding any of the
-///   tables shire creates (see `SHIRE_TABLES`);
-/// * a database that cannot be opened or queried (a corrupt index, one locked
-///   by another process) gets no verdict here and is left to the removal
-///   guard, which is what decides whether a damaged index may be rebuilt;
+/// * so is a SQLite database with no objects at all, or one carrying the
+///   `shire_meta` table (`create_schema` runs in one transaction, so a killed
+///   first build leaves one of those two states and never a half-schema);
+/// * a database that cannot be opened or queried — damaged, or locked by
+///   another process mid-write — is left to the removal guard *only* inside a
+///   location shire manages, where a damaged index is the only thing it can
+///   be; anywhere else "could not tell" is refused rather than written into;
 /// * a path that cannot be examined (a symlink, a FIFO, a directory) is left
 ///   to the open itself, which already has an opinion about each.
-pub fn reject_unrelated_file_at_db_path(db_path: &Path) -> Result<()> {
+pub fn reject_unrelated_file_at_db_path(db_path: &Path, root: Option<&Path>) -> Result<()> {
+    reject_unrelated_file_within(db_path, root, crate::db::BUSY_TIMEOUT)
+}
+
+/// [`reject_unrelated_file_at_db_path`] with an explicit budget for waiting
+/// out a writer, so the "locked database" path is testable in milliseconds.
+fn reject_unrelated_file_within(
+    db_path: &Path,
+    root: Option<&Path>,
+    busy_timeout: std::time::Duration,
+) -> Result<()> {
     let Ok(Some(mut file)) = open_no_follow(db_path) else {
         return Ok(());
     };
@@ -280,93 +292,98 @@ pub fn reject_unrelated_file_at_db_path(db_path: &Path) -> Result<()> {
         );
     }
 
-    if peek_db_contents(db_path) == DbContents::Foreign {
-        anyhow::bail!(
+    match peek_db_contents_within(db_path, busy_timeout) {
+        DbContents::Shire => Ok(()),
+        DbContents::Foreign => anyhow::bail!(
             "refusing to use {} as the index database: it is a SQLite database that \
-             shire did not create — it holds other tables and no shire index of its \
-             own. Check shire.toml's db_path (or --db) — shire will not write its \
-             schema into a database it did not create",
+             shire did not create — it holds tables of its own and no 'shire_meta'. \
+             Check shire.toml's db_path (or --db) — shire will not write its schema \
+             into a database it did not create",
             db_path.display()
-        );
+        ),
+        // A database shire cannot read is only safely *assumed* to be shire's
+        // where shire is the one that puts databases: `<repo>/.shire/` or
+        // `~/.claude/shire/`, where a damaged index is the only thing it can
+        // be and `open_or_create_in_repo` rebuilds it. Anywhere else the file
+        // belongs to whoever `db_path` names, and "could not tell" must not
+        // resolve to "write the index into it".
+        DbContents::Unknown(reason) if !is_in_managed_location(db_path, root) => {
+            anyhow::bail!(
+                "refusing to use {} as the index database: it is a SQLite database \
+                 that could not be inspected ({reason}) — it may be in use by another \
+                 process, or damaged. shire will not write its schema into a database \
+                 it cannot identify as its own; check shire.toml's db_path (or --db)",
+                db_path.display()
+            )
+        }
+        DbContents::Unknown(_) => Ok(()),
     }
-
-    Ok(())
 }
 
-/// Tables a shire index creates. Used only to recognise a database as shire's
-/// *own* before writing to it — never to authorise deleting one, which stays
-/// keyed on `shire_meta` alone (see [`looks_like_shire_db`]).
-///
-/// `create_schema` issues its `CREATE TABLE IF NOT EXISTS` statements one at a
-/// time, and `shire_meta` is not the first, so a first build killed partway
-/// through leaves a real shire index carrying some of these and not that one.
-/// Recognising any of them keeps such a database adoptable.
-const SHIRE_TABLES: &[&str] = &[
-    "shire_meta",
-    "packages",
-    "dependencies",
-    "symbols",
-    "symbol_refs",
-    "files",
-    "docs",
-    "manifest_hashes",
-    "file_hashes",
-    "source_hashes",
-];
-
 /// What a read-only peek inside an existing SQLite file at `db_path` found.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum DbContents {
-    /// Empty (no objects at all), or holding tables shire itself creates.
-    /// Writing an index here is safe.
+    /// Shire's own: it has the `shire_meta` table every index carries, or it
+    /// has no objects at all (a brand-new database, which is also what SQLite
+    /// makes of a zero-byte file).
     Shire,
-    /// It holds objects, none of them shire's: someone else's database.
+    /// It holds objects and no `shire_meta`: someone else's database.
+    ///
+    /// Deliberately strict — matching on shire's other table names would
+    /// admit any database that happens to hold a `files` or `packages` table,
+    /// and shire would then write `shire_meta` into it, after which
+    /// `shire clean` would delete it as its own. The partly-created first
+    /// build that reasoning was meant to protect is instead handled at the
+    /// source: `db::create_schema` runs in one transaction, so it leaves
+    /// either a complete schema or no objects.
     Foreign,
-    /// It could not be opened or queried — corrupt, or locked by another
-    /// process. No verdict, so the callers that already handle a corrupt
-    /// index decide (`open_or_create_in_repo` and its removal guard).
-    Unknown,
+    /// It could not be opened or queried, with the reason: damaged, or locked
+    /// by another process mid-write (a build runs under `journal_mode=MEMORY`,
+    /// whose write transactions block readers).
+    Unknown(String),
 }
 
 /// Peek inside an existing SQLite database, strictly read-only, to see whose
 /// it is. Never creates, writes to, or locks the file.
-fn peek_db_contents(db_path: &Path) -> DbContents {
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
+fn peek_db_contents_within(db_path: &Path, busy_timeout: std::time::Duration) -> DbContents {
+    let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return DbContents::Unknown;
+    ) {
+        Ok(conn) => conn,
+        Err(e) => return DbContents::Unknown(e.to_string()),
     };
+    // Wait out a writer rather than reading "busy" as "cannot tell": the
+    // answer to that decides whether shire writes its schema into the file.
+    if let Err(e) = conn.busy_timeout(busy_timeout) {
+        return DbContents::Unknown(e.to_string());
+    }
 
-    let Ok(objects) = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+    let objects = match conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
-    }) else {
-        return DbContents::Unknown;
+    }) {
+        Ok(n) => n,
+        Err(e) => return DbContents::Unknown(e.to_string()),
     };
     if objects == 0 {
-        // A brand-new database — which is also what SQLite makes of the
-        // zero-byte file handled above.
         return DbContents::Shire;
     }
 
-    let is_shire = SHIRE_TABLES.iter().any(|table| {
-        conn.query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .is_ok()
-    });
-    if is_shire {
-        DbContents::Shire
-    } else {
-        DbContents::Foreign
+    match conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shire_meta'",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => DbContents::Shire,
+        Err(rusqlite::Error::QueryReturnedNoRows) => DbContents::Foreign,
+        Err(e) => DbContents::Unknown(e.to_string()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn an_unrelated_file_at_db_path_is_refused_before_anything_is_created() {
@@ -378,12 +395,18 @@ mod tests {
         let secret = dir.path().join("secret");
         std::fs::write(&secret, b"hunter2\n").unwrap();
 
-        let err = reject_unrelated_file_at_db_path(&secret)
+        let err = reject_unrelated_file_at_db_path(&secret, None)
             .expect_err("a plain file is not a database and must be refused");
         assert!(
             format!("{err:#}").contains("not a SQLite database"),
             "got {err:#}"
         );
+    }
+
+    /// A valid SQLite database at `path` holding exactly `schema`.
+    fn write_sqlite_with(path: &Path, schema: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(schema).unwrap();
     }
 
     #[test]
@@ -392,38 +415,106 @@ mod tests {
         // outright: the build wrote shire's schema into it, after which it
         // carried a `shire_meta` table and `shire clean` deleted it as shire's
         // own. A repo-controlled db_path can name any file on the machine.
+        //
+        // The verdict keys on `shire_meta` alone. Matching shire's other
+        // table names instead would admit any database that happens to hold a
+        // `files` or `packages` table of its own — including one sitting next
+        // to tables that are nobody's business but their owner's.
         let dir = tempfile::TempDir::new().unwrap();
-        let foreign = dir.path().join("places.sqlite");
-        let conn = rusqlite::Connection::open(&foreign).unwrap();
-        conn.execute_batch("CREATE TABLE places (id INTEGER PRIMARY KEY, url TEXT);")
-            .unwrap();
-        drop(conn);
+        for (name, schema) in [
+            (
+                "places.sqlite",
+                "CREATE TABLE places (id INTEGER PRIMARY KEY, url TEXT);",
+            ),
+            ("app.db", "CREATE TABLE files (id INTEGER, blob BLOB);"),
+            (
+                "crm.db",
+                "CREATE TABLE packages (id INTEGER, sku TEXT);
+                 CREATE TABLE customer_secrets (id INTEGER, token TEXT);",
+            ),
+            (
+                "views.db",
+                "CREATE TABLE t (id INTEGER); CREATE VIEW symbols AS SELECT id FROM t;",
+            ),
+        ] {
+            let foreign = dir.path().join(name);
+            write_sqlite_with(&foreign, schema);
 
-        let err = reject_unrelated_file_at_db_path(&foreign)
-            .expect_err("someone else's database must not be written into");
+            let err = reject_unrelated_file_at_db_path(&foreign, None)
+                .expect_err("someone else's database must not be written into");
+            let err = format!("{err:#}");
+            assert!(err.contains("shire did not create"), "{name}: got {err}");
+        }
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_inspected_is_refused_outside_a_managed_location() {
+        // A build holds an exclusive write lock for the length of a phase
+        // (builds run under journal_mode=MEMORY, which blocks readers), so
+        // "busy" is a real answer here — and reading it as "cannot tell, carry
+        // on" wrote shire's whole index into whatever the file turned out to
+        // be. Outside the two directories shire itself manages, a file it
+        // cannot identify is not its to write into.
+        let dir = tempfile::TempDir::new().unwrap();
+        let foreign = dir.path().join("notes.db");
+        write_sqlite_with(&foreign, "CREATE TABLE notes (id INTEGER, body TEXT);");
+
+        let holder = rusqlite::Connection::open(&foreign).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let err = reject_unrelated_file_within(&foreign, None, Duration::from_millis(50))
+            .expect_err("a database that cannot be inspected must not be written into");
+        holder.execute_batch("ROLLBACK;").unwrap();
+        let err = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("shire did not create"),
-            "got {err:#}"
+            err.contains("could not be inspected") && err.contains("in use by another process"),
+            "the error must say why: {err}"
         );
     }
 
     #[test]
-    fn a_partly_created_shire_index_is_still_adopted() {
-        // `create_schema` runs its CREATE TABLE statements one at a time and
-        // `shire_meta` is not the first, so a first build killed partway
-        // through leaves a real index without it. That must still be a
-        // database shire may finish building.
-        let dir = tempfile::TempDir::new().unwrap();
-        let half = dir.path().join("index.db");
-        let conn = rusqlite::Connection::open(&half).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE packages (name TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL);",
-        )
-        .unwrap();
-        drop(conn);
+    fn a_database_that_cannot_be_inspected_inside_a_managed_location_is_left_alone() {
+        // Inside `<repo>/.shire/` a database shire cannot read is a damaged
+        // index and nothing else, and `open_or_create_in_repo` rebuilds it.
+        // That path must not start failing because the file was busy.
+        let repo = tempfile::TempDir::new().unwrap();
+        let shire_dir = repo.path().join(".shire");
+        std::fs::create_dir_all(&shire_dir).unwrap();
+        let db = shire_dir.join("index.db");
+        write_sqlite_with(
+            &db,
+            "CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);",
+        );
 
-        reject_unrelated_file_at_db_path(&half)
-            .expect("a shire index missing only shire_meta must still be adoptable");
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+        let verdict =
+            reject_unrelated_file_within(&db, Some(repo.path()), Duration::from_millis(50));
+        holder.execute_batch("ROLLBACK;").unwrap();
+        verdict.expect("shire's own directory keeps the corrupt-index handling");
+
+        // And so is a genuinely corrupt file there.
+        let corrupt = shire_dir.join("other.db");
+        corrupt_sqlite_like(&corrupt);
+        reject_unrelated_file_at_db_path(&corrupt, Some(repo.path()))
+            .expect("a damaged index in a managed location still reaches the removal guard");
+    }
+
+    #[test]
+    fn a_corrupt_database_outside_a_managed_location_is_refused() {
+        // The same rule seen from the other side: a file shire cannot read,
+        // in a directory shire does not manage, is not assumed to be shire's.
+        let dir = tempfile::TempDir::new().unwrap();
+        let corrupt = dir.path().join("index.db");
+        corrupt_sqlite_like(&corrupt);
+
+        let err = reject_unrelated_file_at_db_path(&corrupt, None)
+            .expect_err("an unreadable database outside shire's own directories is refused");
+        assert!(
+            format!("{err:#}").contains("could not be inspected"),
+            "got {err:#}"
+        );
     }
 
     #[test]
@@ -433,22 +524,17 @@ mod tests {
         // empty database), and an actual index.
         let dir = tempfile::TempDir::new().unwrap();
 
-        reject_unrelated_file_at_db_path(&dir.path().join("nope.db")).unwrap();
+        reject_unrelated_file_at_db_path(&dir.path().join("nope.db"), None).unwrap();
 
         let empty = dir.path().join("empty.db");
         std::fs::write(&empty, b"").unwrap();
-        reject_unrelated_file_at_db_path(&empty).unwrap();
-
-        let corrupt = dir.path().join("index.db");
-        corrupt_sqlite_like(&corrupt);
-        reject_unrelated_file_at_db_path(&corrupt)
-            .expect("a damaged shire index still has to reach the removal guard");
+        reject_unrelated_file_at_db_path(&empty, None).unwrap();
 
         // A SQLite database with no objects at all is what an interrupted
         // first build leaves, and is indistinguishable from a fresh one.
         let blank = dir.path().join("blank.db");
         rusqlite::Connection::open(&blank).unwrap();
-        reject_unrelated_file_at_db_path(&blank)
+        reject_unrelated_file_at_db_path(&blank, None)
             .expect("an empty SQLite database must still be adopted");
 
         // And shire's own index, obviously.
@@ -457,7 +543,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);")
             .unwrap();
         drop(conn);
-        reject_unrelated_file_at_db_path(&shire).expect("shire's own index must be adopted");
+        reject_unrelated_file_at_db_path(&shire, None).expect("shire's own index must be adopted");
     }
 
     fn corrupt_sqlite_like(path: &Path) {

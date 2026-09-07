@@ -3523,12 +3523,16 @@ fn test_build_refuses_a_foreign_sqlite_database_at_db_path() {
         "export function alpha(): number { return 1; }\n",
     );
 
+    // Note the table name: shire has a `files` table of its own, and
+    // recognising a database by any of shire's table names rather than by
+    // `shire_meta` alone would adopt this one.
     let victim = dir.path().join("notes.db");
     {
         let conn = rusqlite::Connection::open(&victim).unwrap();
         conn.execute_batch(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
-             INSERT INTO notes (body) VALUES ('remember the milk');",
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE customer_secrets (id INTEGER PRIMARY KEY, token TEXT);
+             INSERT INTO files (body) VALUES ('remember the milk');",
         )
         .unwrap();
     }

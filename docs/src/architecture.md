@@ -107,8 +107,14 @@ since its trigger comes round again.
 build. Neither command creates the lock file until it has established that
 `db_path` is shire's to use: `db_path` comes from the repository's own
 `shire.toml`, and `build` refuses outright a path holding a file that is not a
-SQLite database, or a SQLite database holding someone else's tables — it will
-not write its schema into a database it did not create. The `<db_path>.lock` file itself is left in place — it is an empty
+SQLite database, one holding a SQLite database with tables of its own and no
+`shire_meta` (the mark every shire index carries), and — outside `<repo>/.shire/`
+and `~/.claude/shire/` — one it cannot inspect at all because the file is
+damaged or locked by another process. It will not write its schema into a
+database it cannot identify as its own. Inside those two directories an
+unreadable database is a damaged index and is rebuilt as before, and the schema
+is created in a single transaction, so an interrupted first build leaves either
+a complete index or an empty file. The `<db_path>.lock` file itself is left in place — it is an empty
 sidecar like `-wal`/`-shm`, and unlinking it while a builder holds a lock on
 that inode is what would let a second builder take the lock at the same path.
 

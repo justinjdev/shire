@@ -3556,7 +3556,7 @@ fn build_index_inner(
     // file sitting at that path. The guard that protects the file itself does
     // not run until the database is opened, several steps further down
     // (INDEX-3-7).
-    crate::db::guard::reject_unrelated_file_at_db_path(&db_path)?;
+    crate::db::guard::reject_unrelated_file_at_db_path(&db_path, Some(repo_root))?;
 
     // Serialize builds across processes for the whole pipeline. Two builders
     // that both read `is_full_build` from an empty `manifest_hashes` before

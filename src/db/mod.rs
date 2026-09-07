@@ -339,6 +339,27 @@ fn readonly_open_error(err: rusqlite::Error) -> anyhow::Error {
 }
 
 fn create_schema(conn: &Connection) -> Result<()> {
+    // One transaction for the whole schema. `db::guard` identifies a shire
+    // index by its `shire_meta` table before writing to it, and `shire_meta`
+    // is not the first table created here — so a first build killed partway
+    // through used to leave a database carrying some of shire's tables and
+    // not that one, which the guard can only read as someone else's. With the
+    // transaction a killed build leaves either a complete schema or a file
+    // with no objects at all, and both are unambiguous. SQLite's DDL is
+    // transactional, `CREATE VIRTUAL TABLE` included.
+    //
+    // A caller that already opened a transaction provides the same guarantee,
+    // and nesting one would fail.
+    if !conn.is_autocommit() {
+        return create_schema_statements(conn);
+    }
+    let tx = conn.unchecked_transaction()?;
+    create_schema_statements(conn)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn create_schema_statements(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS packages (
@@ -939,6 +960,51 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         create_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn test_create_schema_is_all_or_nothing() {
+        // `db::guard` identifies a shire index by its `shire_meta` table
+        // before writing anything into the file. `shire_meta` is not the
+        // first table created here, so a first build killed partway through
+        // must not be able to leave a database holding shire's other tables
+        // and not that one — the guard could only read that as someone
+        // else's database. One transaction is what rules that state out.
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Standing in for the kill: the transaction the schema was built in
+        // is rolled back instead of committed. Nothing may survive it.
+        let tx = conn.unchecked_transaction().unwrap();
+        create_schema(&conn).unwrap();
+        assert!(
+            !conn.is_autocommit(),
+            "create_schema must not commit out from under a caller's transaction"
+        );
+        tx.rollback().unwrap();
+
+        let objects: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            objects, 0,
+            "an interrupted schema creation must leave no objects at all, \
+             never a half-schema without shire_meta"
+        );
+
+        // And on the committed path, the mark the guard looks for is there
+        // alongside everything else.
+        create_schema(&conn).unwrap();
+        assert!(conn.is_autocommit(), "the transaction must be closed");
+        for table in ["shire_meta", "packages", "symbols", "files", "docs"] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} missing after create_schema");
+        }
     }
 
     #[test]

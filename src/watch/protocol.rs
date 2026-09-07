@@ -57,7 +57,6 @@ const READONLY_COMMANDS: &[&str] = &[
     "whereis",
     "whence",
     "type",
-    "command",
     "env",
     "printenv",
     "set",
@@ -98,10 +97,8 @@ const READONLY_COMMANDS: &[&str] = &[
     "npx",
     "yarn test",
     "pnpm test",
-    "python -c",
     "python -m pytest",
     "pytest",
-    "node -e",
     "make check",
     "make test",
     "jq",
@@ -122,14 +119,32 @@ const READONLY_COMMANDS: &[&str] = &[
     "gh run view",
 ];
 
-/// Commands that wrap or chain into another, arbitrary command. Several of these
+/// Commands that wrap or chain into another, arbitrary command, or are inline
+/// interpreters whose string/script argument this filter can't scan. Several of these
 /// (`find`, `xargs`, `env`, `npx`) are *often* used read-only, but just as easily wrap
 /// something mutating (`find . -exec rm {} \;`, `echo f | xargs rm`, `env FOO=1 mv a
-/// b`, `npx <codegen>`), so a segment starting with one of these is never treated as
-/// read-only regardless of what it's wrapping — this overrides any match against
+/// b`, `npx <codegen>`); the interpreter ones (`python -c "open('x','w')..."`, `node -e
+/// "fs.writeFileSync(...)"`) can write files directly with no shell-visible redirection
+/// at all. A segment starting with one of these is never treated as read-only
+/// regardless of what it's wrapping — this overrides any match against
 /// READONLY_COMMANDS.
 const WRAPPER_COMMANDS: &[&str] = &[
-    "env", "xargs", "find", "npx", "sudo", "nohup", "eval", "bash -c", "sh -c",
+    "env",
+    "xargs",
+    "find",
+    "npx",
+    "sudo",
+    "nohup",
+    "eval",
+    "bash -c",
+    "sh -c",
+    "command",
+    "builtin",
+    "python -c",
+    "python3 -c",
+    "node -e",
+    "ruby -e",
+    "perl -e",
 ];
 
 /// Whether a single command segment could have a side effect that a prefix match
@@ -141,7 +156,17 @@ fn segment_has_hidden_side_effect(segment: &str) -> bool {
     // like `2>&1` — this filter is meant to fail toward triggering a rebuild, so an
     // occasional harmless extra rebuild from stderr redirection is an acceptable
     // trade-off for never missing a real file write.
-    segment.contains('>') || segment.contains("$(") || segment.contains('`')
+    if segment.contains('>') || segment.contains("$(") || segment.contains('`') {
+        return true;
+    }
+    // curl/wget are read-only listed for the common "fetch and print/pipe" case, but
+    // -o/-O (curl) and -O (wget) write the response to a file in the tree.
+    if segment.starts_with("curl") || segment.starts_with("wget") {
+        return segment
+            .split_whitespace()
+            .any(|tok| tok == "-O" || tok.starts_with("-o") || tok.starts_with("--output"));
+    }
+    false
 }
 
 impl HookInput {
@@ -170,15 +195,14 @@ impl HookInput {
             None => return true,
         };
 
-        // Check every segment of piped/chained/sequenced commands.
+        // Check every segment of piped/chained/sequenced/backgrounded commands.
         // If ALL are read-only, skip. If ANY is unknown (or looks risky), rebuild.
-        // Splitting on '|' also splits '||' (into two segments plus an empty one that
-        // gets filtered out), so a single char class covers both pipe and or-chains;
-        // '\n' covers multi-line Bash strings, which Claude Code commonly produces.
-        !cmd.split(['\n', '|', ';'])
+        // A single char class covers '|' and '||' together (splitting on '|' breaks
+        // '||' into two segments plus a filtered-out empty one), and likewise '&' and
+        // '&&'; '\n' and '\r' cover multi-line Bash strings (CRLF, LF, or a bare CR —
+        // classic Mac line endings — all split the same way).
+        !cmd.split(['\n', '\r', '|', '&', ';'])
             .map(|s| s.trim().trim_start_matches('('))
-            // split on && (crude: split on & then skip empty segments)
-            .flat_map(|s| s.split("&&").map(|s| s.trim()))
             .filter(|s| !s.is_empty())
             .all(|segment| {
                 !segment_has_hidden_side_effect(segment)
@@ -321,5 +345,64 @@ mod tests {
     #[test]
     fn test_bash_wrapper_commands_still_flagged_when_piped() {
         assert!(hook("Bash", Some("git log | xargs -I{} echo {}")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_inline_interpreters_rebuild() {
+        for cmd in [
+            r#"python -c "open('x.rs','w').write('x')""#,
+            r#"python3 -c "open('x.rs','w').write('x')""#,
+            r#"node -e "require('fs').writeFileSync('x.rs','x')""#,
+            r#"ruby -e "File.write('x.rs','x')""#,
+            r#"perl -e "open(F,'>x.rs')""#,
+        ] {
+            assert!(
+                hook("Bash", Some(cmd)).should_rebuild(),
+                "expected rebuild for: {cmd}"
+            );
+        }
+        // python -m pytest / pytest themselves remain read-only.
+        assert!(!hook("Bash", Some("python -m pytest")).should_rebuild());
+        assert!(!hook("Bash", Some("pytest")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_downloader_output_flags_rebuild() {
+        for cmd in [
+            "curl -o src/x.ts https://example.com/x.ts",
+            "curl -O https://example.com/x.ts",
+            "curl https://example.com/x.ts -o src/x.ts",
+            "wget -O x.ts https://example.com/x.ts",
+        ] {
+            assert!(
+                hook("Bash", Some(cmd)).should_rebuild(),
+                "expected rebuild for: {cmd}"
+            );
+        }
+        // Plain fetch-and-print/pipe usage stays read-only.
+        assert!(!hook("Bash", Some("curl https://example.com/status")).should_rebuild());
+        assert!(!hook("Bash", Some("wget -q -O- https://example.com | grep ok")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_command_and_builtin_wrappers_rebuild() {
+        assert!(hook("Bash", Some("command rm x.rs")).should_rebuild());
+        assert!(hook("Bash", Some("builtin rm x.rs")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_single_ampersand_background_chain_rebuilds() {
+        assert!(hook("Bash", Some("echo hi & mv a.rs b.rs")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_carriage_return_separated_commands_rebuild() {
+        assert!(hook("Bash", Some("cat a.rs\rmv b.rs c.rs")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_crlf_separated_readonly_still_skips() {
+        // A CRLF-joined pair of genuinely read-only commands should still skip.
+        assert!(!hook("Bash", Some("git status\r\ncat a.rs")).should_rebuild());
     }
 }

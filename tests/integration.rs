@@ -3492,8 +3492,17 @@ fn test_build_refuses_to_delete_a_short_file_at_db_path() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("refusing to delete and rebuild"),
+        stderr.contains("shire will not overwrite a file it did not create"),
         "the error must say the file was left alone, got: {stderr}"
+    );
+    // INDEX-3-7: the build lock's path is db_path + ".lock", and it used to be
+    // created before any of this was checked — so a hostile shire.toml got an
+    // empty file dropped next to whatever it named.
+    let mut lock = victim.as_os_str().to_owned();
+    lock.push(".lock");
+    assert!(
+        !std::path::Path::new(&lock).exists(),
+        "no lock file may be created beside a file shire refuses to use"
     );
 }
 

@@ -230,9 +230,90 @@ pub fn classify_for_removal(db_path: &Path, root: Option<&Path>) -> Result<Remov
     }
 }
 
+/// Refuse, before anything is created beside it, a `db_path` that already holds
+/// a file shire plainly did not write.
+///
+/// The build lock is taken *before* the database is opened (a builder that
+/// loses the race must not have written anything), and its path is
+/// `db_path` + ".lock" — so a repo-controlled `shire.toml` could get an empty
+/// `.lock` file, and the directories above it, created next to an arbitrary
+/// file, with [`classify_for_removal`] not running until much later
+/// (INDEX-3-7). This is the cheap precondition that closes that: a non-empty
+/// file without SQLite's header is not an index and never will be.
+///
+/// Deliberately narrow, so it only ever refuses what the later checks would
+/// refuse anyway:
+/// * a missing `db_path` is fine — that is every first build;
+/// * a zero-length file is fine — SQLite opens one as a brand-new empty
+///   database, and an interrupted first build can leave one behind;
+/// * a path that cannot be examined (a symlink, a FIFO, a directory) is left
+///   to the open itself, which already has an opinion about each.
+pub fn reject_unrelated_file_at_db_path(db_path: &Path) -> Result<()> {
+    let Ok(Some(mut file)) = open_no_follow(db_path) else {
+        return Ok(());
+    };
+    let is_empty = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+    if is_empty {
+        return Ok(());
+    }
+
+    let is_sqlite = {
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
+    };
+    if is_sqlite {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to use {} as the index database: there is already a file there \
+         and it is not a SQLite database. Check shire.toml's db_path (or --db) — \
+         shire will not overwrite a file it did not create",
+        db_path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unrelated_file_at_db_path_is_refused_before_anything_is_created() {
+        // INDEX-3-7: the build lock is `db_path` + ".lock" and is taken before
+        // the database is opened, so this is the only thing standing between a
+        // repo-controlled db_path and an empty file appearing next to an
+        // arbitrary one.
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"hunter2\n").unwrap();
+
+        let err = reject_unrelated_file_at_db_path(&secret)
+            .expect_err("a plain file is not a database and must be refused");
+        assert!(
+            format!("{err:#}").contains("not a SQLite database"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_missing_empty_or_sqlite_db_path_is_accepted() {
+        // The three shapes a real db_path takes: never built yet, a zero-byte
+        // file left by an interrupted first build (SQLite opens one as a new
+        // empty database), and an actual index.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        reject_unrelated_file_at_db_path(&dir.path().join("nope.db")).unwrap();
+
+        let empty = dir.path().join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        reject_unrelated_file_at_db_path(&empty).unwrap();
+
+        let corrupt = dir.path().join("index.db");
+        corrupt_sqlite_like(&corrupt);
+        reject_unrelated_file_at_db_path(&corrupt)
+            .expect("a damaged shire index still has to reach the removal guard");
+    }
 
     fn corrupt_sqlite_like(path: &Path) {
         let mut content = SQLITE_HEADER.to_vec();

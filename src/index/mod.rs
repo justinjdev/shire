@@ -3534,6 +3534,13 @@ fn build_index_inner(
         crate::config::resolve_db_path_with_info(config, repo_root, &wt_info)?
     };
 
+    // The lock file below is `db_path` + ".lock", and `db_path` comes from the
+    // repo's own shire.toml — so check first that there is not some unrelated
+    // file sitting at that path. The guard that protects the file itself does
+    // not run until the database is opened, several steps further down
+    // (INDEX-3-7).
+    crate::db::guard::reject_unrelated_file_at_db_path(&db_path)?;
+
     // Serialize builds across processes for the whole pipeline. Two builders
     // that both read `is_full_build` from an empty `manifest_hashes` before
     // either commits will both insert without deleting, doubling every symbol

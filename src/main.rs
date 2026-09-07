@@ -235,46 +235,7 @@ async fn main() -> Result<()> {
             root,
             db,
             config: cfg_path,
-        } => {
-            let root = std::fs::canonicalize(&root)?;
-
-            // Stop the watch daemon if running. stop_daemon() itself waits (up to ~5s)
-            // for the process to actually exit before touching its pid/socket files, so
-            // a single is_running() check afterward is meaningful: if the daemon is
-            // still alive at this point, it truly did not stop cleanly (previously the
-            // pid file was deleted before the process had exited, which made this
-            // check — and the bail below — unreachable, and let `clean` remove `.shire`
-            // out from under a daemon that was still mid-rebuild).
-            if watch::daemon::is_running(&root) {
-                eprintln!("Stopping watch daemon...");
-                watch::daemon::stop_daemon(&root)?;
-                if watch::daemon::is_running(&root) {
-                    anyhow::bail!("Watch daemon did not stop cleanly");
-                }
-            }
-
-            // Resolve and remove the database file. db_path comes from a
-            // repo-controlled shire.toml (or a global ~/.claude/shire.toml), so it must
-            // not be deleted unconditionally — see remove_index_db().
-            let db_path = if let Some(p) = db {
-                p
-            } else {
-                let config = config::load_config_from(cfg_path.as_deref(), &root)?;
-                config::resolve_db_path(&config, &root)?
-            };
-            remove_index_db(&db_path, &root)?;
-
-            // Remove the .shire directory
-            let shire_dir = root.join(".shire");
-            if shire_dir.exists() {
-                std::fs::remove_dir_all(&shire_dir)
-                    .with_context(|| format!("Failed to remove {}", shire_dir.display()))?;
-                eprintln!("Removed {}", shire_dir.display());
-            }
-
-            eprintln!("Clean complete.");
-            Ok(())
-        }
+        } => run_clean(&root, db, cfg_path.as_deref()),
         Commands::Rebuild {
             root,
             mut file,
@@ -318,6 +279,78 @@ async fn main() -> Result<()> {
             watch::send_rebuild(&root, file)
         }
     }
+}
+
+/// `shire clean`: stop the watch daemon, remove the index database, and remove
+/// `<root>/.shire`.
+///
+/// Split out of `main` so the parts that must not be got wrong — refusing to
+/// delete a file shire did not build, and refusing to run at all while a build
+/// holds the lock — are reachable from tests.
+fn run_clean(root: &Path, db: Option<PathBuf>, cfg_path: Option<&Path>) -> Result<()> {
+    let root = std::fs::canonicalize(root)?;
+
+    // Stop the watch daemon if running. stop_daemon() itself waits (up to ~5s)
+    // for the process to actually exit before touching its pid/socket files, so
+    // a single is_running() check afterward is meaningful: if the daemon is
+    // still alive at this point, it truly did not stop cleanly (previously the
+    // pid file was deleted before the process had exited, which made this
+    // check — and the bail below — unreachable, and let `clean` remove `.shire`
+    // out from under a daemon that was still mid-rebuild).
+    if watch::daemon::is_running(&root) {
+        eprintln!("Stopping watch daemon...");
+        watch::daemon::stop_daemon(&root)?;
+        if watch::daemon::is_running(&root) {
+            anyhow::bail!("Watch daemon did not stop cleanly");
+        }
+    }
+
+    // Resolve and remove the database file. db_path comes from a
+    // repo-controlled shire.toml (or a global ~/.claude/shire.toml), so it must
+    // not be deleted unconditionally — see remove_index_db().
+    let db_path = if let Some(p) = db {
+        p
+    } else {
+        let config = config::load_config_from(cfg_path, &root)?;
+        config::resolve_db_path(&config, &root)?
+    };
+    // Hold the build lock for the whole of `clean`. Without it a build
+    // in flight has its database deleted underneath it, and — worse —
+    // unlinking the lock file while a builder holds an `flock` on that
+    // inode voids the mutual exclusion entirely: the holder keeps a
+    // lock on an unlinked inode while the next builder creates a fresh
+    // file at the same path and takes it immediately (INDEX-3-6).
+    //
+    // Taken only once the guard below has accepted `db_path`, so a
+    // repo-controlled `shire.toml` cannot get a lock file created next
+    // to an arbitrary file (INDEX-3-7). `Skip` rather than a wait:
+    // `clean` is interactive, and "a build is running" is the useful
+    // answer.
+    let _build_lock =
+        if guard::classify_for_removal(&db_path, Some(&root))? == guard::RemovalVerdict::Missing {
+            None
+        } else {
+            match index::lock::acquire(&db_path, index::lock::LockWait::Skip)? {
+                Some(lock) => Some(lock),
+                None => anyhow::bail!(
+                    "a shire build is running against {}. Wait for it to finish, \
+                         then run `shire clean` again.",
+                    db_path.display()
+                ),
+            }
+        };
+    remove_index_db(&db_path, &root)?;
+
+    // Remove the .shire directory
+    let shire_dir = root.join(".shire");
+    if shire_dir.exists() {
+        std::fs::remove_dir_all(&shire_dir)
+            .with_context(|| format!("Failed to remove {}", shire_dir.display()))?;
+        eprintln!("Removed {}", shire_dir.display());
+    }
+
+    eprintln!("Clean complete.");
+    Ok(())
 }
 
 /// Remove `path` unless it's a symlink or missing. Errors (including "it's a symlink")
@@ -370,19 +403,23 @@ fn remove_index_db(db_path: &Path, root: &Path) -> Result<()> {
         .with_context(|| format!("Failed to remove database {}", db_path.display()))?;
     eprintln!("Removed {}", db_path.display());
 
-    // Only remove the WAL/SHM sidecars and the build lock file once the main file
-    // passed one of the checks above, and only via the same "never follow a symlink"
-    // open each of them gets on their own — they're just as attacker-nameable as
-    // db_path, being derived from it by string concatenation.
+    // Only remove the WAL/SHM sidecars once the main file passed one of the
+    // checks above, and only via the same "never follow a symlink" open each of
+    // them gets on their own — they're just as attacker-nameable as db_path,
+    // being derived from it by string concatenation.
+    //
+    // The `<db_path>.lock` file is deliberately NOT removed. It is an empty
+    // sidecar whose whole purpose is to persist: unlinking it while a builder
+    // holds an `flock` on that inode lets the next builder create a fresh file
+    // at the same path and take the lock immediately, which is exactly the
+    // two-builds-at-once condition the lock exists to prevent (INDEX-3-6).
+    // `clean` holds the lock while it runs, and a `.shire` directory removal
+    // takes the file with it anyway.
     for suffix in &["-wal", "-shm"] {
         let mut p = db_path.as_os_str().to_owned();
         p.push(suffix);
         remove_sidecar(&PathBuf::from(p));
     }
-    // The build lock's name comes from `index::lock`, not from a literal here:
-    // a `clean` that spelled it itself would silently stop removing the file
-    // the moment the lock moved.
-    remove_sidecar(&index::lock::lock_path(db_path));
 
     Ok(())
 }
@@ -390,6 +427,7 @@ fn remove_index_db(db_path: &Path, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A file that starts with the SQLite magic header but is otherwise garbage —
     /// passes the format check but fails both to open cleanly as SQLite in most cases
@@ -411,6 +449,69 @@ mod tests {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch("CREATE TABLE places (id INTEGER PRIMARY KEY, url TEXT);")
             .unwrap();
+    }
+
+    /// A real, minimal shire index: a SQLite database carrying the
+    /// `shire_meta` table `classify_for_removal` identifies shire by.
+    fn write_shire_db(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+    }
+
+    #[test]
+    fn clean_refuses_to_run_while_a_build_holds_the_lock() {
+        // INDEX-3-6: `clean` used to delete the database — and unlink the lock
+        // file — out from under a running build. Unlinking the lock is the
+        // worse half: the holder keeps its `flock` on an unlinked inode while
+        // the next builder creates a fresh file at the same path and takes it
+        // straight away, which is the two-builds-at-once condition the lock
+        // exists to prevent.
+        let repo = tempfile::TempDir::new().unwrap();
+        let db = repo.path().join(".shire").join("index.db");
+        write_shire_db(&db);
+
+        let held = index::lock::acquire(&db, index::lock::LockWait::Wait(Duration::from_secs(5)))
+            .unwrap()
+            .expect("the test holds the lock, standing in for a running build");
+
+        let err = run_clean(repo.path(), Some(db.clone()), None)
+            .expect_err("clean must not run while a build holds the lock");
+        assert!(
+            format!("{err:#}").contains("a shire build is running"),
+            "the error must name the cause: {err:#}"
+        );
+        assert!(db.exists(), "the running build's database must survive");
+        assert!(
+            index::lock::lock_path(&db).exists(),
+            "and so must the lock it is holding"
+        );
+
+        // Once the build finishes, clean works.
+        drop(held);
+        run_clean(repo.path(), Some(db.clone()), None).unwrap();
+        assert!(!db.exists());
+    }
+
+    #[test]
+    fn clean_leaves_the_build_lock_file_behind() {
+        // The lock file is an empty sidecar whose whole purpose is to persist,
+        // exactly like the -wal/-shm files: removing it is what lets two
+        // builders end up holding "the lock" on two different inodes.
+        let repo = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let db = elsewhere.path().join("index.db");
+        write_shire_db(&db);
+        let lock = index::lock::lock_path(&db);
+        std::fs::write(&lock, b"").unwrap();
+
+        run_clean(repo.path(), Some(db.clone()), None).unwrap();
+
+        assert!(!db.exists(), "the index itself is removed");
+        assert!(lock.exists(), "the build lock file is not");
     }
 
     /// Build a sidecar path the same way remove_index_db() does: appended directly to

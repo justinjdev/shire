@@ -594,7 +594,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Use instead of Grep for 'where is function X?'. Omit query with a package filter to list the start of that package in (file, line) order."
+        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Matches the symbol name and its sub-tokens only, never signatures or file paths. Use instead of Grep for 'where is function X?'. Omit `query` with a `package` filter to list that package's symbols in (file, line) order, capped at `limit`."
     )]
     fn search_symbols(
         &self,

@@ -1,4 +1,4 @@
-use super::manifest::{DepInfo, DepKind, ManifestParser, NoPackageManifest, PackageInfo};
+use super::manifest::{self, DepInfo, DepKind, ManifestParser, NoPackageManifest, PackageInfo};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,11 +18,14 @@ impl ManifestParser for CargoParser {
             NoPackageManifest("No [package] section (likely a virtual workspace root)".to_string())
         })?;
 
+        // `[package]` without a `name` is invalid Cargo, but the parser is
+        // lenient — it must still not file the crate's symbols under "".
         let name = package
             .get("name")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| relative_dir.replace('/', "-"));
+            .unwrap_or_else(|| manifest::fallback_name(manifest_path, relative_dir));
 
         let version = package
             .get("version")
@@ -104,11 +107,14 @@ impl CargoParser {
             NoPackageManifest("No [package] section (likely a virtual workspace root)".to_string())
         })?;
 
+        // `[package]` without a `name` is invalid Cargo, but the parser is
+        // lenient — it must still not file the crate's symbols under "".
         let name = package
             .get("name")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| relative_dir.replace('/', "-"));
+            .unwrap_or_else(|| manifest::fallback_name(manifest_path, relative_dir));
 
         let version = package
             .get("version")
@@ -421,5 +427,45 @@ serde = "1"
         // A virtual workspace root is a recognized "no package" outcome, not
         // a genuine parse failure — callers must be able to tell them apart.
         assert!(crate::index::manifest::is_no_package_marker(&err));
+    }
+
+    #[test]
+    fn test_root_cargo_toml_without_a_name_uses_the_repo_dir_name() {
+        // MANIFESTS-2-4: `[package]` with no `name` at the repo root.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, b"[package]\nversion = \"0.1.0\"\n").unwrap();
+
+        let info = CargoParser.parse(&path, "").unwrap();
+
+        assert_eq!(info.name, dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(info.path, "");
+    }
+
+    #[test]
+    fn test_root_cargo_toml_without_a_name_via_workspace_parsing() {
+        // The workspace-aware entry point has its own copy of the fallback.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, b"[package]\nversion = \"0.1.0\"\n").unwrap();
+
+        let info = CargoParser
+            .parse_with_workspace_deps(&path, "", &HashMap::new())
+            .unwrap();
+
+        assert_eq!(info.name, dir.path().file_name().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn test_nested_cargo_toml_without_a_name_keeps_the_path_derived_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("crates/core");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("Cargo.toml");
+        std::fs::write(&path, b"[package]\nversion = \"0.1.0\"\n").unwrap();
+
+        let info = CargoParser.parse(&path, "crates/core").unwrap();
+
+        assert_eq!(info.name, "crates-core");
     }
 }

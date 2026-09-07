@@ -119,6 +119,18 @@ fn fts_phrase(raw: &str) -> Option<String> {
     Some(part)
 }
 
+/// The term at the end of a raw query token, with trailing characters that
+/// are not part of any term dropped (`handle*`, `handle.`, `handle)`).
+///
+/// [`fts_match_expr`] already ignores those when deciding whether to append
+/// the prefix operator, so a caller typing the FTS syntax gets a prefix
+/// search. Anything comparing the query against a symbol *name* has to trim
+/// the same way, or it silently stops working for exactly the query forms
+/// that syntax supports.
+fn query_term(raw: &str) -> &str {
+    raw.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+}
+
 fn fts_match_expr(query: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for raw in query.split_whitespace() {
@@ -343,7 +355,14 @@ fn promote_exact_name(
 ) -> Result<()> {
     let name = query.trim();
     // Multi-token queries do not name a single symbol.
-    if name.is_empty() || name.split_whitespace().count() != 1 {
+    if name.split_whitespace().count() != 1 {
+        return Ok(());
+    }
+    // `handle*` and `handle.` are prefix-searched on the term `handle`, so
+    // the promotion has to compare on that term too — otherwise it no-ops for
+    // the very queries the prefix syntax exists to serve.
+    let name = query_term(name);
+    if name.is_empty() {
         return Ok(());
     }
     // FTS matching folds case, so the promotion has to as well: an LLM
@@ -2143,6 +2162,47 @@ mod tests {
         // A kind filter that excludes the exact symbol must not resurrect it.
         let hits = search_symbols(&conn, "handle", None, Some("class"), 3).unwrap();
         assert!(hits.iter().all(|h| h.kind == "class"), "got {hits:?}");
+    }
+
+    /// `fts_match_expr` deliberately supports the FTS prefix operator and a
+    /// trailing dot (`handle*`, `handle.`) by matching on the term before
+    /// them. The exact-name promotion has to compare on the same term, or it
+    /// no-ops for exactly those queries and the symbol literally named
+    /// `handle` drops out of a small window.
+    #[test]
+    fn test_search_symbols_exact_name_promotion_ignores_trailing_syntax() {
+        let conn = test_db();
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'function', ?2, ?3, '')",
+                rusqlite::params![
+                    format!("handleThing{i:03}"),
+                    format!("services/auth/src/f{i:03}.ts"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+             VALUES ('auth-service', 'handle', 'function', 'services/auth/src/zz.ts', 99, '')",
+            [],
+        )
+        .unwrap();
+
+        for query in ["handle", "handle*", "handle.", "handle)"] {
+            let hits = search_symbols(&conn, query, None, None, 3).unwrap();
+            assert_eq!(hits.len(), 3, "{query:?} still prefix-matches");
+            assert_eq!(
+                hits[0].name, "handle",
+                "{query:?} must promote the exactly-named symbol"
+            );
+        }
+        // Punctuation on its own names no symbol and must not promote one.
+        assert!(query_term("*").is_empty());
+        assert_eq!(query_term("handle*"), "handle");
+        assert_eq!(query_term("os.path"), "os.path");
     }
 
     #[test]

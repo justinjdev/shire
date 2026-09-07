@@ -42,8 +42,9 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
   for text inside a signature). `search_files` matches the path,
   `search_packages` the package name, description and path, and `search_docs`
   the doc title, body and path.
-- `search_symbols` orders exact name matches first, so searching `handle`
-  never buries a symbol actually called `handle` under its own prefixes.
+- `search_symbols` orders exact name matches first, so searching `handle` —
+  or `handle*`, or a pasted `handle.` — never buries a symbol actually called
+  `handle` under its own prefixes.
 - Symbol names are additionally indexed by their **sub-tokens**:
   `verifyJwtToken` is indexed as `verify`, `jwt`, `token`, so `verify jwt`,
   `jwt` and `token` all find it. This applies to symbol names only, not to

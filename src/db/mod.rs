@@ -1,3 +1,4 @@
+pub mod guard;
 pub mod queries;
 
 use anyhow::Result;
@@ -10,7 +11,7 @@ use std::time::Duration;
 /// `serve --root` on-demand rebuilds, several worktrees possibly sharing one
 /// db_path), and SQLite's default is 0 — the first collision fails instantly
 /// with "database is locked".
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Message appended to corruption errors that we could not repair
 /// automatically (read-only paths).
@@ -72,23 +73,6 @@ fn remove_db_files(path: &Path) {
     }
 }
 
-/// True when auto-deleting `path` is safe: it is either absent, empty, or
-/// starts with the SQLite file magic. Guards against wiping an unrelated
-/// file a user pointed `--db` at.
-fn looks_like_sqlite_file(path: &Path) -> bool {
-    use std::io::Read;
-    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return true, // nothing there to destroy
-    };
-    let mut header = [0u8; 16];
-    match f.read_exact(&mut header) {
-        Ok(()) => &header == MAGIC,
-        Err(_) => true, // shorter than a header — a truncated/empty DB
-    }
-}
-
 /// Open the index for writing, creating it if needed.
 ///
 /// Builds run with `journal_mode=MEMORY` for throughput, which SQLite
@@ -97,25 +81,67 @@ fn looks_like_sqlite_file(path: &Path) -> bool {
 /// "database disk image is malformed" (whose only cure was `shire clean`),
 /// detect that state and rebuild from scratch: a corrupt index is a
 /// derived artifact, never a source of truth.
+///
+/// Callers that know the repository root should use
+/// [`open_or_create_in_repo`] instead: the auto-clean is gated on the same
+/// guard `shire clean` uses, and `<repo>/.shire/` is one of the two
+/// locations that guard recognises as shire's own.
 pub fn open_or_create(path: &Path) -> Result<Connection> {
+    open_or_create_in_repo(path, None)
+}
+
+/// [`open_or_create`], told which repository the database belongs to.
+///
+/// `db_path` is repo-controlled (a cloned repo's own `shire.toml` names it,
+/// with no confinement to the repo root), so "the file here is corrupt" must
+/// never by itself authorise deleting it: it once deleted any file shorter
+/// than a SQLite header, which SQLite reports as `SQLITE_NOTADB` and this
+/// code read as corruption (INDEX-2-2). The delete now runs only for a file
+/// [`guard::classify_for_removal`] recognises as shire's own — the identical
+/// check `shire clean` makes — and anything else is reported, not removed.
+pub fn open_or_create_in_repo(path: &Path, repo_root: Option<&Path>) -> Result<Connection> {
     match open_or_create_inner(path) {
         Ok(conn) => Ok(conn),
-        Err(e) if anyhow_is_corruption(&e) && looks_like_sqlite_file(path) => {
-            tracing::warn!(
-                db = %path.display(),
-                error = %e,
-                "index database is corrupt (most likely an interrupted build) — \
-                 deleting it and rebuilding from scratch"
-            );
-            eprintln!(
-                "warning: index database at {} is corrupt — deleting it and rebuilding from scratch",
-                path.display()
-            );
-            remove_db_files(path);
-            open_or_create_inner(path)
+        Err(e) if anyhow_is_corruption(&e) => {
+            match guard::classify_for_removal(path, repo_root) {
+                Ok(guard::RemovalVerdict::Allowed) | Ok(guard::RemovalVerdict::Missing) => {
+                    tracing::warn!(
+                        db = %path.display(),
+                        error = %e,
+                        "index database is corrupt (most likely an interrupted build) — \
+                         deleting it and rebuilding from scratch"
+                    );
+                    eprintln!(
+                        "warning: index database at {} is corrupt — deleting it and rebuilding from scratch",
+                        path.display()
+                    );
+                    remove_db_files(path);
+                    open_or_create_inner(path)
+                }
+                Ok(verdict) => Err(e.context(refuse_message(path, &verdict))),
+                // The path cannot even be examined safely (a symlink, a FIFO,
+                // a directory): say why, and still do not delete anything.
+                Err(guard_err) => Err(e.context(format!("{guard_err:#}"))),
+            }
         }
         Err(e) => Err(e),
     }
+}
+
+/// Why an unreadable database at `path` was left alone.
+fn refuse_message(path: &Path, verdict: &guard::RemovalVerdict) -> String {
+    let what = match verdict {
+        guard::RemovalVerdict::NotSqlite => "it is not a SQLite database at all",
+        _ => "it is a SQLite database, but not one shire built (no 'shire_meta' table)",
+    };
+    format!(
+        "refusing to delete and rebuild {}: {what}, and it is not under a location \
+         shire manages (<repo>/.shire/ or ~/.claude/shire/). Check shire.toml's \
+         db_path (or --db) — shire will not overwrite a file it did not create. \
+         If this really is a shire index that has been damaged, delete it by hand \
+         and run the build again",
+        path.display()
+    )
 }
 
 fn open_or_create_inner(path: &Path) -> Result<Connection> {
@@ -1509,13 +1535,22 @@ mod open_tests {
             .expect("writer must wait out the lock instead of failing immediately");
     }
 
+    /// A repo whose `.shire/` directory exists — the location shire itself
+    /// manages, and the only one where a file too damaged to identify may
+    /// still be auto-cleaned.
+    fn managed_db(dir: &Path) -> std::path::PathBuf {
+        let shire_dir = dir.join(".shire");
+        std::fs::create_dir_all(&shire_dir).unwrap();
+        shire_dir.join("index.db")
+    }
+
     #[test]
     fn test_open_or_create_rebuilds_corrupt_db() {
         // DB-1: a corrupt index is a derived artifact — delete and recreate.
         let dir = tempdir().unwrap();
-        let path = dir.path().join("t.db");
+        let path = managed_db(dir.path());
         {
-            let conn = open_or_create(&path).unwrap();
+            let conn = open_or_create_in_repo(&path, Some(dir.path())).unwrap();
             conn.execute(
                 "INSERT INTO packages (name, path, kind) VALUES ('p', 'p', 'npm')",
                 [],
@@ -1524,7 +1559,8 @@ mod open_tests {
         }
         corrupt(&path);
 
-        let conn = open_or_create(&path).expect("open_or_create must recover from corruption");
+        let conn = open_or_create_in_repo(&path, Some(dir.path()))
+            .expect("open_or_create must recover from corruption");
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
             .unwrap();
@@ -1534,18 +1570,100 @@ mod open_tests {
     #[test]
     fn test_open_or_create_deletes_wal_sidecars_on_recovery() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("t.db");
-        let _ = open_or_create(&path).unwrap();
-        let wal = dir.path().join("t.db-wal");
+        let path = managed_db(dir.path());
+        let _ = open_or_create_in_repo(&path, Some(dir.path())).unwrap();
+        let wal = dir.path().join(".shire").join("index.db-wal");
         std::fs::write(&wal, b"stale wal").unwrap();
         corrupt(&path);
 
-        let _conn = open_or_create(&path).unwrap();
+        let _conn = open_or_create_in_repo(&path, Some(dir.path())).unwrap();
         assert_ne!(
             std::fs::read(&wal).unwrap_or_default(),
             b"stale wal".to_vec(),
             "a stale WAL sidecar must not survive the rebuild"
         );
+    }
+
+    #[test]
+    fn test_open_or_create_does_not_delete_a_short_file() {
+        // INDEX-2-2: a file shorter than the SQLite header opens as
+        // SQLITE_NOTADB, which reads as corruption — and used to be deleted
+        // and replaced with a fresh index. `db_path` comes from a
+        // repo-controlled shire.toml, so that was arbitrary file destruction.
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("small_secret");
+        std::fs::write(&secret, b"hunter2\n").unwrap();
+
+        let err = open_or_create_in_repo(&secret, Some(dir.path()))
+            .expect_err("a short non-database file must not be adopted as an index");
+
+        assert_eq!(
+            std::fs::read(&secret).unwrap(),
+            b"hunter2\n".to_vec(),
+            "the file must be left byte-for-byte intact"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to delete and rebuild"),
+            "the error must say the file was left alone: {msg}"
+        );
+        assert!(
+            msg.contains("db_path"),
+            "the error must point at the setting that named it: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_or_create_does_not_delete_a_foreign_sqlite_db() {
+        // A real SQLite database that is not shire's (a browser profile, say)
+        // survives even when it is genuinely corrupt.
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("places.sqlite");
+        {
+            let conn = Connection::open(&victim).unwrap();
+            conn.execute_batch("CREATE TABLE places (id INTEGER PRIMARY KEY, url TEXT);")
+                .unwrap();
+        }
+        corrupt(&victim);
+        let before = std::fs::read(&victim).unwrap();
+
+        let err = open_or_create_in_repo(&victim, Some(dir.path()))
+            .expect_err("a foreign database must not be rebuilt in place");
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            before,
+            "a foreign database must be left byte-for-byte intact"
+        );
+        assert!(
+            format!("{err:#}").contains("shire_meta"),
+            "the error must explain the identity check: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_open_or_create_recovers_a_corrupt_db_inside_dot_shire() {
+        // The default layout: <repo>/.shire/index.db. A build that died
+        // mid-write leaves a file too damaged to identify, and recovering it
+        // automatically is the whole point of the auto-clean.
+        let dir = tempdir().unwrap();
+        let path = managed_db(dir.path());
+        {
+            let conn = open_or_create_in_repo(&path, Some(dir.path())).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('p', 'p', 'npm')",
+                [],
+            )
+            .unwrap();
+        }
+        corrupt(&path);
+
+        let conn = open_or_create_in_repo(&path, Some(dir.path()))
+            .expect("a corrupt index in .shire/ must be rebuilt from scratch");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

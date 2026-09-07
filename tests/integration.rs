@@ -3331,9 +3331,19 @@ fn test_linked_worktree_indexes_unstaged_edit() {
     );
 }
 
+/// Shred the schema b-tree on page 1, leaving the SQLite header intact —
+/// exactly what a SIGKILL during a MEMORY-journal build produces. The file is
+/// then unreadable as a database, so nothing can confirm it is shire's own.
+fn corrupt_db_file(db: &Path) {
+    use std::io::{Seek, SeekFrom};
+    let mut f = fs::OpenOptions::new().write(true).open(db).unwrap();
+    f.seek(SeekFrom::Start(100)).unwrap();
+    f.write_all(&[0xEEu8; 3000]).unwrap();
+    f.sync_all().unwrap();
+}
+
 #[test]
 fn test_build_recovers_from_corrupt_db() {
-    use std::io::{Seek, SeekFrom};
     let bin = cargo_bin();
     let dir = tempfile::TempDir::new().unwrap();
     let repo = dir.path().join("repo");
@@ -3346,18 +3356,14 @@ fn test_build_recovers_from_corrupt_db() {
     );
     git_commit_all(&repo, "fixture");
 
-    let db = dir.path().join("index.db");
+    // The default layout: shire's own directory inside the repo, which is
+    // what lets a file too damaged to identify still be recognised as an
+    // index shire made.
+    let db = repo.join(".shire").join("index.db");
     run_build(&bin, &repo, &db);
     assert_eq!(sym_count(&db, "alpha"), 1);
 
-    // Shred the schema b-tree on page 1, leaving the SQLite header intact —
-    // exactly what a SIGKILL during a MEMORY-journal build produces.
-    {
-        let mut f = fs::OpenOptions::new().write(true).open(&db).unwrap();
-        f.seek(SeekFrom::Start(100)).unwrap();
-        f.write_all(&[0xEEu8; 3000]).unwrap();
-        f.sync_all().unwrap();
-    }
+    corrupt_db_file(&db);
 
     let out = Command::new(&bin)
         .args([
@@ -3378,6 +3384,53 @@ fn test_build_recovers_from_corrupt_db() {
         sym_count(&db, "alpha"),
         1,
         "the rebuilt index must contain the symbols again"
+    );
+}
+
+#[test]
+fn test_build_refuses_to_delete_a_short_file_at_db_path() {
+    // INDEX-2-2: `db_path` comes from the repo's own shire.toml, unconfined.
+    // A file shorter than the SQLite header opens as SQLITE_NOTADB, which
+    // reads as corruption — and used to be deleted and replaced with an
+    // index, exiting 0. Running the default command on a cloned repo must
+    // not destroy an arbitrary file.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    let victim = dir.path().join("small_secret");
+    fs::write(&victim, b"hunter2\n").unwrap();
+    // The hostile config names it, exactly as a cloned repo could.
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", victim.display()),
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "build must fail rather than adopt an unrelated file as its index"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"hunter2\n".to_vec(),
+        "the file must be left byte-for-byte intact"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to delete and rebuild"),
+        "the error must say the file was left alone, got: {stderr}"
     );
 }
 
@@ -3461,6 +3514,108 @@ fn test_serve_works_on_non_wal_db() {
         "serve on a healthy non-WAL DB must answer queries; stdout={} stderr={}",
         stdout,
         stderr
+    );
+}
+
+#[test]
+fn test_serve_root_reindexes_an_unstaged_edit_in_a_git_repo() {
+    // INDEX-2-1: `serve --root` used to decide staleness from the `.git/index`
+    // mtime alone. An ordinary edit never writes that file, so inside a Git
+    // repository the server answered from the index it started with, forever.
+    // The only freshness mechanism now is the debounce window: once it has
+    // elapsed, the incremental build runs and decides for itself.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkga",
+        "export function alphaOne(): number { return 1; }\n",
+    );
+    // Keep the test quick: re-check the tree one second after the last build.
+    fs::write(repo.join("shire.toml"), "[serve]\ndebounce_s = 1\n").unwrap();
+    git_commit_all(&repo, "fixture");
+
+    let db = dir.path().join("index.db");
+    run_build(&bin, &repo, &db);
+
+    use std::process::Stdio;
+    let mut child = Command::new(&bin)
+        .args([
+            "serve",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn shire serve --root");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"t","version":"0"}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        // Before the edit: the symbol does not exist yet.
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search_symbols","arguments":{{"query":"zebraServe"}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // An UNSTAGED working-tree edit: nothing touches .git/index.
+        let src = repo.join("pkga").join("src").join("index.ts");
+        let mut body = fs::read_to_string(&src).unwrap();
+        body.push_str("export function zebraServe(): number { return 9; }\n");
+        fs::write(&src, body).unwrap();
+
+        // Past the debounce window, the next tool call must re-check the tree.
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"search_symbols","arguments":{{"query":"zebraServe"}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    // Let the rebuild + answer land before EOF cancels the session.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    child.stdin.take();
+    let out = child.wait_with_output().expect("serve did not exit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let line_with = |id: &str| -> String {
+        stdout
+            .lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no response {id} in stdout={stdout} stderr={stderr}"))
+            .to_string()
+    };
+
+    assert!(
+        !line_with(r#""id":2"#).contains("zebraServe"),
+        "the symbol must not exist before the edit: {}",
+        line_with(r#""id":2"#)
+    );
+    assert!(
+        line_with(r#""id":3"#).contains("zebraServe"),
+        "an unstaged edit must be indexed after the debounce window; \
+         stdout={stdout} stderr={stderr}"
     );
 }
 

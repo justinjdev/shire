@@ -115,7 +115,10 @@ pub async fn run_server(db_path: &Path, build_ctx: Option<BuildContext>) -> Resu
                 Some(ctx) => {
                     tracing::warn!(%e, "index database is corrupt — rebuilding");
                     eprintln!("warning: index database is corrupt — rebuilding it");
-                    crate::index::build_index_quiet(
+                    // Waits for a competing build: there is nothing to serve
+                    // until a build has actually run, so skipping would only
+                    // turn the conflict into a startup failure.
+                    crate::index::build_index_quiet_waiting(
                         &ctx.repo_root,
                         &ctx.config,
                         false,

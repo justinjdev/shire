@@ -128,7 +128,13 @@ fn fts_phrase(raw: &str) -> Option<String> {
 /// the same way, or it silently stops working for exactly the query forms
 /// that syntax supports.
 fn query_term(raw: &str) -> &str {
-    raw.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+    raw.trim_end_matches(|c: char| !is_term_char(c))
+}
+
+/// A character the `unicode61` tokenizer (with `_`/`-` as tokenchars) keeps
+/// inside a term. Everything else ends one.
+fn is_term_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
 }
 
 fn fts_match_expr(query: &str) -> Option<String> {
@@ -141,11 +147,10 @@ fn fts_match_expr(query: &str) -> Option<String> {
         // is not part of any term (`handle*`, `handle)`, `config.` all end in
         // the term before it), so skip it before measuring, or a user typing
         // the FTS prefix syntax `handle*` would get an exact match instead.
-        let tail = raw
+        let tail = query_term(raw)
             .chars()
             .rev()
-            .skip_while(|c| !(c.is_alphanumeric() || *c == '_' || *c == '-'))
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .take_while(|c| is_term_char(*c))
             .count();
         if tail >= MIN_PREFIX_CHARS {
             part.push('*');
@@ -1274,6 +1279,37 @@ fn collect_rows<T>(
     out
 }
 
+/// Append `AND ({column} IS NULL OR {column} NOT IN (?, ?, …))`, binding one
+/// parameter per value. An empty list excludes nothing rather than rendering
+/// the syntax error `IN ()`.
+///
+/// The NULL arm is load-bearing: SQL's `NOT IN` is unknown for NULL, and a
+/// ref whose package could not be attributed must not be dropped by a filter
+/// about *other* packages.
+///
+/// Free-standing because `query_symbol_callers_exact` builds its own SQL (the
+/// exclusion has to land inside the aggregating subquery, where `r.package`
+/// is still in scope) rather than going through [`RefQueryBuilder`].
+fn push_exclude_in(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    column: &str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    sql.push_str(&format!(" AND ({column} IS NULL OR {column} NOT IN ("));
+    for (i, v) in values.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        params.push(Box::new(v.clone()));
+    }
+    sql.push_str("))");
+}
+
 /// Builds a parameterized WHERE clause for cross-reference queries.
 /// Avoids the repeated `sql.push_str(" AND col = ?")` + `params.push(Box::new(...))`
 /// pattern duplicated across `query_symbol_{references,callers,callees}`.
@@ -1295,25 +1331,9 @@ impl RefQueryBuilder {
         self.params.push(Box::new(value.to_string()));
     }
 
-    /// `AND ({column} IS NULL OR {column} NOT IN (?, ?, …))`. An empty list
-    /// excludes nothing rather than rendering the syntax error `IN ()`. The
-    /// NULL arm is load-bearing: SQL's `NOT IN` is unknown for NULL, and a
-    /// ref whose package could not be attributed must not be dropped by a
-    /// filter about other packages.
+    /// [`push_exclude_in`] against this builder's clause and parameters.
     fn exclude_in(&mut self, column: &str, values: &[String]) {
-        if values.is_empty() {
-            return;
-        }
-        self.sql
-            .push_str(&format!(" AND ({column} IS NULL OR {column} NOT IN ("));
-        for (i, v) in values.iter().enumerate() {
-            if i > 0 {
-                self.sql.push(',');
-            }
-            self.sql.push('?');
-            self.params.push(Box::new(v.clone()));
-        }
-        self.sql.push_str("))");
+        push_exclude_in(&mut self.sql, &mut self.params, column, values);
     }
 
     fn build_with_order_and_limit(
@@ -1638,19 +1658,8 @@ fn query_symbol_callers_exact(
         params.push(Box::new(p.to_string()));
     }
     // Packages whose own same-named symbol claims their call sites — see
-    // `RefNameMatch`. A NULL package is never excluded by a filter about
-    // other packages.
-    if !excluded_packages.is_empty() {
-        sql.push_str(" AND (r.package IS NULL OR r.package NOT IN (");
-        for (i, pkg) in excluded_packages.iter().enumerate() {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-            params.push(Box::new(pkg.clone()));
-        }
-        sql.push_str("))");
-    }
+    // `RefNameMatch`.
+    push_exclude_in(&mut sql, &mut params, "r.package", excluded_packages);
     sql.push_str(
         " GROUP BY r.enclosing_symbol, r.file_id, r.package \
          ) AS g \
@@ -1793,6 +1802,14 @@ pub struct ChangeImpact {
     /// any package, and `home_package` is a guess among them.
     #[serde(skip_serializing_if = "is_false")]
     pub qualifier_dropped: bool,
+    /// Packages whose own same-named symbol claimed their references, so
+    /// their refs were left out of every bucket below — of `direct_impact`
+    /// and `cross_package_impact`, of `summary.affected_packages`, and of the
+    /// reverse-dep walk seeded from it. This is the one part of the blast
+    /// radius the qualifier deliberately hides, so a caller weighing a rename
+    /// has to be able to see it. Absent when nothing was excluded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_packages: Vec<String>,
     /// The package where the symbol is defined. `None` when the symbol is not
     /// in the `symbols` table and no `package` hint was given — in that case
     /// every ref falls into `cross_package_impact`.
@@ -1955,6 +1972,7 @@ pub fn change_impact(
             .is_rewritten(name)
             .then(|| matched.matched_name.clone()),
         qualifier_dropped: matched.qualifier_dropped,
+        excluded_packages: matched.excluded_packages,
         home_package,
         direct_impact,
         cross_package_impact,
@@ -3878,6 +3896,13 @@ mod refs_tests {
             "the api call site is real cross-package blast radius"
         );
         assert_eq!(impact.cross_package_impact.len(), 2, "api + unattributed");
+        // admin-panel's call site was attributed away, and every bucket above
+        // is missing it — so the answer has to name the package it dropped.
+        assert_eq!(
+            impact.excluded_packages,
+            vec!["admin-panel".to_string()],
+            "a package left out of the blast radius must be reported"
+        );
     }
 
     /// The same scoping for `symbol_references`, and the home package

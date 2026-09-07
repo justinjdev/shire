@@ -293,59 +293,70 @@ impl ShireService {
         let at_ceiling = limit >= queries::MAX_ROWS && rows.len() as u32 >= limit;
         let truncated = over_limit || at_ceiling;
         let shown = &rows[..rows.len().min(limit as usize)];
-        let mut value = if truncated {
-            serde_json::to_value(TruncatedList {
-                results: shown,
-                truncated: true,
-                limit,
-                max: queries::MAX_ROWS,
-                note: format!(
-                    "showing the first {limit} results (limit={limit}, max {max}). \
-                     {more} — {advice}.",
-                    max = queries::MAX_ROWS,
-                    more = if over_limit {
-                        "More exist"
-                    } else {
-                        "`limit` is at the ceiling, so more may exist"
-                    },
-                    advice = Self::truncation_advice(limit, narrow_hint)
-                ),
-            })
-        } else {
-            serde_json::to_value(shown)
-        }
-        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        let capped = truncated.then(|| TruncatedList {
+            results: shown,
+            truncated: true,
+            limit,
+            max: queries::MAX_ROWS,
+            note: format!(
+                "showing the first {limit} results (limit={limit}, max {max}). \
+                 {more} — {advice}.",
+                max = queries::MAX_ROWS,
+                more = if over_limit {
+                    "More exist"
+                } else {
+                    "`limit` is at the ceiling, so more may exist"
+                },
+                advice = Self::truncation_advice(limit, narrow_hint)
+            ),
+        });
         // Only a rewritten name needs the envelope; a name matched as given
         // keeps serializing as the bare array (or the truncation object) it
-        // always was.
-        if let Some(m) = matched.filter(|m| m.is_rewritten(requested)) {
-            if !value.is_object() {
-                value = serde_json::json!({ "results": value });
+        // always was — straight to text, with no `Value` round-trip on the
+        // path every other tool takes.
+        let Some(m) = matched.filter(|m| m.is_rewritten(requested)) else {
+            let json = match &capped {
+                Some(t) => serde_json::to_string(t),
+                None => serde_json::to_string(shown),
             }
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "matched_name".into(),
-                    serde_json::Value::from(m.matched_name.clone()),
-                );
-                obj.insert(
-                    "matched_note".into(),
-                    serde_json::Value::from(Self::match_note(m, requested)),
-                );
-                if !m.defined_in.is_empty() {
-                    obj.insert(
-                        "defined_in".into(),
-                        serde_json::Value::from(m.defined_in.clone()),
-                    );
-                }
-                if !m.excluded_packages.is_empty() {
-                    obj.insert(
-                        "excluded_packages".into(),
-                        serde_json::Value::from(m.excluded_packages.clone()),
-                    );
-                }
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        };
+        // A truncation object already has a `results` key to hang the match
+        // fields off; a bare array has to be wrapped in one first.
+        let mut obj = match &capped {
+            Some(t) => match serde_json::to_value(t).map_err(|e| Self::mcp_err(e.to_string()))? {
+                serde_json::Value::Object(o) => o,
+                other => serde_json::Map::from_iter([("results".to_string(), other)]),
+            },
+            None => {
+                let results =
+                    serde_json::to_value(shown).map_err(|e| Self::mcp_err(e.to_string()))?;
+                serde_json::Map::from_iter([("results".to_string(), results)])
             }
+        };
+        obj.insert(
+            "matched_name".into(),
+            serde_json::Value::from(m.matched_name.clone()),
+        );
+        obj.insert(
+            "matched_note".into(),
+            serde_json::Value::from(Self::match_note(m, requested)),
+        );
+        if !m.defined_in.is_empty() {
+            obj.insert(
+                "defined_in".into(),
+                serde_json::Value::from(m.defined_in.clone()),
+            );
         }
-        let json = serde_json::to_string(&value).map_err(|e| Self::mcp_err(e.to_string()))?;
+        if !m.excluded_packages.is_empty() {
+            obj.insert(
+                "excluded_packages".into(),
+                serde_json::Value::from(m.excluded_packages.clone()),
+            );
+        }
+        let json = serde_json::to_string(&serde_json::Value::Object(obj))
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -983,7 +994,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; same name-based-match caveat as symbol_references (`matched_name` reports a rewritten name) — pass `package` to disambiguate same-name symbols."
+        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name and `excluded_packages` names the packages whose own same-named symbol claimed their references — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name to see them. Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
     )]
     fn change_impact(
         &self,
@@ -1041,12 +1052,17 @@ impl ShireService {
                     max = queries::MAX_ROWS,
                     advice = Self::truncation_advice(limit, "pass `package`"),
                     capped = if impact.summary.counts_capped {
-                        "and the scan stopped at its \
-                         10000-reference cap, so both are floors \
-                         (`summary.counts_capped`)"
+                        format!(
+                            "and the scan stopped at its {scan}-reference cap, so both \
+                             are floors (`summary.counts_capped`)",
+                            scan = queries::MAX_REFS_SCANNED
+                        )
                     } else {
-                        "which stops at 10000 references \
-                         (`summary.counts_capped` is false, so both are totals)"
+                        format!(
+                            "which stops at {scan} references (`summary.counts_capped` \
+                             is false, so both are totals)",
+                            scan = queries::MAX_REFS_SCANNED
+                        )
                     },
                     transitive = if transitive_capped {
                         "the transitive walk stopped at the cap, so \
@@ -1633,6 +1649,7 @@ mod tests {
         assert_eq!(v["summary"]["direct_count"], 1);
         assert_eq!(v["summary"]["cross_package_count"], 0);
         assert_eq!(v["summary"]["counts_capped"], false);
+        assert_eq!(v["excluded_packages"], serde_json::json!(["admin-panel"]));
         assert!(
             v.get("qualifier_dropped").is_none(),
             "flag is off, so absent"

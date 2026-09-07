@@ -20,7 +20,7 @@ Shire exposes the following tools over the Model Context Protocol:
 | `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` is resolved through `symbols.parent_symbol`, and references written in packages that define their own symbol of that name are left out — see [Qualified names](#qualified-names). |
 | `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` is resolved through the type that defines the method (see [Qualified names](#qualified-names)). Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 | `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, first_file, first_line, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
-| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it; same name-based-match caveat as `symbol_references`. |
+| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it and reports `excluded_packages`; same name-based-match caveat as `symbol_references`. |
 | `schema_consumers` | Find all files generated from a schema file (e.g. `.proto`). Returns generated file paths and their packages. Use to understand the blast radius of a schema change. |
 | `generated_from` | Find the source schema file that generated a given file. Use to trace a generated file (e.g. `user.pb.go`) back to its source proto. |
 
@@ -76,9 +76,22 @@ fed straight back in. A qualified name is resolved in three steps:
 
 Whenever the rows were matched on a name other than the one passed, the result
 carries `matched_name` (the name actually matched), `matched_note` (what that
-means) and, for step 2, `defined_in` and `excluded_packages`. `change_impact`
-reports `matched_name` plus `qualifier_dropped`, and takes its `home_package`
-from the resolved symbol.
+means) and, for step 2, `defined_in` and `excluded_packages`. Because those
+fields need somewhere to live, a rewritten name always returns the single
+object form described under [Result limits](#result-limits) — `results` plus
+the match fields — even when nothing was truncated. `change_impact` already
+returns an object, and gains `matched_name`, `qualifier_dropped` and
+`excluded_packages`; it takes its `home_package` from the resolved symbol.
+
+`excluded_packages` is worth reading before acting on a `change_impact`
+answer: those packages were left out of `direct_impact`,
+`cross_package_impact`, `summary.affected_packages` and the reverse-dep walk
+seeded from it, so a call site in one of them is real blast radius the
+qualifier chose to attribute elsewhere. Re-run with the bare name to see it.
+
+A `package` filter is applied on top of the resolution, so asking for a
+qualified name *and* a package that step 2 excluded is a contradiction and
+returns nothing — `excluded_packages` in the response is what says why.
 
 What this cannot do is separate two same-named methods **inside one package**:
 with only the bare name recorded, `A.run` and `B.run` in the same package still
@@ -100,8 +113,9 @@ list-returning tool is bounded:
 SQL, and one row beyond it is fetched to tell a page that was cut from a list
 that merely ends there.
 
-A complete result is the bare JSON array. A truncated one is a single JSON
-object instead:
+A complete result is the bare JSON array. A truncated one — or, for the
+reference tools, one whose name was rewritten (see
+[Qualified names](#qualified-names)) — is a single JSON object instead:
 
 ```json
 {"results": [...], "truncated": true, "limit": 20, "max": 200, "note": "showing the first 20 results …"}

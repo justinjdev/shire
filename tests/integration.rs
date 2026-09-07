@@ -3601,6 +3601,126 @@ fn test_build_refuses_a_foreign_sqlite_database_at_db_path() {
 }
 
 #[test]
+fn test_build_refuses_a_symlinked_db_path() {
+    // `Connection::open` follows a symlink. Letting an unexaminable db_path
+    // through had shire create `<db_path>.lock` beside the link and then write
+    // its schema into whatever it pointed at — including a database that was
+    // never shire's. db_path must name a regular file: the removal guard
+    // refuses a symlink too, so a symlinked index could not be repaired
+    // either.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    let foreign = dir.path().join("notes.db");
+    {
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+    }
+    let real_index = dir.path().join("real-index.db");
+    run_build(&bin, &repo, &real_index);
+
+    for target in [&foreign, &real_index] {
+        let link = dir.path().join("link.db");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let before = fs::read(target).unwrap();
+
+        let out = Command::new(&bin)
+            .args([
+                "build",
+                "--root",
+                repo.to_str().unwrap(),
+                "--db",
+                link.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            !out.status.success(),
+            "a symlinked db_path must be refused, not followed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is a symlink"),
+            "the error must name the cause, got: {stderr}"
+        );
+        assert_eq!(
+            fs::read(target).unwrap(),
+            before,
+            "the symlink target must be untouched"
+        );
+        let mut lock = link.as_os_str().to_owned();
+        lock.push(".lock");
+        assert!(
+            !std::path::Path::new(&lock).exists(),
+            "and no lock file may be created beside the link"
+        );
+    }
+}
+
+#[test]
+fn test_build_waits_out_a_writer_holding_shires_own_index() {
+    // A shire index at a db_path outside `<repo>/.shire/` and
+    // `~/.claude/shire/` cannot be identified while another process holds it
+    // under an exclusive write transaction — which is what a shire build looks
+    // like, since builds run under journal_mode=MEMORY. The pre-lock
+    // inspection must therefore defer rather than refuse: the build lock waits
+    // the writer out, and the pass under the lock is the one that decides.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    let db = dir.path().join("unmanaged").join("index.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    run_build(&bin, &repo, &db);
+    assert_eq!(sym_count(&db, "alpha"), 1);
+
+    let holder_path = db.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&holder_path).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        conn.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    let out = Command::new(&bin)
+        .args([
+            "build",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    holder.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "the build must wait the writer out, not refuse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(sym_count(&db, "alpha"), 1);
+}
+
+#[test]
 fn test_serve_reports_corrupt_db_clearly() {
     use std::io::{Seek, SeekFrom};
     let bin = cargo_bin();

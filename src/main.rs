@@ -510,26 +510,35 @@ mod tests {
         let repo = tempfile::TempDir::new().unwrap();
         let elsewhere = tempfile::TempDir::new().unwrap();
 
-        for victim in ["secret", "notes.db"] {
+        // A symlink is the third shape: `classify_for_removal` opens with
+        // O_NOFOLLOW and errors rather than resolving it, so `clean` must
+        // neither remove the target nor create a lock file beside the link.
+        let target = elsewhere.path().join("real-index.db");
+        write_shire_db(&target);
+        std::os::unix::fs::symlink(&target, elsewhere.path().join("link.db")).unwrap();
+
+        for victim in ["secret", "notes.db", "link.db"] {
             let path = elsewhere.path().join(victim);
-            if victim.ends_with(".db") {
-                write_foreign_sqlite_db(&path);
-            } else {
-                std::fs::write(&path, b"hunter2\n").unwrap();
+            match victim {
+                "notes.db" => write_foreign_sqlite_db(&path),
+                "link.db" => {}
+                _ => std::fs::write(&path, b"hunter2\n").unwrap(),
             }
             let before = std::fs::read(&path).unwrap();
 
             let err = run_clean(repo.path(), Some(path.clone()), None)
                 .expect_err("clean must refuse a file shire did not build");
+            let msg = format!("{err:#}");
             assert!(
-                format!("{err:#}").contains("Refusing to remove"),
-                "got {err:#}"
+                msg.contains("Refusing to remove") || msg.contains("is a symlink"),
+                "{victim}: got {msg}"
             );
             assert_eq!(
                 std::fs::read(&path).unwrap(),
                 before,
                 "{victim} was touched"
             );
+            assert!(target.exists(), "{victim}: a symlink target must survive");
             assert!(
                 !index::lock::lock_path(&path).exists(),
                 "no lock file may be created beside {victim}"

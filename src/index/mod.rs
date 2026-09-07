@@ -3556,7 +3556,18 @@ fn build_index_inner(
     // file sitting at that path. The guard that protects the file itself does
     // not run until the database is opened, several steps further down
     // (INDEX-3-7).
-    crate::db::guard::reject_unrelated_file_at_db_path(&db_path, Some(repo_root))?;
+    //
+    // A database this pass cannot inspect is deliberately not fatal yet: a
+    // shire build already running against this db_path holds it under
+    // `journal_mode=MEMORY`, whose write transactions block readers, and
+    // refusing here would make two builders on one db_path fail instead of
+    // serialise. The lock below waits that build out; the second pass, under
+    // the lock, is the one that decides.
+    crate::db::guard::reject_unrelated_file_at_db_path(
+        &db_path,
+        Some(repo_root),
+        crate::db::guard::Inspection::BeforeBuildLock,
+    )?;
 
     // Serialize builds across processes for the whole pipeline. Two builders
     // that both read `is_full_build` from an empty `manifest_hashes` before
@@ -3567,6 +3578,15 @@ fn build_index_inner(
         Some(guard) => guard,
         None => return Ok((BuildOutcome::Skipped, Vec::new())),
     };
+
+    // Nothing else is building against this db_path now, so a database that
+    // still cannot be identified is not a peer of ours: it is damaged, or it
+    // belongs to whoever else has it open.
+    crate::db::guard::reject_unrelated_file_at_db_path(
+        &db_path,
+        Some(repo_root),
+        crate::db::guard::Inspection::UnderBuildLock,
+    )?;
 
     // Seed from main worktree's DB if this is a new linked-worktree build.
     if !db_path.exists()
@@ -6006,7 +6026,12 @@ anyhow = "1"
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("src")).unwrap();
-        for i in 0..10 {
+        // Comfortably more than the cap plus the overshoot: the length check
+        // happens after the push, so every worker that passed it before the
+        // cap was reached contributes one extra entry, and the number of
+        // workers is the machine's.
+        const FILES: usize = 64;
+        for i in 0..FILES {
             fs::write(
                 root.join("src").join(format!("f{i}.ts")),
                 "export const a = 1;\n",
@@ -6018,7 +6043,7 @@ anyhow = "1"
 
         assert!(walk.capped, "the walk must record that it stopped early");
         assert!(
-            walk.files.len() < 10,
+            walk.files.len() < FILES,
             "a capped walk must not enumerate the whole tree: {}",
             walk.files.len()
         );

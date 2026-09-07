@@ -106,15 +106,27 @@ since its trigger comes round again.
 "a shire build is running" rather than deleting a database out from under a
 build. Neither command creates the lock file until it has established that
 `db_path` is shire's to use: `db_path` comes from the repository's own
-`shire.toml`, and `build` refuses outright a path holding a file that is not a
-SQLite database, one holding a SQLite database with tables of its own and no
-`shire_meta` (the mark every shire index carries), and — outside `<repo>/.shire/`
-and `~/.claude/shire/` — one it cannot inspect at all because the file is
-damaged or locked by another process. It will not write its schema into a
-database it cannot identify as its own. Inside those two directories an
-unreadable database is a damaged index and is rebuilt as before, and the schema
-is created in a single transaction, so an interrupted first build leaves either
-a complete index or an empty file. The `<db_path>.lock` file itself is left in place — it is an empty
+`shire.toml`, so before the lock file is created `build` checks what is already
+at that path. It refuses a symlink (the open that creates the index would
+follow it, and a symlinked index cannot be auto-repaired either — `db_path`
+must name a regular file), a file that is not a SQLite database, and a SQLite
+database holding tables of its own and no `shire_meta`, the mark every shire
+index carries. It will not write its schema into a database it did not create.
+
+A database that cannot be inspected at all — damaged, or held by another
+process mid-write — is not decided before the lock: a shire build already
+running against the same `db_path` looks exactly like that, since builds run
+under `journal_mode=MEMORY`, whose write transactions block readers. Taking the
+lock waits that build out, and the check runs again under it. If the database
+still cannot be identified it is refused, unless it sits in `<repo>/.shire/` or
+`~/.claude/shire/`, where a damaged index is the only thing it can be and is
+rebuilt as before. The cost of asking twice is that a foreign database held by
+its own writer gets an empty `<db_path>.lock` sidecar beside it before the
+refusal; the database itself is never touched.
+
+The schema is created in a single transaction, so an interrupted first build
+leaves either a complete index or an empty file — never a half-schema that the
+checks above could only read as someone else's database. The `<db_path>.lock` file itself is left in place — it is an empty
 sidecar like `-wal`/`-shm`, and unlinking it while a builder holds a lock on
 that inode is what would let a second builder take the lock at the same path.
 

@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use shire::config;
+use shire::db::guard;
 use shire::index;
 use shire::init;
 use shire::install;
@@ -319,85 +320,11 @@ async fn main() -> Result<()> {
     }
 }
 
-/// SQLite's on-disk file header — the first 16 bytes of every valid SQLite database
-/// file (see the SQLite file format spec).
-const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
-
-/// Open `path` refusing to follow a trailing symlink (O_NOFOLLOW on unix) and refusing
-/// to block on a FIFO with no writer (O_NONBLOCK — opening a FIFO read-only can
-/// otherwise hang forever waiting for a writer that will never arrive, a DoS via a
-/// hostile `db_path`), returning `Ok(None)` for a missing file and `Err` for a symlink,
-/// a non-regular file (FIFO, device, socket, directory), or any other open failure.
-/// Centralizes this pattern for both the main db file and its `-wal`/`-shm` sidecars
-/// (the sidecar paths are just as attacker-nameable as `db_path` itself, being derived
-/// from it by string concatenation).
-fn open_no_follow(path: &Path) -> Result<Option<std::fs::File>> {
-    #[cfg(unix)]
-    let opened = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let opened = std::fs::File::open(path);
-
-    let file = match opened {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => anyhow::bail!(
-            "{} is a symlink, not a plain file. Remove it by hand if that's intentional.",
-            path.display()
-        ),
-        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", path.display())),
-    };
-
-    // O_NONBLOCK only prevents the *open* from hanging on a FIFO; a FIFO that does
-    // have a writer would still open successfully, so its type must be checked
-    // explicitly. This also gives directories, devices, and sockets a clear refusal
-    // instead of relying on read_exact() failing downstream for some of them.
-    #[cfg(unix)]
-    {
-        let meta = file
-            .metadata()
-            .with_context(|| format!("Failed to stat {}", path.display()))?;
-        if !meta.is_file() {
-            let kind = describe_unix_file_type(&meta.file_type());
-            anyhow::bail!(
-                "{} is not a regular file ({kind}). Refusing to treat it as a database.",
-                path.display()
-            );
-        }
-    }
-
-    Ok(Some(file))
-}
-
-#[cfg(unix)]
-fn describe_unix_file_type(ft: &std::fs::FileType) -> &'static str {
-    use std::os::unix::fs::FileTypeExt;
-    if ft.is_dir() {
-        "a directory"
-    } else if ft.is_fifo() {
-        "a FIFO"
-    } else if ft.is_socket() {
-        "a socket"
-    } else if ft.is_char_device() {
-        "a character device"
-    } else if ft.is_block_device() {
-        "a block device"
-    } else {
-        "not a regular file"
-    }
-}
-
 /// Remove `path` unless it's a symlink or missing. Errors (including "it's a symlink")
 /// are swallowed with a warning: sidecar removal is best-effort and shouldn't turn a
 /// successful main-file removal into a failed `shire clean`.
 fn remove_sidecar(path: &Path) {
-    match open_no_follow(path) {
+    match guard::open_no_follow(path) {
         Ok(Some(f)) => {
             drop(f);
             let _ = std::fs::remove_file(path);
@@ -407,80 +334,6 @@ fn remove_sidecar(path: &Path) {
     }
 }
 
-/// Does `path` (an existing, real — non-symlink — SQLite database) have the
-/// `shire_meta` table that every shire-built index database creates? Opened strictly
-/// read-only via rusqlite so this can't create, write to, or lock the file.
-fn looks_like_shire_db(path: &Path) -> bool {
-    let conn = match rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shire_meta'",
-        [],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
-/// Canonicalize `dir` only if it is, itself, a real directory rather than a symlink
-/// (`lstat`, not `stat`). Used for the two locations shire manages: a repo tracked in
-/// git can commit `.shire` (not normally gitignored by shire itself) as a *symlink* to
-/// anywhere — e.g. a browser profile directory — and naively canonicalizing
-/// `root.join(".shire")` in that case would follow it, making "is this path under
-/// `.shire`" trivially true for wherever the symlink points, defeating the whole
-/// location check. Refusing to trust a symlinked `.shire`/`~/.claude/shire` at all
-/// closes that: `starts_with` against a path that failed to resolve here can never
-/// match.
-fn canonical_managed_dir(dir: &Path) -> Option<PathBuf> {
-    let meta = std::fs::symlink_metadata(dir).ok()?;
-    if !meta.is_dir() {
-        return None;
-    }
-    std::fs::canonicalize(dir).ok()
-}
-
-/// Is `db_path` somewhere shire itself manages — `<repo_root>/.shire/` or
-/// `~/.claude/shire/`? Used only as a fallback for a database that fails the
-/// `shire_meta` identity check because it's corrupt (which a real, crashed shire index
-/// can be — `shire build` auto-cleans a corrupt DB it finds), not as a way to accept an
-/// unidentified file from an arbitrary location.
-///
-/// Checks the canonicalized *parent directory* of `db_path`, not `db_path` itself:
-/// `O_NOFOLLOW` in `open_no_follow` only guards the final path component, so a symlink
-/// planted at any ancestor directory (`<repo>/.shire/index.db` where `.shire` — or any
-/// directory above it — is a symlink) would otherwise reach an arbitrary location
-/// while still superficially "being under root". Canonicalizing the full parent
-/// resolves every symlink along the way, so the comparison is against where the file
-/// actually, physically lives.
-fn is_in_managed_location(db_path: &Path, root: &Path) -> bool {
-    let Some(parent) = db_path.parent() else {
-        return false;
-    };
-    let Ok(canon_parent) = std::fs::canonicalize(parent) else {
-        return false;
-    };
-
-    if let Some(repo_shire) = canonical_managed_dir(&root.join(".shire"))
-        && canon_parent.starts_with(&repo_shire)
-    {
-        return true;
-    }
-
-    if let Ok(home) = std::env::var("HOME")
-        && let Some(claude_shire) =
-            canonical_managed_dir(&PathBuf::from(home).join(".claude/shire"))
-        && canon_parent.starts_with(&claude_shire)
-    {
-        return true;
-    }
-
-    false
-}
-
 /// Remove the index database file at `db_path` (plus its `-wal`/`-shm` sidecars), but
 /// only after verifying it is really a shire-built SQLite database.
 ///
@@ -488,49 +341,29 @@ fn is_in_managed_location(db_path: &Path, root: &Path) -> bool {
 /// expansion and no confinement to the repo root, since the documented global setup
 /// puts real per-worktree databases under `~/.claude/shire/{repo}/{worktree}/`), so a
 /// hostile repo could otherwise point it at an arbitrary file and have `shire clean`
-/// delete it unconditionally. Two checks gate the delete, in order:
-///
-/// 1. The file must open (O_NOFOLLOW — never follow a symlink) and start with the
-///    SQLite magic header, read from that same handle to avoid a check-then-delete
-///    race. This alone only proves *format*, not identity: `~/.mozilla/.../places.sqlite`
-///    or a browser's `Login Data` file would pass it too.
-/// 2. It must have a `shire_meta` table (queried via a strictly read-only rusqlite
-///    connection) — the identifying mark every shire-built index carries. A real shire
-///    database can fail this by being corrupt rather than foreign (`shire build`
-///    auto-cleans a corrupt DB it encounters), so a file that fails step 2 is still
-///    removed if — and only if — its canonical path is under `<repo_root>/.shire/` or
-///    `~/.claude/shire/`, the only places shire itself ever creates one.
+/// delete it unconditionally. [`guard::classify_for_removal`] makes that decision —
+/// the same one `shire build` makes before auto-cleaning a corrupt index, so the two
+/// commands cannot disagree about what they may delete. This function only turns its
+/// verdict into `shire clean`'s wording and removes the sidecars.
 ///
 /// A missing `db_path` is not an error (nothing to clean up).
 fn remove_index_db(db_path: &Path, root: &Path) -> Result<()> {
-    let Some(mut file) = open_no_follow(db_path)? else {
-        return Ok(());
-    };
-
-    let is_sqlite = {
-        use std::io::Read;
-        let mut header = [0u8; 16];
-        file.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
-    };
-    drop(file);
-
-    if !is_sqlite {
-        anyhow::bail!(
+    match guard::classify_for_removal(db_path, Some(root))? {
+        guard::RemovalVerdict::Missing => return Ok(()),
+        guard::RemovalVerdict::Allowed => {}
+        guard::RemovalVerdict::NotSqlite => anyhow::bail!(
             "Refusing to remove {}: it does not look like a shire index database \
              (missing the SQLite file header). Check shire.toml's db_path before \
              removing this file by hand.",
             db_path.display()
-        );
-    }
-
-    if !looks_like_shire_db(db_path) && !is_in_managed_location(db_path, root) {
-        anyhow::bail!(
+        ),
+        guard::RemovalVerdict::Foreign => anyhow::bail!(
             "Refusing to remove {}: it's a SQLite database, but not one shire built \
              (no 'shire_meta' table) and it isn't under a location shire manages \
              (<repo>/.shire/ or ~/.claude/shire/). shire.toml's db_path may be \
              pointing somewhere unexpected — delete it by hand if that's intended.",
             db_path.display()
-        );
+        ),
     }
 
     std::fs::remove_file(db_path)
@@ -562,7 +395,7 @@ mod tests {
     /// bytes" — either way, identity can't be confirmed and the location fallback
     /// decides it.
     fn write_corrupt_sqlite_like_file(path: &Path) {
-        let mut content = SQLITE_HEADER.to_vec();
+        let mut content = guard::SQLITE_HEADER.to_vec();
         content.extend_from_slice(b"rest of a fake but header-valid sqlite file");
         std::fs::write(path, content).unwrap();
     }

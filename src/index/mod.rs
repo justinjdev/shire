@@ -2995,7 +2995,7 @@ fn build_index_inner(
         eprintln!("Seeded DB from {}", seed_path.display());
     }
 
-    let conn = db::open_or_create(&db_path)?;
+    let conn = db::open_or_create_in_repo(&db_path, Some(repo_root))?;
 
     if force {
         with_transaction(&conn, || {

@@ -3696,6 +3696,55 @@ mod watch_daemon_ownership {
         cond()
     }
 
+    /// Last-resort cleanup for a daemon spawned by a test: if the test panics (an
+    /// assertion fails) before it reaches its own explicit stop, this makes sure the
+    /// daemon doesn't outlive the test process and get left running/orphaned for CI to
+    /// find later. Deliberately kills by PID directly (SIGKILL) rather than going
+    /// through `shire watch --stop`, since that path is frequently exactly what's under
+    /// test and may itself be broken in the scenario being exercised. Checks liveness
+    /// first so a normal, already-confirmed-stopped daemon doesn't risk signalling a
+    /// PID that has since been reused by an unrelated process.
+    struct DaemonGuard {
+        pid: u32,
+    }
+
+    impl DaemonGuard {
+        fn new(pid: u32) -> Self {
+            Self { pid }
+        }
+    }
+
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            if pid_alive(self.pid) {
+                unsafe {
+                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// On Linux, confirm the kernel actually marked the daemon's exe link deleted after
+    /// an in-place binary replace — the specific condition
+    /// `stop_recognizes_a_daemon_after_its_binary_is_replaced_in_place` exists to
+    /// exercise. Not meaningful on macOS (no `/proc`, and `ps`'s reported command path
+    /// doesn't grow a "(deleted)" marker the same way) — the daemon still being
+    /// recognized there is instead verified portably via `--status`/`--stop`, which use
+    /// the crate's own `ps`-based fallback.
+    #[cfg(target_os = "linux")]
+    fn assert_exe_link_marked_deleted(pid: u32) {
+        let exe_link = fs::read_link(format!("/proc/{pid}/exe"))
+            .expect("failed to read /proc/<pid>/exe for the running daemon");
+        assert!(
+            exe_link.to_string_lossy().ends_with(" (deleted)"),
+            "expected the kernel to mark the daemon's exe link deleted after the in-place \
+             replace, got {exe_link:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn assert_exe_link_marked_deleted(_pid: u32) {}
+
     /// WATCHCLI-2-1: a shire binary whose filename doesn't start with "shire" must
     /// still be recognized as the daemon's own executable, so `--stop` actually stops
     /// it instead of refusing to signal it and deleting its socket/pid files out from
@@ -3905,23 +3954,19 @@ mod watch_daemon_ownership {
             pid_alive(pid),
             "daemon pid should be alive right after starting"
         );
+        // From here on, any assertion below that panics must not leak this daemon —
+        // the guard's Drop kills it if it's still running.
+        let _guard = DaemonGuard::new(pid);
 
         // Simulate an in-place upgrade: build the new binary at a side path, then
         // rename it over the original — this unlinks the old inode (the running
         // daemon keeps executing it just fine) while `installed` starts naming the
-        // new file. `/proc/<pid>/exe` for the still-running daemon now reads
-        // "<installed> (deleted)".
+        // new file. On Linux, `/proc/<pid>/exe` for the still-running daemon now reads
+        // "<installed> (deleted)"; see `assert_exe_link_marked_deleted`.
         let staged = root.join("totally-different-name.new");
         copy_renamed_binary(&staged);
         fs::rename(&staged, &installed).expect("failed to replace the binary in place");
-
-        let exe_link = fs::read_link(format!("/proc/{pid}/exe"))
-            .expect("failed to read /proc/<pid>/exe for the running daemon");
-        assert!(
-            exe_link.to_string_lossy().ends_with(" (deleted)"),
-            "expected the kernel to mark the daemon's exe link deleted after the \
-             in-place replace, got {exe_link:?}"
-        );
+        assert_exe_link_marked_deleted(pid);
 
         // `--status`, run through the replaced (now different-inode) binary at the
         // same install path, must still recognize its own daemon.
@@ -4002,6 +4047,9 @@ mod watch_daemon_ownership {
             pid_alive(pid),
             "daemon pid should be alive right after starting"
         );
+        // From here on, any assertion below that panics must not leak this daemon —
+        // the guard's Drop kills it if it's still running.
+        let _guard = DaemonGuard::new(pid);
 
         // `clean`, run via the *actual* built `shire` binary — a different file from
         // the wrapper that started the daemon — must refuse rather than remove

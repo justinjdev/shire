@@ -3387,6 +3387,69 @@ fn test_build_recovers_from_corrupt_db() {
     );
 }
 
+/// Every package name in the index, sorted.
+fn package_names_in(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM packages ORDER BY name")
+        .unwrap();
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    names
+}
+
+#[test]
+fn test_removing_one_of_two_manifests_in_a_directory_leaves_the_other_indexed() {
+    // INDEX-3-4: `packages.path` is UNIQUE, so a directory holding both a
+    // Cargo.toml and a package.json gets one package row between them. When
+    // the winner's manifest was deleted, its package went with it and the
+    // survivor was never re-parsed (its content hash had not changed), so the
+    // directory held zero packages for every later build.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    let dual = repo.join("dual");
+    fs::create_dir_all(dual.join("src")).unwrap();
+    fs::write(
+        dual.join("package.json"),
+        br#"{"name": "dual-npm", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        dual.join("Cargo.toml"),
+        b"[package]\nname = \"dual-crate\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(dual.join("src/lib.rs"), b"pub fn dual_fn() {}\n").unwrap();
+    let db = dir.path().join("index.db");
+
+    run_build(&bin, &repo, &db);
+    let indexed = package_names_in(&db);
+    assert_eq!(
+        indexed.len(),
+        1,
+        "one directory can only hold one package row: {indexed:?}"
+    );
+    let (winner_manifest, survivor) = if indexed[0] == "dual-crate" {
+        ("Cargo.toml", "dual-npm")
+    } else {
+        ("package.json", "dual-crate")
+    };
+
+    fs::remove_file(dual.join(winner_manifest)).unwrap();
+    run_build(&bin, &repo, &db);
+    run_build(&bin, &repo, &db);
+
+    assert_eq!(
+        package_names_in(&db),
+        vec![survivor.to_string()],
+        "the manifest still on disk must be indexed again"
+    );
+}
+
 #[test]
 fn test_build_refuses_to_delete_a_short_file_at_db_path() {
     // INDEX-2-2: `db_path` comes from the repo's own shire.toml, unconfined.

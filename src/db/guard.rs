@@ -241,11 +241,20 @@ pub fn classify_for_removal(db_path: &Path, root: Option<&Path>) -> Result<Remov
 /// (INDEX-3-7). This is the cheap precondition that closes that: a non-empty
 /// file without SQLite's header is not an index and never will be.
 ///
-/// Deliberately narrow, so it only ever refuses what the later checks would
-/// refuse anyway:
+/// It also closes the other half of the same hole: a *valid* SQLite database
+/// that shire did not build (a browser profile, someone's notes.db) was
+/// adopted outright — shire wrote its schema into it, after which the file
+/// carried a `shire_meta` table and `shire clean` would delete it as its own.
+///
+/// Deliberately narrow, so nothing that could be a shire index is refused:
 /// * a missing `db_path` is fine — that is every first build;
 /// * a zero-length file is fine — SQLite opens one as a brand-new empty
 ///   database, and an interrupted first build can leave one behind;
+/// * so is a SQLite database with no objects at all, or one holding any of the
+///   tables shire creates (see `SHIRE_TABLES`);
+/// * a database that cannot be opened or queried (a corrupt index, one locked
+///   by another process) gets no verdict here and is left to the removal
+///   guard, which is what decides whether a damaged index may be rebuilt;
 /// * a path that cannot be examined (a symlink, a FIFO, a directory) is left
 ///   to the open itself, which already has an opinion about each.
 pub fn reject_unrelated_file_at_db_path(db_path: &Path) -> Result<()> {
@@ -262,16 +271,97 @@ pub fn reject_unrelated_file_at_db_path(db_path: &Path) -> Result<()> {
         let mut header = [0u8; 16];
         file.read_exact(&mut header).is_ok() && &header == SQLITE_HEADER
     };
-    if is_sqlite {
-        return Ok(());
+    if !is_sqlite {
+        anyhow::bail!(
+            "refusing to use {} as the index database: there is already a file there \
+             and it is not a SQLite database. Check shire.toml's db_path (or --db) — \
+             shire will not overwrite a file it did not create",
+            db_path.display()
+        );
     }
 
-    anyhow::bail!(
-        "refusing to use {} as the index database: there is already a file there \
-         and it is not a SQLite database. Check shire.toml's db_path (or --db) — \
-         shire will not overwrite a file it did not create",
-        db_path.display()
-    )
+    if peek_db_contents(db_path) == DbContents::Foreign {
+        anyhow::bail!(
+            "refusing to use {} as the index database: it is a SQLite database that \
+             shire did not create — it holds other tables and no shire index of its \
+             own. Check shire.toml's db_path (or --db) — shire will not write its \
+             schema into a database it did not create",
+            db_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Tables a shire index creates. Used only to recognise a database as shire's
+/// *own* before writing to it — never to authorise deleting one, which stays
+/// keyed on `shire_meta` alone (see [`looks_like_shire_db`]).
+///
+/// `create_schema` issues its `CREATE TABLE IF NOT EXISTS` statements one at a
+/// time, and `shire_meta` is not the first, so a first build killed partway
+/// through leaves a real shire index carrying some of these and not that one.
+/// Recognising any of them keeps such a database adoptable.
+const SHIRE_TABLES: &[&str] = &[
+    "shire_meta",
+    "packages",
+    "dependencies",
+    "symbols",
+    "symbol_refs",
+    "files",
+    "docs",
+    "manifest_hashes",
+    "file_hashes",
+    "source_hashes",
+];
+
+/// What a read-only peek inside an existing SQLite file at `db_path` found.
+#[derive(Debug, PartialEq, Eq)]
+enum DbContents {
+    /// Empty (no objects at all), or holding tables shire itself creates.
+    /// Writing an index here is safe.
+    Shire,
+    /// It holds objects, none of them shire's: someone else's database.
+    Foreign,
+    /// It could not be opened or queried — corrupt, or locked by another
+    /// process. No verdict, so the callers that already handle a corrupt
+    /// index decide (`open_or_create_in_repo` and its removal guard).
+    Unknown,
+}
+
+/// Peek inside an existing SQLite database, strictly read-only, to see whose
+/// it is. Never creates, writes to, or locks the file.
+fn peek_db_contents(db_path: &Path) -> DbContents {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return DbContents::Unknown;
+    };
+
+    let Ok(objects) = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    }) else {
+        return DbContents::Unknown;
+    };
+    if objects == 0 {
+        // A brand-new database — which is also what SQLite makes of the
+        // zero-byte file handled above.
+        return DbContents::Shire;
+    }
+
+    let is_shire = SHIRE_TABLES.iter().any(|table| {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .is_ok()
+    });
+    if is_shire {
+        DbContents::Shire
+    } else {
+        DbContents::Foreign
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +387,46 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_sqlite_database_at_db_path_is_refused() {
+        // A valid SQLite database shire did not build used to be adopted
+        // outright: the build wrote shire's schema into it, after which it
+        // carried a `shire_meta` table and `shire clean` deleted it as shire's
+        // own. A repo-controlled db_path can name any file on the machine.
+        let dir = tempfile::TempDir::new().unwrap();
+        let foreign = dir.path().join("places.sqlite");
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE places (id INTEGER PRIMARY KEY, url TEXT);")
+            .unwrap();
+        drop(conn);
+
+        let err = reject_unrelated_file_at_db_path(&foreign)
+            .expect_err("someone else's database must not be written into");
+        assert!(
+            format!("{err:#}").contains("shire did not create"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_partly_created_shire_index_is_still_adopted() {
+        // `create_schema` runs its CREATE TABLE statements one at a time and
+        // `shire_meta` is not the first, so a first build killed partway
+        // through leaves a real index without it. That must still be a
+        // database shire may finish building.
+        let dir = tempfile::TempDir::new().unwrap();
+        let half = dir.path().join("index.db");
+        let conn = rusqlite::Connection::open(&half).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE packages (name TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, kind TEXT NOT NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        reject_unrelated_file_at_db_path(&half)
+            .expect("a shire index missing only shire_meta must still be adoptable");
+    }
+
+    #[test]
     fn a_missing_empty_or_sqlite_db_path_is_accepted() {
         // The three shapes a real db_path takes: never built yet, a zero-byte
         // file left by an interrupted first build (SQLite opens one as a new
@@ -313,6 +443,21 @@ mod tests {
         corrupt_sqlite_like(&corrupt);
         reject_unrelated_file_at_db_path(&corrupt)
             .expect("a damaged shire index still has to reach the removal guard");
+
+        // A SQLite database with no objects at all is what an interrupted
+        // first build leaves, and is indistinguishable from a fresh one.
+        let blank = dir.path().join("blank.db");
+        rusqlite::Connection::open(&blank).unwrap();
+        reject_unrelated_file_at_db_path(&blank)
+            .expect("an empty SQLite database must still be adopted");
+
+        // And shire's own index, obviously.
+        let shire = dir.path().join("shire.db");
+        let conn = rusqlite::Connection::open(&shire).unwrap();
+        conn.execute_batch("CREATE TABLE shire_meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        drop(conn);
+        reject_unrelated_file_at_db_path(&shire).expect("shire's own index must be adopted");
     }
 
     fn corrupt_sqlite_like(path: &Path) {

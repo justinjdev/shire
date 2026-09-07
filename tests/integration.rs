@@ -3507,6 +3507,96 @@ fn test_build_refuses_to_delete_a_short_file_at_db_path() {
 }
 
 #[test]
+fn test_build_refuses_a_foreign_sqlite_database_at_db_path() {
+    // A valid SQLite database shire did not build used to be adopted outright:
+    // the build wrote its schema into it, after which the file carried a
+    // `shire_meta` table and `shire clean` would delete it as shire's own. A
+    // cloned repo's shire.toml can name any file on the machine.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    let victim = dir.path().join("notes.db");
+    {
+        let conn = rusqlite::Connection::open(&victim).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+             INSERT INTO notes (body) VALUES ('remember the milk');",
+        )
+        .unwrap();
+    }
+    let before = fs::read(&victim).unwrap();
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", victim.display()),
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "build must refuse a database it did not create"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        before,
+        "no schema may be written into it"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("shire did not create"),
+        "the error must say whose database it is, got: {stderr}"
+    );
+    let mut lock = victim.as_os_str().to_owned();
+    lock.push(".lock");
+    assert!(
+        !std::path::Path::new(&lock).exists(),
+        "and no lock file may be created beside it"
+    );
+
+    // The neighbours that must keep working: an empty SQLite file at db_path
+    // is adopted, and so is the index that build then produces.
+    let blank = dir.path().join("blank.db");
+    rusqlite::Connection::open(&blank).unwrap();
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", blank.display()),
+    )
+    .unwrap();
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an empty SQLite database must still be adopted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(package_names_in(&blank), vec!["pkg-a".to_string()]);
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "and a second build against shire's own index must too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn test_serve_reports_corrupt_db_clearly() {
     use std::io::{Seek, SeekFrom};
     let bin = cargo_bin();

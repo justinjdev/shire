@@ -104,7 +104,11 @@ since its trigger comes round again.
 
 `shire clean` takes the same lock before removing anything, and refuses with
 "a shire build is running" rather than deleting a database out from under a
-build. The `<db_path>.lock` file itself is left in place — it is an empty
+build. Neither command creates the lock file until it has established that
+`db_path` is shire's to use: `db_path` comes from the repository's own
+`shire.toml`, and `build` refuses outright a path holding a file that is not a
+SQLite database, or a SQLite database holding someone else's tables — it will
+not write its schema into a database it did not create. The `<db_path>.lock` file itself is left in place — it is an empty
 sidecar like `-wal`/`-shm`, and unlinking it while a builder holds a lock on
 that inode is what would let a second builder take the lock at the same path.
 

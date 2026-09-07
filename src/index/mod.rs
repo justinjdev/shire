@@ -504,8 +504,19 @@ struct WalkedFile {
 
 const MAX_FILES: usize = 500_000;
 
+/// What one file-tree walk saw.
+struct FileWalk {
+    files: Vec<WalkedFile>,
+    /// Repo-relative paths the walk could not read this time — a directory
+    /// whose permissions changed, an unmounted network share, a container
+    /// volume mid-remount. Their contents are *invisible*, which is not the
+    /// same as absent, and the difference decides whether the `files` rows
+    /// underneath them may be deleted.
+    unreadable: Vec<String>,
+}
+
 /// Walk the repo and collect all files with metadata.
-fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
+fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
     let walker = ignore_walk_builder(repo_root)
@@ -521,6 +532,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
         .build_parallel();
 
     let files = std::sync::Mutex::new(Vec::new());
+    let unreadable = std::sync::Mutex::new(Vec::new());
     let capped = std::sync::atomic::AtomicBool::new(false);
     let repo_root_ref = repo_root;
 
@@ -531,7 +543,25 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
             }
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
+                Err(e) => {
+                    // Remember *where* the walk went blind. Everything under
+                    // that path is unknown for this build, not deleted — see
+                    // `FileWalk::unreadable`.
+                    if let Some(path) = walk_error_path(&e) {
+                        let rel = path
+                            .strip_prefix(repo_root_ref)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .to_string();
+                        tracing::warn!(path = %rel, error = %e, "file walk could not read a path");
+                        if let Ok(mut guard) = unreadable.lock() {
+                            guard.push(rel);
+                        }
+                    } else {
+                        tracing::warn!(error = %e, "file walk error with no path");
+                    }
+                    return ignore::WalkState::Continue;
+                }
             };
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
@@ -572,7 +602,42 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
         })
     });
 
-    Ok(files.into_inner().unwrap())
+    Ok(FileWalk {
+        files: files.into_inner().unwrap(),
+        unreadable: unreadable.into_inner().unwrap(),
+    })
+}
+
+/// The path an `ignore` walk error is about, dug out of whatever wrappers the
+/// crate put around it (`WithPath` inside `WithDepth`, and so on). `None` for
+/// an error that names no path — which the caller must treat as "scope
+/// unknown", not "nothing was affected".
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errs) => errs.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
+/// Is `path` inside (or exactly) one of the unreadable roots this walk hit?
+///
+/// Prefix-matched on path segments, so `p1` covers `p1/src/a.ts` but not
+/// `p10/x.ts`. An empty root (the repo root itself was unreadable) covers
+/// everything — the walk saw nothing at all, so it can prove nothing was
+/// deleted.
+fn is_under_unreadable(path: &str, unreadable: &[String]) -> bool {
+    unreadable.iter().any(|root| {
+        root.is_empty()
+            || path == root
+            || (path.len() > root.len()
+                && path.starts_with(root.as_str())
+                && path.as_bytes()[root.len()] == b'/')
+    })
 }
 
 /// Associate files with their owning package using longest-prefix matching.
@@ -628,17 +693,26 @@ fn associate_files_with_packages(
 /// Incrementally update the files table: insert new files, delete removed files,
 /// update files whose package/extension/size changed. Avoids a full table wipe.
 ///
-/// Returns `(deleted_rows, changed_packages)`. `changed_packages` names every
-/// package in which a file was added, removed, or had its package/extension/
-/// size change — the only cheap signal for a content change that moves
-/// neither the file's mtime nor its path, and the reason
-/// `phase_source_incremental` cannot trust its mtime pre-check alone
+/// Returns `(deleted_rows, changed_packages, preserved_rows)`.
+/// `changed_packages` names every package in which a file was added, removed,
+/// or had its package/extension/size change — the only cheap signal for a
+/// content change that moves neither the file's mtime nor its path, and the
+/// reason `phase_source_incremental` cannot trust its mtime pre-check alone
 /// (INDEX-3). It is derived from the `existing` snapshot this function
 /// already loads, so it costs no extra query.
+///
+/// `unreadable` names the paths the walk could not read. Rows under them are
+/// left exactly as they are and counted as `preserved_rows`: their files are
+/// invisible this build, not gone. Deleting them would take `symbol_refs`
+/// with them — refs key on `files.id`, and the orphan sweep removes any ref
+/// whose file row disappeared — permanently destroying half the index for a
+/// package whose symbols the extraction failure deliberately kept
+/// (INDEX-2-3), with no later build able to restore it.
 fn incremental_upsert_files(
     conn: &Connection,
     files: &[(String, Option<String>, String, u64)],
-) -> Result<(usize, HashSet<String>)> {
+    unreadable: &[String],
+) -> Result<(usize, HashSet<String>, usize)> {
     // Load existing file paths from DB
     let existing: HashMap<String, (Option<String>, String, i64)> = {
         let mut stmt = conn.prepare("SELECT path, package, extension, size_bytes FROM files")?;
@@ -686,11 +760,24 @@ fn incremental_upsert_files(
         }
     }
 
-    // Delete files no longer present
-    let to_delete: Vec<&str> = existing
+    // Delete files no longer present — except those the walk could not see,
+    // which are unknown rather than deleted.
+    let missing: Vec<&str> = existing
         .keys()
         .filter(|p| !new_set.contains_key(p.as_str()))
         .map(|p| p.as_str())
+        .collect();
+    let preserved_rows = if unreadable.is_empty() {
+        0
+    } else {
+        missing
+            .iter()
+            .filter(|p| is_under_unreadable(p, unreadable))
+            .count()
+    };
+    let to_delete: Vec<&str> = missing
+        .into_iter()
+        .filter(|p| unreadable.is_empty() || !is_under_unreadable(p, unreadable))
         .collect();
     for path in &to_delete {
         if let Some((old_pkg, _, _)) = existing.get(*path) {
@@ -758,7 +845,7 @@ fn incremental_upsert_files(
         }
     }
 
-    Ok((deleted_rows, changed_packages))
+    Ok((deleted_rows, changed_packages, preserved_rows))
 }
 
 /// Scan walked Cargo.toml files for workspace roots and collect `[workspace.dependencies]`.
@@ -2317,7 +2404,10 @@ fn phase_index_files(
     repo_root: &Path,
     config: &Config,
 ) -> Result<FileIndexResult> {
-    let walked_files = walk_files(repo_root, config)?;
+    let FileWalk {
+        files: walked_files,
+        unreadable,
+    } = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
     let file_tuples: Vec<(String, u64)> = walked_files
@@ -2376,9 +2466,11 @@ fn phase_index_files(
         })
         .collect();
 
-    let num_files = validated_files.len();
-    let (deleted_file_rows, mut changed_packages) =
-        incremental_upsert_files(conn, &validated_files)?;
+    let (deleted_file_rows, mut changed_packages, preserved_file_rows) =
+        incremental_upsert_files(conn, &validated_files, &unreadable)?;
+    // Rows kept for a directory this walk could not read are still in the
+    // index and still served, so they count.
+    let num_files = validated_files.len() + preserved_file_rows;
 
     // Carry forward anything an earlier build recorded but never got to
     // re-extract — `incremental_upsert_files` compares against the `files`
@@ -5071,7 +5163,7 @@ anyhow = "1"
         repo_with_local_git_excludes(root, "*.ts\n");
         fs::write(root.join("kept.ts"), "export function kept() {}\n").unwrap();
 
-        let files = walk_files(root, &Config::default()).unwrap();
+        let files = walk_files(root, &Config::default()).unwrap().files;
 
         assert!(
             files.iter().any(|f| f.relative_path == "kept.ts"),
@@ -5091,7 +5183,7 @@ anyhow = "1"
         fs::write(root.join("generated.ts"), "export function gen() {}\n").unwrap();
         fs::write(root.join("kept.ts"), "export function kept() {}\n").unwrap();
 
-        let files = walk_files(root, &Config::default()).unwrap();
+        let files = walk_files(root, &Config::default()).unwrap().files;
         let paths: Vec<&String> = files.iter().map(|f| &f.relative_path).collect();
 
         assert!(paths.iter().any(|p| p.as_str() == "kept.ts"));
@@ -5556,8 +5648,9 @@ mod incremental_signal_tests {
         let conn = files_db();
 
         // First build: everything is new.
-        let (deleted, changed) =
-            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)]).unwrap();
+        let (deleted, changed, _) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)], &[])
+                .unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(
             changed,
@@ -5566,26 +5659,152 @@ mod incremental_signal_tests {
         );
 
         // Nothing moved.
-        let (_, changed) =
-            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)]).unwrap();
+        let (_, changed, _) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)], &[])
+                .unwrap();
         assert!(changed.is_empty(), "an unchanged tree marks nothing");
 
         // A size change marks only that package.
-        let (_, changed) =
-            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11), f("b/y.ts", "b", 10)]).unwrap();
+        let (_, changed, _) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11), f("b/y.ts", "b", 10)], &[])
+                .unwrap();
         assert_eq!(changed, HashSet::from(["a".to_string()]));
 
         // A deletion marks the package the file used to belong to.
-        let (deleted, changed) = incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11)]).unwrap();
+        let (deleted, changed, _) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 11)], &[]).unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(changed, HashSet::from(["b".to_string()]));
     }
 
     #[test]
+    fn test_walk_error_path_digs_through_the_crates_wrappers() {
+        // `ignore` reports a directory it could not read as an Io error
+        // wrapped in WithPath, itself usually wrapped in WithDepth. Missing
+        // the path means the build cannot tell which rows are merely
+        // invisible, so it deletes them.
+        let io = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let wrapped = ignore::Error::WithDepth {
+            depth: 2,
+            err: Box::new(ignore::Error::WithPath {
+                path: std::path::PathBuf::from("/repo/p1/src"),
+                err: Box::new(ignore::Error::Io(io())),
+            }),
+        };
+        assert_eq!(
+            walk_error_path(&wrapped),
+            Some(Path::new("/repo/p1/src")),
+            "a wrapped path must still be found"
+        );
+        assert_eq!(walk_error_path(&ignore::Error::Io(io())), None);
+    }
+
+    #[test]
+    fn test_is_under_unreadable_matches_whole_path_segments() {
+        assert!(is_under_unreadable("p1/src/a.ts", &["p1".to_string()]));
+        assert!(is_under_unreadable("p1", &["p1".to_string()]));
+        assert!(!is_under_unreadable("p10/src/a.ts", &["p1".to_string()]));
+        assert!(!is_under_unreadable("p2/src/a.ts", &["p1".to_string()]));
+        // The repo root itself was unreadable: the walk proved nothing.
+        assert!(is_under_unreadable("anything/at/all", &[String::new()]));
+    }
+
+    #[test]
+    fn test_incremental_upsert_files_keeps_rows_under_an_unreadable_path() {
+        // INDEX-2-3: a package directory that is briefly unreadable (a
+        // network mount blinking, a permission change, a container volume
+        // remount) is invisible to the walk. Deleting its `files` rows is
+        // what destroyed its symbol_refs — the rows must stay put instead.
+        let conn = files_db();
+        let (_, _, _) =
+            incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)], &[])
+                .unwrap();
+
+        // Next build: package `a`'s directory could not be read at all.
+        let (deleted, changed, preserved) =
+            incremental_upsert_files(&conn, &[f("b/y.ts", "b", 10)], &["a".to_string()]).unwrap();
+
+        assert_eq!(deleted, 0, "an unreadable directory is not a deletion");
+        assert_eq!(preserved, 1);
+        assert!(
+            changed.is_empty(),
+            "an invisible file did not change; marking it would claim otherwise"
+        );
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'a/x.ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "the file row must survive the walk that missed it");
+    }
+
+    #[test]
+    fn test_incremental_upsert_files_still_deletes_outside_the_unreadable_path() {
+        // The guard is scoped: a file that genuinely disappeared elsewhere in
+        // the tree is still removed on the same build.
+        let conn = files_db();
+        incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10), f("b/y.ts", "b", 10)], &[])
+            .unwrap();
+
+        let (deleted, changed, preserved) =
+            incremental_upsert_files(&conn, &[], &["a".to_string()]).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(preserved, 1);
+        assert_eq!(changed, HashSet::from(["b".to_string()]));
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(paths, vec!["a/x.ts".to_string()]);
+    }
+
+    #[test]
+    fn test_refs_of_an_unreadable_package_survive_the_orphan_sweep() {
+        // The whole point: symbol_refs key on `files.id`, and the integrity
+        // sweep deletes every ref whose file row is gone. Keeping the rows
+        // for an unreadable directory is what keeps the refs — otherwise the
+        // package's symbols are preserved (INDEX-10) while its references are
+        // silently destroyed, and no later build restores them because the
+        // per-file content hashes still match.
+        let conn = files_db();
+        incremental_upsert_files(&conn, &[f("a/x.ts", "a", 10)], &[]).unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = 'a/x.ts'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+             VALUES ('helperCall', 'call', ?1, 3, 'a', 'oneFn')",
+            [file_id],
+        )
+        .unwrap();
+
+        // A build during which `a/` cannot be read.
+        incremental_upsert_files(&conn, &[], &["a".to_string()]).unwrap();
+        validate_referential_integrity(&conn).unwrap();
+
+        let refs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            refs, 1,
+            "a transiently unreadable directory must not destroy the package's references"
+        );
+    }
+
+    #[test]
     fn test_incremental_upsert_files_marks_both_sides_of_a_move() {
         let conn = files_db();
-        incremental_upsert_files(&conn, &[f("shared.ts", "a", 10)]).unwrap();
-        let (_, changed) = incremental_upsert_files(&conn, &[f("shared.ts", "b", 10)]).unwrap();
+        incremental_upsert_files(&conn, &[f("shared.ts", "a", 10)], &[]).unwrap();
+        let (_, changed, _) =
+            incremental_upsert_files(&conn, &[f("shared.ts", "b", 10)], &[]).unwrap();
         assert_eq!(
             changed,
             HashSet::from(["a".to_string(), "b".to_string()]),
@@ -5667,18 +5886,20 @@ mod pending_recheck_tests {
         .unwrap();
 
         // Build 1: file indexed at 10 bytes, extraction succeeds.
-        let (_, changed) = incremental_upsert_files(
+        let (_, changed, _) = incremental_upsert_files(
             &conn,
             &[("a/x.ts".into(), Some("a".into()), "ts".into(), 10)],
+            &[],
         )
         .unwrap();
         write_pending_source_recheck(&conn, &changed).unwrap();
         clear_pending_source_recheck(&conn).unwrap(); // extraction committed
 
         // Build 2: same path and mtime, different size. Phase 9 commits…
-        let (_, mut changed) = incremental_upsert_files(
+        let (_, mut changed, _) = incremental_upsert_files(
             &conn,
             &[("a/x.ts".into(), Some("a".into()), "ts".into(), 11)],
+            &[],
         )
         .unwrap();
         assert_eq!(changed, HashSet::from(["a".to_string()]));
@@ -5688,9 +5909,10 @@ mod pending_recheck_tests {
 
         // Build 3: nothing changed on disk since build 2, so the file-tree
         // hash matches and incremental_upsert_files would report nothing.
-        let (_, rediscovered) = incremental_upsert_files(
+        let (_, rediscovered, _) = incremental_upsert_files(
             &conn,
             &[("a/x.ts".into(), Some("a".into()), "ts".into(), 11)],
+            &[],
         )
         .unwrap();
         assert!(

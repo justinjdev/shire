@@ -1373,9 +1373,14 @@ pub struct RefNameMatch {
     /// The packages defining the qualified symbol. Empty when the name
     /// carried no qualifier that resolved.
     pub defined_in: Vec<String>,
-    /// Packages whose own same-named symbol claims their references, so their
-    /// rows were left out. Empty when the name carried no qualifier that
-    /// resolved, or nothing competes with it.
+    /// Packages whose own same-named symbol claims their references, so any
+    /// rows they had were left out. Empty when the name carried no qualifier
+    /// that resolved, or nothing competes with it.
+    ///
+    /// Derived from the `symbols` table, not from the rows that were dropped:
+    /// a package that defines its own `run` and never references one is
+    /// listed here too, having had nothing to leave out. So this is where to
+    /// *look*, not a set of confirmed call sites.
     pub excluded_packages: Vec<String>,
     /// The qualifier was dropped because no indexed symbol carries it, so the
     /// rows are every symbol with that bare name, on any type in any package.
@@ -1457,10 +1462,18 @@ fn qualified_target<'a>(conn: &Connection, name: &'a str) -> Result<Option<Quali
     if bare.is_empty() {
         return Ok(None);
     }
-    let qualifier = head.rsplit('.').next().unwrap_or(head);
-    if qualifier.is_empty() {
-        return Ok(None);
-    }
+    // The last *non-empty* segment. An empty one is not a qualifier, and
+    // bailing out on it would take the bare fallback with it: `.run` and
+    // `A..run` would resolve to nothing at all rather than to `run`.
+    let Some(qualifier) = head.rsplit('.').find(|s| !s.is_empty()) else {
+        // No segment to resolve through, so the bare name is the answer —
+        // reported as widened, exactly like an unknown qualifier.
+        return Ok(Some(QualifiedTarget {
+            bare,
+            defined_in: Vec::new(),
+            competing: Vec::new(),
+        }));
+    };
     // One indexed pass over `idx_symbols_name`, grouped by package: whether
     // each package defines *this* symbol decides which list it lands in, and
     // ordering the defining packages first makes the cap harmless.
@@ -1772,6 +1785,13 @@ pub struct ChangeImpactSummary {
     /// more than 10 000 times — which is exactly the case where a model most
     /// needs to know the number is not the whole story.
     pub counts_capped: bool,
+    /// References the qualifier attributed elsewhere: rows named
+    /// `matched_name` written in `excluded_packages`, which are in none of
+    /// the buckets above. Zero when nothing was excluded — and often zero
+    /// even when `excluded_packages` is not, since a package can define its
+    /// own symbol of that name and never reference one. It is the number that
+    /// says whether the heuristic hid anything.
+    pub excluded_ref_count: usize,
     /// Unique packages that contain cross-package references. Computed from
     /// the full ref set before truncation — this is the authoritative list
     /// of directly affected packages.
@@ -1839,6 +1859,31 @@ fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>>
 /// `summary.counts_capped`.
 pub const MAX_REFS_SCANNED: i64 = 10_000;
 
+/// How many refs named `name` live in `packages` — the rows a qualified
+/// lookup attributed to those packages' own symbols and left out.
+///
+/// One indexed count on `idx_refs_package_name`, and only when a qualifier
+/// actually excluded something.
+fn count_refs_in_packages(conn: &Connection, name: &str, packages: &[String]) -> Result<usize> {
+    if packages.is_empty() {
+        return Ok(0);
+    }
+    let mut sql = String::from("SELECT COUNT(*) FROM symbol_refs WHERE name = ? AND package IN (");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(name.to_string())];
+    for (i, p) in packages.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        params.push(Box::new(p.clone()));
+    }
+    sql.push(')');
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
 /// Compute the transitive impact of changing a symbol by combining the
 /// cross-reference index with the dependency graph.
 ///
@@ -1871,6 +1916,12 @@ pub fn change_impact(
     let (all_refs, matched) =
         query_symbol_references_resolved(conn, name, None, None, MAX_REFS_SCANNED)?;
     let counts_capped = all_refs.len() as i64 >= MAX_REFS_SCANNED;
+    // What the qualifier left out. `excluded_packages` names where to look;
+    // this says whether there was anything there — a rename decision made off
+    // an under-reported blast radius is the failure this tool exists to
+    // prevent.
+    let excluded_ref_count =
+        count_refs_in_packages(conn, &matched.matched_name, &matched.excluded_packages)?;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
@@ -1962,6 +2013,7 @@ pub fn change_impact(
         direct_count,
         cross_package_count,
         counts_capped,
+        excluded_ref_count,
         affected_packages,
         transitive_package_count: transitive_impact.len(),
     };
@@ -3903,6 +3955,10 @@ mod refs_tests {
             vec!["admin-panel".to_string()],
             "a package left out of the blast radius must be reported"
         );
+        assert_eq!(
+            impact.summary.excluded_ref_count, 1,
+            "and so must the number of refs it actually hid"
+        );
     }
 
     /// The same scoping for `symbol_references`, and the home package
@@ -3933,6 +3989,10 @@ mod refs_tests {
         assert_eq!(impact.matched_name.as_deref(), Some("run"));
         assert!(!impact.qualifier_dropped);
         assert!(!impact.summary.counts_capped);
+        assert_eq!(
+            impact.summary.excluded_ref_count, 1,
+            "admin-panel's own `run` call site is the one row left out"
+        );
 
         let other = change_impact(&conn, "B.run", None, 1, 100).unwrap();
         assert_eq!(other.home_package.as_deref(), Some("admin-panel"));
@@ -4022,6 +4082,24 @@ mod refs_tests {
                 ]
             )),
             "an unknown qualifier defines nothing"
+        );
+
+        // An empty segment is not a qualifier. `A..run` still resolves on
+        // `A`, and `.run` keeps the bare fallback instead of resolving to
+        // nothing — treating the empty segment as "no qualifier at all" would
+        // silently stop answering these names.
+        assert_eq!(target("A..run"), target("A.run"));
+        assert_eq!(
+            target(".run"),
+            Some(("run".into(), vec![], vec![])),
+            "no segment to resolve through, so the bare name answers"
+        );
+        assert_eq!(
+            query_symbol_callers(&conn, ".run", None, 100)
+                .unwrap()
+                .len(),
+            3,
+            "and the bare fallback actually runs"
         );
     }
 

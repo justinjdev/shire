@@ -86,8 +86,12 @@ returns an object, and gains `matched_name`, `qualifier_dropped` and
 `excluded_packages` is worth reading before acting on a `change_impact`
 answer: those packages were left out of `direct_impact`,
 `cross_package_impact`, `summary.affected_packages` and the reverse-dep walk
-seeded from it, so a call site in one of them is real blast radius the
-qualifier chose to attribute elsewhere. Re-run with the bare name to see it.
+seeded from it, so a call site in one of them is blast radius the qualifier
+chose to attribute elsewhere. The list names every package that defines a
+symbol of that name, not only the ones that turned out to reference it — most
+entries will have had nothing to drop. `summary.excluded_ref_count` is the
+number that matters: how many references those packages actually held. When it
+is not zero, re-run with the bare name to see them.
 
 A `package` filter is applied on top of the resolution, so asking for a
 qualified name *and* a package that step 2 excluded is a contradiction and

@@ -994,7 +994,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name and `excluded_packages` names the packages whose own same-named symbol claimed their references — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name to see them. Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
+        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name, `excluded_packages` names the packages whose own same-named symbol claimed their references, and `summary.excluded_ref_count` says how many rows that hid — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name when the count is not zero. Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
     )]
     fn change_impact(
         &self,
@@ -1650,6 +1650,7 @@ mod tests {
         assert_eq!(v["summary"]["cross_package_count"], 0);
         assert_eq!(v["summary"]["counts_capped"], false);
         assert_eq!(v["excluded_packages"], serde_json::json!(["admin-panel"]));
+        assert_eq!(v["summary"]["excluded_ref_count"], 1);
         assert!(
             v.get("qualifier_dropped").is_none(),
             "flag is off, so absent"

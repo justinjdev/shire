@@ -1832,6 +1832,12 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// `#[serde(skip_serializing_if)]` predicate: a one-element list of defining
+/// packages says nothing `home_package` does not already say.
+fn fewer_than_two(v: &[String]) -> bool {
+    v.len() < 2
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeImpact {
     pub symbol: String,
@@ -1853,6 +1859,18 @@ pub struct ChangeImpact {
     /// has to be able to see it. Absent when nothing was excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded_packages: Vec<String>,
+    /// Every package defining the resolved symbol, in name order. Serialized
+    /// only when there is more than one — that is the case where
+    /// `home_package` is a tiebreak rather than a fact, and the whole
+    /// direct/cross split turns on it.
+    #[serde(skip_serializing_if = "fewer_than_two")]
+    pub defined_in: Vec<String>,
+    /// Why `home_package` may not be the one the caller meant: it was picked
+    /// among several definitions, or the `package` hint names a package whose
+    /// references the qualifier attributed elsewhere. `None` when neither
+    /// applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_package_note: Option<String>,
     /// The package where the symbol is defined. `None` when the symbol is not
     /// in the `symbols` table and no `package` hint was given — in that case
     /// every ref falls into `cross_package_impact`.
@@ -1863,18 +1881,21 @@ pub struct ChangeImpact {
     pub summary: ChangeImpactSummary,
 }
 
-/// Resolve the "home package" of a symbol — the package that defines it.
-/// Used by `change_impact` to decide which refs are in-package (direct) vs
-/// cross-package. Picks the first match when multiple same-name symbols exist
-/// across packages (callers can disambiguate by passing `package` explicitly).
-fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1")?;
-    let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
-    match rows.next() {
-        Some(row) => Ok(Some(row?)),
-        None => Ok(None),
-    }
+/// Every package defining a symbol named `name`, in name order.
+///
+/// `change_impact` takes its home package from the first of these, and reports
+/// the rest: with two definitions the direct/cross split is decided by an
+/// alphabetical tiebreak, and a caller cannot see that — let alone correct it
+/// with `package` — unless the alternatives are in the payload. Capped like
+/// every other package list here; the cap only ever shortens the disclosure.
+fn packages_defining(conn: &Connection, name: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![name, MAX_QUALIFIER_PACKAGES], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(collect_rows(rows))
 }
 
 /// Safety cap on the refs `change_impact` scans before partitioning. A symbol
@@ -1905,6 +1926,54 @@ fn count_refs_in_packages(conn: &Connection, name: &str, packages: &[String]) ->
     let mut stmt = conn.prepare(&sql)?;
     let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
     Ok(count.max(0) as usize)
+}
+
+/// What a caller has to know before trusting `change_impact`'s direct/cross
+/// split, or `None` when the home package is unambiguous.
+///
+/// Two ways it can mislead. The symbol is defined in several packages and the
+/// first one won a tiebreak; or the `package` hint names a package whose
+/// references the qualifier attributed to that package's own symbol, so the
+/// direct bucket is empty by construction rather than by fact.
+fn home_package_note(
+    package_hint: Option<&str>,
+    defined_in: &[String],
+    matched: &RefNameMatch,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(hint) = package_hint
+        && matched.excluded_packages.iter().any(|p| p == hint)
+    {
+        parts.push(format!(
+            "the `package` hint `{hint}` is in `excluded_packages`: it defines a \
+             `{name}` of its own, so its references were attributed there and \
+             `direct_impact` is empty by construction, not because none exist — \
+             re-run with the bare name `{name}` to see them.",
+            name = matched.matched_name
+        ));
+    }
+    if defined_in.len() > 1 {
+        let list = defined_in.join("`, `");
+        parts.push(match package_hint {
+            Some(_) => format!(
+                "`{name}` is defined in more than one package (`{list}`); \
+                 `home_package` is the one you passed.",
+                name = matched.matched_name
+            ),
+            None => format!(
+                "`{name}` is defined in more than one package (`{list}`); \
+                 `home_package` is the first of them, chosen by name, and the \
+                 direct/cross-package split follows from that choice — pass \
+                 `package` to pick another.",
+                name = matched.matched_name
+            ),
+        });
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 /// Compute the transitive impact of changing a symbol by combining the
@@ -1946,15 +2015,20 @@ pub fn change_impact(
     let excluded_ref_count =
         count_refs_in_packages(conn, &matched.matched_name, &matched.excluded_packages)?;
 
+    // Where the resolved symbol is defined. A qualifier narrows this to the
+    // definitions under that qualifier; otherwise it is every symbol of that
+    // name. The home package is the first — an alphabetical tiebreak when
+    // there is more than one, which is exactly why the list is reported.
+    let defined_in = if matched.defined_in.is_empty() {
+        packages_defining(conn, &matched.matched_name)?
+    } else {
+        matched.defined_in.clone()
+    };
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
-        // The qualifier resolved, so the home package is the package that
-        // defines *this* symbol — not whichever same-named symbol happens to
-        // sort first. (A qualified name defined in several packages keeps the
-        // same first-by-name tiebreak, over a much smaller set.)
-        None if !matched.defined_in.is_empty() => matched.defined_in.first().cloned(),
-        None => resolve_home_package(conn, &matched.matched_name)?,
+        None => defined_in.first().cloned(),
     };
+    let home_package_note = home_package_note(package_hint, &defined_in, &matched);
 
     let mut direct_impact: Vec<ReferenceRow> = Vec::new();
     let mut cross_package_impact: Vec<ReferenceRow> = Vec::new();
@@ -2048,6 +2122,8 @@ pub fn change_impact(
             .then(|| matched.matched_name.clone()),
         qualifier_dropped: matched.qualifier_dropped,
         excluded_packages: matched.excluded_packages,
+        defined_in,
+        home_package_note,
         home_package,
         direct_impact,
         cross_package_impact,
@@ -4059,6 +4135,97 @@ mod refs_tests {
         assert_eq!(other.home_package.as_deref(), Some("admin-panel"));
         assert_eq!(other.direct_impact.len(), 1);
         assert!(other.cross_package_impact.is_empty());
+    }
+
+    /// `home_package` decides the whole direct/cross split, and with two
+    /// definitions of the name it is an alphabetical tiebreak. The payload has
+    /// to say so — and name the alternative the caller can pass instead.
+    #[test]
+    fn test_change_impact_discloses_an_ambiguous_home_package() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("ambiguous.db")).unwrap();
+        seed_two_runs(&conn);
+        // A second definition of `A.run`, in another package.
+        seed_package(&conn, "payments");
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, parent_symbol) \
+             VALUES ('payments', 'run', 'method', 'payments/job.py', 3, 'A')",
+            [],
+        )
+        .unwrap();
+
+        // Qualified: both definitions of `A.run` are reported.
+        let impact = change_impact(&conn, "A.run", None, 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("billing"));
+        assert_eq!(
+            impact.defined_in,
+            vec!["billing".to_string(), "payments".to_string()]
+        );
+        let note = impact
+            .home_package_note
+            .expect("ambiguity must be disclosed");
+        assert!(note.contains("payments"), "names the alternative: {note}");
+        assert!(note.contains("pass `package`"), "{note}");
+
+        // Bare: same disclosure over every package defining `run`.
+        let impact = change_impact(&conn, "run", None, 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("admin-panel"));
+        assert_eq!(
+            impact.defined_in,
+            vec![
+                "admin-panel".to_string(),
+                "billing".to_string(),
+                "payments".to_string()
+            ]
+        );
+        assert!(impact.home_package_note.is_some());
+
+        // A hint keeps the list but says the choice was the caller's.
+        let impact = change_impact(&conn, "A.run", Some("payments"), 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("payments"));
+        let note = impact.home_package_note.expect("still ambiguous");
+        assert!(note.contains("the one you passed"), "{note}");
+
+        // One definition, one answer: no note, and `defined_in` stays out of
+        // the payload.
+        let impact = change_impact(&conn, "B.run", None, 1, 100).unwrap();
+        assert_eq!(impact.defined_in, vec!["admin-panel".to_string()]);
+        assert!(impact.home_package_note.is_none());
+        let v = serde_json::to_value(&impact).unwrap();
+        assert!(
+            v.get("defined_in").is_none(),
+            "one package says nothing new"
+        );
+        assert!(v.get("home_package_note").is_none());
+    }
+
+    /// A `package` hint naming a package the qualifier excluded produces an
+    /// empty direct bucket by construction. Silently, that reads as "nothing
+    /// in this package calls it".
+    #[test]
+    fn test_change_impact_flags_a_hint_the_qualifier_excluded() {
+        let dir = tempdir().unwrap();
+        let conn = open_or_create(&dir.path().join("hint.db")).unwrap();
+        seed_two_runs(&conn);
+
+        let impact = change_impact(&conn, "A.run", Some("admin-panel"), 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("admin-panel"));
+        assert_eq!(impact.excluded_packages, vec!["admin-panel".to_string()]);
+        assert_eq!(impact.summary.direct_count, 0);
+        assert_eq!(
+            impact.summary.excluded_ref_count, 1,
+            "admin-panel's own call site is the row that was attributed away"
+        );
+        let note = impact
+            .home_package_note
+            .expect("the empty bucket needs a why");
+        assert!(note.contains("excluded_packages"), "{note}");
+        assert!(note.contains("empty by construction"), "{note}");
+
+        // A hint the qualifier did not exclude gets no such note.
+        let impact = change_impact(&conn, "A.run", Some("billing"), 1, 100).unwrap();
+        assert_eq!(impact.summary.direct_count, 2);
+        assert!(impact.home_package_note.is_none());
     }
 
     /// A qualifier no indexed symbol carries still falls back to the bare

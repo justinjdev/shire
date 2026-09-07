@@ -994,7 +994,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name, `excluded_packages` names the packages whose own same-named symbol claimed their references, and `summary.excluded_ref_count` says how many rows that hid — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name when the count is not zero. Same name-based-match caveat as symbol_references — pass `package` to disambiguate same-name symbols."
+        description = "Analyze the impact of changing a symbol. Combines the cross-reference index with the dependency graph to return: direct_impact (same-package refs), cross_package_impact (refs in other packages), and transitive_impact (packages that depend on affected packages via the reverse dep graph). Use before renaming, changing a signature, or deleting a symbol. Requires `symbols.references_enabled = true` (experimental). A dot-qualified `name` sets `home_package` from the type that defines it; `matched_name` reports a rewritten name, `excluded_packages` names the packages whose own same-named symbol claimed their references, and `summary.excluded_ref_count` says how many rows that hid — those are missing from every bucket and from `summary.affected_packages`, so re-run with the bare name when the count is not zero. `home_package` decides the direct/cross split; when the symbol is defined in more than one package the response carries `defined_in` (all of them) and `home_package_note` saying the home package was chosen among them — pass `package` to pick another, and read that note too when a `package` hint sits in `excluded_packages` and leaves `direct_impact` empty by construction. Same name-based-match caveat as symbol_references."
     )]
     fn change_impact(
         &self,
@@ -1655,6 +1655,67 @@ mod tests {
             v.get("qualifier_dropped").is_none(),
             "flag is off, so absent"
         );
+    }
+
+    /// The tool payload carries the home-package disclosure, not just the
+    /// library struct: an ambiguous `home_package` decides the direct/cross
+    /// split, and a model reading the JSON has to see the alternatives.
+    #[test]
+    fn test_change_impact_payload_discloses_an_ambiguous_home_package() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_two_runs(dir.path());
+        {
+            let conn = svc.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('payments','payments','python')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, parent_symbol) \
+                 VALUES ('payments','run','method','payments/job.py',3,'A')",
+                [],
+            )
+            .unwrap();
+        }
+        let impact = |name: &str, package: Option<&str>| -> serde_json::Value {
+            let r = svc
+                .change_impact(Parameters(ChangeImpactArgs {
+                    name: name.into(),
+                    package: package.map(str::to_string),
+                    transitive_depth: Some(1),
+                    limit: None,
+                }))
+                .unwrap();
+            serde_json::from_str(&result_text(&r)).expect("valid JSON")
+        };
+
+        let v = impact("A.run", None);
+        assert_eq!(v["home_package"], "billing");
+        assert_eq!(v["defined_in"], serde_json::json!(["billing", "payments"]));
+        assert!(
+            v["home_package_note"]
+                .as_str()
+                .expect("note")
+                .contains("payments"),
+            "got {v}"
+        );
+
+        // A hint the qualifier excluded explains its own empty bucket.
+        let v = impact("A.run", Some("admin-panel"));
+        assert_eq!(v["summary"]["direct_count"], 0);
+        assert!(
+            v["home_package_note"]
+                .as_str()
+                .expect("note")
+                .contains("excluded_packages"),
+            "got {v}"
+        );
+
+        // Unambiguous: neither field is spent on a non-event.
+        let v = impact("B.run", None);
+        assert!(v.get("defined_in").is_none(), "got {v}");
+        assert!(v.get("home_package_note").is_none(), "got {v}");
     }
 
     /// End-to-end: wire a minimal symbol + refs + dep graph through the

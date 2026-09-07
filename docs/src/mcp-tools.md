@@ -20,7 +20,7 @@ Shire exposes the following tools over the Model Context Protocol:
 | `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` is resolved through `symbols.parent_symbol`, and references written in packages that define their own symbol of that name are left out — see [Qualified names](#qualified-names). |
 | `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` is resolved through the type that defines the method (see [Qualified names](#qualified-names)). Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 | `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, first_file, first_line, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
-| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it and reports `excluded_packages`; same name-based-match caveat as `symbol_references`. |
+| `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** A dot-qualified `name` sets `home_package` from the type that defines it and reports `excluded_packages`; when the name is defined in more than one package the response also carries `defined_in` and a `home_package_note` saying the home package was a choice among them. Same name-based-match caveat as `symbol_references`. |
 | `schema_consumers` | Find all files generated from a schema file (e.g. `.proto`). Returns generated file paths and their packages. Use to understand the blast radius of a schema change. |
 | `generated_from` | Find the source schema file that generated a given file. Use to trace a generated file (e.g. `user.pb.go`) back to its source proto. |
 
@@ -95,7 +95,26 @@ is not zero, re-run with the bare name to see them.
 
 A `package` filter is applied on top of the resolution, so asking for a
 qualified name *and* a package that step 2 excluded is a contradiction and
-returns nothing — `excluded_packages` in the response is what says why.
+returns nothing — `excluded_packages` in the response is what says why. In
+`change_impact`, where `package` is a home-package hint rather than a filter,
+the same combination empties `direct_impact` by construction (that package's
+references were attributed to its own symbol), and `home_package_note` says
+so.
+
+### Which package is `home_package`
+
+`change_impact` splits references into `direct_impact` and
+`cross_package_impact` by comparing each reference's package against
+`home_package`, so that one value decides the whole answer. It is the
+`package` argument when given, and otherwise the first — by name — of the
+packages defining the resolved symbol. When there is more than one, that
+first is a tiebreak, not a fact, and the response says so:
+
+- `defined_in` lists every package defining the symbol (present only when
+  there is more than one, and narrowed to the definitions under the qualifier
+  for a qualified name).
+- `home_package_note` explains what was chosen and how to choose differently
+  — pass `package` to make one of the others the home package.
 
 What this cannot do is separate two same-named methods **inside one package**:
 with only the bare name recorded, `A.run` and `B.run` in the same package still

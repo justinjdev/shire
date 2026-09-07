@@ -343,7 +343,7 @@ fn batch_insert_symbols(
     syms: &[symbols::SymbolInfo],
 ) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO symbols (package, name, kind, signature, file_path, line, visibility, parent_symbol, return_type, parameters, name_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
 
     for sym in syms {
@@ -363,6 +363,10 @@ fn batch_insert_symbols(
             &sym.parent_symbol,
             &sym.return_type,
             &params_json,
+            // Identifier sub-tokens for the FTS index, computed here so they
+            // ride along in the same batched INSERT — no second pass over
+            // `symbols`.
+            db::split_identifier(&sym.name),
         ])?;
     }
 
@@ -1508,14 +1512,10 @@ fn phase_extract_symbols(
     // Skip entirely when phase 7 had no packages to process.
     if !results.is_empty() {
         conn.execute_batch("DROP TABLE IF EXISTS symbols_fts")?;
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-                name, kind, signature, file_path,
-                content='symbols',
-                content_rowid='rowid',
-                tokenize='unicode61 tokenchars ''_-'''
-            )",
-        )?;
+        // Shared definition — see `db::SYMBOLS_FTS_DDL`. Recreating the
+        // table here with a hand-copied tokenizer used to silently change
+        // search results depending on which path last created it.
+        conn.execute_batch(db::SYMBOLS_FTS_DDL)?;
         conn.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')", [])?;
     }
 

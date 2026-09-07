@@ -149,6 +149,15 @@ Remove the index database, WAL/SHM files, the `.shire` directory, and stop the w
 shire clean
 ```
 
+### Watch daemon status
+
+Check whether the watch daemon is running for a repo (PID, socket path, and whether it's
+actually reachable — see [Watch Daemon](./watch-daemon.md)):
+
+```sh
+shire watch --root /path/to/repo --status
+```
+
 ## Incremental builds
 
 Subsequent builds are **incremental** — only manifests whose content has changed (by SHA-256 hash) are re-parsed. Source files are tracked at **per-file granularity**: if individual source files change without a manifest change, only those files have their symbols re-extracted. An **mtime pre-check** skips hash computation entirely for packages whose source files haven't been touched since the last build.

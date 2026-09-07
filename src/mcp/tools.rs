@@ -16,6 +16,21 @@ pub struct ShireService {
     pub tool_router: ToolRouter<ShireService>,
     build_ctx: Option<BuildContext>,
     last_indexed: Mutex<Option<SystemTime>>,
+    /// Serializes on-demand rebuilds. Tool calls arrive concurrently, and
+    /// without this every one of them saw `is_stale() == true` and started
+    /// its own `build_index_quiet` against the same SQLite file: the losers
+    /// hit "database is locked", never swapped their connection, and
+    /// answered with a bare -32603. Holders re-check staleness under the
+    /// guard, so waiters see the winner's fresh index instead of rebuilding.
+    rebuild_lock: Mutex<()>,
+    /// When the last rebuild attempt failed. `last_indexed` is deliberately
+    /// left alone on failure so a transient error is retried, but without
+    /// this every waiter in the same burst would run its own full build
+    /// while the failure persists.
+    last_rebuild_failure: Mutex<Option<SystemTime>>,
+    /// Number of index rebuilds this process has actually run. Used by the
+    /// concurrency test to assert that N racing tool calls produce one build.
+    rebuild_count: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for ShireService {
@@ -30,6 +45,17 @@ impl std::fmt::Debug for ShireService {
 
 impl ShireService {
     pub fn new(conn: Connection, build_ctx: Option<BuildContext>) -> Self {
+        // A read-only connection never migrates, so an index written by an
+        // older release keeps serving its old FTS tables: no error, just
+        // silently missing prefix/sub-token matching. Say so once at startup.
+        if !crate::db::schema_is_current(&conn) {
+            tracing::warn!(
+                "index was built by an older shire and has not been migrated — \
+                 symbol search will miss prefix and sub-token matches until you \
+                 run `shire build`"
+            );
+        }
+
         // Initialize last_indexed from DB metadata if available
         let last_indexed = Self::read_indexed_at(&conn);
 
@@ -38,6 +64,9 @@ impl ShireService {
             tool_router: Self::tool_router(),
             build_ctx,
             last_indexed: Mutex::new(last_indexed),
+            rebuild_lock: Mutex::new(()),
+            last_rebuild_failure: Mutex::new(None),
+            rebuild_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -105,8 +134,20 @@ impl ShireService {
         }
     }
 
+    /// Number of rebuilds this service has run since start.
+    #[cfg(test)]
+    fn rebuild_count(&self) -> u64 {
+        self.rebuild_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Rebuild the index if stale. No-op in read-only mode.
+    ///
+    /// The staleness check and the build happen together under
+    /// `rebuild_lock`, so concurrent tool calls wait for the in-flight
+    /// rebuild rather than starting their own.
     fn maybe_rebuild(&self) {
+        // Cheap pre-check outside the lock: the common case is a warm index
+        // where nothing is stale and nothing should serialize.
         if !self.is_stale() {
             return;
         }
@@ -116,7 +157,35 @@ impl ShireService {
             None => return,
         };
 
+        // A poisoned lock only means some other rebuild panicked; the guard
+        // still gives us the mutual exclusion we need, so recover it.
+        let _guard = match self.rebuild_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Re-check under the guard: whoever held it before us may have
+        // rebuilt and swapped in a fresh connection already.
+        if !self.is_stale() {
+            return;
+        }
+
+        // Back off after a failure for the same window the staleness check
+        // debounces by, so a burst of calls against a repo that cannot build
+        // does not turn into one full build per call.
+        if let Ok(failed) = self.last_rebuild_failure.lock()
+            && let Some(at) = *failed
+            && at
+                .elapsed()
+                .is_ok_and(|e| e < std::time::Duration::from_secs(ctx.config.serve.debounce_s))
+        {
+            tracing::debug!("skipping rebuild: previous attempt failed recently");
+            return;
+        }
+
         tracing::info!("rebuilding index (stale)");
+        self.rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         match crate::index::build_index_quiet(
             &ctx.repo_root,
@@ -135,6 +204,9 @@ impl ShireService {
                             if let Ok(mut li) = self.last_indexed.lock() {
                                 *li = now;
                             }
+                            if let Ok(mut failed) = self.last_rebuild_failure.lock() {
+                                *failed = None;
+                            }
                             tracing::info!("index rebuilt");
                         }
                         Err(e) => tracing::warn!(%e, "index rebuilt but failed to swap connection"),
@@ -148,8 +220,47 @@ impl ShireService {
                     }
                 }
             }
-            Err(e) => tracing::warn!(%e, "rebuild failed"),
+            Err(e) => {
+                if let Ok(mut failed) = self.last_rebuild_failure.lock() {
+                    *failed = Some(SystemTime::now());
+                }
+                tracing::warn!(%e, "rebuild failed")
+            }
         }
+    }
+
+    /// Resolve a caller-supplied `limit` against this tool's default and the
+    /// query layer's hard ceiling. Every list-returning tool goes through
+    /// this: a tool response is pasted verbatim into an LLM context window,
+    /// so "no limit" is never an option.
+    fn resolve_limit(requested: Option<u32>, default: u32) -> u32 {
+        // `limit: 0` is a common client encoding for "no cap"; treat it as
+        // "use the default" rather than silently returning a single row.
+        requested
+            .filter(|n| *n > 0)
+            .unwrap_or(default)
+            .min(queries::MAX_ROWS)
+    }
+
+    /// Serialize rows to JSON, appending a truncation notice when the result
+    /// filled the limit exactly. Without the notice a capped list is
+    /// indistinguishable from a complete one, and the model reasons about a
+    /// package as if it had seen all of it.
+    fn json_result<T: serde::Serialize>(
+        rows: &[T],
+        limit: u32,
+        narrow_hint: &str,
+    ) -> Result<CallToolResult, ErrorData> {
+        let json = serde_json::to_string(rows).map_err(|e| Self::mcp_err(e.to_string()))?;
+        let mut content = vec![Content::text(json)];
+        if rows.len() as u32 >= limit {
+            content.push(Content::text(format!(
+                "Note: showing the first {limit} results (limit={limit}, max {max}). \
+                 More may exist — {narrow_hint}.",
+                max = queries::MAX_ROWS
+            )));
+        }
+        Ok(CallToolResult::success(content))
     }
 
     pub(crate) fn mcp_err(detail: String) -> ErrorData {
@@ -200,18 +311,24 @@ pub struct DepsParams {
     pub internal_only: bool,
     /// Traversal depth (default: direct only; >1 for transitive)
     pub depth: Option<u32>,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DependentsParams {
     /// Package name
     pub name: String,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListParams {
     /// Filter by package kind: "npm", "go", "cargo", "python", "maven", "gradle", "perl", "ruby"
     pub kind: Option<String>,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -232,6 +349,8 @@ pub struct GetFileSymbolsParams {
     pub file_path: String,
     /// Filter by symbol kind: "function", "class", "struct", "interface", "type", "enum", "trait", "method", "constant"
     pub kind: Option<String>,
+    /// Max results (default 100, max 200), in file order
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -240,6 +359,8 @@ pub struct ListPackageFilesParams {
     pub package: String,
     /// Filter by file extension
     pub extension: Option<String>,
+    /// Max results (default 100, max 200), in path order
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -250,6 +371,8 @@ pub struct SearchFilesParams {
     pub package: Option<String>,
     /// Filter by file extension (e.g., "ts", "go", "rs")
     pub extension: Option<String>,
+    /// Max results (default 20, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -329,12 +452,16 @@ pub struct ChangeImpactArgs {
 pub struct SchemaConsumersArgs {
     /// Path to the schema file (e.g. "proto/user.proto")
     pub path: String,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GeneratedFromArgs {
     /// Path to the generated file (e.g. "gen/user.pb.go")
     pub path: String,
+    /// Max results (default 100, max 200)
+    pub limit: Option<u32>,
 }
 
 #[tool_router]
@@ -354,11 +481,14 @@ impl ShireService {
             )]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let limit = params.limit.unwrap_or(20);
+        let limit = Self::resolve_limit(params.limit, 20);
         let results = queries::search_packages(&conn, &params.query, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(
+            &results,
+            limit,
+            "raise `limit` or use a more specific query",
+        )
     }
 
     #[tool(
@@ -374,20 +504,21 @@ impl ShireService {
         match params.depth {
             Some(n) if n > 1 => {
                 let depth = n.min(20);
-                let edges =
+                let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
+                let mut edges =
                     queries::dependency_graph(&conn, &params.name, depth, params.internal_only)
                         .map_err(|e| Self::mcp_err(e.to_string()))?;
-                let json =
-                    serde_json::to_string(&edges).map_err(|e| Self::mcp_err(e.to_string()))?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                // The graph walk is bounded only by its own MAX_EDGES; the
+                // edge list goes into a context window like any other list.
+                edges.truncate(limit as usize);
+                Self::json_result(&edges, limit, "raise `limit` or lower `depth`")
             }
             _ => {
+                let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
                 let results =
-                    queries::package_dependencies(&conn, &params.name, params.internal_only)
+                    queries::package_dependencies(&conn, &params.name, params.internal_only, limit)
                         .map_err(|e| Self::mcp_err(e.to_string()))?;
-                let json =
-                    serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Self::json_result(&results, limit, "raise `limit`")
             }
         }
     }
@@ -400,10 +531,10 @@ impl ShireService {
         tracing::debug!(tool = "package_dependents", name = %params.name);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::package_dependents(&conn, &params.name)
+        let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
+        let results = queries::package_dependents(&conn, &params.name, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&results, limit, "raise `limit`")
     }
 
     #[tool(description = "List all indexed packages, optionally filtered by kind")]
@@ -414,14 +545,14 @@ impl ShireService {
         tracing::debug!(tool = "list_packages", kind = ?params.kind);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::list_packages(&conn, params.kind.as_deref())
+        let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
+        let results = queries::list_packages(&conn, params.kind.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
     }
 
     #[tool(
-        description = "Find functions, classes, types, methods by name or signature. Use instead of Grep for 'where is function X?' or 'what matches pattern Y?'. Omit query with a package filter to list all symbols in that package."
+        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Use instead of Grep for 'where is function X?'. Omit query with a package filter to list the start of that package in (file, line) order."
     )]
     fn search_symbols(
         &self,
@@ -429,7 +560,7 @@ impl ShireService {
     ) -> Result<CallToolResult, ErrorData> {
         tracing::debug!(tool = "search_symbols", query = ?params.query, package = ?params.package, kind = ?params.kind, limit = ?params.limit);
         self.maybe_rebuild();
-        let limit = params.limit.unwrap_or(20);
+        let limit = Self::resolve_limit(params.limit, 20);
         let query = params.query.as_deref().unwrap_or("").trim();
         if query.is_empty() {
             // No query: list all symbols in a package
@@ -442,10 +573,16 @@ impl ShireService {
                 }
             };
             let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-            let results = queries::get_package_symbols(&conn, pkg, params.kind.as_deref())
+            let results = queries::get_package_symbols(&conn, pkg, params.kind.as_deref(), limit)
                 .map_err(|e| Self::mcp_err(e.to_string()))?;
-            let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            // Ordered by (file_path, line), so a capped listing is the first
+            // `limit` symbols of the alphabetically-first files — say so.
+            return Self::json_result(
+                &results,
+                limit,
+                "this is the start of the package in (file, line) order; \
+                 narrow with `kind` or `get_file_symbols`, or raise `limit`",
+            );
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
 
@@ -458,8 +595,11 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(
+            &results,
+            limit,
+            "raise `limit` or use a more specific query",
+        )
     }
 
     #[tool(
@@ -472,10 +612,11 @@ impl ShireService {
         tracing::debug!(tool = "get_file_symbols", file_path = %params.file_path, kind = ?params.kind);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let results = queries::get_file_symbols(&conn, &params.file_path, params.kind.as_deref())
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
+        let results =
+            queries::get_file_symbols(&conn, &params.file_path, params.kind.as_deref(), limit)
+                .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
     }
 
     #[tool(
@@ -488,11 +629,11 @@ impl ShireService {
         tracing::debug!(tool = "list_package_files", package = %params.package, extension = ?params.extension);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
         let results =
-            queries::list_package_files(&conn, &params.package, params.extension.as_deref())
+            queries::list_package_files(&conn, &params.package, params.extension.as_deref(), limit)
                 .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&results, limit, "raise `limit` or filter by `extension`")
     }
 
     #[tool(description = "Index build metadata: timestamp, git commit, counts")]
@@ -506,7 +647,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find files by path or name. Use instead of Glob/find for locating files. Useful for 'middleware', 'proto files', or files in a specific directory."
+        description = "Find files by path or name, matching each whitespace-separated token by prefix against the path's own tokens (path components are not split further). Use instead of Glob/find for locating files."
     )]
     fn search_files(
         &self,
@@ -520,15 +661,20 @@ impl ShireService {
             )]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = Self::resolve_limit(params.limit, 20);
         let results = queries::search_files(
             &conn,
             &params.query,
             params.package.as_deref(),
             params.extension.as_deref(),
+            limit,
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(
+            &results,
+            limit,
+            "raise `limit` or use a more specific query",
+        )
     }
 
     #[tool(
@@ -546,11 +692,14 @@ impl ShireService {
             )]));
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let limit = params.limit.unwrap_or(20);
+        let limit = Self::resolve_limit(params.limit, 20);
         let results = queries::search_docs(&conn, &params.query, params.package.as_deref(), limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&results).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(
+            &results,
+            limit,
+            "raise `limit` or use a more specific query",
+        )
     }
 
     #[tool(
@@ -694,10 +843,10 @@ impl ShireService {
         tracing::debug!(tool = "schema_consumers", path = %args.path);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let rows = queries::query_schema_consumers(&conn, &args.path)
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_schema_consumers(&conn, &args.path, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&rows, limit, "raise `limit`")
     }
 
     #[tool(
@@ -710,10 +859,10 @@ impl ShireService {
         tracing::debug!(tool = "generated_from", path = %args.path);
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-        let rows = queries::query_generated_from(&conn, &args.path)
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_generated_from(&conn, &args.path, limit)
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&rows, limit, "raise `limit`")
     }
 }
 
@@ -1066,6 +1215,7 @@ mod tests {
         let svc = ShireService::new(conn, None);
         let args = SchemaConsumersArgs {
             path: "a.proto".into(),
+            limit: None,
         };
         let r = svc.schema_consumers(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {
@@ -1090,6 +1240,260 @@ mod tests {
         );
     }
 
+    /// Text of the first content block of a tool result.
+    fn result_text(r: &CallToolResult) -> String {
+        match &r.content.first().expect("content").raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    /// A service over a real (on-disk) schema, with `n` symbols in one
+    /// package spread over `n` files.
+    fn service_with_symbols(dir: &std::path::Path, n: usize) -> ShireService {
+        let path = dir.join("t.db");
+        {
+            let conn = crate::db::open_or_create(&path).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('pkg', 'pkg', 'npm')",
+                [],
+            )
+            .unwrap();
+            for i in 0..n {
+                conn.execute(
+                    "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                     VALUES ('pkg', ?1, 'function', ?2, 1, 'handle thing')",
+                    rusqlite::params![format!("handleThing{i}"), format!("pkg/src/f{i:03}.ts")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO files (path, package, extension, size_bytes)
+                     VALUES (?1, 'pkg', 'ts', 10)",
+                    [format!("pkg/src/f{i:03}.ts")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO symbols (package, name, kind, file_path, line)
+                     VALUES ('pkg', ?1, 'function', 'pkg/src/big.ts', ?2)",
+                    rusqlite::params![format!("sym{i}"), i as i64],
+                )
+                .unwrap();
+            }
+        }
+        let conn = crate::db::open_or_create(&path).unwrap();
+        ShireService::new(conn, None)
+    }
+
+    /// MCP-1: `search_symbols` with a package filter and no query used to
+    /// ignore `limit` entirely and serialize the whole package.
+    #[test]
+    fn test_search_symbols_package_listing_honors_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), 300);
+
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(5),
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 5, "limit must be honored");
+        // …and the model must be told the list was cut.
+        assert_eq!(r.content.len(), 2, "expected a truncation note");
+        let note = match &r.content[1].raw {
+            RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(note.contains("first 5 results"), "got {note}");
+
+        // Default (no limit given) is 20, not "everything".
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: None,
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
+
+        // The hard ceiling wins over an absurd request.
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(100_000),
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            queries::MAX_ROWS as usize,
+            "capped at MAX_ROWS"
+        );
+    }
+
+    /// MCP-5 / DB-5: the other list-returning tools are bounded too.
+    #[test]
+    fn test_list_tools_are_bounded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), 300);
+
+        let len = |r: &CallToolResult| -> usize {
+            serde_json::from_str::<serde_json::Value>(&result_text(r))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+        };
+
+        let r = svc
+            .list_package_files(Parameters(ListPackageFilesParams {
+                package: "pkg".into(),
+                extension: None,
+                limit: None,
+            }))
+            .unwrap();
+        assert_eq!(len(&r), queries::DEFAULT_LIST_LIMIT as usize);
+
+        let r = svc
+            .get_file_symbols(Parameters(GetFileSymbolsParams {
+                file_path: "pkg/src/big.ts".into(),
+                kind: None,
+                limit: Some(7),
+            }))
+            .unwrap();
+        assert_eq!(len(&r), 7);
+
+        let r = svc
+            .list_packages(Parameters(ListParams {
+                kind: None,
+                limit: Some(1),
+            }))
+            .unwrap();
+        assert_eq!(len(&r), 1);
+
+        let r = svc
+            .search_files(Parameters(SearchFilesParams {
+                query: "pkg".into(),
+                package: None,
+                extension: None,
+                limit: Some(3),
+            }))
+            .unwrap();
+        assert_eq!(len(&r), 3);
+
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: Some("handle".into()),
+                package: None,
+                kind: None,
+                limit: Some(4),
+            }))
+            .unwrap();
+        assert_eq!(len(&r), 4, "prefix query still respects limit");
+    }
+
+    /// `limit: 0` is a common client encoding for "no cap"; it must not
+    /// come back as a single row plus a "showing the first 1 results" note.
+    #[test]
+    fn test_zero_limit_falls_back_to_default() {
+        assert_eq!(ShireService::resolve_limit(Some(0), 20), 20);
+        assert_eq!(ShireService::resolve_limit(None, 20), 20);
+        assert_eq!(ShireService::resolve_limit(Some(5), 20), 5);
+        assert_eq!(
+            ShireService::resolve_limit(Some(u32::MAX), 20),
+            queries::MAX_ROWS
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), 50);
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(0),
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
+    }
+
+    /// A short list gets no truncation note — the note must mean something.
+    #[test]
+    fn test_no_truncation_note_when_under_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), 3);
+        let r = svc
+            .list_packages(Parameters(ListParams {
+                kind: None,
+                limit: None,
+            }))
+            .unwrap();
+        assert_eq!(r.content.len(), 1, "no note for a complete list");
+    }
+
+    /// MCP-2: concurrent tool calls under `serve --root` all saw
+    /// `is_stale() == true` and each started its own build against the same
+    /// SQLite file; the losers failed with "database is locked" and answered
+    /// -32603. The rebuild lock must collapse them into one build.
+    #[test]
+    fn test_concurrent_rebuilds_run_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"p","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/a.ts"),
+            "export function verifyJwtToken(): string { return \"t\"; }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/index"), "x").unwrap();
+
+        let svc = make_service_with_ctx(root.clone());
+        assert!(svc.is_stale(), "no index yet");
+
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| svc.maybe_rebuild());
+            }
+        });
+
+        assert_eq!(
+            svc.rebuild_count(),
+            1,
+            "six racing callers must produce exactly one build"
+        );
+        assert!(!svc.is_stale(), "index is fresh after the rebuild");
+
+        // The winner's connection was swapped in, so every caller can query.
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: Some("jwt".into()),
+                package: None,
+                kind: None,
+                limit: None,
+            }))
+            .unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(
+            rows.as_array().unwrap().len(),
+            1,
+            "sub-token search over the freshly built index"
+        );
+    }
+
     #[test]
     fn test_generated_from_empty_db() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1097,6 +1501,7 @@ mod tests {
         let svc = ShireService::new(conn, None);
         let args = GeneratedFromArgs {
             path: "a.pb.go".into(),
+            limit: None,
         };
         let r = svc.generated_from(Parameters(args)).unwrap();
         let text = match &r.content.first().expect("content").raw {

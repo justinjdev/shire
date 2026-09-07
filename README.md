@@ -179,7 +179,7 @@ This creates:
 shire init --global --no-hook
 ```
 
-With `--no-hook`, the MCP server starts with `--root .` and checks whether the index is stale before each query by comparing `.git/index` mtime against the last build timestamp. If stale, it rebuilds automatically. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
+With `--no-hook`, the MCP server starts with `--root .` and checks before each query whether the index may be stale (the Git index's mtime against the last build, resolved through the gitdir pointer in a linked worktree; "can't tell" counts as stale). If so it rebuilds — the rebuild itself compares file mtimes and SHA-256 content hashes, so it is cheap when nothing changed and correct when something did. No PostToolUse hook is installed. This is simpler but may add latency to the first query after changes.
 
 **Per-repo setup** — for project-level config (creates `shire.toml` and `.claude/settings.local.json`):
 

@@ -37,7 +37,7 @@ This produces separate databases like:
 
 ### Shared vs separate databases
 
-If your `db_path` does **not** include `{worktree}`, all worktrees share the same database. This is fine for read-only use but means concurrent builds from different worktrees will conflict.
+If your `db_path` does **not** include `{worktree}`, all worktrees share the same database. This is fine for read-only use; concurrent builds from different worktrees serialize on the database (each connection waits up to 5 seconds for the other writer), and a build that still cannot get the lock fails rather than corrupting anything.
 
 Including `{worktree}` in the path gives each worktree its own database, which is the recommended setup.
 

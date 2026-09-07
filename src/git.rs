@@ -59,18 +59,7 @@ pub fn worktree_info(repo_root: &Path) -> WorktreeInfo {
 /// A linked worktree's `.git` file contains a line like:
 ///   gitdir: /path/to/main-repo/.git/worktrees/<worktree-name>
 fn parse_linked_worktree(dot_git_file: &Path, repo_root: &Path) -> Option<WorktreeInfo> {
-    let content = std::fs::read_to_string(dot_git_file).ok()?;
-    let gitdir_line = content.trim();
-    let gitdir_path = gitdir_line.strip_prefix("gitdir: ")?;
-
-    // Resolve relative gitdir paths against repo_root
-    let gitdir = if Path::new(gitdir_path).is_absolute() {
-        PathBuf::from(gitdir_path)
-    } else {
-        repo_root.join(gitdir_path)
-    };
-
-    let gitdir = gitdir.canonicalize().ok()?;
+    let gitdir = resolve_gitdir_pointer(dot_git_file, repo_root)?;
 
     // Expected structure: <main-repo>/.git/worktrees/<name>
     // Walk up: gitdir parent = "worktrees", grandparent = ".git", great-grandparent = main repo
@@ -93,6 +82,45 @@ fn parse_linked_worktree(dot_git_file: &Path, repo_root: &Path) -> Option<Worktr
         worktree_name: worktree_id,
         main_root: Some(main_repo_root.to_path_buf()),
     })
+}
+
+/// Resolve the path of the repository's Git index file for `repo_root`.
+///
+/// In the primary working tree that is `<root>/.git/index`. In a **linked
+/// worktree** `.git` is a *file* holding a `gitdir:` pointer, and the index
+/// lives at `<main>/.git/worktrees/<id>/index` — `<root>/.git/index` does
+/// not exist at all, so callers that stat it directly conclude "no git
+/// index" and, if they treat that as "not stale", freeze forever.
+///
+/// Returns `None` when `repo_root` is not a Git working tree, or when the
+/// resolved index file does not exist (a repository with nothing staged
+/// yet). Callers must treat `None` as "unknown", never as "unchanged".
+pub fn index_path(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else if dot_git.is_file() {
+        resolve_gitdir_pointer(&dot_git, repo_root)?
+    } else {
+        return None;
+    };
+
+    let index = git_dir.join("index");
+    index.exists().then_some(index)
+}
+
+/// Read a `.git` file's `gitdir: <path>` pointer and return the directory it
+/// names (resolved against `repo_root` when relative).
+fn resolve_gitdir_pointer(dot_git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(dot_git_file).ok()?;
+    let gitdir_path = content.trim().strip_prefix("gitdir: ")?;
+    let gitdir = if Path::new(gitdir_path).is_absolute() {
+        PathBuf::from(gitdir_path)
+    } else {
+        repo_root.join(gitdir_path)
+    };
+    gitdir.canonicalize().ok()
 }
 
 fn dir_name(path: &Path) -> String {
@@ -242,6 +270,51 @@ mod tests {
 
         // The two worktree names must differ
         assert_ne!(linked.worktree_name, primary.worktree_name);
+    }
+
+    #[test]
+    fn test_index_path_main_working_tree() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(index_path(&repo), None, "no index file staged yet");
+        std::fs::write(repo.join(".git").join("index"), "x").unwrap();
+        assert_eq!(index_path(&repo), Some(repo.join(".git").join("index")));
+    }
+
+    #[test]
+    fn test_index_path_linked_worktree() {
+        // INDEX-12: a linked worktree has no <root>/.git/index — the index
+        // lives under the main repo's .git/worktrees/<id>/.
+        let dir = TempDir::new().unwrap();
+        let main_repo = dir.path().join("my-repo");
+        let wt_git_dir = main_repo.join(".git").join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_git_dir).unwrap();
+        std::fs::write(wt_git_dir.join("index"), "x").unwrap();
+
+        let wt_dir = dir.path().join("feat");
+        std::fs::create_dir(&wt_dir).unwrap();
+        std::fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", wt_git_dir.display()),
+        )
+        .unwrap();
+
+        assert!(
+            !wt_dir.join(".git/index").exists(),
+            "the naive path must not exist — that is the bug"
+        );
+        let resolved = index_path(&wt_dir).expect("linked worktree index must resolve");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            wt_git_dir.join("index").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_index_path_non_git_directory() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(index_path(dir.path()), None);
     }
 
     #[test]

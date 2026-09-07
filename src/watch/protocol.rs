@@ -122,6 +122,28 @@ const READONLY_COMMANDS: &[&str] = &[
     "gh run view",
 ];
 
+/// Commands that wrap or chain into another, arbitrary command. Several of these
+/// (`find`, `xargs`, `env`, `npx`) are *often* used read-only, but just as easily wrap
+/// something mutating (`find . -exec rm {} \;`, `echo f | xargs rm`, `env FOO=1 mv a
+/// b`, `npx <codegen>`), so a segment starting with one of these is never treated as
+/// read-only regardless of what it's wrapping — this overrides any match against
+/// READONLY_COMMANDS.
+const WRAPPER_COMMANDS: &[&str] = &[
+    "env", "xargs", "find", "npx", "sudo", "nohup", "eval", "bash -c", "sh -c",
+];
+
+/// Whether a single command segment could have a side effect that a prefix match
+/// against READONLY_COMMANDS can't see: shell output redirection (creates/overwrites a
+/// file) or command substitution (runs an arbitrary embedded command, which could
+/// itself mutate — `echo $(protoc --go_out=. x.proto)` looks read-only by prefix alone).
+fn segment_has_hidden_side_effect(segment: &str) -> bool {
+    // Covers `>` and `>>`. Deliberately not narrowed to exclude fd-duplication forms
+    // like `2>&1` — this filter is meant to fail toward triggering a rebuild, so an
+    // occasional harmless extra rebuild from stderr redirection is an acceptable
+    // trade-off for never missing a real file write.
+    segment.contains('>') || segment.contains("$(") || segment.contains('`')
+}
+
 impl HookInput {
     /// Parse Claude Code hook JSON from stdin.
     /// Returns None if parsing fails (non-fatal — caller falls back to empty file list).
@@ -134,7 +156,10 @@ impl HookInput {
 
     /// Whether this hook event should trigger a rebuild signal.
     /// For Bash: returns false only for commands known to be read-only.
-    /// Unknown commands default to triggering a rebuild (safe default).
+    /// Unknown commands default to triggering a rebuild (safe default), and so does
+    /// anything this filter can't fully account for (redirections, command
+    /// substitution, wrapper commands) — see `segment_has_hidden_side_effect` and
+    /// `WRAPPER_COMMANDS`.
     pub fn should_rebuild(&self) -> bool {
         if self.tool_name.as_deref() != Some("Bash") {
             return true;
@@ -145,14 +170,21 @@ impl HookInput {
             None => return true,
         };
 
-        // Check every segment of piped/chained commands.
-        // If ALL are read-only, skip. If ANY is unknown, rebuild.
-        !cmd.split(&['|', ';'][..])
+        // Check every segment of piped/chained/sequenced commands.
+        // If ALL are read-only, skip. If ANY is unknown (or looks risky), rebuild.
+        // Splitting on '|' also splits '||' (into two segments plus an empty one that
+        // gets filtered out), so a single char class covers both pipe and or-chains;
+        // '\n' covers multi-line Bash strings, which Claude Code commonly produces.
+        !cmd.split(['\n', '|', ';'])
             .map(|s| s.trim().trim_start_matches('('))
             // split on && (crude: split on & then skip empty segments)
             .flat_map(|s| s.split("&&").map(|s| s.trim()))
             .filter(|s| !s.is_empty())
-            .all(|segment| READONLY_COMMANDS.iter().any(|ro| segment.starts_with(ro)))
+            .all(|segment| {
+                !segment_has_hidden_side_effect(segment)
+                    && !WRAPPER_COMMANDS.iter().any(|w| segment.starts_with(w))
+                    && READONLY_COMMANDS.iter().any(|ro| segment.starts_with(ro))
+            })
     }
 }
 
@@ -225,5 +257,69 @@ mod tests {
     #[test]
     fn test_bash_no_command_rebuilds() {
         assert!(hook("Bash", None).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_output_redirection_rebuilds() {
+        // A redirection after a "read-only" leading command still writes a file.
+        for cmd in [
+            "echo generated > out.rs",
+            "cat template > gen.rs",
+            "printf 'x' >> a.rs",
+            "cat a.rs 2>&1 > out.log",
+        ] {
+            assert!(
+                hook("Bash", Some(cmd)).should_rebuild(),
+                "expected rebuild for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_wrapper_commands_rebuild() {
+        for cmd in [
+            r#"find . -name "*.tmp" -exec rm {} \;"#,
+            "echo src/gen.rs | xargs rm",
+            "env FOO=bar mv a.rs b.rs",
+            "npx tsc --outDir gen",
+            "sudo rm -rf build",
+            "nohup ./codegen.sh &",
+            r#"eval "$CMD""#,
+            r#"bash -c "mv a.rs b.rs""#,
+            r#"sh -c "mv a.rs b.rs""#,
+        ] {
+            assert!(
+                hook("Bash", Some(cmd)).should_rebuild(),
+                "expected rebuild for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_newline_separated_commands_rebuild() {
+        assert!(hook("Bash", Some("cat a.rs\nmv b.rs c.rs")).should_rebuild());
+        // The mutating line first should also be caught (order shouldn't matter).
+        assert!(hook("Bash", Some("mv b.rs c.rs\ncat a.rs")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_or_chain_with_mutating_segment_rebuilds() {
+        assert!(hook("Bash", Some("false || rm -rf build")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_or_chain_all_readonly_skips() {
+        assert!(!hook("Bash", Some("git status || true")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_command_substitution_rebuilds() {
+        assert!(hook("Bash", Some("echo $(protoc --go_out=. x.proto)")).should_rebuild());
+        assert!(hook("Bash", Some("echo `codegen`")).should_rebuild());
+    }
+
+    #[test]
+    fn test_bash_wrapper_commands_still_flagged_when_piped() {
+        assert!(hook("Bash", Some("git log | xargs -I{} echo {}")).should_rebuild());
     }
 }

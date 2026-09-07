@@ -122,10 +122,14 @@ fn read_proc_state(pid: u32) -> Option<char> {
 ///    renamed on download, or a copy kept side by side during an upgrade. Does not
 ///    require the file to exist on disk, so it still works after the on-disk binary was
 ///    replaced (see the `" (deleted)"` handling below). Deliberately requires the `-`
-///    separator rather than a bare prefix match: without it, an unrelated binary that
-///    merely happens to start with "shire" (e.g. a `shire-metrics-exporter` tool from an
-///    unrelated codebase) would be misidentified as shire's own daemon if its PID were
-///    ever reused for one after a crash/reboot.
+///    separator rather than a bare prefix match: without it, an unrelated binary whose
+///    name merely *starts with* "shire" with no separator at all (e.g. `shireling` or
+///    `shirecheck`, as opposed to a hyphenated `shire-<something>`) would be
+///    misidentified as shire's own daemon if its PID were ever reused for one after a
+///    crash/reboot. Note this does NOT rule out a same-uid tool that happens to be
+///    named `shire-<anything>` (e.g. `shire-metrics-exporter`) — that residual case is
+///    left to the separate cmdline check in `check_pid_ownership`, which additionally
+///    requires the literal argv tokens "watch" and "--foreground".
 /// 2. It resolves (after canonicalization) to the exact same file as this process's own
 ///    `std::env::current_exe()` — covers a wrapper name that doesn't start with `shire`
 ///    at all, so long as it truly is the same binary that would be spawned by
@@ -639,8 +643,18 @@ mod tests {
         // long as it resolves to the exact same on-disk file as this test binary's own
         // current_exe() — the fallback path start_daemon relies on implicitly, since it
         // always re-execs current_exe().
+        //
+        // Symlink to a name that deliberately does NOT start with "shire" at all: under
+        // `cargo test`, current_exe() itself is `.../deps/shire-<hash>`, whose basename
+        // *does* start with "shire-" and would satisfy the basename check on its own —
+        // asserting on current_exe()'s path directly would pass without ever
+        // exercising the canonicalize()/current_exe() identity fallback this test is
+        // named for.
         let current = std::env::current_exe().unwrap();
-        assert!(exe_path_is_shire(current.to_str().unwrap()));
+        let dir = TempDir::new().unwrap();
+        let wrapper = dir.path().join("totally-different-name");
+        std::os::unix::fs::symlink(&current, &wrapper).unwrap();
+        assert!(exe_path_is_shire(wrapper.to_str().unwrap()));
     }
 
     // --- ownership_from_checks: pure tri-state decision logic ---

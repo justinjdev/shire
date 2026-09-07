@@ -65,7 +65,9 @@ basename starting with `shire-` (a versioned install like `shire-v0.7`, a rename
 download), or the exact same file as the `shire` binary currently invoking
 `--stop`/`--status` — so a renamed or versioned binary is recognized correctly rather
 than being refused and having its live socket deleted out from under it, while an
-unrelated binary that merely happens to start with "shire" is not.
+unrelated binary whose name merely starts with "shire" with no separator (e.g.
+`shireling`) is not. This is combined with a cmdline check requiring the literal argv
+tokens "watch" and "--foreground" before anything is signalled.
 
 ## Smart filtering
 

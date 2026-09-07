@@ -47,7 +47,7 @@ Median latency over 100 iterations per query:
 | `search_files("test")` | 0.07ms | 0.60ms | 1.99ms |
 | `list_packages(None)` | 0.11ms | 0.01ms | 0.01ms |
 
-All queries use SQLite FTS5 full-text search with `unicode61` tokenizer and prefix indexes. Query latency depends primarily on result set size, not total index size.
+All queries use SQLite FTS5 full-text search with the `unicode61` tokenizer. `packages_fts` and `docs_fts` carry a `prefix='2,3'` index; `symbols_fts` and `files_fts` deliberately do not (a prefix query there walks a term range instead). Query latency depends primarily on result set size, not total index size.
 
 ## Reproducing benchmarks
 

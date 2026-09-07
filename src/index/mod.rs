@@ -1297,7 +1297,17 @@ fn single_pass_extract(
 ) -> Result<SinglePassExtract> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
-        return Ok(SinglePassExtract::empty());
+        // Every package path here is the directory of a manifest this build
+        // just walked, so it existed moments ago. If it is gone (or its
+        // parent stopped being readable — a network mount blinking out, a
+        // permission change), that is a failure, not "this package has no
+        // source files": returning an empty result would make
+        // `write_package_extract_results` delete every symbol, reference and
+        // file hash the package has and still report exit code 0.
+        anyhow::bail!(
+            "package directory {} is missing or not readable",
+            package_dir.display()
+        );
     }
 
     let all_exts = symbols::walker::all_extensions();
@@ -2198,6 +2208,23 @@ fn write_pending_source_recheck(conn: &Connection, pkgs: &HashSet<String>) -> Re
     Ok(())
 }
 
+/// The packages that still owe a source hash pass after an extraction run.
+///
+/// A flagged package that was actually re-checked is done; one whose walk
+/// failed is not, and dropping its flag would strand it: the change that set
+/// the flag moved neither an mtime nor a path, so nothing on disk can ever
+/// surface it again.
+fn pending_after_extraction(
+    flagged: &HashSet<String>,
+    failures: &[(String, String)],
+) -> HashSet<String> {
+    flagged
+        .iter()
+        .filter(|pkg| failures.iter().any(|(failed, _)| failed == *pkg))
+        .cloned()
+        .collect()
+}
+
 /// Drop the pending set. Called from the extraction transaction, so it
 /// commits atomically with the symbols the re-check produced.
 fn clear_pending_source_recheck(conn: &Connection) -> Result<()> {
@@ -2876,15 +2903,20 @@ struct BuildGuard<'a> {
 
 impl Drop for BuildGuard<'_> {
     fn drop(&mut self) {
-        if self.completed
-            && let Err(e) = crate::db::set_build_in_progress(self.conn, false)
-        {
-            tracing::warn!(%e, "failed to clear build_in_progress marker");
-        }
+        // Restore WAL *before* clearing the marker. The marker's whole job is
+        // to say "the last write this process made was crash-safe"; clearing
+        // it while the journal is still MEMORY would make that very write the
+        // unprotected one, so a kill at that instant could leave a damaged
+        // file that the next open no longer bothers to verify.
         if self.restore_wal
             && let Err(e) = self.conn.execute_batch("PRAGMA journal_mode=WAL;")
         {
             tracing::warn!(%e, "failed to restore WAL journal mode after build");
+        }
+        if self.completed
+            && let Err(e) = crate::db::set_build_in_progress(self.conn, false)
+        {
+            tracing::warn!(%e, "failed to clear build_in_progress marker");
         }
     }
 }
@@ -3242,13 +3274,19 @@ fn build_index_inner(
         // symbol_refs — so MCP tools cannot return silent [] from a
         // partially-repopulated table.
         crate::db::write_references_enabled(&conn, refs_enabled)?;
-        // The packages phase_index_files flagged have now been re-checked,
-        // and that fact commits together with the symbols it produced. If
-        // this transaction never commits, the flags survive for the next
-        // build (see FileIndexResult::changed_packages).
-        clear_pending_source_recheck(&conn)?;
         let mut extract_failures = extract_failures;
         extract_failures.extend(incremental_failures);
+        // The packages phase_index_files flagged have now been re-checked,
+        // and that fact commits together with the symbols it produced — but
+        // only for the ones we actually managed to re-check. A package whose
+        // walk failed still owes a hash pass: its change moved neither an
+        // mtime nor a path, so once the flag is dropped nothing on disk can
+        // ever surface it again. Keep those flagged. If this transaction
+        // never commits, the whole set survives for the next build (see
+        // FileIndexResult::changed_packages).
+        let still_pending =
+            pending_after_extraction(&file_index.changed_packages, &extract_failures);
+        write_pending_source_recheck(&conn, &still_pending)?;
         Ok((count, extract_failures))
     })?;
     if let Some(pb) = pb_sym {
@@ -4437,6 +4475,22 @@ anyhow = "1"
     }
 
     #[test]
+    fn test_single_pass_extract_fails_on_missing_package_dir() {
+        // A missing/unreadable package directory must be an error, not an
+        // empty result: `write_package_extract_results` treats an empty
+        // `Extracted` as authoritative and deletes every symbol, reference
+        // and file hash the package has.
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], true, 0, 0)
+            .err()
+            .expect("a vanished package directory must not look like an empty package");
+        assert!(
+            err.to_string().contains("gone"),
+            "the error must name the directory: {err}"
+        );
+    }
+
+    #[test]
     fn test_single_pass_extract_recovers_symbols_from_non_utf8_file() {
         // SYM-7: a single invalid byte anywhere in the file used to make
         // `String::from_utf8` fail, silently dropping every symbol in the
@@ -5191,6 +5245,24 @@ mod pending_recheck_tests {
             )
             .unwrap();
         assert_eq!(rows, 0, "an empty set must not leave a stale row behind");
+    }
+
+    #[test]
+    fn test_pending_after_extraction_keeps_only_failed_packages() {
+        let flagged = HashSet::from(["a".to_string(), "b".to_string()]);
+        // Nothing failed — the whole set is discharged.
+        assert!(pending_after_extraction(&flagged, &[]).is_empty());
+        // `b` could not be walked, so its flag has to survive: the change
+        // that set it moved no mtime and no path, and the files table
+        // already carries the new state, so nothing else can rediscover it.
+        let failures = vec![("b".to_string(), "Permission denied".to_string())];
+        assert_eq!(
+            pending_after_extraction(&flagged, &failures),
+            HashSet::from(["b".to_string()])
+        );
+        // A failure for a package that was never flagged does not add one.
+        let other = vec![("c".to_string(), "boom".to_string())];
+        assert!(pending_after_extraction(&flagged, &other).is_empty());
     }
 
     #[test]

@@ -28,8 +28,15 @@ pub fn is_corruption_error(err: &rusqlite::Error) -> bool {
     {
         return true;
     }
+    // Fall back to the message only for SQLite's own corruption wording.
+    // A bare `contains("malformed")` would also match unrelated errors (a
+    // malformed FTS MATCH expression, a malformed JSON value), and
+    // `open_or_create` responds to a corruption verdict by DELETING the
+    // database — so this test has to name the exact phrases.
     let text = err.to_string().to_ascii_lowercase();
-    text.contains("malformed") || text.contains("file is not a database")
+    text.contains("malformed database schema")
+        || text.contains("database disk image is malformed")
+        || text.contains("file is not a database")
 }
 
 fn sqlite_error_code(err: &rusqlite::Error) -> Option<rusqlite::ErrorCode> {
@@ -1130,6 +1137,27 @@ mod open_tests {
             format!("{err:#}").contains("shire build"),
             "the error must name the recovery command: {err:#}"
         );
+    }
+
+    #[test]
+    fn test_ordinary_sql_errors_are_not_corruption() {
+        // `open_or_create` deletes the database when it sees corruption, so
+        // the message-based fallback must not fire on unrelated errors that
+        // merely contain the word "malformed".
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let conn = open_or_create(&path).unwrap();
+        let err = conn
+            .execute("SELECT * FROM symbols_fts WHERE symbols_fts MATCH '\"'", [])
+            .expect_err("a bad FTS query must fail");
+        assert!(
+            !is_corruption_error(&err),
+            "an FTS/SQL error must not be read as corruption: {err}"
+        );
+        let err = conn
+            .execute("SELECT * FROM no_such_table", [])
+            .expect_err("a missing table must fail");
+        assert!(!is_corruption_error(&err));
     }
 
     #[test]

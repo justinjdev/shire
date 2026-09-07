@@ -60,19 +60,33 @@ fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
     // create_new failing next.
     let _ = fs::remove_file(path);
 
-    let mut f = fs::OpenOptions::new()
+    let open_result = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "Failed to create {} — a file or symlink reappeared there, or a \
-                 concurrent process is racing this write",
+        .open(path);
+    let mut f = match open_result {
+        Ok(f) => f,
+        // remove_file() above can't remove a directory, so AlreadyExists here most
+        // often means one is sitting at `path` — give a specific, actionable message
+        // instead of a raw io::Error and a backtrace.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                anyhow::bail!(
+                    "Refusing to write {}: a directory exists at that path. Remove it \
+                     manually and re-run.",
+                    path.display()
+                );
+            }
+            anyhow::bail!(
+                "Failed to create {}: a file or symlink reappeared there, or a \
+                 concurrent process is racing this write.",
                 path.display()
-            )
-        })?;
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to write {}", path.display())),
+    };
     f.write_all(content.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -82,6 +96,54 @@ fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
 fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
     let _ = fs::remove_file(path);
     fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Ensure `dir` (a path under `root`, e.g. `<root>/.claude` or `<root>/.claude/rules`)
+/// exists as a real directory, confined to `root`: every path component from `root`
+/// down is lstat'd (not stat'd) and required to be either absent — in which case it's
+/// created fresh with `create_dir`, one level at a time — or already a plain
+/// directory. Refuses with a clear error if any component is a symlink or exists as
+/// something else (a file, say).
+///
+/// `write_with_mode`'s O_NOFOLLOW only guards the *final* component of a write path; a
+/// hostile repo committing `.claude` itself (or `.claude/rules`) as a symlink to a
+/// directory outside the repo would otherwise have the settings.json / rules/shire.md
+/// write silently follow it there, since a plain `create_dir_all` happily walks
+/// through an existing symlink to reach (and create files under) wherever it points.
+fn create_dir_confined(root: &Path, dir: &Path) -> Result<()> {
+    let rel = dir
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not under {}", dir.display(), root.display()))?;
+
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Refusing to write into {}: it is a symlink, not a plain directory. \
+                     Remove it (or point it at a real directory yourself) and re-run.",
+                    current.display()
+                );
+            }
+            Ok(meta) if !meta.is_dir() => {
+                anyhow::bail!(
+                    "Refusing to write into {}: it exists but is not a directory.",
+                    current.display()
+                );
+            }
+            Ok(_) => {} // already a real directory
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .with_context(|| format!("Failed to create directory {}", current.display()))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to stat {}", current.display()));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 const CLAUDE_MD_LINE: &str = "When searching code, use Shire MCP tools (search_symbols, search_files, explore) instead of Grep/Glob.";
@@ -392,8 +454,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 3. Write hooks to .claude/settings.json (only in hook mode)
     if opts.use_hook {
         let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir)
-            .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
+        create_dir_confined(root, &claude_dir)?;
         let settings_path = claude_dir.join("settings.json");
         patch_claude_hooks(&settings_path, ".claude/settings.json", "shire init")?;
     }
@@ -401,6 +462,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 4. Write .claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = root.join(".claude/rules");
+        create_dir_confined(root, &rules_dir)?;
         write_rules_file(&rules_dir, ".claude/rules/shire.md", opts.refs_enabled)?;
     }
 
@@ -1655,6 +1717,121 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the symlink must have been replaced by a real file"
+        );
+    }
+
+    // --- round-3 findings: symlinked .claude confinement, and a clear error when a
+    // directory sits at a write's target path ---
+
+    #[test]
+    #[cfg(unix)]
+    fn run_init_refuses_a_symlinked_claude_directory() {
+        // A hostile repo commits `.claude` itself as a symlink to a directory outside
+        // the repo; O_NOFOLLOW on the final write component alone doesn't stop this,
+        // since create_dir_all (or a plain write) happily walks through an existing
+        // symlink to reach wherever it points.
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude")).unwrap();
+
+        let result = run_init(repo.path(), false, true);
+
+        assert!(
+            result.is_err(),
+            "init must refuse rather than write through the symlinked .claude"
+        );
+        assert!(
+            !outside.path().join("settings.json").exists(),
+            "settings.json must not be created outside the repo via the symlink"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_init_refuses_a_symlinked_claude_rules_directory() {
+        // .claude itself is a real directory, but .claude/rules is a symlink outside
+        // the repo — the confinement check walks every component, not just the last.
+        // no_hook=true keeps step 3 (which would otherwise create .claude first) out
+        // of the way, so this specifically exercises step 4's own confinement check.
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude/rules")).unwrap();
+
+        let result = run_init(repo.path(), true, true);
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("shire.md").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_creates_missing_directories() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let rules_dir = repo.path().join(".claude/rules");
+
+        create_dir_confined(repo.path(), &rules_dir).unwrap();
+
+        assert!(rules_dir.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(repo.path().join(".claude"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_is_idempotent_on_existing_real_directories() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let claude_dir = repo.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        create_dir_confined(repo.path(), &claude_dir).unwrap();
+        assert!(claude_dir.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_refuses_a_symlinked_component() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude")).unwrap();
+
+        let result = create_dir_confined(repo.path(), &repo.path().join(".claude"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_refuses_a_non_directory_component() {
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::write(repo.path().join(".claude"), "not a directory").unwrap();
+
+        let result = create_dir_confined(repo.path(), &repo.path().join(".claude"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_reports_a_clear_error_for_a_directory_at_the_target_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("mcp.json.tmp");
+        std::fs::create_dir_all(target.join("keepme")).unwrap();
+        std::fs::write(target.join("keepme/data"), "IMPORTANT").unwrap();
+
+        let err = write_with_mode(&target, "content", 0o600).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("directory exists") && msg.contains(&target.display().to_string()),
+            "expected a clear directory-specific message, got: {msg}"
+        );
+        // The directory and its contents must survive untouched.
+        assert_eq!(
+            std::fs::read_to_string(target.join("keepme/data")).unwrap(),
+            "IMPORTANT"
         );
     }
 }

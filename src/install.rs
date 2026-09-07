@@ -58,19 +58,33 @@ fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
     // create_new failing next.
     let _ = fs::remove_file(path);
 
-    let mut f = fs::OpenOptions::new()
+    let open_result = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .mode(mode)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "Failed to create {} — a file or symlink reappeared there, or a \
-                 concurrent process is racing this write",
+        .open(path);
+    let mut f = match open_result {
+        Ok(f) => f,
+        // remove_file() above can't remove a directory, so AlreadyExists here most
+        // often means one is sitting at `path` — give a specific, actionable message
+        // instead of a raw io::Error and a backtrace.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                anyhow::bail!(
+                    "Refusing to write {}: a directory exists at that path. Remove it \
+                     manually and re-run.",
+                    path.display()
+                );
+            }
+            anyhow::bail!(
+                "Failed to create {}: a file or symlink reappeared there, or a \
+                 concurrent process is racing this write.",
                 path.display()
-            )
-        })?;
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to write {}", path.display())),
+    };
     f.write_all(content.as_bytes())
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())

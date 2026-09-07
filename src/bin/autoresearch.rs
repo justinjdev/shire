@@ -254,7 +254,8 @@ fn run_build_benchmark(repos: &[PathBuf]) {
             );
 
             let start = Instant::now();
-            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
+            if let Err(e) =
+                shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path))
             {
                 eprintln!(
                     "error: build_index failed on {} iteration {}: {}",
@@ -340,7 +341,9 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
         cleanup_bench_db(&db_path);
         eprintln!("[incremental] initial full build...");
         let start = Instant::now();
-        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+        if let Err(e) =
+            shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path))
+        {
             eprintln!("error: initial build failed for {}: {}", repo_name, e);
             std::process::exit(1);
         }
@@ -360,7 +363,7 @@ fn run_incremental_benchmark(repos: &[PathBuf]) {
 
             let start = Instant::now();
             if let Err(e) =
-                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path))
+                shire::index::build_index_quiet_waiting(repo_dir, &config, false, Some(&db_path))
             {
                 eprintln!(
                     "error: incremental build failed on {} iteration {}: {}",
@@ -440,7 +443,8 @@ fn run_query_benchmark(repos: &[PathBuf]) {
                 repo_name
             );
             let config = shire::config::load_config(repo_dir).unwrap_or_default();
-            if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path))
+            if let Err(e) =
+                shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path))
             {
                 eprintln!("error: build_index failed for {}: {}", repo_name, e);
                 std::process::exit(1);
@@ -665,7 +669,9 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
         cleanup_bench_db(&db_path);
         eprintln!("[lifecycle] initial full build...");
         let start = Instant::now();
-        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+        if let Err(e) =
+            shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path))
+        {
             eprintln!("error: initial build failed: {}", e);
             // Nothing has been written to the repo's source files yet, but the
             // failed build may have left a partial DB behind.
@@ -749,7 +755,7 @@ fn run_lifecycle_benchmark(repos: &[PathBuf]) {
             // Incremental rebuild (simulates maybe_rebuild)
             let start = Instant::now();
             if let Err(e) =
-                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path))
+                shire::index::build_index_quiet_waiting(repo_dir, &config, false, Some(&db_path))
             {
                 eprintln!("error: rebuild failed on cycle {}: {}", cycle + 1, e);
                 cleanup_lifecycle_artifacts(&modifications, &originals, &db_path);
@@ -906,7 +912,9 @@ fn run_quality_checks(repos: &[PathBuf]) {
 
         // Build fresh index
         cleanup_bench_db(&db_path);
-        if let Err(e) = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path)) {
+        if let Err(e) =
+            shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path))
+        {
             eprintln!("FAIL: initial build failed: {}", e);
             total_fail += 1;
             cleanup_bench_db(&db_path);
@@ -1172,7 +1180,7 @@ fn run_quality_checks(repos: &[PathBuf]) {
         // 12. Deterministic: build twice, same symbol count
         drop(conn);
         cleanup_bench_db(&db_path);
-        let _ = shire::index::build_index_quiet(repo_dir, &config, true, Some(&db_path));
+        let _ = shire::index::build_index_quiet_waiting(repo_dir, &config, true, Some(&db_path));
         let conn2 = shire::db::open_readonly(&db_path).expect("failed to open DB");
         let sym_count_2: i64 = conn2
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -1204,7 +1212,8 @@ fn run_quality_checks(repos: &[PathBuf]) {
             let mut originals: HashMap<PathBuf, Vec<u8>> = HashMap::new();
             append_bench_line(&test_file, "\n// quality check\n", &mut originals);
             let incr_ok =
-                shire::index::build_index_quiet(repo_dir, &config, false, Some(&db_path)).is_ok();
+                shire::index::build_index_quiet_waiting(repo_dir, &config, false, Some(&db_path))
+                    .is_ok();
             restore_originals(&originals);
 
             let conn3 = shire::db::open_readonly(&db_path).expect("failed to open DB");

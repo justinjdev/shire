@@ -374,11 +374,15 @@ fn remove_index_db(db_path: &Path, root: &Path) -> Result<()> {
     // passed one of the checks above, and only via the same "never follow a symlink"
     // open each of them gets on their own — they're just as attacker-nameable as
     // db_path, being derived from it by string concatenation.
-    for suffix in &["-wal", "-shm", ".lock"] {
+    for suffix in &["-wal", "-shm"] {
         let mut p = db_path.as_os_str().to_owned();
         p.push(suffix);
         remove_sidecar(&PathBuf::from(p));
     }
+    // The build lock's name comes from `index::lock`, not from a literal here:
+    // a `clean` that spelled it itself would silently stop removing the file
+    // the moment the lock moved.
+    remove_sidecar(&index::lock::lock_path(db_path));
 
     Ok(())
 }

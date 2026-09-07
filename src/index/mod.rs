@@ -215,7 +215,7 @@ fn walk_manifests(
 
     Ok(ManifestWalk {
         manifests,
-        unreadable,
+        unreadable: normalize_unreadable_roots(unreadable),
     })
 }
 
@@ -649,7 +649,7 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
 
     Ok(FileWalk {
         files: files.into_inner().unwrap(),
-        unreadable: unreadable.into_inner().unwrap(),
+        unreadable: normalize_unreadable_roots(unreadable.into_inner().unwrap()),
     })
 }
 
@@ -715,6 +715,37 @@ fn is_under_unreadable(path: &str, unreadable: &[String]) -> bool {
                 && path.starts_with(root.as_str())
                 && path.as_bytes()[root.len()] == b'/')
     })
+}
+
+/// Reduce a walk's raw blind-spot list to the minimal set of roots that covers
+/// it: deduplicated, with any root already covered by a shallower one dropped
+/// (and everything dropped when the repo root itself is in the list).
+///
+/// A walk reports one error per entry it could not read, so a vendored tree
+/// with thousands of unreadable directories yields thousands of entries — and
+/// both `is_under_unreadable` callers scan the whole list once per candidate
+/// path, making the file upsert O(rows × entries). Collapsing the list first
+/// keeps that linear in practice without changing which paths it covers.
+fn normalize_unreadable_roots(mut roots: Vec<String>) -> Vec<String> {
+    if roots.len() < 2 {
+        return roots;
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    // Sorted order puts a covering root immediately before everything it
+    // covers, so one pass keeping only paths not covered by the last kept
+    // root is enough.
+    let mut kept: Vec<String> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if kept
+            .last()
+            .is_some_and(|last| is_under_unreadable(&root, std::slice::from_ref(last)))
+        {
+            continue;
+        }
+        kept.push(root);
+    }
+    kept
 }
 
 /// Drop from `removed` every manifest key under a path the manifest walk could
@@ -858,23 +889,25 @@ fn incremental_upsert_files(
 
     // Delete files no longer present — except those the walk could not see,
     // which are unknown rather than deleted.
-    let missing: Vec<&str> = existing
+    let missing = existing
         .keys()
         .filter(|p| !new_set.contains_key(p.as_str()))
-        .map(|p| p.as_str())
-        .collect();
-    let preserved_rows = if unreadable.is_empty() {
-        0
+        .map(|p| p.as_str());
+    // One pass over the missing paths: each is classified exactly once, so the
+    // blind-spot scan is not repeated per row.
+    let (mut to_delete, mut preserved_rows) = (Vec::new(), 0usize);
+    if unreadable.is_empty() {
+        to_delete.extend(missing);
     } else {
-        missing
-            .iter()
-            .filter(|p| is_under_unreadable(p, unreadable))
-            .count()
-    };
-    let to_delete: Vec<&str> = missing
-        .into_iter()
-        .filter(|p| unreadable.is_empty() || !is_under_unreadable(p, unreadable))
-        .collect();
+        for path in missing {
+            if is_under_unreadable(path, unreadable) {
+                preserved_rows += 1;
+            } else {
+                to_delete.push(path);
+            }
+        }
+    }
+    let to_delete = to_delete;
     for path in &to_delete {
         if let Some((old_pkg, _, _)) = existing.get(*path) {
             mark(old_pkg, &mut changed_packages);
@@ -6189,6 +6222,42 @@ mod incremental_signal_tests {
         assert!(!is_under_unreadable("p2/src/a.ts", &["p1".to_string()]));
         // The repo root itself was unreadable: the walk proved nothing.
         assert!(is_under_unreadable("anything/at/all", &[String::new()]));
+    }
+
+    #[test]
+    fn test_normalize_unreadable_roots_collapses_duplicates_and_nesting() {
+        // A walk reports one error per entry it could not read, so an
+        // unreadable subtree yields one root per directory in it. Both
+        // `is_under_unreadable` callers scan the whole list per candidate
+        // path, so leaving it unreduced makes the file upsert O(rows ×
+        // entries) for exactly the repos that hit this.
+        let roots = normalize_unreadable_roots(vec![
+            "p1/src".to_string(),
+            "p1".to_string(),
+            "p1/src/deep".to_string(),
+            "p1".to_string(),
+            "p10".to_string(),
+            "p2/a".to_string(),
+        ]);
+        assert_eq!(
+            roots,
+            vec!["p1".to_string(), "p10".to_string(), "p2/a".to_string()],
+            "nested and duplicate roots collapse; a sibling with a shared \
+             prefix (p10) does not"
+        );
+        // Coverage is unchanged by the reduction.
+        assert!(is_under_unreadable("p1/src/deep/x.ts", &roots));
+        assert!(is_under_unreadable("p10/x.ts", &roots));
+        assert!(!is_under_unreadable("p2/b/x.ts", &roots));
+    }
+
+    #[test]
+    fn test_normalize_unreadable_roots_keeps_only_the_repo_root() {
+        // The repo root itself was unreadable: it already covers everything.
+        let roots =
+            normalize_unreadable_roots(vec!["p1".to_string(), String::new(), "p2".to_string()]);
+        assert_eq!(roots, vec![String::new()]);
+        assert!(is_under_unreadable("anything/at/all", &roots));
     }
 
     #[test]

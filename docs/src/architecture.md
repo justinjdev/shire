@@ -80,7 +80,7 @@ The `symbol_refs` table stores cross-reference records extracted alongside symbo
 | `file_id` | INTEGER | `REFERENCES files(id) ON DELETE CASCADE` — the file containing the reference |
 | `line` | INTEGER | Line number of the reference |
 | `package` | TEXT | Package the referencing file belongs to (nullable) |
-| `enclosing_symbol` | TEXT | Nearest enclosing function or method (nullable) |
+| `enclosing_symbol` | TEXT | Dot-qualified path of the enclosing scopes, innermost last (`AuthService.login`, `Outer.outer.Inner.run`); nullable |
 
 `file_id` stores a compact reference into `files(id)` rather than a duplicated path string; `phase_index_files` runs before symbol extraction so `files` is already populated when refs are inserted, and read queries JOIN `files` to resolve `file_path`. B-tree indexes on `name`, `file_id`, and `enclosing_symbol` (plus composite and partial covering indexes for the callers/callees/package-scoped queries) support the exact-match lookups used by the `symbol_references`, `symbol_callers`, and `symbol_callees` MCP tools. No FTS5 table — reference queries are exact-name only.
 

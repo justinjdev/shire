@@ -238,25 +238,88 @@ impl ShireService {
             .min(queries::MAX_ROWS)
     }
 
-    /// Serialize rows to JSON, appending a truncation notice when the result
-    /// filled the limit exactly. Without the notice a capped list is
-    /// indistinguishable from a complete one, and the model reasons about a
-    /// package as if it had seen all of it.
+    /// How many rows to actually fetch for a caller-visible `limit`: one
+    /// more, whose presence proves further rows exist. Without the probe row
+    /// a complete list that happens to fill the limit exactly is
+    /// indistinguishable from a capped one, and every such answer carried a
+    /// false "More may exist". At `MAX_ROWS` the probe cannot be fetched (the
+    /// query layer's ceiling absorbs it), so a result filling the ceiling is
+    /// reported as truncated.
+    fn probe_limit(limit: u32) -> u32 {
+        limit.saturating_add(1).min(queries::MAX_ROWS)
+    }
+
+    /// Serialize rows fetched with [`Self::probe_limit`] to JSON, cut back to
+    /// `limit`, telling the model when rows were left behind. Without that a
+    /// capped list is indistinguishable from a complete one and the model
+    /// reasons about a package as if it had seen all of it.
+    ///
+    /// A complete list serializes as the bare JSON array it always was. A
+    /// truncated one serializes as `{"results": [...], "truncated": true,
+    /// ...}` — one content block either way, so concatenating a tool result's
+    /// text blocks still yields parseable JSON.
+    ///
+    /// `narrow_hint` says how to make the result *smaller* (a filter, a
+    /// tighter query); the "raise `limit`" half of the advice is added here,
+    /// and only when raising it can actually help — see
+    /// [`Self::truncation_advice`].
     fn json_result<T: serde::Serialize>(
         rows: &[T],
         limit: u32,
         narrow_hint: &str,
     ) -> Result<CallToolResult, ErrorData> {
-        let json = serde_json::to_string(rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        let mut content = vec![Content::text(json)];
-        if rows.len() as u32 >= limit {
-            content.push(Content::text(format!(
-                "Note: showing the first {limit} results (limit={limit}, max {max}). \
-                 More may exist — {narrow_hint}.",
-                max = queries::MAX_ROWS
-            )));
+        // A probe row we actually saw proves more rows exist. At the ceiling
+        // there is no room for one, so a full result only *may* have been
+        // cut — say so rather than asserting a truncation we cannot see.
+        let over_limit = rows.len() as u32 > limit;
+        let at_ceiling = limit >= queries::MAX_ROWS && rows.len() as u32 >= limit;
+        let truncated = over_limit || at_ceiling;
+        let shown = &rows[..rows.len().min(limit as usize)];
+        let json = if truncated {
+            serde_json::to_string(&TruncatedList {
+                results: shown,
+                truncated: true,
+                limit,
+                max: queries::MAX_ROWS,
+                note: format!(
+                    "showing the first {limit} results (limit={limit}, max {max}). \
+                     {more} — {advice}.",
+                    max = queries::MAX_ROWS,
+                    more = if over_limit {
+                        "More exist"
+                    } else {
+                        "`limit` is at the ceiling, so more may exist"
+                    },
+                    advice = Self::truncation_advice(limit, narrow_hint)
+                ),
+            })
+        } else {
+            serde_json::to_string(shown)
         }
-        Ok(CallToolResult::success(content))
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// What to tell the model to do about a truncated result.
+    ///
+    /// "Raise `limit`" is only advice while there is headroom: at
+    /// `MAX_ROWS` [`Self::resolve_limit`] clamps a bigger request straight
+    /// back down, so a model that follows it spends a second call to receive
+    /// the identical rows and the identical note. Past the ceiling the only
+    /// way forward is to narrow.
+    fn truncation_advice(limit: u32, narrow_hint: &str) -> String {
+        let max = queries::MAX_ROWS;
+        if limit >= max {
+            if narrow_hint.is_empty() {
+                format!("`limit` cannot go above {max}, so narrow the request instead")
+            } else {
+                format!("`limit` cannot go above {max}; {narrow_hint}")
+            }
+        } else if narrow_hint.is_empty() {
+            format!("raise `limit` (max {max})")
+        } else {
+            format!("raise `limit` (max {max}) or {narrow_hint}")
+        }
     }
 
     pub(crate) fn mcp_err(detail: String) -> ErrorData {
@@ -288,6 +351,17 @@ impl ShireService {
             )])),
         }
     }
+}
+
+/// Envelope for a list that was cut at `limit`. Only truncated results are
+/// wrapped — a complete list stays the bare array clients already parse.
+#[derive(serde::Serialize)]
+struct TruncatedList<'a, T: serde::Serialize> {
+    results: &'a [T],
+    truncated: bool,
+    limit: u32,
+    max: u32,
+    note: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -397,7 +471,7 @@ pub struct SymbolRefsArgs {
     /// Optional package filter
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -409,7 +483,7 @@ pub struct SymbolCallersArgs {
     /// Optional: restrict callers to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -421,7 +495,7 @@ pub struct SymbolCalleesArgs {
     /// Optional: restrict to this package
     #[serde(default)]
     pub package: Option<String>,
-    /// Max results (default 100, clamped to 1..=1000)
+    /// Max results (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -439,7 +513,7 @@ pub struct ChangeImpactArgs {
     /// 0..=10. Use 0 to skip transitive analysis entirely.
     #[serde(default)]
     pub transitive_depth: Option<u32>,
-    /// Max results per bucket (default 100, clamped 1..=1000)
+    /// Max results per bucket (default 100, ceiling 200; 0 means "use the default")
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -478,13 +552,9 @@ impl ShireService {
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, 20);
-        let results = queries::search_packages(&conn, &params.query, limit)
+        let results = queries::search_packages(&conn, &params.query, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -506,15 +576,19 @@ impl ShireService {
                         .map_err(|e| Self::mcp_err(e.to_string()))?;
                 // The graph walk is bounded only by its own MAX_EDGES; the
                 // edge list goes into a context window like any other list.
-                edges.truncate(limit as usize);
-                Self::json_result(&edges, limit, "raise `limit` or lower `depth`")
+                edges.truncate(Self::probe_limit(limit) as usize);
+                Self::json_result(&edges, limit, "lower `depth`")
             }
             _ => {
                 let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
-                let results =
-                    queries::package_dependencies(&conn, &params.name, params.internal_only, limit)
-                        .map_err(|e| Self::mcp_err(e.to_string()))?;
-                Self::json_result(&results, limit, "raise `limit`")
+                let results = queries::package_dependencies(
+                    &conn,
+                    &params.name,
+                    params.internal_only,
+                    Self::probe_limit(limit),
+                )
+                .map_err(|e| Self::mcp_err(e.to_string()))?;
+                Self::json_result(&results, limit, "")
             }
         }
     }
@@ -528,9 +602,9 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
-        let results = queries::package_dependents(&conn, &params.name, limit)
+        let results = queries::package_dependents(&conn, &params.name, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit`")
+        Self::json_result(&results, limit, "")
     }
 
     #[tool(description = "List all indexed packages, optionally filtered by kind")]
@@ -542,13 +616,14 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
-        let results = queries::list_packages(&conn, params.kind.as_deref(), limit)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
+        let results =
+            queries::list_packages(&conn, params.kind.as_deref(), Self::probe_limit(limit))
+                .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&results, limit, "filter by `kind`")
     }
 
     #[tool(
-        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Use instead of Grep for 'where is function X?'. Omit query with a package filter to list the start of that package in (file, line) order."
+        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Matches the symbol name and its sub-tokens only, never signatures or file paths. Use instead of Grep for 'where is function X?'. Omit `query` with a `package` filter to list that package's symbols in (file, line) order, capped at `limit`."
     )]
     fn search_symbols(
         &self,
@@ -569,15 +644,20 @@ impl ShireService {
                 }
             };
             let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
-            let results = queries::get_package_symbols(&conn, pkg, params.kind.as_deref(), limit)
-                .map_err(|e| Self::mcp_err(e.to_string()))?;
+            let results = queries::get_package_symbols(
+                &conn,
+                pkg,
+                params.kind.as_deref(),
+                Self::probe_limit(limit),
+            )
+            .map_err(|e| Self::mcp_err(e.to_string()))?;
             // Ordered by (file_path, line), so a capped listing is the first
             // `limit` symbols of the alphabetically-first files — say so.
             return Self::json_result(
                 &results,
                 limit,
                 "this is the start of the package in (file, line) order; \
-                 narrow with `kind` or `get_file_symbols`, or raise `limit`",
+                 narrow with `kind` or `get_file_symbols`",
             );
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
@@ -587,15 +667,11 @@ impl ShireService {
             query,
             params.package.as_deref(),
             params.kind.as_deref(),
-            limit,
+            Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
 
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -609,10 +685,14 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
-        let results =
-            queries::get_file_symbols(&conn, &params.file_path, params.kind.as_deref(), limit)
-                .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `kind`")
+        let results = queries::get_file_symbols(
+            &conn,
+            &params.file_path,
+            params.kind.as_deref(),
+            Self::probe_limit(limit),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&results, limit, "filter by `kind`")
     }
 
     #[tool(
@@ -626,10 +706,14 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, queries::DEFAULT_LIST_LIMIT);
-        let results =
-            queries::list_package_files(&conn, &params.package, params.extension.as_deref(), limit)
-                .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&results, limit, "raise `limit` or filter by `extension`")
+        let results = queries::list_package_files(
+            &conn,
+            &params.package,
+            params.extension.as_deref(),
+            Self::probe_limit(limit),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&results, limit, "filter by `extension`")
     }
 
     #[tool(description = "Index build metadata: timestamp, git commit, counts")]
@@ -663,14 +747,10 @@ impl ShireService {
             &params.query,
             params.package.as_deref(),
             params.extension.as_deref(),
-            limit,
+            Self::probe_limit(limit),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
-        )
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -689,13 +769,14 @@ impl ShireService {
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(params.limit, 20);
-        let results = queries::search_docs(&conn, &params.query, params.package.as_deref(), limit)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(
-            &results,
-            limit,
-            "raise `limit` or use a more specific query",
+        let results = queries::search_docs(
+            &conn,
+            &params.query,
+            params.package.as_deref(),
+            Self::probe_limit(limit),
         )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&results, limit, "use a more specific query")
     }
 
     #[tool(
@@ -731,7 +812,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
+        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and the dot-qualified enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
     )]
     fn symbol_references(
         &self,
@@ -754,21 +835,20 @@ impl ShireService {
                 "Unknown kind {k:?}. Valid kinds are: call, type, import, impl."
             ))]));
         }
-        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
         let rows = queries::query_symbol_references(
             &conn,
             &args.name,
             args.kind.as_deref(),
             args.package.as_deref(),
-            limit,
+            i64::from(Self::probe_limit(limit)),
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Self::json_result(&rows, limit, "filter by `package`/`kind`")
     }
 
     #[tool(
-        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward."
+        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward. `caller_name` is dot-qualified for methods (`AuthService.login`) and can be passed straight back in as `name`: a qualified name with no exact match falls back to its last segment."
     )]
     fn symbol_callers(
         &self,
@@ -780,11 +860,15 @@ impl ShireService {
         if let Some(disabled) = Self::refs_disabled_result(&conn) {
             return Ok(disabled);
         }
-        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
-        let rows = queries::query_symbol_callers(&conn, &args.name, args.package.as_deref(), limit)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_symbol_callers(
+            &conn,
+            &args.name,
+            args.package.as_deref(),
+            i64::from(Self::probe_limit(limit)),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&rows, limit, "filter by `package`")
     }
 
     #[tool(
@@ -800,11 +884,15 @@ impl ShireService {
         if let Some(disabled) = Self::refs_disabled_result(&conn) {
             return Ok(disabled);
         }
-        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
-        let rows = queries::query_symbol_callees(&conn, &args.name, args.package.as_deref(), limit)
-            .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&rows).map_err(|e| Self::mcp_err(e.to_string()))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        let rows = queries::query_symbol_callees(
+            &conn,
+            &args.name,
+            args.package.as_deref(),
+            i64::from(Self::probe_limit(limit)),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        Self::json_result(&rows, limit, "filter by `package`")
     }
 
     #[tool(
@@ -821,11 +909,60 @@ impl ShireService {
             return Ok(disabled);
         }
         let depth = args.transitive_depth.unwrap_or(2).min(10);
-        let limit = i64::from(args.limit.unwrap_or(100).clamp(1, 1000));
-        let impact =
-            queries::change_impact(&conn, &args.name, args.package.as_deref(), depth, limit)
-                .map_err(|e| Self::mcp_err(e.to_string()))?;
-        let json = serde_json::to_string(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
+        let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
+        // Buckets are filled with the probe row too: `summary` proves whether
+        // the two ref buckets were cut, but nothing counts the transitive
+        // walk, which simply stops at the cap — so a complete list of exactly
+        // `limit` packages would otherwise be reported as truncated.
+        let mut impact = queries::change_impact(
+            &conn,
+            &args.name,
+            args.package.as_deref(),
+            depth,
+            i64::from(Self::probe_limit(limit)),
+        )
+        .map_err(|e| Self::mcp_err(e.to_string()))?;
+        // The payload is an object, not a list, so the truncation marker goes
+        // on it as extra fields.
+        let over = |n: usize| n as u32 > limit || (limit >= queries::MAX_ROWS && n as u32 >= limit);
+        let transitive_capped = over(impact.transitive_impact.len());
+        let truncated = impact.summary.direct_count as u32 > limit
+            || impact.summary.cross_package_count as u32 > limit
+            || transitive_capped;
+        impact.direct_impact.truncate(limit as usize);
+        impact.cross_package_impact.truncate(limit as usize);
+        impact.transitive_impact.truncate(limit as usize);
+        // `direct_count`/`cross_package_count` are true totals; the
+        // transitive count is not (the walk stops at the cap), so keep it
+        // consistent with the rows actually returned — `truncated` is what
+        // says more exist.
+        impact.summary.transitive_package_count = impact.transitive_impact.len();
+        let mut value = serde_json::to_value(&impact).map_err(|e| Self::mcp_err(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut()
+            && truncated
+        {
+            obj.insert("truncated".into(), serde_json::Value::Bool(true));
+            obj.insert("limit".into(), serde_json::Value::from(limit));
+            obj.insert("max".into(), serde_json::Value::from(queries::MAX_ROWS));
+            obj.insert(
+                "note".into(),
+                serde_json::Value::from(format!(
+                    "each impact bucket is capped at {limit} rows (max {max}); \
+                     `summary.direct_count` and `summary.cross_package_count` are true \
+                     totals, but {transitive} — {advice}.",
+                    max = queries::MAX_ROWS,
+                    advice = Self::truncation_advice(limit, "pass `package`"),
+                    transitive = if transitive_capped {
+                        "the transitive walk stopped at the cap, so \
+                         `summary.transitive_package_count` is a floor, \
+                         not a total"
+                    } else {
+                        "`summary.transitive_package_count` counts only the rows returned"
+                    }
+                )),
+            );
+        }
+        let json = serde_json::to_string(&value).map_err(|e| Self::mcp_err(e.to_string()))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -840,9 +977,9 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
-        let rows = queries::query_schema_consumers(&conn, &args.path, limit)
+        let rows = queries::query_schema_consumers(&conn, &args.path, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit`")
+        Self::json_result(&rows, limit, "")
     }
 
     #[tool(
@@ -856,9 +993,9 @@ impl ShireService {
         self.maybe_rebuild();
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;
         let limit = Self::resolve_limit(args.limit, queries::DEFAULT_LIST_LIMIT);
-        let rows = queries::query_generated_from(&conn, &args.path, limit)
+        let rows = queries::query_generated_from(&conn, &args.path, Self::probe_limit(limit))
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-        Self::json_result(&rows, limit, "raise `limit`")
+        Self::json_result(&rows, limit, "")
     }
 }
 
@@ -1095,6 +1232,155 @@ mod tests {
         assert_eq!(text, "[]", "empty DB returns empty array");
     }
 
+    /// A service whose index has `n` `target` call-refs, each from its own
+    /// enclosing symbol, plus `n` calls made *by* `caller`.
+    fn service_with_refs(dir: &std::path::Path, n: usize) -> ShireService {
+        let path = dir.join("refs.db");
+        {
+            let conn = crate::db::open_or_create(&path).unwrap();
+            crate::db::write_references_enabled(&conn, true).unwrap();
+            conn.execute(
+                "INSERT INTO packages (name, path, kind) VALUES ('p','p','rust')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line) \
+                 VALUES ('p','target','function','p/t.rs',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, package, extension, size_bytes) VALUES ('p/t.rs','p','rs',0)",
+                [],
+            )
+            .unwrap();
+            let file_id: i64 = conn
+                .query_row("SELECT id FROM files WHERE path='p/t.rs'", [], |r| r.get(0))
+                .unwrap();
+            for i in 0..n {
+                conn.execute(
+                    "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                     VALUES ('target','call',?1,?2,'p',?3)",
+                    rusqlite::params![file_id, i as i64, format!("c{i}")],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                     VALUES (?1,'call',?2,?3,'p','caller')",
+                    rusqlite::params![format!("callee{i}"), file_id, 100 + i as i64],
+                )
+                .unwrap();
+            }
+        }
+        let conn = crate::db::open_or_create(&path).unwrap();
+        ShireService::new(conn, None)
+    }
+
+    /// The four reference tools rolled their own
+    /// `limit.unwrap_or(100).clamp(1, 1000)` and returned a bare
+    /// `Content::text`, so `limit: 0` answered "one caller" and a capped list
+    /// read as the complete blast radius. They go through `resolve_limit` /
+    /// `json_result` like every other list tool now.
+    #[test]
+    fn test_reference_tools_use_the_shared_limit_helpers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_refs(dir.path(), 5);
+
+        let refs = |limit: Option<u32>| {
+            svc.symbol_references(Parameters(SymbolRefsArgs {
+                name: "target".into(),
+                kind: None,
+                package: None,
+                limit,
+            }))
+            .unwrap()
+        };
+        let callers = |limit: Option<u32>| {
+            svc.symbol_callers(Parameters(SymbolCallersArgs {
+                name: "target".into(),
+                package: None,
+                limit,
+            }))
+            .unwrap()
+        };
+        let callees = |limit: Option<u32>| {
+            svc.symbol_callees(Parameters(SymbolCalleesArgs {
+                name: "caller".into(),
+                package: None,
+                limit,
+            }))
+            .unwrap()
+        };
+
+        // `limit: 0` means "no cap" to plenty of clients; it used to clamp to
+        // one row, i.e. "this symbol has exactly one reference".
+        for r in [refs(Some(0)), callers(Some(0)), callees(Some(0))] {
+            assert_eq!(result_rows(&r).len(), 5);
+            assert_eq!(truncation_note(&r), None, "complete list, no note");
+        }
+        for r in [refs(None), callers(None), callees(None)] {
+            assert_eq!(result_rows(&r).len(), 5);
+        }
+
+        // A capped list says so, in the same envelope as every other tool.
+        for r in [refs(Some(2)), callers(Some(2)), callees(Some(2))] {
+            assert_eq!(result_rows(&r).len(), 2);
+            let note = truncation_note(&r).expect("truncation note");
+            assert!(note.contains("first 2 results"), "got {note}");
+            assert_eq!(r.content.len(), 1, "one parseable JSON block");
+        }
+
+        // Exactly-full complete lists stay unmarked.
+        for r in [refs(Some(5)), callers(Some(5)), callees(Some(5))] {
+            assert_eq!(result_rows(&r).len(), 5);
+            assert_eq!(truncation_note(&r), None);
+        }
+
+        // The ref tools used to accept up to 1000 rows; they share the
+        // MAX_ROWS ceiling now.
+        assert_eq!(
+            ShireService::resolve_limit(Some(1000), queries::DEFAULT_LIST_LIMIT),
+            queries::MAX_ROWS
+        );
+    }
+
+    /// `change_impact` returns an object rather than a list, so its
+    /// truncation marker rides on the object; `summary` keeps the true
+    /// counts either way.
+    #[test]
+    fn test_change_impact_marks_truncated_buckets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_refs(dir.path(), 5);
+
+        let call = |limit: Option<u32>| -> serde_json::Value {
+            let r = svc
+                .change_impact(Parameters(ChangeImpactArgs {
+                    name: "target".into(),
+                    package: None,
+                    transitive_depth: Some(1),
+                    limit,
+                }))
+                .unwrap();
+            assert_eq!(r.content.len(), 1);
+            serde_json::from_str(&result_text(&r)).expect("valid JSON")
+        };
+
+        let v = call(Some(2));
+        assert_eq!(v["direct_impact"].as_array().unwrap().len(), 2);
+        assert_eq!(v["summary"]["direct_count"], 5);
+        assert_eq!(v["truncated"], serde_json::Value::Bool(true));
+        assert!(v["note"].as_str().unwrap().contains("summary"));
+
+        // Not truncated: no marker, and `limit: 0` is the tool default, not
+        // a one-row answer.
+        for v in [call(Some(5)), call(Some(0)), call(None)] {
+            assert_eq!(v["direct_impact"].as_array().unwrap().len(), 5);
+            assert_eq!(v["summary"]["direct_count"], 5);
+            assert!(v.get("truncated").is_none(), "unexpected marker in {v}");
+        }
+    }
+
     #[test]
     fn test_change_impact_refs_disabled_message() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1237,6 +1523,29 @@ mod tests {
         }
     }
 
+    /// Rows of a list tool's result, whether it came back as the bare array
+    /// (complete) or as the `{results, truncated, …}` envelope (truncated).
+    fn result_rows(r: &CallToolResult) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(&result_text(r)).unwrap();
+        match v {
+            serde_json::Value::Array(rows) => rows,
+            serde_json::Value::Object(ref o) => o
+                .get("results")
+                .and_then(|r| r.as_array())
+                .unwrap_or_else(|| panic!("no results array in {v}"))
+                .clone(),
+            other => panic!("unexpected result shape: {other}"),
+        }
+    }
+
+    /// The truncation note of a list tool's result, when it has one.
+    fn truncation_note(r: &CallToolResult) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(&result_text(r)).unwrap();
+        let note = v.get("note")?.as_str()?.to_string();
+        assert_eq!(v.get("truncated"), Some(&serde_json::Value::Bool(true)));
+        Some(note)
+    }
+
     /// A service over a real (on-disk) schema, with `n` symbols in one
     /// package spread over `n` files.
     fn service_with_symbols(dir: &std::path::Path, n: usize) -> ShireService {
@@ -1288,14 +1597,11 @@ mod tests {
                 limit: Some(5),
             }))
             .unwrap();
-        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 5, "limit must be honored");
-        // …and the model must be told the list was cut.
-        assert_eq!(r.content.len(), 2, "expected a truncation note");
-        let note = match &r.content[1].raw {
-            RawContent::Text(t) => t.text.clone(),
-            _ => panic!("expected text"),
-        };
+        assert_eq!(result_rows(&r).len(), 5, "limit must be honored");
+        // …and the model must be told the list was cut, inside the one JSON
+        // block, so the whole tool output stays parseable.
+        assert_eq!(r.content.len(), 1, "the note rides in the JSON envelope");
+        let note = truncation_note(&r).expect("expected a truncation note");
         assert!(note.contains("first 5 results"), "got {note}");
 
         // Default (no limit given) is 20, not "everything".
@@ -1307,8 +1613,7 @@ mod tests {
                 limit: None,
             }))
             .unwrap();
-        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 20);
+        assert_eq!(result_rows(&r).len(), 20);
 
         // The hard ceiling wins over an absurd request.
         let r = svc
@@ -1319,9 +1624,8 @@ mod tests {
                 limit: Some(100_000),
             }))
             .unwrap();
-        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
         assert_eq!(
-            rows.as_array().unwrap().len(),
+            result_rows(&r).len(),
             queries::MAX_ROWS as usize,
             "capped at MAX_ROWS"
         );
@@ -1333,13 +1637,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = service_with_symbols(dir.path(), 300);
 
-        let len = |r: &CallToolResult| -> usize {
-            serde_json::from_str::<serde_json::Value>(&result_text(r))
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len()
-        };
+        let len = |r: &CallToolResult| -> usize { result_rows(r).len() };
 
         let r = svc
             .list_package_files(Parameters(ListPackageFilesParams {
@@ -1410,15 +1708,57 @@ mod tests {
                 limit: Some(0),
             }))
             .unwrap();
-        let rows: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 20);
+        assert_eq!(result_rows(&r).len(), 20);
     }
 
-    /// A short list gets no truncation note — the note must mean something.
+    /// The note must not assert a truncation the probe row never proved. At
+    /// `MAX_ROWS` there is no room to fetch the probe, so a result filling the
+    /// ceiling is flagged — but "more exist" would be a guess, and it points
+    /// the model at a `limit` it cannot raise.
     #[test]
-    fn test_no_truncation_note_when_under_limit() {
+    fn test_ceiling_note_says_more_may_exist() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = service_with_symbols(dir.path(), 3);
+        let svc = service_with_symbols(dir.path(), queries::MAX_ROWS as usize);
+
+        // Exactly MAX_ROWS files, asked for MAX_ROWS: the probe cannot be
+        // fetched, so the cut is unproven.
+        let r = svc
+            .list_package_files(Parameters(ListPackageFilesParams {
+                package: "pkg".into(),
+                extension: None,
+                limit: Some(queries::MAX_ROWS),
+            }))
+            .unwrap();
+        assert_eq!(result_rows(&r).len(), queries::MAX_ROWS as usize);
+        let note = truncation_note(&r).expect("ceiling is still flagged");
+        assert!(note.contains("may exist"), "got {note}");
+        // …and it must not send the model back for an identical second call:
+        // `resolve_limit` clamps anything above the ceiling straight down.
+        assert!(
+            !note.contains("raise `limit`"),
+            "advice at the ceiling must not be to raise it: {note}"
+        );
+
+        // Below the ceiling the probe row is real proof.
+        let r = svc
+            .list_package_files(Parameters(ListPackageFilesParams {
+                package: "pkg".into(),
+                extension: None,
+                limit: Some(10),
+            }))
+            .unwrap();
+        let note = truncation_note(&r).expect("truncated");
+        assert!(note.contains("More exist"), "got {note}");
+        assert!(note.contains("raise `limit`"), "got {note}");
+    }
+
+    /// A complete list gets no truncation note — the note must mean
+    /// something, including when the list happens to fill the limit exactly.
+    #[test]
+    fn test_no_truncation_note_when_the_list_is_complete() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // One package, two symbols.
+        let svc = service_with_symbols(dir.path(), 1);
         let r = svc
             .list_packages(Parameters(ListParams {
                 kind: None,
@@ -1426,6 +1766,48 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(r.content.len(), 1, "no note for a complete list");
+        assert_eq!(result_text(&r).chars().next(), Some('['), "bare array");
+
+        // Exactly-full and complete: 2 symbols, limit 2. The old
+        // `rows.len() >= limit` test called this truncated.
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(2),
+            }))
+            .unwrap();
+        assert_eq!(result_rows(&r).len(), 2);
+        assert_eq!(truncation_note(&r), None, "complete list, no note");
+
+        // One more row exists → the note, and the whole output is still one
+        // parseable JSON document.
+        let r = svc
+            .search_symbols(Parameters(SearchSymbolsParams {
+                query: None,
+                package: Some("pkg".into()),
+                kind: None,
+                limit: Some(1),
+            }))
+            .unwrap();
+        assert_eq!(result_rows(&r).len(), 1);
+        assert!(
+            truncation_note(&r)
+                .expect("truncated")
+                .contains("first 1 results")
+        );
+        assert_eq!(r.content.len(), 1);
+        serde_json::from_str::<serde_json::Value>(
+            &r.content
+                .iter()
+                .map(|c| match &c.raw {
+                    RawContent::Text(t) => t.text.clone(),
+                    _ => panic!("expected text"),
+                })
+                .collect::<String>(),
+        )
+        .expect("concatenated content blocks must parse as JSON");
     }
 
     /// MCP-2: concurrent tool calls under `serve --root` all saw

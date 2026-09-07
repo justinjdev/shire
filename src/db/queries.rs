@@ -146,7 +146,52 @@ fn fts_match_expr(query: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
-/// FTS5 search across symbol names and signatures.
+/// The `symbols_fts` columns a symbol search is allowed to match.
+///
+/// The table also indexes `kind`, `signature` and `file_path`. Matching a
+/// prefix against those turns an ordinary identifier query into a path/
+/// parameter search: `mod` matched every symbol living in a `module_00.go`,
+/// and `p` matched every symbol with a parameter named `p`, at 10-40x the
+/// latency. `search_symbols` is documented as identifier matching, so the
+/// MATCH is scoped to the identifier columns. (`kind` is still reachable —
+/// as the explicit `kind:"..."` filter appended for the `kind` argument.)
+const SYMBOL_MATCH_COLUMNS: &str = "{name name_tokens}";
+
+/// The same scope for an index that predates the `name_tokens` column.
+const SYMBOL_MATCH_COLUMNS_LEGACY: &str = "{name}";
+
+/// The column scope to use against *this* database.
+///
+/// `name_tokens` arrived with FTS schema v8, and a read-only connection never
+/// migrates (only `open_or_create` does), so `shire serve` can be pointed at
+/// an index written by an older release. Naming a column the table does not
+/// have is a hard FTS5 error ("no such column: name_tokens"), which would
+/// turn the documented graceful degradation — search still works, it just
+/// misses sub-token matches — into a failing `search_symbols`/`explore`. The
+/// probe is a cached no-op prepare on a current index.
+fn symbol_match_columns(conn: &Connection) -> &'static str {
+    if conn
+        .prepare_cached("SELECT name_tokens FROM symbols_fts LIMIT 0")
+        .is_ok()
+    {
+        SYMBOL_MATCH_COLUMNS
+    } else {
+        SYMBOL_MATCH_COLUMNS_LEGACY
+    }
+}
+
+/// Restrict an FTS5 expression to a column set: `{a b} : (expr)`.
+///
+/// The parentheses are load-bearing: in `{a b} : "x"* "y"*` the filter binds
+/// to the first phrase only, and `"y"*` would go on matching every column.
+fn column_scoped(columns: &str, expr: &str) -> String {
+    format!("{columns} : ({expr})")
+}
+
+/// FTS5 search across symbol names and their identifier sub-tokens.
+///
+/// Signatures, file paths and kinds are indexed in `symbols_fts` but are
+/// deliberately not searched here — see [`SYMBOL_MATCH_COLUMNS`].
 ///
 /// Results are ordered exact-name-first, then by FTS rank: prefix and
 /// sub-token matching means a query for `handle` also matches
@@ -163,17 +208,19 @@ pub fn search_symbols(
         return Ok(Vec::new());
     }
     let sanitized = match fts_match_expr(query) {
-        Some(expr) => expr,
+        Some(expr) => column_scoped(symbol_match_columns(conn), &expr),
         None => return Ok(Vec::new()),
     };
     let limit = clamp_limit(limit);
 
     // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
     // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
+    // The `AND` is explicit: FTS5 only infers it between bare phrases, and the
+    // scoped `{cols} : (...)` expression on the left is not one.
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
         match (package_filter, kind_filter) {
             (Some(pkg), Some(kind)) => {
-                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                let fts_query = format!("{} AND kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
                 (
                     "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -204,7 +251,7 @@ pub fn search_symbols(
                 ],
             ),
             (None, Some(kind)) => {
-                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                let fts_query = format!("{} AND kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
                 (
                     "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -258,6 +305,24 @@ pub fn search_symbols(
     Ok(result)
 }
 
+/// Case-insensitive equality that folds the way the `unicode61` tokenizer
+/// does. `eq_ignore_ascii_case` alone leaves a non-ASCII identifier out: FTS
+/// finds `Élève` for the query `élève`, and an ASCII-only comparison then
+/// discards it, so the exactly-named symbol goes missing from its own search.
+/// The ASCII test runs first because it needs no allocation and covers
+/// nearly every identifier — and when both sides are ASCII its answer is
+/// final, so a *non*-match allocates nothing either. That matters: this runs
+/// once per returned row, and a mismatch is the common case.
+fn eq_case_folded(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if a.is_ascii() && b.is_ascii() {
+        return false;
+    }
+    a.to_lowercase() == b.to_lowercase()
+}
+
 /// Make sure a symbol named exactly like the query is in the result, and
 /// first.
 ///
@@ -283,10 +348,7 @@ fn promote_exact_name(
     }
     // FTS matching folds case, so the promotion has to as well: an LLM
     // querying `config` for a type called `Config` must still get it.
-    if let Some(pos) = result
-        .iter()
-        .position(|r| r.name.eq_ignore_ascii_case(name))
-    {
+    if let Some(pos) = result.iter().position(|r| eq_case_folded(&r.name, name)) {
         if pos > 0 {
             let exact = result.remove(pos);
             result.insert(0, exact);
@@ -336,7 +398,7 @@ fn promote_exact_name(
     let mut rows = rows
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|r: &SymbolRow| r.name.eq_ignore_ascii_case(name));
+        .filter(|r: &SymbolRow| eq_case_folded(&r.name, name));
     if let Some(exact) = rows.next() {
         result.insert(0, exact);
         result.truncate(limit as usize);
@@ -1232,6 +1294,47 @@ pub fn query_symbol_references(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
+    Ok(query_symbol_references_resolved(conn, name, kind, package, limit)?.0)
+}
+
+/// [`query_symbol_references`], plus the name the rows were actually matched
+/// on: `name` itself, or its last dot-separated segment when the qualified
+/// form matched nothing and the segment did. `change_impact` needs that —
+/// keying its home-package lookup off the raw argument would resolve a
+/// different symbol than the refs it is partitioning.
+fn query_symbol_references_resolved<'a>(
+    conn: &Connection,
+    name: &'a str,
+    kind: Option<&str>,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<ReferenceRow>, &'a str)> {
+    let rows = query_symbol_references_exact(conn, name, kind, package, limit)?;
+    if !rows.is_empty() {
+        return Ok((rows, name));
+    }
+    match unqualified_name(name) {
+        Some(bare) => {
+            let bare_rows = query_symbol_references_exact(conn, bare, kind, package, limit)?;
+            // Only a fallback that found something renames the query; an
+            // empty result must keep reporting the name the caller asked for.
+            if bare_rows.is_empty() {
+                Ok((bare_rows, name))
+            } else {
+                Ok((bare_rows, bare))
+            }
+        }
+        None => Ok((rows, name)),
+    }
+}
+
+fn query_symbol_references_exact(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ReferenceRow>> {
     let mut qb = RefQueryBuilder::new(
         "SELECT r.name, r.kind, f.path, r.line, r.package, r.enclosing_symbol \
          FROM symbol_refs r JOIN files f ON f.id = r.file_id WHERE r.name = ?",
@@ -1268,6 +1371,21 @@ pub struct CallerRow {
     pub call_sites: i64,
 }
 
+/// The bare identifier at the end of a dot-qualified name, or `None` when the
+/// name has no qualifier.
+///
+/// `symbol_refs.enclosing_symbol` is dot-qualified (`AuthService.login`) while
+/// `symbol_refs.name` is always a bare identifier, so a value the caller read
+/// out of `enclosing_symbol` — which is exactly what the `reference_audit`
+/// prompt tells a model to feed back into `symbol_callers` — never matches a
+/// ref name. Name-keyed ref queries retry once with this segment when the
+/// qualified form found nothing, which keeps the indexed equality lookup
+/// first and never widens a query that already matched.
+fn unqualified_name(name: &str) -> Option<&str> {
+    let (_, tail) = name.rsplit_once('.')?;
+    if tail.is_empty() { None } else { Some(tail) }
+}
+
 /// Escape the LIKE wildcards in a user-supplied string so it can be used as
 /// a literal inside a `LIKE ... ESCAPE '\\'` pattern.
 fn escape_like(s: &str) -> String {
@@ -1282,6 +1400,24 @@ fn escape_like(s: &str) -> String {
 }
 
 pub fn query_symbol_callers(
+    conn: &Connection,
+    name: &str,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CallerRow>> {
+    let rows = query_symbol_callers_exact(conn, name, package, limit)?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    // The caller may have passed a value read out of `enclosing_symbol`
+    // (`AuthService.login`); ref names are bare, so retry with the segment.
+    match unqualified_name(name) {
+        Some(bare) => query_symbol_callers_exact(conn, bare, package, limit),
+        None => Ok(rows),
+    }
+}
+
+fn query_symbol_callers_exact(
     conn: &Connection,
     name: &str,
     package: Option<&str>,
@@ -1410,6 +1546,10 @@ pub struct ChangeImpactSummary {
     /// the full ref set before truncation — this is the authoritative list
     /// of directly affected packages.
     pub affected_packages: Vec<String>,
+    /// Packages reached by the reverse-dep walk. Unlike the two counts above
+    /// this is *not* a true total: the walk stops at `per_bucket_limit`, so a
+    /// capped result reports a floor. `change_impact`'s truncation marker is
+    /// what says whether more exist.
     pub transitive_package_count: usize,
 }
 
@@ -1463,11 +1603,19 @@ pub fn change_impact(
     // and BFS under-reports blast radius. The safety cap keeps memory
     // bounded for pathologically-called symbols.
     const MAX_REFS_SCANNED: i64 = 10_000;
-    let all_refs = query_symbol_references(conn, name, None, None, MAX_REFS_SCANNED)?;
+    // `symbols.name` is bare, so a qualified argument (`AuthService.login`,
+    // the form `enclosing_symbol` reports) has to resolve through its last
+    // segment or every ref lands in the cross-package bucket. The home
+    // package is looked up under the name the *refs* matched, never the raw
+    // argument: a dotted name that matched refs literally (an `import` ref
+    // such as `os.path`) must not pick up the package of some unrelated
+    // symbol called `path`.
+    let (all_refs, effective_name) =
+        query_symbol_references_resolved(conn, name, None, None, MAX_REFS_SCANNED)?;
 
     let home_package = match package_hint {
         Some(p) => Some(p.to_string()),
-        None => resolve_home_package(conn, name)?,
+        None => resolve_home_package(conn, effective_name)?,
     };
 
     let mut direct_impact: Vec<ReferenceRow> = Vec::new();
@@ -2019,6 +2167,37 @@ mod tests {
         assert_eq!(hits[0].name, "AuthMiddleware");
     }
 
+    /// The tokenizer folds Unicode case, so the promotion has to as well —
+    /// with an ASCII-only comparison `Élève` was found by the confirm lookup
+    /// and then discarded, and fell out of the result window entirely.
+    #[test]
+    fn test_search_symbols_exact_name_promotion_folds_non_ascii_case() {
+        let conn = test_db();
+        for i in 0..20 {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'function', 'services/auth/src/a.ts', ?2, ?1)",
+                rusqlite::params![format!("élève_helper{i:02}"), i as i64],
+            )
+            .unwrap();
+        }
+        // Long signature so bm25 ranks this row last: the promotion, not the
+        // ranking, is what has to put it in a 3-row window.
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, name_tokens)
+             VALUES ('auth-service', 'Élève', 'class', ?1, 'services/auth/src/z.ts', 99, 'élève')",
+            [format!("class Élève {}", "pad ".repeat(200))],
+        )
+        .unwrap();
+
+        let hits = search_symbols(&conn, "élève", None, None, 3).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            hits[0].name, "Élève",
+            "exact non-ASCII name must be promoted"
+        );
+    }
+
     #[test]
     fn test_search_symbols_single_char_query_is_not_a_prefix_query() {
         // A 1-character prefix has no prefix index to use (`prefix='2,3'`),
@@ -2065,6 +2244,111 @@ mod tests {
             hits.iter().any(|r| r.name == "makeToken"),
             "got {:?}",
             hits.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The MATCH is scoped to `{name name_tokens}`: a query must not match a
+    /// symbol through its file path, its signature or its kind. Before the
+    /// scoping, `mod` returned every symbol defined in a `module_*.go` file
+    /// and `par` every symbol with a parameter named `parent`.
+    #[test]
+    fn test_search_symbols_does_not_match_paths_or_signatures() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, name_tokens)
+             VALUES ('auth-service', 'Config', 'class', 'func Config(parent int)',
+                     'services/auth/src/module_00.go', 1, 'config')",
+            [],
+        )
+        .unwrap();
+        let names = |q: &str| -> Vec<String> {
+            search_symbols(&conn, q, None, None, 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // file_path tokens
+        assert!(names("mod").is_empty(), "matched via file_path");
+        assert!(names("module").is_empty(), "matched via file_path");
+        assert!(names("services").is_empty(), "matched via file_path");
+        // signature tokens
+        assert!(names("par").is_empty(), "matched via signature");
+        assert!(names("parent").is_empty(), "matched via signature");
+        // kind is only reachable through the `kind` argument
+        assert!(names("class").is_empty(), "matched via kind");
+        // …and the identifier itself still matches, by prefix and exactly.
+        assert_eq!(names("conf"), vec!["Config"]);
+        assert_eq!(names("Config"), vec!["Config"]);
+    }
+
+    /// An index written before FTS schema v8 has no `name_tokens` column, and
+    /// a read-only `serve` never migrates it. Naming a missing column in the
+    /// MATCH is a hard FTS5 error ("no such column: name_tokens"), so scoping
+    /// has to fall back to `{name}` — search degrades to whole-name matching
+    /// instead of failing outright, which is what the startup warning
+    /// promises.
+    #[test]
+    fn test_search_symbols_works_against_a_pre_v8_symbols_fts() {
+        let conn = test_db_with_identifiers();
+        // Recreate `symbols_fts` with the v7 column list, then rebuild it
+        // from the (unchanged) `symbols` content table.
+        conn.execute_batch(
+            "DROP TABLE symbols_fts;
+             CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                 name, kind, signature, file_path,
+                 content='symbols',
+                 content_rowid='rowid',
+                 tokenize=\"unicode61 tokenchars '_'\"
+             );
+             INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild');",
+        )
+        .unwrap();
+        assert_eq!(symbol_match_columns(&conn), SYMBOL_MATCH_COLUMNS_LEGACY);
+
+        let names = |q: &str| -> Vec<String> {
+            search_symbols(&conn, q, None, None, 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // Whole-name prefix matching still works…
+        assert!(names("verify").contains(&"verifyJwtToken".to_string()));
+        assert_eq!(names("AuthMiddleware"), vec!["AuthMiddleware"]);
+        // …and paths/signatures are still out of scope.
+        assert!(names("middleware").is_empty(), "matched via file_path");
+        assert!(names("export").is_empty(), "matched via signature");
+        // The kind filter composes with the legacy scope too.
+        let hits = search_symbols(&conn, "handle", None, Some("method"), 20).unwrap();
+        assert!(hits.iter().all(|h| h.kind == "method"), "got {hits:?}");
+    }
+
+    /// Column scoping composes with the `kind:` filter and with multi-token
+    /// queries (the scoped expression has to be parenthesised, or only the
+    /// first token would be scoped).
+    #[test]
+    fn test_search_symbols_column_scope_composes_with_filters() {
+        assert_eq!(
+            column_scoped(SYMBOL_MATCH_COLUMNS, "\"verify\"* \"jwt\"*"),
+            "{name name_tokens} : (\"verify\"* \"jwt\"*)"
+        );
+        let conn = test_db_with_identifiers();
+        // Multi-token: both tokens scoped, so `services` (a path token) rules
+        // the query out instead of matching every symbol under services/.
+        assert!(
+            search_symbols(&conn, "verify services", None, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = search_symbols(&conn, "verify jwt", None, None, 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "verifyJwtToken");
+        // kind filter still narrows a scoped query.
+        let hits = search_symbols(&conn, "handle", None, Some("function"), 20).unwrap();
+        assert!(
+            hits.iter().all(|h| h.kind == "function") && !hits.is_empty(),
+            "got {hits:?}"
         );
     }
 
@@ -2305,10 +2589,18 @@ mod tests {
         assert_eq!(results[0].package, "auth-service");
     }
 
+    /// Signature text is indexed in `symbols_fts` but is not searched: the
+    /// only place `token` appears is `validate`'s signature, and an
+    /// identifier query must not reach a symbol through its parameters.
     #[test]
-    fn test_search_symbols_by_signature() {
+    fn test_search_symbols_ignores_signature_text() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "token", None, None, 20).unwrap();
+        assert!(
+            search_symbols(&conn, "token", None, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        let results = search_symbols(&conn, "validate", None, None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
     }
@@ -2316,11 +2608,11 @@ mod tests {
     #[test]
     fn test_search_symbols_filter_by_package() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "interface", Some("shared-types"), None, 20).unwrap();
+        let results = search_symbols(&conn, "UserConfig", Some("shared-types"), None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "UserConfig");
 
-        let results = search_symbols(&conn, "interface", Some("auth-service"), None, 20).unwrap();
+        let results = search_symbols(&conn, "UserConfig", Some("auth-service"), None, 20).unwrap();
         assert!(results.is_empty());
     }
 
@@ -3061,6 +3353,149 @@ mod refs_tests {
             .map(|c| c.callee_name)
             .collect();
         assert_eq!(logout, vec!["other"]);
+    }
+
+    /// `enclosing_symbol` is dot-qualified (`A.run`) while `symbol_refs.name`
+    /// is bare, and the `reference_audit` prompt tells the model to feed an
+    /// `enclosing_symbol` straight back into `symbol_callers`. The qualified
+    /// form must therefore resolve, without widening a name that already
+    /// matched exactly.
+    #[test]
+    fn test_query_symbol_callers_accepts_a_qualified_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cq.db");
+        let conn = open_or_create(&db_path).unwrap();
+        let ids = seed_files(&conn, &["a.rs", "b.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {a}, 5, 'p', 'boot'), \
+                        ('run', 'call', {a}, 6, 'p', 'boot'), \
+                        ('run', 'call', {b}, 9, 'q', 'other'), \
+                        ('A.run', 'call', {b}, 12, 'p', 'literal')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        // Bare name: unchanged.
+        let bare = query_symbol_callers(&conn, "run", None, 100).unwrap();
+        assert_eq!(bare.len(), 2);
+
+        // Qualified name with no exact ref of its own falls back to `run`.
+        let qualified = query_symbol_callers(&conn, "Outer.Inner.run", None, 100).unwrap();
+        let names: Vec<&str> = qualified.iter().map(|c| c.caller_name.as_str()).collect();
+        assert_eq!(names, vec!["boot", "other"]);
+
+        // Filters survive the fallback.
+        let scoped = query_symbol_callers(&conn, "Outer.run", Some("p"), 100).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].caller_name, "boot");
+        assert_eq!(scoped[0].call_sites, 2);
+
+        // A name that does match exactly is never widened: `A.run` is itself
+        // a ref name here, so the fallback must not fire for the unscoped
+        // lookup.
+        let exact = query_symbol_callers(&conn, "A.run", None, 100).unwrap();
+        let names: Vec<&str> = exact.iter().map(|c| c.caller_name.as_str()).collect();
+        assert_eq!(names, vec!["literal"]);
+
+        // Nothing to fall back to.
+        assert!(
+            query_symbol_callers(&conn, "nosuch.thing", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_symbol_callers(&conn, "trailing.", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Same tolerance for `symbol_references`, and for the home-package
+    /// lookup behind `change_impact` — otherwise a qualified name would put
+    /// every reference in the cross-package bucket.
+    #[test]
+    fn test_qualified_name_resolves_for_references_and_change_impact() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("rq.db");
+        let conn = open_or_create(&db_path).unwrap();
+        seed_package(&conn, "home");
+        seed_package(&conn, "away");
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'run', 'method', 'home/a.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["home/a.rs", "away/b.rs"]);
+        let a = ids["home/a.rs"];
+        let b = ids["away/b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {a}, 5, 'home', 'A.boot'), \
+                        ('run', 'call', {b}, 7, 'away', 'B.boot')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let refs = query_symbol_references(&conn, "A.run", None, None, 100).unwrap();
+        assert_eq!(refs.len(), 2);
+        let scoped =
+            query_symbol_references(&conn, "A.run", Some("call"), Some("home"), 100).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].file_path, "home/a.rs");
+
+        let impact = change_impact(&conn, "A.run", None, 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("home"));
+        assert_eq!(impact.direct_impact.len(), 1);
+        assert_eq!(impact.cross_package_impact.len(), 1);
+    }
+
+    /// Not every dot is a namespace separator: an `import` ref carries the
+    /// module path as its name (`os.path`, `helper.rb`). Such a name matches
+    /// refs literally, so the home-package lookup must key on it — falling
+    /// back to `path` would hand `change_impact` the package of an unrelated
+    /// symbol and reclassify cross-package refs as direct.
+    #[test]
+    fn test_change_impact_does_not_borrow_a_home_package_for_a_dotted_ref_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("dotted.db");
+        let conn = open_or_create(&db_path).unwrap();
+        seed_package(&conn, "away");
+        seed_package(&conn, "unrelated");
+        // A symbol named after the dotted name's last segment, in a package
+        // that has nothing to do with the import.
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('unrelated', 'path', 'function', 'unrelated/p.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["away/b.rs"]);
+        let b = ids["away/b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('os.path', 'import', {b}, 1, 'away', NULL)"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let impact = change_impact(&conn, "os.path", None, 1, 100).unwrap();
+        assert_eq!(
+            impact.home_package, None,
+            "a literally-matched dotted name has no home package"
+        );
+        assert_eq!(impact.cross_package_impact.len(), 1);
+        assert!(impact.direct_impact.is_empty());
     }
 
     /// LIKE wildcards in the queried name must be literal, or `_ogin` would

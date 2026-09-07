@@ -2327,6 +2327,13 @@ struct FileIndexResult {
     /// pass for packages whose content changed without any mtime moving
     /// (INDEX-3).
     ///
+    /// Note what this does and does not cover. It is computed from the
+    /// `files` snapshot, whose columns are (path, package, extension,
+    /// size) — so a `cp -p`/`rsync -a` that changes a file's *size* is
+    /// caught here even though its mtime went backwards, but one that
+    /// preserves both size and mtime changes nothing any of the three
+    /// signals looks at and needs `--force` (INDEX-2-5).
+    ///
     /// The set is *durable*: it is persisted to
     /// `shire_meta.pending_source_recheck` inside this phase's transaction
     /// and only cleared once the extraction transaction has committed. It
@@ -2334,9 +2341,7 @@ struct FileIndexResult {
     /// new `file_tree_hash` in its own transaction: if the build then dies
     /// (or a later phase errors) before symbols are written, the next build
     /// would see a matching tree hash and an already-updated `files` table,
-    /// recompute an *empty* changed set, and — for a change that moved no
-    /// mtime and no path, e.g. `rsync -a`/`cp -p` over a file — skip the
-    /// package indefinitely.
+    /// recompute an *empty* changed set, and skip the package indefinitely.
     changed_packages: HashSet<String>,
 }
 

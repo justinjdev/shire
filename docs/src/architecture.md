@@ -56,6 +56,19 @@ src/
     └── autoresearch.rs # Benchmark harness, gated behind the non-default `bench` feature
 ```
 
+## What an incremental build re-reads
+
+A build re-hashes a package's source files when any of them changes **mtime,
+size, or path**. Between them those cover the ordinary cases: an editor save
+moves the mtime, a rename or a new/deleted file moves the path set, and a
+restore that rewinds an mtime is still caught if the size differs.
+
+One case is not covered: an edit that keeps the file's size *and* its mtime.
+That is what `cp -p`/`install -p` out of a build cache, `rsync -a`, a `tar -x`
+restore and some patch tools do. Nothing on disk distinguishes it from an
+untouched file without reading every byte of the repo on every build, so
+shire does not try — run `shire build --force` after one.
+
 ## symbol_refs table
 
 The `symbol_refs` table stores cross-reference records extracted alongside symbol definitions. Each row captures a reference to a named symbol:

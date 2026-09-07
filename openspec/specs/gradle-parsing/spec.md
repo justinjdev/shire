@@ -19,8 +19,9 @@
 #### Scenario: group:projectName collides with another subproject
 
 - **WHEN** two `build.gradle` files in different directories share a `group` and compute the same `group:projectName` name (e.g. both directories are named `app`)
-- **THEN** the first-seen package keeps the `group:projectName` name
-- **AND** the second, colliding package instead gets a path-derived name (its relative directory with `/` replaced by `-`)
+- **THEN** whichever package already holds that name in the index keeps it (the first of the two the build reaches — walk order, which is not currently guaranteed to be stable)
+- **AND** the colliding package instead gets a path-derived name (its relative directory with `/` replaced by `-`)
+- **AND** if that path-derived name is itself already held by a package at a different path, a numeric suffix is appended (`-2`, then `-3`, …) until the name is free
 - **AND** a warning is logged naming both directories
 - **AND** neither package is silently dropped
 

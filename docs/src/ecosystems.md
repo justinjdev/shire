@@ -13,6 +13,31 @@
 | `Gemfile` | ruby | `gem` / `group :test` blocks |
 | `flake.nix` | nix | `inputs` attrset (dotted and block forms) |
 
+## Package naming
+
+A package's name is the join key everything else carries (`symbols.package`,
+`dependencies.package`, the `package` filter on every MCP tool), so it is
+never empty:
+
+| Manifest | Name |
+|---|---|
+| `package.json`, `pyproject.toml`, `Cargo.toml` | the declared name |
+| `go.mod` | the last segment of the `module` path |
+| `pom.xml`, `build.gradle` | `group:artifact` (`artifact` alone when there is no group) |
+| `cpanfile`, `Gemfile`, `flake.nix` | no name field exists — see below |
+
+When a manifest declares no name (a `Gemfile`, a tooling-only root
+`pyproject.toml`, a private `package.json`), the name is derived from its
+location: a nested manifest takes its directory path with `/` replaced by `-`
+(`services/api/Gemfile` → `services-api`), and a manifest at the repo root
+takes the repository directory's own name.
+
+Two Gradle subprojects can compute the same `group:projectName` (two
+directories both called `app`). The one indexed first keeps that name; the
+colliding one falls back to its path-derived name, with `-2`, `-3`… appended
+if that name is taken as well. A warning naming both directories is logged,
+and neither package is dropped.
+
 ## Symbol extraction
 
 Shire extracts public symbols (functions, classes, types, methods, interfaces) from source files using [tree-sitter](https://tree-sitter.github.io/tree-sitter/), with full signatures, parameters, and return types.

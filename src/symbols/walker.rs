@@ -114,11 +114,15 @@ pub fn all_extensions() -> Vec<&'static str> {
 
 /// Walk a directory and collect source files matching the given extensions,
 /// skipping excluded directories, generated/test files, and anything
-/// gitignored. Uses the same `ignore` crate (and the same `.gitignore`/
-/// `.ignore`/global-gitignore honoring) as the file-index and manifest
-/// walks in `index::mod`. A symbol row can point at a file absent from the
-/// `files` table if the caller's `exclude_dirs` don't match what the file
-/// walk in `index::mod` excludes — see `walk_source_files_with_excludes`.
+/// gitignored. Uses the same `ignore` crate as the file-index and manifest
+/// walks in `index::mod` (committed `.gitignore`/`.ignore` files, including
+/// nested ones) — but, like those walks, does NOT honor the developer's
+/// personal global gitignore or `.git/info/exclude` (INFRA-2-1), since
+/// those are not part of the repository and would make the index depend on
+/// the machine it was built on. A symbol row can point at a file absent
+/// from the `files` table if the caller's `exclude_dirs` don't match what
+/// the file walk in `index::mod` excludes — see
+/// `walk_source_files_with_excludes`.
 /// `extra_skip_patterns` are user-configured patterns from shire.toml
 /// (matched as suffix or prefix against the filename).
 pub fn walk_source_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
@@ -153,6 +157,12 @@ pub fn walk_source_files_with_excludes(
 
     let walker = WalkBuilder::new(dir)
         .hidden(true)
+        // Committed .gitignore/.ignore files only — never a developer's
+        // personal global gitignore or .git/info/exclude, both of which
+        // are machine-local and would make the index non-deterministic
+        // across clones (INFRA-2-1).
+        .git_global(false)
+        .git_exclude(false)
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_str().unwrap_or("");
@@ -471,6 +481,49 @@ mod tests {
 
         let files = walk_source_files(&pkg, &["rs"]).unwrap();
         assert_eq!(files.len(), 1, "got {:?}", files);
+        assert!(files[0].ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn test_walk_ignores_global_gitignore() {
+        // INFRA-2-1: `WalkBuilder` defaults to honouring the developer's
+        // personal `core.excludesFile` (global gitignore) and
+        // `.git/info/exclude`, neither of which is part of the repository.
+        // Only committed `.gitignore`/`.ignore` files (and nested ones)
+        // should affect what gets indexed, so the index is the same on
+        // every machine and in CI.
+        let old_home = std::env::var_os("HOME");
+
+        let home = tempfile::TempDir::new().unwrap();
+        fs::write(home.path().join(".gitignore_global"), "**/*.rs\n").unwrap();
+        fs::write(
+            home.path().join(".gitconfig"),
+            format!(
+                "[core]\n\texcludesFile = {}\n",
+                home.path().join(".gitignore_global").display()
+            ),
+        )
+        .unwrap();
+
+        let repo = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join("src/lib.rs"), "pub fn a() {}").unwrap();
+
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let result = walk_source_files(repo.path(), &["rs"]);
+        match old_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        let files = result.unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "global gitignore must not affect the symbol walk: got {:?}",
+            files
+        );
         assert!(files[0].ends_with("src/lib.rs"));
     }
 }

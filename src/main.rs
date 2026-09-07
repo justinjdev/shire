@@ -321,7 +321,7 @@ fn run_clean(root: &Path, db: Option<PathBuf>, cfg_path: Option<&Path>) -> Resul
     // lock on an unlinked inode while the next builder creates a fresh
     // file at the same path and takes it immediately (INDEX-3-6).
     //
-    // Taken only once the guard below has accepted `db_path`, so a
+    // Taken only once `classify_for_removal` has accepted `db_path`, so a
     // repo-controlled `shire.toml` cannot get a lock file created next
     // to an arbitrary file (INDEX-3-7). `Skip` rather than a wait:
     // `clean` is interactive, and "a build is running" is the useful
@@ -334,7 +334,7 @@ fn run_clean(root: &Path, db: Option<PathBuf>, cfg_path: Option<&Path>) -> Resul
                 Some(lock) => Some(lock),
                 None => anyhow::bail!(
                     "a shire build is running against {}. Wait for it to finish, \
-                         then run `shire clean` again.",
+                     then run `shire clean` again.",
                     db_path.display()
                 ),
             }

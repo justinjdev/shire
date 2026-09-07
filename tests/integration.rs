@@ -3331,9 +3331,19 @@ fn test_linked_worktree_indexes_unstaged_edit() {
     );
 }
 
+/// Shred the schema b-tree on page 1, leaving the SQLite header intact —
+/// exactly what a SIGKILL during a MEMORY-journal build produces. The file is
+/// then unreadable as a database, so nothing can confirm it is shire's own.
+fn corrupt_db_file(db: &Path) {
+    use std::io::{Seek, SeekFrom};
+    let mut f = fs::OpenOptions::new().write(true).open(db).unwrap();
+    f.seek(SeekFrom::Start(100)).unwrap();
+    f.write_all(&[0xEEu8; 3000]).unwrap();
+    f.sync_all().unwrap();
+}
+
 #[test]
 fn test_build_recovers_from_corrupt_db() {
-    use std::io::{Seek, SeekFrom};
     let bin = cargo_bin();
     let dir = tempfile::TempDir::new().unwrap();
     let repo = dir.path().join("repo");
@@ -3346,18 +3356,14 @@ fn test_build_recovers_from_corrupt_db() {
     );
     git_commit_all(&repo, "fixture");
 
-    let db = dir.path().join("index.db");
+    // The default layout: shire's own directory inside the repo, which is
+    // what lets a file too damaged to identify still be recognised as an
+    // index shire made.
+    let db = repo.join(".shire").join("index.db");
     run_build(&bin, &repo, &db);
     assert_eq!(sym_count(&db, "alpha"), 1);
 
-    // Shred the schema b-tree on page 1, leaving the SQLite header intact —
-    // exactly what a SIGKILL during a MEMORY-journal build produces.
-    {
-        let mut f = fs::OpenOptions::new().write(true).open(&db).unwrap();
-        f.seek(SeekFrom::Start(100)).unwrap();
-        f.write_all(&[0xEEu8; 3000]).unwrap();
-        f.sync_all().unwrap();
-    }
+    corrupt_db_file(&db);
 
     let out = Command::new(&bin)
         .args([
@@ -3378,6 +3384,53 @@ fn test_build_recovers_from_corrupt_db() {
         sym_count(&db, "alpha"),
         1,
         "the rebuilt index must contain the symbols again"
+    );
+}
+
+#[test]
+fn test_build_refuses_to_delete_a_short_file_at_db_path() {
+    // INDEX-2-2: `db_path` comes from the repo's own shire.toml, unconfined.
+    // A file shorter than the SQLite header opens as SQLITE_NOTADB, which
+    // reads as corruption — and used to be deleted and replaced with an
+    // index, exiting 0. Running the default command on a cloned repo must
+    // not destroy an arbitrary file.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+    let victim = dir.path().join("small_secret");
+    fs::write(&victim, b"hunter2\n").unwrap();
+    // The hostile config names it, exactly as a cloned repo could.
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", victim.display()),
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "build must fail rather than adopt an unrelated file as its index"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        b"hunter2\n".to_vec(),
+        "the file must be left byte-for-byte intact"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to delete and rebuild"),
+        "the error must say the file was left alone, got: {stderr}"
     );
 }
 

@@ -42,7 +42,7 @@ fn is_interface_member(node: &Node) -> bool {
 }
 
 /// Like `check_modifiers`, but folds in the JLS-implicit modifiers for
-/// interface members described above.
+/// interface members and enum constants described above.
 fn effective_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool) {
     let (mut public, protected, private, mut is_static, mut is_final) =
         check_modifiers(node, source);
@@ -52,6 +52,15 @@ fn effective_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bo
             is_static = true;
             is_final = true;
         }
+    }
+    // Enum constants (`RED` in `enum Color { RED, GREEN }`) are implicitly
+    // public static final per the JLS; `enum_constant` nodes don't carry a
+    // `modifiers` child at all, so `check_modifiers` alone would report
+    // every one of them as package-private and drop it.
+    if node.kind() == "enum_constant" {
+        public = true;
+        is_static = true;
+        is_final = true;
     }
     (public, protected, private, is_static, is_final)
 }
@@ -95,7 +104,7 @@ fn is_visible(node: &Node, source: &str) -> bool {
 /// return the enclosing type's name.
 fn resolve_parent(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
-        "method_declaration" | "field_declaration" | "constant_declaration" => {
+        "method_declaration" | "field_declaration" | "constant_declaration" | "enum_constant" => {
             // Walk up once and take the *nearest* type of any kind. Trying
             // `class_declaration` first (then interface, then enum, then
             // record) would reach past an inner interface/record to the
@@ -227,11 +236,20 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
                 return None;
             }
 
-            // Extract name from variable_declarator child
-            let declarator = find_child_by_kind(node, "variable_declarator")?;
-            let name = find_identifier(&declarator, source)?;
+            // `enum_constant` (`RED` in `enum Color { RED, GREEN }`) has no
+            // `variable_declarator` — its name is a direct `name` field, and
+            // its "type" is the enclosing enum itself.
+            let (name, type_str) = if node.kind() == "enum_constant" {
+                let name_node = node.child_by_field_name("name")?;
+                let name = node_text(&name_node, source)?.to_string();
+                (name, resolve_parent(node, source))
+            } else {
+                // Extract name from variable_declarator child
+                let declarator = find_child_by_kind(node, "variable_declarator")?;
+                let name = find_identifier(&declarator, source)?;
+                (name, find_type_node(node, source))
+            };
 
-            let type_str = find_type_node(node, source);
             let vis = &sym.visibility;
             let signature = format!(
                 "{} static final {} {}",
@@ -300,9 +318,19 @@ pub fn hooks() -> LanguageHooks {
         extract_return_type: Some(extract_return_type),
         post_process: Some(post_process),
         reference_hooks: Some(ReferenceHooks {
+            // `constructor_declaration`/`compact_constructor_declaration` are
+            // deliberately absent: a constructor never exists as a symbol
+            // (there is no `@definition.*` pattern for it), and a
+            // constructor's `name` field is always identical to its
+            // enclosing type's name — including it here just duplicated the
+            // type name onto refs inside an ordinary constructor
+            // ("Point.Point") while a record's *compact* constructor was
+            // never in this list at all, so refs inside it were attributed
+            // to the record with no distinguishing suffix. Leaving both out
+            // makes every constructor's refs attribute uniformly to the
+            // enclosing type (SYMBOLS-2-6).
             enclosing_ancestors: &[
                 "method_declaration",
-                "constructor_declaration",
                 "class_declaration",
                 "interface_declaration",
                 "enum_declaration",

@@ -1251,6 +1251,7 @@ dependencies = [
  "glob",
  "ignore",
  "indicatif",
+ "libc",
  "quick-xml",
  "rayon",
  "regex",

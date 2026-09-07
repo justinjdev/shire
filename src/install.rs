@@ -18,6 +18,84 @@ enum RegStatus {
     Failed(String),
 }
 
+/// Mode to (re)write `path` with: its current mode if it exists, otherwise
+/// `default_new_mode`.
+#[cfg(unix)]
+fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(default_new_mode)
+}
+
+#[cfg(not(unix))]
+fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
+    default_new_mode
+}
+
+/// Write `content` to `path`, creating it fresh with `mode` applied at creation time.
+///
+/// Never follows a symlink at `path` and never writes through whatever's already
+/// there. `path` is often a predictable name (a `.tmp` sibling of a config file, or a
+/// plain project file like shire.toml) that a hostile repo can commit ahead of time as
+/// a symlink pointing outside the repo — or as a dangling symlink — and have this
+/// function write through it (attacker-controlled content, in the .gitignore case) to
+/// an arbitrary user-writable location. Any pre-existing entry at `path` (always
+/// something *we* own — a stale temp file, or the file we're about to (re)create) is
+/// removed first; `remove_file` never follows a symlink for removal, so this can't be
+/// redirected into deleting something else. The file is then created with
+/// `O_CREAT|O_EXCL` (`create_new`) plus `O_NOFOLLOW`: if something reappears at `path`
+/// between the remove and the create — a symlink replanted in that narrow window, or a
+/// concurrent process — the create fails with `AlreadyExists`/`ELOOP` rather than
+/// following it or overwriting it, and that is a hard error here, not a silent retry.
+#[cfg(unix)]
+fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Best-effort: clear whatever's there so create_new below starts from a clean
+    // slate. Not fatal by itself (e.g. permission denied) — a real problem surfaces as
+    // create_new failing next.
+    let _ = fs::remove_file(path);
+
+    let open_result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(path);
+    let mut f = match open_result {
+        Ok(f) => f,
+        // remove_file() above can't remove a directory, so AlreadyExists here most
+        // often means one is sitting at `path` — give a specific, actionable message
+        // instead of a raw io::Error and a backtrace.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                anyhow::bail!(
+                    "Refusing to write {}: a directory exists at that path. Remove it \
+                     manually and re-run.",
+                    path.display()
+                );
+            }
+            anyhow::bail!(
+                "Failed to create {}: a file or symlink reappeared there, or a \
+                 concurrent process is racing this write.",
+                path.display()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("Failed to write {}", path.display())),
+    };
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
+    let _ = fs::remove_file(path);
+    fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
+}
+
 /// Installs shire MCP entries for supported CLIs and editors.
 ///
 /// Attempts to register the current binary with supported tools (Claude Code, Codex CLI,
@@ -150,7 +228,11 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
             _ => None,
         })
         .collect();
-    if !dry_run && !failures.is_empty() {
+    // A tool with a config format we can't parse (e.g. Zed's JSONC settings.json, which
+    // ships with `//` comments serde_json rejects) shouldn't fail the whole install when
+    // other tools registered successfully — report it as a skipped/failed entry above
+    // and only return an error if nothing at all got registered.
+    if !dry_run && !failures.is_empty() && registered == 0 {
         anyhow::bail!("installation failed for {}", failures.join(", "));
     }
 
@@ -461,6 +543,10 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
 
     match upsert_json_mcp(&claude_json, "mcpServers", "shire", entry, force) {
         Ok(UpsertResult::Created) => {
+            // ~/.claude.json routinely carries oauth/account metadata and
+            // mcpServers env blocks; upsert_json_mcp creates a brand-new file at 0600
+            // (matching Claude Code's own default) via write_with_mode/target_mode,
+            // applied at creation time rather than a later chmod.
             println!("  Added mcpServers.shire to ~/.claude.json");
             Registration {
                 tool: "Claude Code",
@@ -483,7 +569,7 @@ fn register_claude_code_file(binary_path: &Path, dry_run: bool, force: bool) -> 
         }
         Err(e) => Registration {
             tool: "Claude Code",
-            status: RegStatus::Failed(e.to_string()),
+            status: RegStatus::Failed(format!("{e:#}")),
         },
     }
 }
@@ -520,7 +606,7 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         Err(e) => {
             return Registration {
                 tool: "Codex CLI",
-                status: RegStatus::Failed(e.to_string()),
+                status: RegStatus::Failed(format!("{e:#}")),
             };
         }
     };
@@ -568,7 +654,7 @@ fn register_codex(binary_path: &Path, dry_run: bool, force: bool) -> Registratio
         }
         Err(e) => Registration {
             tool: "Codex CLI",
-            status: RegStatus::Failed(e.to_string()),
+            status: RegStatus::Failed(format!("{e:#}")),
         },
     }
 }
@@ -649,8 +735,7 @@ fn upsert_codex_toml(config_file: &Path, binary_path: &Path, force: bool) -> Res
 
     // Atomic write via temp file
     let tmp_path = config_file.with_extension("toml.tmp");
-    fs::write(&tmp_path, &output)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    write_with_mode(&tmp_path, &output, target_mode(config_file, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, config_file) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -724,7 +809,7 @@ fn remove_codex_mcp(dry_run: bool) {
 
     let output = toml::to_string_pretty(&doc).unwrap_or_default();
     let tmp_path = config_file.with_extension("toml.tmp");
-    if fs::write(&tmp_path, &output).is_ok() {
+    if write_with_mode(&tmp_path, &output, target_mode(&config_file, 0o600)).is_ok() {
         if fs::rename(&tmp_path, &config_file).is_ok() {
             println!("  Removed MCP section");
         } else {
@@ -834,10 +919,14 @@ fn register_editor_mcp(
             }
         }
         Err(e) => {
-            println!("  Failed: {}", e);
+            // Print the full anyhow cause chain (e.g. the serde line/column for a
+            // JSONC file like Zed's settings.json, which ships with `//` comments
+            // serde_json rejects) instead of just the outermost "Failed to parse
+            // <path>" context, which gave the user nothing to act on.
+            println!("  Failed: {e:#}");
             Registration {
                 tool: tool_name,
-                status: RegStatus::Failed(e.to_string()),
+                status: RegStatus::Failed(format!("{e:#}")),
             }
         }
     }
@@ -903,7 +992,8 @@ fn remove_editor_mcp(
     servers.remove("shire");
     if let Ok(out) = serde_json::to_string_pretty(&Value::Object(root)) {
         let tmp_path = config_path.with_extension("json.tmp");
-        if fs::write(&tmp_path, format!("{}\n", out)).is_ok() {
+        let mode = target_mode(config_path, 0o600);
+        if write_with_mode(&tmp_path, &format!("{out}\n"), mode).is_ok() {
             if fs::rename(&tmp_path, config_path).is_ok() {
                 println!("  Removed shire");
             } else {
@@ -1097,8 +1187,7 @@ fn upsert_json_mcp(
 
     // Atomic write via temp file
     let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, format!("{}\n", output))
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    write_with_mode(&tmp_path, &format!("{output}\n"), target_mode(path, 0o600))?;
     if let Err(e) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
@@ -1405,5 +1494,299 @@ mod tests {
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(parsed["mcpServers"]["other"].is_object());
+    }
+
+    // --- CLI-1: rewriting a config file must not drop its permission mode ---
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+        fs::write(&path, json!({"mcpServers": {}}).to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "rewriting must preserve the existing 0600 mode"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_creates_new_files_at_0600() {
+        // Every new file these helpers create defaults to 0600 (applied at creation,
+        // not via a later chmod, so there's no permissive-umask window) — not just
+        // ~/.claude.json specifically.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_json_mcp_new_file_is_never_more_permissive_than_0600_even_under_umask_0() {
+        // Regression for the transient-window finding: under a permissive umask, a
+        // plain fs::write()-then-chmod sequence exposes the temp file (and, if chmod
+        // ran after rename, briefly the final path) at 0o666. Creating the temp file
+        // with an explicit mode from the start must not be affected by umask at all
+        // for a request this restrictive (0o600 has no group/other bits for umask to
+        // clear, and an explicit mode is never *widened* beyond what was requested).
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        // SAFETY: umask is process-global state; this test restores it immediately
+        // after the write it's testing, and other tests in this binary don't depend
+        // on a specific umask value.
+        let old_umask = unsafe { libc::umask(0) };
+        let result = upsert_json_mcp(
+            &path,
+            "mcpServers",
+            "shire",
+            json!({"command": "shire"}),
+            false,
+        );
+        unsafe {
+            libc::umask(old_umask);
+        }
+        result.unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "must be exactly 0600 even under umask 0");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upsert_codex_toml_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        upsert_codex_toml(&path, Path::new("/usr/local/bin/shire"), false).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn register_claude_code_file_sets_0600_on_a_new_claude_json() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        // SAFETY: single-threaded test process; no other test reads HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+
+        let reg = register_claude_code_file(Path::new("/usr/local/bin/shire"), false, false);
+        assert!(matches!(reg.status, RegStatus::Registered(_)));
+
+        let claude_json = dir.path().join(".claude.json");
+        let mode = fs::metadata(&claude_json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // --- CLI-3: install shouldn't abort entirely just because one tool's config
+    // couldn't be parsed, as long as something else registered ---
+
+    #[test]
+    fn run_install_exit_logic_only_fails_when_nothing_registered() {
+        fn any_registered(statuses: &[RegStatus]) -> bool {
+            statuses.iter().any(|s| {
+                matches!(
+                    s,
+                    RegStatus::Registered(_)
+                        | RegStatus::Updated(_)
+                        | RegStatus::AlreadyRegistered(_)
+                )
+            })
+        }
+
+        let mixed = [
+            RegStatus::Registered("a".into()),
+            RegStatus::Failed("bad JSONC".into()),
+        ];
+        assert!(
+            any_registered(&mixed),
+            "a mix of one success and one failure must count as \"something registered\""
+        );
+
+        let all_failed = [RegStatus::Failed("bad JSONC".into())];
+        assert!(!any_registered(&all_failed));
+    }
+
+    #[test]
+    fn register_editor_mcp_reports_full_cause_chain_on_jsonc_parse_failure() {
+        // A stock Zed settings.json ships with `//` comments, which serde_json rejects.
+        // The failure message must carry the underlying serde error (line/column),
+        // not just the outer "Failed to parse <path>" context, or the user has nothing
+        // to act on.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            "// Zed settings\n{ \"theme\": \"One Dark\" // trailing comment\n}\n",
+        )
+        .unwrap();
+
+        let reg = register_editor_mcp(
+            Path::new("/usr/local/bin/shire"),
+            "Zed",
+            &Some(path.clone()),
+            "context_servers",
+            None,
+            false,
+            false,
+        );
+
+        match reg.status {
+            RegStatus::Failed(msg) => {
+                assert!(
+                    msg.len() > "Failed to parse ...".len() && msg.contains(':'),
+                    "expected the full cause chain (outer context + serde detail), got: {msg}"
+                );
+                assert!(
+                    !msg.to_lowercase().contains("panic"),
+                    "message should be a clean error, not a panic: {msg}"
+                );
+            }
+            other => panic!(
+                "expected RegStatus::Failed for unparseable JSONC, got a different status (tool={}, is_failed={})",
+                reg.tool,
+                matches!(other, RegStatus::Failed(_))
+            ),
+        }
+
+        // The file itself must be untouched — a failed parse must not corrupt it.
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.contains("// Zed settings"));
+    }
+
+    #[test]
+    fn run_install_bail_condition_treats_partial_success_as_ok() {
+        // Mirrors the exact condition in run_install(): only bail when nothing at all
+        // registered, even if some tools failed.
+        let dry_run = false;
+        let failures = ["Zed: Failed to parse ...".to_string()];
+        let registered = 1usize;
+        assert!(!(!dry_run && !failures.is_empty() && registered == 0));
+
+        let registered = 0usize;
+        assert!(!dry_run && !failures.is_empty() && registered == 0);
+    }
+
+    // --- round-2 escalation: write_with_mode must never follow a symlink at its
+    // target path (a hostile repo committing e.g. mcp.json.tmp as a symlink) ---
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_removes_a_symlinked_target_and_writes_a_fresh_file() {
+        // The symlink at `target` is always something *we* own at that path (a stale
+        // temp file's worth of trust) — it's removed and a brand-new regular file is
+        // created in its place, so the write succeeds and the attacker's redirection
+        // is discarded entirely, rather than just refused.
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim_outside_repo");
+        std::fs::write(&victim, "original content").unwrap();
+        let target = dir.path().join("mcp.json.tmp");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        write_with_mode(&target, "attacker-controlled or generated content", 0o600).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original content",
+            "the former symlink target must be completely untouched"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a real file"
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "attacker-controlled or generated content"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_removes_a_dangling_symlink_and_writes_a_fresh_file() {
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside_repo_dir");
+        fs::create_dir_all(&outside).unwrap();
+        let dangling_target = outside.join("shire.toml");
+        let link = dir.path().join("shire.toml");
+        std::os::unix::fs::symlink(&dangling_target, &link).unwrap();
+
+        write_with_mode(&link, "# generated shire.toml", 0o600).unwrap();
+
+        assert!(
+            !dangling_target.exists(),
+            "must not create the file at the symlink's target"
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "# generated shire.toml");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_replaces_a_stale_leftover_tmp_file_freshly() {
+        // A pre-planted (or crash-leftover) world-writable tmp file at the exact
+        // target path must not have its mode or inode reused — the new file is always
+        // created fresh at the requested mode.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("claude.json.tmp");
+        fs::write(&path, "stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_with_mode(&path, "fresh content", 0o600).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fresh content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_with_mode_succeeds_normally_with_no_pre_existing_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fresh.json.tmp");
+        write_with_mode(&path, "hello", 0o600).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
     }
 }

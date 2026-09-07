@@ -267,8 +267,12 @@ impl ShireService {
         limit: u32,
         narrow_hint: &str,
     ) -> Result<CallToolResult, ErrorData> {
-        let truncated =
-            rows.len() as u32 > limit || (limit >= queries::MAX_ROWS && rows.len() as u32 >= limit);
+        // A probe row we actually saw proves more rows exist. At the ceiling
+        // there is no room for one, so a full result only *may* have been
+        // cut — say so rather than asserting a truncation we cannot see.
+        let over_limit = rows.len() as u32 > limit;
+        let at_ceiling = limit >= queries::MAX_ROWS && rows.len() as u32 >= limit;
+        let truncated = over_limit || at_ceiling;
         let shown = &rows[..rows.len().min(limit as usize)];
         let json = if truncated {
             serde_json::to_string(&TruncatedList {
@@ -278,8 +282,13 @@ impl ShireService {
                 max: queries::MAX_ROWS,
                 note: format!(
                     "showing the first {limit} results (limit={limit}, max {max}). \
-                     More exist — {narrow_hint}.",
-                    max = queries::MAX_ROWS
+                     {more} — {narrow_hint}.",
+                    max = queries::MAX_ROWS,
+                    more = if over_limit {
+                        "More exist"
+                    } else {
+                        "`limit` is at the ceiling, so more may exist"
+                    }
                 ),
             })
         } else {
@@ -906,11 +915,12 @@ impl ShireService {
         )
         .map_err(|e| Self::mcp_err(e.to_string()))?;
         // The payload is an object, not a list, so the truncation marker goes
-        // on it as extra fields. `summary` carries the true totals.
+        // on it as extra fields.
         let over = |n: usize| n as u32 > limit || (limit >= queries::MAX_ROWS && n as u32 >= limit);
+        let transitive_capped = over(impact.transitive_impact.len());
         let truncated = impact.summary.direct_count as u32 > limit
             || impact.summary.cross_package_count as u32 > limit
-            || over(impact.transitive_impact.len());
+            || transitive_capped;
         impact.direct_impact.truncate(limit as usize);
         impact.cross_package_impact.truncate(limit as usize);
         impact.transitive_impact.truncate(limit as usize);
@@ -930,8 +940,16 @@ impl ShireService {
                 "note".into(),
                 serde_json::Value::from(format!(
                     "each impact bucket is capped at {limit} rows (max {max}); \
-                         `summary` carries the true counts — raise `limit` or pass `package`.",
-                    max = queries::MAX_ROWS
+                     `summary.direct_count` and `summary.cross_package_count` are true \
+                     totals, but {transitive} — raise `limit` or pass `package`.",
+                    max = queries::MAX_ROWS,
+                    transitive = if transitive_capped {
+                        "the transitive walk stopped at the cap, so \
+                         `summary.transitive_package_count` is a floor, \
+                         not a total"
+                    } else {
+                        "`summary.transitive_package_count` counts only the rows returned"
+                    }
                 )),
             );
         }
@@ -1689,6 +1707,40 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(result_rows(&r).len(), 20);
+    }
+
+    /// The note must not assert a truncation the probe row never proved. At
+    /// `MAX_ROWS` there is no room to fetch the probe, so a result filling the
+    /// ceiling is flagged — but "more exist" would be a guess, and it points
+    /// the model at a `limit` it cannot raise.
+    #[test]
+    fn test_ceiling_note_says_more_may_exist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = service_with_symbols(dir.path(), queries::MAX_ROWS as usize);
+
+        // Exactly MAX_ROWS files, asked for MAX_ROWS: the probe cannot be
+        // fetched, so the cut is unproven.
+        let r = svc
+            .list_package_files(Parameters(ListPackageFilesParams {
+                package: "pkg".into(),
+                extension: None,
+                limit: Some(queries::MAX_ROWS),
+            }))
+            .unwrap();
+        assert_eq!(result_rows(&r).len(), queries::MAX_ROWS as usize);
+        let note = truncation_note(&r).expect("ceiling is still flagged");
+        assert!(note.contains("may exist"), "got {note}");
+
+        // Below the ceiling the probe row is real proof.
+        let r = svc
+            .list_package_files(Parameters(ListPackageFilesParams {
+                package: "pkg".into(),
+                extension: None,
+                limit: Some(10),
+            }))
+            .unwrap();
+        let note = truncation_note(&r).expect("truncated");
+        assert!(note.contains("More exist"), "got {note}");
     }
 
     /// A complete list gets no truncation note — the note must mean

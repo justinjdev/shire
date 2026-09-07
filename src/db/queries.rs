@@ -1522,6 +1522,10 @@ pub struct ChangeImpactSummary {
     /// the full ref set before truncation — this is the authoritative list
     /// of directly affected packages.
     pub affected_packages: Vec<String>,
+    /// Packages reached by the reverse-dep walk. Unlike the two counts above
+    /// this is *not* a true total: the walk stops at `per_bucket_limit`, so a
+    /// capped result reports a floor. `change_impact`'s truncation marker is
+    /// what says whether more exist.
     pub transitive_package_count: usize,
 }
 

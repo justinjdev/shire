@@ -19,7 +19,7 @@ Shire exposes the following tools over the Model Context Protocol:
 | `index_status` | Index build metadata: timestamp, git commit, counts |
 | `symbol_references` | Find all references to a symbol by name. Returns `[{name, kind, file_path, line, package, enclosing_symbol}]`. Accepts optional `kind` and `package` filters. **Requires `symbols.references_enabled = true` (experimental, opt-in).** Note: matching is name-based — same-name symbols across different packages are merged. `enclosing_symbol` is dot-qualified (`AuthService.login`); a qualified name passed as `name` falls back to its last segment when nothing matches it exactly. |
 | `symbol_callers` | List all callers of a symbol (call-site references). Returns `[{caller_name, caller_file, caller_line, caller_package, call_sites}]`, where `caller_name` is the dot-qualified enclosing path (`AuthService.login`) and can be fed straight back in as `name` — a qualified `name` with no exact match falls back to its last segment. Accepts optional `package` filter. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
-| `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
+| `symbol_callees` | List what a function calls (outbound call graph). Returns `[{callee_name, first_file, first_line, call_sites}]`. Accepts a bare method name (`login`, which matches every qualified form such as `AuthService.login`) or a qualified one (`AuthService.login`, which matches only that method), plus an optional `package` filter. **Requires `symbols.references_enabled = true`.** |
 | `change_impact` | Analyze the blast radius of changing a symbol. Combines cross-references with the dependency graph to return `{direct_impact, cross_package_impact, transitive_impact, summary}`. Use before renaming, changing a signature, or deleting a symbol. Accepts optional `package` (home package hint, for disambiguation), `transitive_depth` (default 2), and `limit`. **Requires `symbols.references_enabled = true`.** Same name-based-match caveat as `symbol_references`. |
 | `schema_consumers` | Find all files generated from a schema file (e.g. `.proto`). Returns generated file paths and their packages. Use to understand the blast radius of a schema change. |
 | `generated_from` | Find the source schema file that generated a given file. Use to trace a generated file (e.g. `user.pb.go`) back to its source proto. |
@@ -77,11 +77,14 @@ object instead:
 so a capped list is never presented as a complete one, and a client that
 concatenates the result's text blocks still gets parseable JSON. (At
 `limit` = 200 the extra row cannot be fetched, so a result that fills the
-ceiling is always reported as truncated.)
+ceiling is always flagged, with a `note` saying more rows *may* exist rather
+than that they do.)
 
 `change_impact` returns an object rather than a list; when a bucket is capped
-it gains the same `truncated` / `limit` / `max` / `note` fields, and its
-`summary` carries the true counts either way.
+it gains the same `truncated` / `limit` / `max` / `note` fields.
+`summary.direct_count` and `summary.cross_package_count` are true totals
+either way, but `summary.transitive_package_count` is not: the reverse-dep
+walk stops at `limit`, so a capped result reports a floor.
 
 ### When to use Shire vs Grep/Glob
 

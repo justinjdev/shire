@@ -32,9 +32,16 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
 - The query is split on whitespace and **every token must match** (implicit AND).
 - Each token matches by **prefix**: `handle` matches `handleRequest` and
   `handle_request`. Tokens of one character are matched exactly instead —
-  `packages_fts`, `symbols_fts` and `docs_fts` index 2- and 3-character
-  prefixes, and a single-character prefix has no index anywhere, so it would
-  have to scan every term.
+  `packages_fts` and `docs_fts` index 2- and 3-character prefixes, while
+  `symbols_fts` and `files_fts` deliberately carry no prefix index (a prefix
+  query there walks a term range instead, measured as equally fast and ~28%
+  smaller on disk), so a single-character prefix would have to scan every term.
+- Each tool searches only the columns it is about. `search_symbols` matches
+  the **symbol name and its sub-tokens** — not signatures, file paths or kinds
+  (filter by kind with `kind`, find paths with `search_files`, and use Grep
+  for text inside a signature). `search_files` matches the path,
+  `search_packages` the package name, description and path, and `search_docs`
+  the doc title, body and path.
 - `search_symbols` orders exact name matches first, so searching `handle`
   never buries a symbol actually called `handle` under its own prefixes.
 - Symbol names are additionally indexed by their **sub-tokens**:

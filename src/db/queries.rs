@@ -146,7 +146,29 @@ fn fts_match_expr(query: &str) -> Option<String> {
     Some(parts.join(" "))
 }
 
-/// FTS5 search across symbol names and signatures.
+/// The `symbols_fts` columns a symbol search is allowed to match.
+///
+/// The table also indexes `kind`, `signature` and `file_path`. Matching a
+/// prefix against those turns an ordinary identifier query into a path/
+/// parameter search: `mod` matched every symbol living in a `module_00.go`,
+/// and `p` matched every symbol with a parameter named `p`, at 10-40x the
+/// latency. `search_symbols` is documented as identifier matching, so the
+/// MATCH is scoped to the identifier columns. (`kind` is still reachable —
+/// as the explicit `kind:"..."` filter appended for the `kind` argument.)
+const SYMBOL_MATCH_COLUMNS: &str = "{name name_tokens}";
+
+/// Restrict an FTS5 expression to a column set: `{a b} : (expr)`.
+///
+/// The parentheses are load-bearing: in `{a b} : "x"* "y"*` the filter binds
+/// to the first phrase only, and `"y"*` would go on matching every column.
+fn column_scoped(columns: &str, expr: &str) -> String {
+    format!("{columns} : ({expr})")
+}
+
+/// FTS5 search across symbol names and their identifier sub-tokens.
+///
+/// Signatures, file paths and kinds are indexed in `symbols_fts` but are
+/// deliberately not searched here — see [`SYMBOL_MATCH_COLUMNS`].
 ///
 /// Results are ordered exact-name-first, then by FTS rank: prefix and
 /// sub-token matching means a query for `handle` also matches
@@ -163,17 +185,19 @@ pub fn search_symbols(
         return Ok(Vec::new());
     }
     let sanitized = match fts_match_expr(query) {
-        Some(expr) => expr,
+        Some(expr) => column_scoped(SYMBOL_MATCH_COLUMNS, &expr),
         None => return Ok(Vec::new()),
     };
     let limit = clamp_limit(limit);
 
     // For kind-filtered queries, push the kind filter into FTS MATCH using column syntax.
     // This lets FTS5 filter at the index level instead of post-filtering via JOIN.
+    // The `AND` is explicit: FTS5 only infers it between bare phrases, and the
+    // scoped `{cols} : (...)` expression on the left is not one.
     let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
         match (package_filter, kind_filter) {
             (Some(pkg), Some(kind)) => {
-                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                let fts_query = format!("{} AND kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
                 (
                     "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -204,7 +228,7 @@ pub fn search_symbols(
                 ],
             ),
             (None, Some(kind)) => {
-                let fts_query = format!("{} kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
+                let fts_query = format!("{} AND kind:\"{}\"", sanitized, kind.replace('"', "\"\""));
                 (
                     "SELECT s.name, s.kind, s.signature, s.package, s.file_path, s.line,
                     s.visibility, s.parent_symbol, s.return_type, s.parameters
@@ -2068,6 +2092,69 @@ mod tests {
         );
     }
 
+    /// The MATCH is scoped to `{name name_tokens}`: a query must not match a
+    /// symbol through its file path, its signature or its kind. Before the
+    /// scoping, `mod` returned every symbol defined in a `module_*.go` file
+    /// and `par` every symbol with a parameter named `parent`.
+    #[test]
+    fn test_search_symbols_does_not_match_paths_or_signatures() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, signature, file_path, line, name_tokens)
+             VALUES ('auth-service', 'Config', 'class', 'func Config(parent int)',
+                     'services/auth/src/module_00.go', 1, 'config')",
+            [],
+        )
+        .unwrap();
+        let names = |q: &str| -> Vec<String> {
+            search_symbols(&conn, q, None, None, 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        // file_path tokens
+        assert!(names("mod").is_empty(), "matched via file_path");
+        assert!(names("module").is_empty(), "matched via file_path");
+        assert!(names("services").is_empty(), "matched via file_path");
+        // signature tokens
+        assert!(names("par").is_empty(), "matched via signature");
+        assert!(names("parent").is_empty(), "matched via signature");
+        // kind is only reachable through the `kind` argument
+        assert!(names("class").is_empty(), "matched via kind");
+        // …and the identifier itself still matches, by prefix and exactly.
+        assert_eq!(names("conf"), vec!["Config"]);
+        assert_eq!(names("Config"), vec!["Config"]);
+    }
+
+    /// Column scoping composes with the `kind:` filter and with multi-token
+    /// queries (the scoped expression has to be parenthesised, or only the
+    /// first token would be scoped).
+    #[test]
+    fn test_search_symbols_column_scope_composes_with_filters() {
+        assert_eq!(
+            column_scoped(SYMBOL_MATCH_COLUMNS, "\"verify\"* \"jwt\"*"),
+            "{name name_tokens} : (\"verify\"* \"jwt\"*)"
+        );
+        let conn = test_db_with_identifiers();
+        // Multi-token: both tokens scoped, so `services` (a path token) rules
+        // the query out instead of matching every symbol under services/.
+        assert!(
+            search_symbols(&conn, "verify services", None, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = search_symbols(&conn, "verify jwt", None, None, 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "verifyJwtToken");
+        // kind filter still narrows a scoped query.
+        let hits = search_symbols(&conn, "handle", None, Some("function"), 20).unwrap();
+        assert!(
+            hits.iter().all(|h| h.kind == "function") && !hits.is_empty(),
+            "got {hits:?}"
+        );
+    }
+
     // ── Injection safety of the query builder ───────────────────────────
 
     /// Hostile inputs must never produce an FTS5 syntax error, never panic,
@@ -2305,10 +2392,18 @@ mod tests {
         assert_eq!(results[0].package, "auth-service");
     }
 
+    /// Signature text is indexed in `symbols_fts` but is not searched: the
+    /// only place `token` appears is `validate`'s signature, and an
+    /// identifier query must not reach a symbol through its parameters.
     #[test]
-    fn test_search_symbols_by_signature() {
+    fn test_search_symbols_ignores_signature_text() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "token", None, None, 20).unwrap();
+        assert!(
+            search_symbols(&conn, "token", None, None, 20)
+                .unwrap()
+                .is_empty()
+        );
+        let results = search_symbols(&conn, "validate", None, None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "validate");
     }
@@ -2316,11 +2411,11 @@ mod tests {
     #[test]
     fn test_search_symbols_filter_by_package() {
         let conn = test_db_with_symbols();
-        let results = search_symbols(&conn, "interface", Some("shared-types"), None, 20).unwrap();
+        let results = search_symbols(&conn, "UserConfig", Some("shared-types"), None, 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "UserConfig");
 
-        let results = search_symbols(&conn, "interface", Some("auth-service"), None, 20).unwrap();
+        let results = search_symbols(&conn, "UserConfig", Some("auth-service"), None, 20).unwrap();
         assert!(results.is_empty());
     }
 

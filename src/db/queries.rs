@@ -358,18 +358,40 @@ fn promote_exact_name(
     limit: i64,
     result: &mut Vec<SymbolRow>,
 ) -> Result<()> {
-    let name = query.trim();
+    let raw = query.trim();
     // Multi-token queries do not name a single symbol.
-    if name.split_whitespace().count() != 1 {
+    if raw.split_whitespace().count() != 1 {
         return Ok(());
     }
-    // `handle*` and `handle.` are prefix-searched on the term `handle`, so
-    // the promotion has to compare on that term too — otherwise it no-ops for
-    // the very queries the prefix syntax exists to serve.
-    let name = query_term(name);
-    if name.is_empty() {
+    // The name *as typed* is tried first. Trailing punctuation is not always
+    // syntax: `!`, `?` and `'` are identifier characters in Ruby, Elixir,
+    // Clojure and Haskell, so `save!` names a symbol called `save!` and must
+    // not promote the `save` sitting next to it.
+    if promote_one_name(conn, raw, package_filter, kind_filter, limit, result)? {
         return Ok(());
     }
+    // Only then the term the FTS query actually ran on: `handle*` and
+    // `handle.` are prefix-searched on `handle`, so the promotion falls back
+    // to that term — otherwise it no-ops for the very queries the prefix
+    // syntax exists to serve.
+    let term = query_term(raw);
+    if term.is_empty() || term == raw {
+        return Ok(());
+    }
+    promote_one_name(conn, term, package_filter, kind_filter, limit, result)?;
+    Ok(())
+}
+
+/// One pass of [`promote_exact_name`] for a single candidate `name`.
+/// Returns whether a symbol named exactly `name` ended up in `result`.
+fn promote_one_name(
+    conn: &Connection,
+    name: &str,
+    package_filter: Option<&str>,
+    kind_filter: Option<&str>,
+    limit: i64,
+    result: &mut Vec<SymbolRow>,
+) -> Result<bool> {
     // FTS matching folds case, so the promotion has to as well: an LLM
     // querying `config` for a type called `Config` must still get it.
     if let Some(pos) = result.iter().position(|r| eq_case_folded(&r.name, name)) {
@@ -377,7 +399,7 @@ fn promote_exact_name(
             let exact = result.remove(pos);
             result.insert(0, exact);
         }
-        return Ok(());
+        return Ok(true);
     }
 
     // Look the name up through the FTS index rather than `symbols`: it is
@@ -386,7 +408,7 @@ fn promote_exact_name(
     // too, but the NOCASE collation cannot use idx_symbols_name, so every
     // miss would scan the whole table — and a miss is the common case here.
     let Some(phrase) = fts_phrase(name) else {
-        return Ok(());
+        return Ok(false);
     };
     let fts_expr = format!("name:{phrase}");
     let mut stmt = conn.prepare_cached(
@@ -426,8 +448,9 @@ fn promote_exact_name(
     if let Some(exact) = rows.next() {
         result.insert(0, exact);
         result.truncate(limit as usize);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// List symbols in a package, optionally filtered by kind, ordered by
@@ -2506,6 +2529,44 @@ mod tests {
         assert!(query_term("*").is_empty());
         assert_eq!(query_term("handle*"), "handle");
         assert_eq!(query_term("os.path"), "os.path");
+    }
+
+    /// `!`, `?` and `'` are identifier characters in Ruby, Elixir, Clojure
+    /// and Haskell, so the trailing-syntax trim must not be applied *before*
+    /// the name as typed has had its chance: searching `save!` has to promote
+    /// `save!`, not the `save` sitting beside it.
+    #[test]
+    fn test_search_symbols_promotes_a_name_ending_in_punctuation() {
+        let conn = test_db();
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+                 VALUES ('auth-service', ?1, 'method', ?2, ?3, '')",
+                rusqlite::params![
+                    format!("saveRecord{i:03}"),
+                    format!("services/auth/src/m{i:03}.rb"),
+                    i as i64
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, name_tokens)
+             VALUES ('auth-service', 'save', 'method', 'services/auth/src/a.rb', 90, ''),
+                    ('auth-service', 'save!', 'method', 'services/auth/src/b.rb', 91, '')",
+            [],
+        )
+        .unwrap();
+
+        for (query, want) in [("save!", "save!"), ("save", "save"), ("save*", "save")] {
+            let hits = search_symbols(&conn, query, None, None, 3).unwrap();
+            assert_eq!(
+                hits[0].name,
+                want,
+                "{query:?} promoted {:?}",
+                hits.iter().map(|h| &h.name).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

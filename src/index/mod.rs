@@ -273,6 +273,27 @@ fn diff_manifests<'a>(
     }
 }
 
+/// The package `pkg` is about to displace at its own path *because it belongs
+/// to another ecosystem*, if any.
+///
+/// `packages.path` is UNIQUE, so a directory holding manifests of two
+/// ecosystems (a Rust crate with a JS wrapper, a Ruby gem with a package.json
+/// for tooling) can only ever have one of them indexed. A same-`kind` row at
+/// the same path is an ordinary rename and not reported.
+fn displaced_foreign_package(
+    conn: &Connection,
+    pkg: &PackageInfo,
+) -> Result<Option<(String, String)>> {
+    let displaced = conn
+        .query_row(
+            "SELECT name, kind FROM packages WHERE path = ?1 AND name != ?2",
+            [&pkg.path, &pkg.name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(displaced.filter(|(_, kind)| kind != pkg.kind))
+}
+
 /// Insert a package and its dependencies into the DB.
 fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
@@ -281,6 +302,23 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Also handle path conflicts: if two manifest parsers produce different
     // package names for the same directory, delete the old row first to avoid
     // a UNIQUE constraint violation on packages.path.
+    //
+    // Two manifests of *different* ecosystems in one directory (a Rust crate
+    // with a JS wrapper, a Ruby gem with a package.json for tooling) also land
+    // on the same `packages.path`, and only one of them can have a row. That
+    // collapse used to be entirely silent, so a directory quietly indexed half
+    // of what it holds; say so (INDEX-3-4).
+    if let Some((dropped, dropped_kind)) = displaced_foreign_package(conn, pkg)? {
+        tracing::warn!(
+            path = %pkg.path,
+            indexed = %pkg.name,
+            indexed_kind = %pkg.kind,
+            %dropped,
+            %dropped_kind,
+            "two manifests of different ecosystems share one directory; only one \
+             package can be indexed there and the other is dropped"
+        );
+    }
     conn.execute(
         "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
         [&pkg.path, &pkg.name],
@@ -564,11 +602,24 @@ struct FileWalk {
     /// volume mid-remount. Their contents are *invisible*, which is not the
     /// same as absent, and the difference decides whether the `files` rows
     /// underneath them may be deleted.
+    ///
+    /// An empty string is the repo root itself: the walk can prove nothing
+    /// about anything.
     unreadable: Vec<String>,
+    /// Did the walk stop early because it hit `MAX_FILES`? Only used to word
+    /// the warning — the truncation is already recorded as a whole-tree blind
+    /// spot in `unreadable`.
+    capped: bool,
 }
 
 /// Walk the repo and collect all files with metadata.
 fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
+    walk_files_capped(repo_root, config, MAX_FILES)
+}
+
+/// [`walk_files`] with an explicit cap, so the truncation path is testable
+/// without materialising half a million files.
+fn walk_files_capped(repo_root: &Path, config: &Config, max_files: usize) -> Result<FileWalk> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
     let walker = ignore_walk_builder(repo_root)
@@ -634,12 +685,15 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
                 size_bytes,
             });
 
-            if guard.len() >= MAX_FILES {
-                tracing::warn!(
-                    max = MAX_FILES,
-                    "file tree walk capped at maximum file count"
-                );
-                capped.store(true, std::sync::atomic::Ordering::Relaxed);
+            if guard.len() >= max_files {
+                // One warning per build, not one per worker that raced to the
+                // limit.
+                if !capped.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        max = max_files,
+                        "file tree walk capped at maximum file count"
+                    );
+                }
                 return ignore::WalkState::Quit;
             }
 
@@ -647,9 +701,24 @@ fn walk_files(repo_root: &Path, config: &Config) -> Result<FileWalk> {
         })
     });
 
+    let capped = capped.load(std::sync::atomic::Ordering::Relaxed);
+    let mut unreadable = normalize_unreadable_roots(unreadable.into_inner().unwrap());
+    if capped {
+        // A truncated walk stopped at an arbitrary point in a
+        // nondeterministic traversal order: it saw *some* of the tree and
+        // knows nothing about the rest, which is exactly the state
+        // `unreadable` describes. Recording the repo root as the blind spot
+        // makes the cap inherit every rule already written for one — no
+        // deletions from a walk that cannot prove absence, and no file-tree
+        // hash stored for a partial walk (INDEX-3-2). Without it, each build
+        // kept a different arbitrary subset and churned the rows in between.
+        unreadable = vec![String::new()];
+    }
+
     Ok(FileWalk {
         files: files.into_inner().unwrap(),
-        unreadable: normalize_unreadable_roots(unreadable.into_inner().unwrap()),
+        unreadable,
+        capped,
     })
 }
 
@@ -677,12 +746,20 @@ fn blind_spot(err: &ignore::Error, repo_root: &Path) -> Option<String> {
         tracing::warn!(error = %err, "I/O walk error with no path — treating the walk as incomplete");
         return Some(String::new());
     };
-    Some(
-        path.strip_prefix(repo_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string(),
-    )
+    let Ok(relative) = path.strip_prefix(repo_root) else {
+        // The error is about something outside the walk root — `ignore` reads
+        // the ancestor `.gitignore` files too, so an unreadable `~/.gitignore`
+        // lands here. It hides nothing *inside* the tree, and recording it
+        // would both add a root that can never match a repo-relative path and
+        // stop the file-tree hash from ever being stored again.
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "I/O walk error outside the repository root — the tree itself is still visible"
+        );
+        return None;
+    };
+    Some(relative.to_string_lossy().to_string())
 }
 
 /// The path an `ignore` walk error is about, dug out of whatever wrappers the
@@ -730,9 +807,18 @@ fn normalize_unreadable_roots(mut roots: Vec<String>) -> Vec<String> {
     if roots.len() < 2 {
         return roots;
     }
-    roots.sort_unstable();
+    // Plain byte order does NOT put a covering root immediately before
+    // everything it covers: every byte below `/` (`a-b`, `a.b`, …) sorts
+    // between `a` and `a/c`, so `a` stops being the last kept root before
+    // `a/c` is reached and the redundant child survives the reduction.
+    // Ordering as if the separator were NUL — which cannot occur in a path —
+    // restores that property; equality (hence `dedup`) is unaffected.
+    fn segment_order_key(path: &str) -> impl Iterator<Item = u8> + '_ {
+        path.bytes().map(|b| if b == b'/' { 0 } else { b })
+    }
+    roots.sort_unstable_by(|a, b| segment_order_key(a).cmp(segment_order_key(b)));
     roots.dedup();
-    // Sorted order puts a covering root immediately before everything it
+    // With that order a covering root sits immediately before everything it
     // covers, so one pass keeping only paths not covered by the last kept
     // root is enough.
     let mut kept: Vec<String> = Vec::with_capacity(roots.len());
@@ -1489,10 +1575,8 @@ fn delete_packages_at_path(conn: &Connection, path: &str, kind: Option<&str>) ->
 /// back to the path-only delete, which is what they had before.
 fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
     for manifest_key in removed {
-        let (relative_dir, filename) = match manifest_key.rsplit_once('/') {
-            Some((dir, file)) => (dir, file),
-            None => ("", manifest_key.as_str()),
-        };
+        let relative_dir = manifest_parent_dir(manifest_key);
+        let filename = manifest_filename(manifest_key);
         // A context-only manifest never owned a package, so it takes none with
         // it — only its own hash row goes.
         if !is_context_only_manifest(filename) {
@@ -1503,7 +1587,85 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             [manifest_key.as_str()],
         )?;
     }
+    reparse_manifests_in_emptied_dirs(conn, removed)?;
     Ok(())
+}
+
+/// The repo-relative directory a manifest key lives in (`""` for a manifest at
+/// the repo root), which is also the `packages.path` of the package it owns.
+fn manifest_parent_dir(manifest_key: &str) -> &str {
+    manifest_key.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The filename part of a manifest key.
+fn manifest_filename(manifest_key: &str) -> &str {
+    manifest_key
+        .rsplit_once('/')
+        .map_or(manifest_key, |(_, f)| f)
+}
+
+/// Forget the stored content hash of every manifest still on disk in a
+/// directory a removal has just left with no package at all, so the next build
+/// re-parses it. Returns how many hashes were cleared.
+///
+/// `packages.path` is UNIQUE, so two manifests of different ecosystems in one
+/// directory produce only one package row between them (see `upsert_package`).
+/// Both still get a `manifest_hashes` row. When the winner's manifest is
+/// deleted, its package goes with it — and the loser is never reconsidered,
+/// because its content hash is unchanged and `diff_manifests` therefore
+/// classifies it as `unchanged`. The directory is then left with no package,
+/// no symbols and no dependency edges for as long as the surviving manifest's
+/// *content* stays the same, which can be forever (INDEX-3-4).
+///
+/// Clearing the hash is the narrow fix: it only ever costs one extra parse of
+/// a manifest in a directory that currently has nothing indexed, and it cannot
+/// loop — the re-parse stores the hash again.
+fn reparse_manifests_in_emptied_dirs(conn: &Connection, removed: &[String]) -> Result<usize> {
+    if removed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut emptied: HashSet<&str> = HashSet::new();
+    for dir in removed
+        .iter()
+        .map(|key| manifest_parent_dir(key))
+        .collect::<HashSet<&str>>()
+    {
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM packages WHERE path = ?1",
+            [dir],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            emptied.insert(dir);
+        }
+    }
+    if emptied.is_empty() {
+        return Ok(0);
+    }
+
+    // Small table (one row per manifest in the repo), and `manifest_hashes`
+    // keys are matched on their directory component — a LIKE prefix would
+    // mis-handle `_`/`%` in a directory name.
+    let keys: Vec<String> = conn
+        .prepare("SELECT path FROM manifest_hashes")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut cleared = 0usize;
+    for key in keys
+        .iter()
+        .filter(|key| emptied.contains(manifest_parent_dir(key)))
+    {
+        conn.execute("DELETE FROM manifest_hashes WHERE path = ?1", [key])?;
+        tracing::info!(
+            manifest = %key,
+            "directory has no package left after a removal — re-parsing this \
+             manifest on the next build"
+        );
+        cleared += 1;
+    }
+    Ok(cleared)
 }
 
 /// Phase 6: Store manifest hashes for parsed manifests using batched multi-row INSERTs.
@@ -2579,6 +2741,7 @@ fn phase_index_files(
     let FileWalk {
         files: walked_files,
         unreadable,
+        capped,
     } = walk_files(repo_root, config)?;
 
     // Compute file-tree hash from (path, size) tuples
@@ -2687,6 +2850,19 @@ fn phase_index_files(
             "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('file_tree_hash', ?1)",
             [&current_hash],
         )?;
+    } else if capped {
+        tracing::warn!(
+            max = MAX_FILES,
+            files = walked_files.len(),
+            "file walk stopped at the file-count cap — the tree was only partly \
+             seen, so no file-tree hash is stored and nothing outside the walked \
+             set is treated as deleted"
+        );
+        eprintln!(
+            "Warning: stopped walking the file tree at {MAX_FILES} files. The index \
+             covers only part of this repository; exclude directories in shire.toml \
+             (discovery.exclude) to bring it under the cap."
+        );
     } else {
         tracing::warn!(
             unreadable = unreadable.len(),
@@ -3213,7 +3389,7 @@ pub fn build_index(
     force: bool,
     db_override: Option<&Path>,
 ) -> Result<()> {
-    let extract_failures = build_index_inner(
+    let (_, extract_failures) = build_index_inner(
         repo_root,
         config,
         force,
@@ -3244,17 +3420,20 @@ pub fn build_index(
 /// would then keep serving the pre-rebuild connection and re-run a full
 /// rebuild on every single tool call.
 ///
-/// If another build already holds the build lock this returns without
-/// building: the build in flight is doing the same work, and this caller (the
-/// MCP server's per-tool-call check) comes round again on the next tool call
-/// past the debounce window. Callers whose trigger is *not* repeated must use
+/// If another build already holds the build lock this returns
+/// [`BuildOutcome::Skipped`] without building: the build in flight is doing
+/// the same work, and this caller (the MCP server's per-tool-call check) comes
+/// round again on the next tool call past the debounce window. The caller must
+/// tell the two apart — treating a skip as a completed rebuild leaves the
+/// stale-index timestamp untouched and so re-triggers on every call
+/// (INDEX-3-5). Callers whose trigger is *not* repeated must use
 /// [`build_index_quiet_waiting`] instead.
 pub fn build_index_quiet(
     repo_root: &Path,
     config: &Config,
     force: bool,
     db_override: Option<&Path>,
-) -> Result<()> {
+) -> Result<BuildOutcome> {
     build_index_quiet_with(repo_root, config, force, db_override, LockWait::Skip)
 }
 
@@ -3279,6 +3458,8 @@ pub fn build_index_quiet_waiting(
         db_override,
         LockWait::Wait(lock::LOCK_TIMEOUT),
     )
+    // `Wait` never skips, so there is no outcome to report.
+    .map(|_| ())
 }
 
 fn build_index_quiet_with(
@@ -3287,8 +3468,8 @@ fn build_index_quiet_with(
     force: bool,
     db_override: Option<&Path>,
     lock_wait: LockWait,
-) -> Result<()> {
-    let extract_failures =
+) -> Result<BuildOutcome> {
+    let (outcome, extract_failures) =
         build_index_inner(repo_root, config, force, db_override, false, lock_wait)?;
     if !extract_failures.is_empty() {
         tracing::warn!(
@@ -3296,7 +3477,7 @@ fn build_index_quiet_with(
             "some packages could not be indexed; their previously indexed rows were kept"
         );
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Restores the DB to a servable state when `build_index_inner` returns,
@@ -3329,6 +3510,21 @@ impl Drop for BuildGuard<'_> {
     }
 }
 
+/// Whether a build actually ran.
+///
+/// A build that was skipped because a competing builder held the lock looks
+/// exactly like a successful one to its caller unless it says so: the MCP
+/// server logged "index rebuilt", re-read the unchanged `indexed_at`, and so
+/// found the index stale again on the very next tool call — the per-call
+/// rebuild storm the debounce exists to prevent (INDEX-3-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildOutcome {
+    /// The build ran to completion and committed.
+    Built,
+    /// Another build held the lock and this one was asked to skip.
+    Skipped,
+}
+
 /// Returns the packages whose symbol extraction failed outright. Their
 /// previously indexed rows were left untouched; it is up to the caller to
 /// decide whether that is fatal (see `build_index` vs `build_index_quiet`).
@@ -3339,7 +3535,7 @@ fn build_index_inner(
     db_override: Option<&Path>,
     progress: bool,
     lock_wait: LockWait,
-) -> Result<Vec<(String, String)>> {
+) -> Result<(BuildOutcome, Vec<(String, String)>)> {
     let build_start = Instant::now();
     let mut timings: Vec<(&str, Duration)> = Vec::new();
     let mp = if progress {
@@ -3355,6 +3551,24 @@ fn build_index_inner(
         crate::config::resolve_db_path_with_info(config, repo_root, &wt_info)?
     };
 
+    // The lock file below is `db_path` + ".lock", and `db_path` comes from the
+    // repo's own shire.toml — so check first that there is not some unrelated
+    // file sitting at that path. The guard that protects the file itself does
+    // not run until the database is opened, several steps further down
+    // (INDEX-3-7).
+    //
+    // A database this pass cannot inspect is deliberately not fatal yet: a
+    // shire build already running against this db_path holds it under
+    // `journal_mode=MEMORY`, whose write transactions block readers, and
+    // refusing here would make two builders on one db_path fail instead of
+    // serialise. The lock below waits that build out; the second pass, under
+    // the lock, is the one that decides.
+    crate::db::guard::reject_unrelated_file_at_db_path(
+        &db_path,
+        Some(repo_root),
+        crate::db::guard::Inspection::BeforeBuildLock,
+    )?;
+
     // Serialize builds across processes for the whole pipeline. Two builders
     // that both read `is_full_build` from an empty `manifest_hashes` before
     // either commits will both insert without deleting, doubling every symbol
@@ -3362,8 +3576,17 @@ fn build_index_inner(
     // by a builder that turns out to have lost the race.
     let _build_lock = match lock::acquire(&db_path, lock_wait)? {
         Some(guard) => guard,
-        None => return Ok(Vec::new()),
+        None => return Ok((BuildOutcome::Skipped, Vec::new())),
     };
+
+    // Nothing else is building against this db_path now, so a database that
+    // still cannot be identified is not a peer of ours: it is damaged, or it
+    // belongs to whoever else has it open.
+    crate::db::guard::reject_unrelated_file_at_db_path(
+        &db_path,
+        Some(repo_root),
+        crate::db::guard::Inspection::UnderBuildLock,
+    )?;
 
     // Seed from main worktree's DB if this is a new linked-worktree build.
     if !db_path.exists()
@@ -3845,7 +4068,7 @@ fn build_index_inner(
     // everything above is already committed, so turning a committed build
     // into an `Err` would make in-process callers believe no rebuild
     // happened. `build_index` turns this into a non-zero exit for the CLI.
-    Ok(summary.extract_failures)
+    Ok((BuildOutcome::Built, summary.extract_failures))
 }
 
 /// Detect proto→generated-code boundary edges from walked files.
@@ -5314,6 +5537,105 @@ anyhow = "1"
     }
 
     #[test]
+    fn test_removing_the_winner_re_parses_the_other_manifest_in_the_directory() {
+        // INDEX-3-4: `packages.path` is UNIQUE, so a directory holding both a
+        // Cargo.toml and a package.json gets one package row between them.
+        // Deleting the winner's manifest took its package with it, while the
+        // survivor's stored hash was untouched — so `diff_manifests` called it
+        // `unchanged`, it was never re-parsed, and the directory stayed empty
+        // for every subsequent build until the file's *content* changed.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('dual-crate', 'dual', 'cargo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_hashes (path, content_hash) \
+             VALUES ('dual/Cargo.toml', 'h1'), ('dual/package.json', 'h2'), \
+                    ('other/package.json', 'h3')",
+            [],
+        )
+        .unwrap();
+
+        phase_remove_deleted(&conn, &["dual/Cargo.toml".to_string()]).unwrap();
+
+        assert!(package_names(&conn).is_empty());
+        let hashes: Vec<String> = conn
+            .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            hashes,
+            vec!["other/package.json".to_string()],
+            "the surviving manifest in the emptied directory must be re-parsed \
+             next build; manifests elsewhere must be left alone"
+        );
+    }
+
+    #[test]
+    fn test_a_directory_that_still_has_a_package_keeps_its_manifest_hashes() {
+        // The neighbour: only a directory left with *no* package at all is
+        // re-parsed. Clearing hashes whenever anything was removed would make
+        // every build re-parse manifests it already knows.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        seed_root_npm_package(&conn);
+
+        phase_remove_deleted(&conn, &["Cargo.toml".to_string()]).unwrap();
+
+        let hashes: Vec<String> = conn
+            .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(hashes, vec!["package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_a_second_ecosystems_package_in_one_directory_is_reported() {
+        // The collapse itself stays (the schema is not changing here), but it
+        // must not be silent: the directory only ever gets one of its two
+        // packages indexed.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('dual-crate', 'dual', 'cargo')",
+            [],
+        )
+        .unwrap();
+
+        let npm = PackageInfo {
+            name: "dual-npm".to_string(),
+            path: "dual".to_string(),
+            kind: "npm",
+            version: None,
+            description: None,
+            dependencies: Vec::new(),
+            metadata: None,
+        };
+        assert_eq!(
+            displaced_foreign_package(&conn, &npm).unwrap(),
+            Some(("dual-crate".to_string(), "cargo".to_string()))
+        );
+
+        // A different name of the *same* kind is an ordinary rename, not a
+        // collapse, and must stay quiet.
+        let renamed = PackageInfo {
+            name: "dual-crate-2".to_string(),
+            kind: "cargo",
+            ..npm
+        };
+        assert_eq!(displaced_foreign_package(&conn, &renamed).unwrap(), None);
+    }
+
+    #[test]
     fn test_phase_remove_deleted_removes_its_own_ecosystems_package() {
         // The other half: the manifest that actually owns the package still
         // takes it with it, along with its symbols and dependencies.
@@ -5526,14 +5848,21 @@ anyhow = "1"
         let held = lock::acquire(&db, lock::LockWait::Wait(lock::LOCK_TIMEOUT))
             .unwrap()
             .unwrap();
-        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        assert_eq!(
+            build_index_quiet(root, &config, false, Some(&db)).unwrap(),
+            BuildOutcome::Skipped,
+            "a skipped build must report itself as skipped, not as a rebuild"
+        );
         assert!(
             !db.exists(),
             "a skipped build must not touch the database at all"
         );
 
         drop(held);
-        build_index_quiet(root, &config, false, Some(&db)).unwrap();
+        assert_eq!(
+            build_index_quiet(root, &config, false, Some(&db)).unwrap(),
+            BuildOutcome::Built
+        );
         let conn = db::open_readonly(&db).unwrap();
         let packages: i64 = conn
             .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
@@ -5683,6 +6012,71 @@ anyhow = "1"
             manifest_walk.unreadable
         );
         assert_eq!(manifest_walk.manifests.len(), 1);
+    }
+
+    #[test]
+    fn test_a_capped_walk_is_a_blind_spot() {
+        // INDEX-3-2: hitting MAX_FILES truncates the walk at an arbitrary
+        // point of a nondeterministic traversal, so it proves nothing about
+        // what is absent. Before this it produced neither an unreadable entry
+        // nor any other marker, so `incremental_upsert_files` deleted every
+        // row outside the truncated set and a `file_tree_hash` was stored for
+        // a partial walk — each build keeping (and churning) a different
+        // arbitrary subset.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        // Comfortably more than the cap plus the overshoot: the length check
+        // happens after the push, so every worker that passed it before the
+        // cap was reached contributes one extra entry, and the number of
+        // workers is the machine's.
+        const FILES: usize = 64;
+        for i in 0..FILES {
+            fs::write(
+                root.join("src").join(format!("f{i}.ts")),
+                "export const a = 1;\n",
+            )
+            .unwrap();
+        }
+
+        let walk = walk_files_capped(root, &Config::default(), 3).unwrap();
+
+        assert!(walk.capped, "the walk must record that it stopped early");
+        assert!(
+            walk.files.len() < FILES,
+            "a capped walk must not enumerate the whole tree: {}",
+            walk.files.len()
+        );
+        assert_eq!(
+            walk.unreadable,
+            vec![String::new()],
+            "a capped walk is blind to the whole tree, so nothing may be \
+             treated as deleted and no file-tree hash may be stored"
+        );
+        assert!(
+            is_under_unreadable("src/f0.ts", &walk.unreadable),
+            "every path must fall inside the blind spot"
+        );
+    }
+
+    #[test]
+    fn test_an_uncapped_walk_is_not_a_blind_spot() {
+        // The neighbour: a walk that finished under the cap sees the whole
+        // tree, so deletions and the file-tree hash must still work.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.join("b.ts"), "export const b = 2;\n").unwrap();
+
+        let walk = walk_files_capped(root, &Config::default(), 1000).unwrap();
+
+        assert!(!walk.capped);
+        assert!(
+            walk.unreadable.is_empty(),
+            "a complete walk has no blind spots: {:?}",
+            walk.unreadable
+        );
+        assert_eq!(walk.files.len(), 2);
     }
 
     #[test]
@@ -6249,6 +6643,61 @@ mod incremental_signal_tests {
         assert!(is_under_unreadable("p1/src/deep/x.ts", &roots));
         assert!(is_under_unreadable("p10/x.ts", &roots));
         assert!(!is_under_unreadable("p2/b/x.ts", &roots));
+    }
+
+    #[test]
+    fn test_normalize_unreadable_roots_collapses_past_a_lower_sorting_sibling() {
+        // Every byte below `/` (`-`, `.`, `+`, …) sorts between a root and
+        // its children in plain byte order, so a plain sort would leave `a`
+        // no longer the last kept root by the time `a/c` is reached and the
+        // redundant child would survive the reduction.
+        let roots = normalize_unreadable_roots(vec![
+            "a/c".to_string(),
+            "a-b".to_string(),
+            "a".to_string(),
+            "a.d".to_string(),
+            "a/c/deep".to_string(),
+        ]);
+        assert_eq!(
+            roots,
+            vec!["a".to_string(), "a-b".to_string(), "a.d".to_string()],
+            "`a` must still swallow `a/c` even though `a-b` sorts between them"
+        );
+        assert!(is_under_unreadable("a/c/deep/x.ts", &roots));
+        assert!(is_under_unreadable("a-b/x.ts", &roots));
+        assert!(!is_under_unreadable("a-bc/x.ts", &roots));
+    }
+
+    #[test]
+    fn test_blind_spot_ignores_an_error_outside_the_repository_root() {
+        // `ignore` reads ancestor .gitignore files, so an unreadable
+        // `~/.gitignore` surfaces as an I/O error whose path is outside the
+        // walk root. It hides nothing inside the tree, and recording it
+        // would add a root that can never match a repo-relative path while
+        // permanently suppressing the file-tree hash.
+        let err = ignore::Error::WithPath {
+            path: std::path::PathBuf::from("/home/dev/.gitignore"),
+            err: Box::new(ignore::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+        };
+        assert_eq!(blind_spot(&err, Path::new("/home/dev/repo")), None);
+    }
+
+    #[test]
+    fn test_blind_spot_reports_a_path_inside_the_repository_root() {
+        let err = ignore::Error::WithPath {
+            path: std::path::PathBuf::from("/home/dev/repo/pkg/src"),
+            err: Box::new(ignore::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))),
+        };
+        assert_eq!(
+            blind_spot(&err, Path::new("/home/dev/repo")),
+            Some("pkg/src".to_string())
+        );
     }
 
     #[test]

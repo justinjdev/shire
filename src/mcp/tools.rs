@@ -23,10 +23,11 @@ pub struct ShireService {
     /// answered with a bare -32603. Holders re-check staleness under the
     /// guard, so waiters see the winner's fresh index instead of rebuilding.
     rebuild_lock: Mutex<()>,
-    /// When the last rebuild attempt failed. `last_indexed` is deliberately
-    /// left alone on failure so a transient error is retried, but without
-    /// this every waiter in the same burst would run its own full build
-    /// while the failure persists.
+    /// When the last rebuild attempt failed — or was skipped because another
+    /// process held the build lock. `last_indexed` is deliberately left alone
+    /// in both cases so the work is retried, but without this every waiter in
+    /// the same burst would run its own full build while the condition
+    /// persists.
     last_rebuild_failure: Mutex<Option<SystemTime>>,
     /// Number of index rebuilds this process has actually run. Used by the
     /// concurrency test to assert that N racing tool calls produce one build.
@@ -189,7 +190,19 @@ impl ShireService {
             false,
             Some(&ctx.db_path),
         ) {
-            Ok(()) => {
+            Ok(crate::index::BuildOutcome::Skipped) => {
+                // Nothing was built, so `indexed_at` has not moved: adopting it
+                // as `last_indexed` would leave the index stale and re-trigger
+                // this whole dance on the very next tool call, for as long as
+                // the competing build runs (INDEX-3-5). Leave the connection
+                // and the timestamp alone, and sit out one debounce window —
+                // the build in flight is doing this build's work.
+                if let Ok(mut failed) = self.last_rebuild_failure.lock() {
+                    *failed = Some(SystemTime::now());
+                }
+                tracing::info!("skipped rebuild: another build is already running");
+            }
+            Ok(crate::index::BuildOutcome::Built) => {
                 // Reopen connection read-only
                 match crate::db::open_readonly(&ctx.db_path) {
                     Ok(new_conn) => match self.conn.lock() {

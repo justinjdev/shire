@@ -3387,6 +3387,69 @@ fn test_build_recovers_from_corrupt_db() {
     );
 }
 
+/// Every package name in the index, sorted.
+fn package_names_in(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM packages ORDER BY name")
+        .unwrap();
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    names
+}
+
+#[test]
+fn test_removing_one_of_two_manifests_in_a_directory_leaves_the_other_indexed() {
+    // INDEX-3-4: `packages.path` is UNIQUE, so a directory holding both a
+    // Cargo.toml and a package.json gets one package row between them. When
+    // the winner's manifest was deleted, its package went with it and the
+    // survivor was never re-parsed (its content hash had not changed), so the
+    // directory held zero packages for every later build.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    let dual = repo.join("dual");
+    fs::create_dir_all(dual.join("src")).unwrap();
+    fs::write(
+        dual.join("package.json"),
+        br#"{"name": "dual-npm", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        dual.join("Cargo.toml"),
+        b"[package]\nname = \"dual-crate\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(dual.join("src/lib.rs"), b"pub fn dual_fn() {}\n").unwrap();
+    let db = dir.path().join("index.db");
+
+    run_build(&bin, &repo, &db);
+    let indexed = package_names_in(&db);
+    assert_eq!(
+        indexed.len(),
+        1,
+        "one directory can only hold one package row: {indexed:?}"
+    );
+    let (winner_manifest, survivor) = if indexed[0] == "dual-crate" {
+        ("Cargo.toml", "dual-npm")
+    } else {
+        ("package.json", "dual-crate")
+    };
+
+    fs::remove_file(dual.join(winner_manifest)).unwrap();
+    run_build(&bin, &repo, &db);
+    run_build(&bin, &repo, &db);
+
+    assert_eq!(
+        package_names_in(&db),
+        vec![survivor.to_string()],
+        "the manifest still on disk must be indexed again"
+    );
+}
+
 #[test]
 fn test_build_refuses_to_delete_a_short_file_at_db_path() {
     // INDEX-2-2: `db_path` comes from the repo's own shire.toml, unconfined.
@@ -3429,9 +3492,232 @@ fn test_build_refuses_to_delete_a_short_file_at_db_path() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("refusing to delete and rebuild"),
+        stderr.contains("shire will not overwrite a file it did not create"),
         "the error must say the file was left alone, got: {stderr}"
     );
+    // INDEX-3-7: the build lock's path is db_path + ".lock", and it used to be
+    // created before any of this was checked — so a hostile shire.toml got an
+    // empty file dropped next to whatever it named.
+    let mut lock = victim.as_os_str().to_owned();
+    lock.push(".lock");
+    assert!(
+        !std::path::Path::new(&lock).exists(),
+        "no lock file may be created beside a file shire refuses to use"
+    );
+}
+
+#[test]
+fn test_build_refuses_a_foreign_sqlite_database_at_db_path() {
+    // A valid SQLite database shire did not build used to be adopted outright:
+    // the build wrote its schema into it, after which the file carried a
+    // `shire_meta` table and `shire clean` would delete it as shire's own. A
+    // cloned repo's shire.toml can name any file on the machine.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    // Note the table name: shire has a `files` table of its own, and
+    // recognising a database by any of shire's table names rather than by
+    // `shire_meta` alone would adopt this one.
+    let victim = dir.path().join("notes.db");
+    {
+        let conn = rusqlite::Connection::open(&victim).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE TABLE customer_secrets (id INTEGER PRIMARY KEY, token TEXT);
+             INSERT INTO files (body) VALUES ('remember the milk');",
+        )
+        .unwrap();
+    }
+    let before = fs::read(&victim).unwrap();
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", victim.display()),
+    )
+    .unwrap();
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "build must refuse a database it did not create"
+    );
+    assert_eq!(
+        fs::read(&victim).unwrap(),
+        before,
+        "no schema may be written into it"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("shire did not create"),
+        "the error must say whose database it is, got: {stderr}"
+    );
+    let mut lock = victim.as_os_str().to_owned();
+    lock.push(".lock");
+    assert!(
+        !std::path::Path::new(&lock).exists(),
+        "and no lock file may be created beside it"
+    );
+
+    // The neighbours that must keep working: an empty SQLite file at db_path
+    // is adopted, and so is the index that build then produces.
+    let blank = dir.path().join("blank.db");
+    rusqlite::Connection::open(&blank).unwrap();
+    fs::write(
+        repo.join("shire.toml"),
+        format!("db_path = \"{}\"\n", blank.display()),
+    )
+    .unwrap();
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an empty SQLite database must still be adopted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(package_names_in(&blank), vec!["pkg-a".to_string()]);
+
+    let out = Command::new(&bin)
+        .args(["build", "--root", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "and a second build against shire's own index must too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_build_refuses_a_symlinked_db_path() {
+    // `Connection::open` follows a symlink. Letting an unexaminable db_path
+    // through had shire create `<db_path>.lock` beside the link and then write
+    // its schema into whatever it pointed at — including a database that was
+    // never shire's. db_path must name a regular file: the removal guard
+    // refuses a symlink too, so a symlinked index could not be repaired
+    // either.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    let foreign = dir.path().join("notes.db");
+    {
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+    }
+    let real_index = dir.path().join("real-index.db");
+    run_build(&bin, &repo, &real_index);
+
+    for target in [&foreign, &real_index] {
+        let link = dir.path().join("link.db");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let before = fs::read(target).unwrap();
+
+        let out = Command::new(&bin)
+            .args([
+                "build",
+                "--root",
+                repo.to_str().unwrap(),
+                "--db",
+                link.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            !out.status.success(),
+            "a symlinked db_path must be refused, not followed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("is a symlink"),
+            "the error must name the cause, got: {stderr}"
+        );
+        assert_eq!(
+            fs::read(target).unwrap(),
+            before,
+            "the symlink target must be untouched"
+        );
+        let mut lock = link.as_os_str().to_owned();
+        lock.push(".lock");
+        assert!(
+            !std::path::Path::new(&lock).exists(),
+            "and no lock file may be created beside the link"
+        );
+    }
+}
+
+#[test]
+fn test_build_waits_out_a_writer_holding_shires_own_index() {
+    // A shire index at a db_path outside `<repo>/.shire/` and
+    // `~/.claude/shire/` cannot be identified while another process holds it
+    // under an exclusive write transaction — which is what a shire build looks
+    // like, since builds run under journal_mode=MEMORY. The pre-lock
+    // inspection must therefore defer rather than refuse: the build lock waits
+    // the writer out, and the pass under the lock is the one that decides.
+    let bin = cargo_bin();
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git_init_repo(&repo);
+    write_ts_package(
+        &repo,
+        "pkg-a",
+        "export function alpha(): number { return 1; }\n",
+    );
+
+    let db = dir.path().join("unmanaged").join("index.db");
+    fs::create_dir_all(db.parent().unwrap()).unwrap();
+    run_build(&bin, &repo, &db);
+    assert_eq!(sym_count(&db, "alpha"), 1);
+
+    let holder_path = db.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&holder_path).unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        conn.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    let out = Command::new(&bin)
+        .args([
+            "build",
+            "--root",
+            repo.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    holder.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "the build must wait the writer out, not refuse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(sym_count(&db, "alpha"), 1);
 }
 
 #[test]

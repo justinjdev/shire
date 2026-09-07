@@ -61,13 +61,30 @@ prints the daemon's PID rather than reporting success while it is still running;
 PID/socket files are left in place, and retrying (or checking `--status`) is safe.
 
 The daemon is identified as shire's own by its executable — an exact basename match, a
-basename starting with `shire-` (a versioned install like `shire-v0.7`, a renamed
-download), or the exact same file as the `shire` binary currently invoking
-`--stop`/`--status` — so a renamed or versioned binary is recognized correctly rather
-than being refused and having its live socket deleted out from under it, while an
-unrelated binary whose name merely starts with "shire" with no separator (e.g.
-`shireling`) is not. This is combined with a cmdline check requiring the literal argv
-tokens "watch" and "--foreground" before anything is signalled.
+basename starting with `shire-` or `shire.` (a versioned install like `shire-v0.7`, a
+renamed download, or a manual `mv shire shire.old && cp new shire`-style in-place
+upgrade), or the exact same file as the `shire` binary currently invoking
+`--stop`/`--status` (including after an in-place upgrade replaces that file while the
+daemon is still running, so long as it's still at the same install path) — so a renamed
+or versioned binary is recognized correctly, while an unrelated binary whose name merely
+starts with "shire" with no separator (e.g. `shireling`) is not. This is combined with a
+cmdline check requiring argv[0] to itself look like shire's own binary, a `--root`
+argument naming this exact repository, and the literal tokens "watch" and "--foreground",
+before anything is signalled.
+
+Executable identity can only be confirmed when `--stop`/`--status`/`clean` run from the
+exact same binary file that started the daemon (or one satisfying the basename rule
+above) — a *different* shire binary checking on a renamed install it didn't start cannot
+positively verify it. In that case shire does not guess: if the daemon's socket is still
+answering, its pid/socket files are left alone and nothing is signalled, rather than being
+treated as stale and deleted out from under a process that is demonstrably still running.
+`shire clean` inherits the same caution and refuses (non-zero exit, nothing removed)
+rather than removing `.shire` while such a daemon is alive.
+
+One residual case has no automatic recovery: if the repository directory itself is
+renamed while the daemon is running, the `--root` recorded in its own argv no longer
+matches the (now different) path passed to `--stop`, so shire refuses to signal it —
+stop it directly instead with `kill $(cat .shire/watch.pid)`.
 
 ## Smart filtering
 

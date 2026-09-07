@@ -735,7 +735,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
+        description = "Find all references (call sites, type uses, imports, impl clauses) to a symbol by name. Use instead of Grep for 'who uses X?' — returns file, line, kind, and the dot-qualified enclosing symbol. Note: matches by name only, so two symbols with the same name cannot be distinguished."
     )]
     fn symbol_references(
         &self,
@@ -772,7 +772,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward."
+        description = "Find which symbols (functions, methods) call the named symbol. Returns the caller name, file, line of first call, and count of call sites. Navigates the call graph upward. `caller_name` is dot-qualified for methods (`AuthService.login`) and can be passed straight back in as `name`: a qualified name with no exact match falls back to its last segment."
     )]
     fn symbol_callers(
         &self,

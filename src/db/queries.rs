@@ -1256,6 +1256,23 @@ pub fn query_symbol_references(
     package: Option<&str>,
     limit: i64,
 ) -> Result<Vec<ReferenceRow>> {
+    let rows = query_symbol_references_exact(conn, name, kind, package, limit)?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    match unqualified_name(name) {
+        Some(bare) => query_symbol_references_exact(conn, bare, kind, package, limit),
+        None => Ok(rows),
+    }
+}
+
+fn query_symbol_references_exact(
+    conn: &Connection,
+    name: &str,
+    kind: Option<&str>,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ReferenceRow>> {
     let mut qb = RefQueryBuilder::new(
         "SELECT r.name, r.kind, f.path, r.line, r.package, r.enclosing_symbol \
          FROM symbol_refs r JOIN files f ON f.id = r.file_id WHERE r.name = ?",
@@ -1292,6 +1309,21 @@ pub struct CallerRow {
     pub call_sites: i64,
 }
 
+/// The bare identifier at the end of a dot-qualified name, or `None` when the
+/// name has no qualifier.
+///
+/// `symbol_refs.enclosing_symbol` is dot-qualified (`AuthService.login`) while
+/// `symbol_refs.name` is always a bare identifier, so a value the caller read
+/// out of `enclosing_symbol` — which is exactly what the `reference_audit`
+/// prompt tells a model to feed back into `symbol_callers` — never matches a
+/// ref name. Name-keyed ref queries retry once with this segment when the
+/// qualified form found nothing, which keeps the indexed equality lookup
+/// first and never widens a query that already matched.
+fn unqualified_name(name: &str) -> Option<&str> {
+    let (_, tail) = name.rsplit_once('.')?;
+    if tail.is_empty() { None } else { Some(tail) }
+}
+
 /// Escape the LIKE wildcards in a user-supplied string so it can be used as
 /// a literal inside a `LIKE ... ESCAPE '\\'` pattern.
 fn escape_like(s: &str) -> String {
@@ -1306,6 +1338,24 @@ fn escape_like(s: &str) -> String {
 }
 
 pub fn query_symbol_callers(
+    conn: &Connection,
+    name: &str,
+    package: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CallerRow>> {
+    let rows = query_symbol_callers_exact(conn, name, package, limit)?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    // The caller may have passed a value read out of `enclosing_symbol`
+    // (`AuthService.login`); ref names are bare, so retry with the segment.
+    match unqualified_name(name) {
+        Some(bare) => query_symbol_callers_exact(conn, bare, package, limit),
+        None => Ok(rows),
+    }
+}
+
+fn query_symbol_callers_exact(
     conn: &Connection,
     name: &str,
     package: Option<&str>,
@@ -1457,9 +1507,21 @@ pub struct ChangeImpact {
 fn resolve_home_package(conn: &Connection, name: &str) -> Result<Option<String>> {
     let mut stmt = conn
         .prepare_cached("SELECT package FROM symbols WHERE name = ?1 ORDER BY package LIMIT 1")?;
-    let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
-    match rows.next() {
-        Some(row) => Ok(Some(row?)),
+    let mut lookup = |n: &str| -> Result<Option<String>> {
+        let mut rows = stmt.query_map([n], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    };
+    if let Some(pkg) = lookup(name)? {
+        return Ok(Some(pkg));
+    }
+    // `symbols.name` is bare, so a qualified name (`AuthService.login`, the
+    // form `enclosing_symbol` reports) resolves through its last segment —
+    // otherwise every ref would be classified as cross-package.
+    match unqualified_name(name) {
+        Some(bare) => lookup(bare),
         None => Ok(None),
     }
 }
@@ -3156,6 +3218,109 @@ mod refs_tests {
             .map(|c| c.callee_name)
             .collect();
         assert_eq!(logout, vec!["other"]);
+    }
+
+    /// `enclosing_symbol` is dot-qualified (`A.run`) while `symbol_refs.name`
+    /// is bare, and the `reference_audit` prompt tells the model to feed an
+    /// `enclosing_symbol` straight back into `symbol_callers`. The qualified
+    /// form must therefore resolve, without widening a name that already
+    /// matched exactly.
+    #[test]
+    fn test_query_symbol_callers_accepts_a_qualified_name() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cq.db");
+        let conn = open_or_create(&db_path).unwrap();
+        let ids = seed_files(&conn, &["a.rs", "b.rs"]);
+        let a = ids["a.rs"];
+        let b = ids["b.rs"];
+
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {a}, 5, 'p', 'boot'), \
+                        ('run', 'call', {a}, 6, 'p', 'boot'), \
+                        ('run', 'call', {b}, 9, 'q', 'other'), \
+                        ('A.run', 'call', {b}, 12, 'p', 'literal')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        // Bare name: unchanged.
+        let bare = query_symbol_callers(&conn, "run", None, 100).unwrap();
+        assert_eq!(bare.len(), 2);
+
+        // Qualified name with no exact ref of its own falls back to `run`.
+        let qualified = query_symbol_callers(&conn, "Outer.Inner.run", None, 100).unwrap();
+        let names: Vec<&str> = qualified.iter().map(|c| c.caller_name.as_str()).collect();
+        assert_eq!(names, vec!["boot", "other"]);
+
+        // Filters survive the fallback.
+        let scoped = query_symbol_callers(&conn, "Outer.run", Some("p"), 100).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].caller_name, "boot");
+        assert_eq!(scoped[0].call_sites, 2);
+
+        // A name that does match exactly is never widened: `A.run` is itself
+        // a ref name here, so the fallback must not fire for the unscoped
+        // lookup.
+        let exact = query_symbol_callers(&conn, "A.run", None, 100).unwrap();
+        let names: Vec<&str> = exact.iter().map(|c| c.caller_name.as_str()).collect();
+        assert_eq!(names, vec!["literal"]);
+
+        // Nothing to fall back to.
+        assert!(
+            query_symbol_callers(&conn, "nosuch.thing", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            query_symbol_callers(&conn, "trailing.", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Same tolerance for `symbol_references`, and for the home-package
+    /// lookup behind `change_impact` — otherwise a qualified name would put
+    /// every reference in the cross-package bucket.
+    #[test]
+    fn test_qualified_name_resolves_for_references_and_change_impact() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("rq.db");
+        let conn = open_or_create(&db_path).unwrap();
+        seed_package(&conn, "home");
+        seed_package(&conn, "away");
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line) \
+             VALUES ('home', 'run', 'method', 'home/a.rs', 1)",
+            [],
+        )
+        .unwrap();
+        let ids = seed_files(&conn, &["home/a.rs", "away/b.rs"]);
+        let a = ids["home/a.rs"];
+        let b = ids["away/b.rs"];
+        conn.execute(
+            &format!(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 VALUES ('run', 'call', {a}, 5, 'home', 'A.boot'), \
+                        ('run', 'call', {b}, 7, 'away', 'B.boot')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let refs = query_symbol_references(&conn, "A.run", None, None, 100).unwrap();
+        assert_eq!(refs.len(), 2);
+        let scoped =
+            query_symbol_references(&conn, "A.run", Some("call"), Some("home"), 100).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].file_path, "home/a.rs");
+
+        let impact = change_impact(&conn, "A.run", None, 1, 100).unwrap();
+        assert_eq!(impact.home_package.as_deref(), Some("home"));
+        assert_eq!(impact.direct_impact.len(), 1);
+        assert_eq!(impact.cross_package_impact.len(), 1);
     }
 
     /// LIKE wildcards in the queried name must be literal, or `_ogin` would

@@ -273,6 +273,27 @@ fn diff_manifests<'a>(
     }
 }
 
+/// The package `pkg` is about to displace at its own path *because it belongs
+/// to another ecosystem*, if any.
+///
+/// `packages.path` is UNIQUE, so a directory holding manifests of two
+/// ecosystems (a Rust crate with a JS wrapper, a Ruby gem with a package.json
+/// for tooling) can only ever have one of them indexed. A same-`kind` row at
+/// the same path is an ordinary rename and not reported.
+fn displaced_foreign_package(
+    conn: &Connection,
+    pkg: &PackageInfo,
+) -> Result<Option<(String, String)>> {
+    let displaced = conn
+        .query_row(
+            "SELECT name, kind FROM packages WHERE path = ?1 AND name != ?2",
+            [&pkg.path, &pkg.name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(displaced.filter(|(_, kind)| kind != pkg.kind))
+}
+
 /// Insert a package and its dependencies into the DB.
 fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Use ON CONFLICT ... DO UPDATE instead of INSERT OR REPLACE to avoid
@@ -281,6 +302,23 @@ fn upsert_package(conn: &Connection, pkg: &PackageInfo) -> Result<String> {
     // Also handle path conflicts: if two manifest parsers produce different
     // package names for the same directory, delete the old row first to avoid
     // a UNIQUE constraint violation on packages.path.
+    //
+    // Two manifests of *different* ecosystems in one directory (a Rust crate
+    // with a JS wrapper, a Ruby gem with a package.json for tooling) also land
+    // on the same `packages.path`, and only one of them can have a row. That
+    // collapse used to be entirely silent, so a directory quietly indexed half
+    // of what it holds; say so (INDEX-3-4).
+    if let Some((dropped, dropped_kind)) = displaced_foreign_package(conn, pkg)? {
+        tracing::warn!(
+            path = %pkg.path,
+            indexed = %pkg.name,
+            indexed_kind = %pkg.kind,
+            %dropped,
+            %dropped_kind,
+            "two manifests of different ecosystems share one directory; only one \
+             package can be indexed there and the other is dropped"
+        );
+    }
     conn.execute(
         "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1 AND name != ?2)",
         [&pkg.path, &pkg.name],
@@ -1520,10 +1558,8 @@ fn delete_packages_at_path(conn: &Connection, path: &str, kind: Option<&str>) ->
 /// back to the path-only delete, which is what they had before.
 fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
     for manifest_key in removed {
-        let (relative_dir, filename) = match manifest_key.rsplit_once('/') {
-            Some((dir, file)) => (dir, file),
-            None => ("", manifest_key.as_str()),
-        };
+        let relative_dir = manifest_parent_dir(manifest_key);
+        let filename = manifest_filename(manifest_key);
         // A context-only manifest never owned a package, so it takes none with
         // it — only its own hash row goes.
         if !is_context_only_manifest(filename) {
@@ -1534,7 +1570,85 @@ fn phase_remove_deleted(conn: &Connection, removed: &[String]) -> Result<()> {
             [manifest_key.as_str()],
         )?;
     }
+    reparse_manifests_in_emptied_dirs(conn, removed)?;
     Ok(())
+}
+
+/// The repo-relative directory a manifest key lives in (`""` for a manifest at
+/// the repo root), which is also the `packages.path` of the package it owns.
+fn manifest_parent_dir(manifest_key: &str) -> &str {
+    manifest_key.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// The filename part of a manifest key.
+fn manifest_filename(manifest_key: &str) -> &str {
+    manifest_key
+        .rsplit_once('/')
+        .map_or(manifest_key, |(_, f)| f)
+}
+
+/// Forget the stored content hash of every manifest still on disk in a
+/// directory a removal has just left with no package at all, so the next build
+/// re-parses it. Returns how many hashes were cleared.
+///
+/// `packages.path` is UNIQUE, so two manifests of different ecosystems in one
+/// directory produce only one package row between them (see `upsert_package`).
+/// Both still get a `manifest_hashes` row. When the winner's manifest is
+/// deleted, its package goes with it — and the loser is never reconsidered,
+/// because its content hash is unchanged and `diff_manifests` therefore
+/// classifies it as `unchanged`. The directory is then left with no package,
+/// no symbols and no dependency edges for as long as the surviving manifest's
+/// *content* stays the same, which can be forever (INDEX-3-4).
+///
+/// Clearing the hash is the narrow fix: it only ever costs one extra parse of
+/// a manifest in a directory that currently has nothing indexed, and it cannot
+/// loop — the re-parse stores the hash again.
+fn reparse_manifests_in_emptied_dirs(conn: &Connection, removed: &[String]) -> Result<usize> {
+    if removed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut emptied: HashSet<&str> = HashSet::new();
+    for dir in removed
+        .iter()
+        .map(|key| manifest_parent_dir(key))
+        .collect::<HashSet<&str>>()
+    {
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM packages WHERE path = ?1",
+            [dir],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            emptied.insert(dir);
+        }
+    }
+    if emptied.is_empty() {
+        return Ok(0);
+    }
+
+    // Small table (one row per manifest in the repo), and `manifest_hashes`
+    // keys are matched on their directory component — a LIKE prefix would
+    // mis-handle `_`/`%` in a directory name.
+    let keys: Vec<String> = conn
+        .prepare("SELECT path FROM manifest_hashes")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut cleared = 0usize;
+    for key in keys
+        .iter()
+        .filter(|key| emptied.contains(manifest_parent_dir(key)))
+    {
+        conn.execute("DELETE FROM manifest_hashes WHERE path = ?1", [key])?;
+        tracing::info!(
+            manifest = %key,
+            "directory has no package left after a removal — re-parsing this \
+             manifest on the next build"
+        );
+        cleared += 1;
+    }
+    Ok(cleared)
 }
 
 /// Phase 6: Store manifest hashes for parsed manifests using batched multi-row INSERTs.
@@ -5356,6 +5470,105 @@ anyhow = "1"
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(hashes, vec!["package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_removing_the_winner_re_parses_the_other_manifest_in_the_directory() {
+        // INDEX-3-4: `packages.path` is UNIQUE, so a directory holding both a
+        // Cargo.toml and a package.json gets one package row between them.
+        // Deleting the winner's manifest took its package with it, while the
+        // survivor's stored hash was untouched — so `diff_manifests` called it
+        // `unchanged`, it was never re-parsed, and the directory stayed empty
+        // for every subsequent build until the file's *content* changed.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('dual-crate', 'dual', 'cargo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifest_hashes (path, content_hash) \
+             VALUES ('dual/Cargo.toml', 'h1'), ('dual/package.json', 'h2'), \
+                    ('other/package.json', 'h3')",
+            [],
+        )
+        .unwrap();
+
+        phase_remove_deleted(&conn, &["dual/Cargo.toml".to_string()]).unwrap();
+
+        assert!(package_names(&conn).is_empty());
+        let hashes: Vec<String> = conn
+            .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            hashes,
+            vec!["other/package.json".to_string()],
+            "the surviving manifest in the emptied directory must be re-parsed \
+             next build; manifests elsewhere must be left alone"
+        );
+    }
+
+    #[test]
+    fn test_a_directory_that_still_has_a_package_keeps_its_manifest_hashes() {
+        // The neighbour: only a directory left with *no* package at all is
+        // re-parsed. Clearing hashes whenever anything was removed would make
+        // every build re-parse manifests it already knows.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        seed_root_npm_package(&conn);
+
+        phase_remove_deleted(&conn, &["Cargo.toml".to_string()]).unwrap();
+
+        let hashes: Vec<String> = conn
+            .prepare("SELECT path FROM manifest_hashes ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(hashes, vec!["package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_a_second_ecosystems_package_in_one_directory_is_reported() {
+        // The collapse itself stays (the schema is not changing here), but it
+        // must not be silent: the directory only ever gets one of its two
+        // packages indexed.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::create_schema_for_test(&conn);
+        conn.execute(
+            "INSERT INTO packages (name, path, kind) VALUES ('dual-crate', 'dual', 'cargo')",
+            [],
+        )
+        .unwrap();
+
+        let npm = PackageInfo {
+            name: "dual-npm".to_string(),
+            path: "dual".to_string(),
+            kind: "npm",
+            version: None,
+            description: None,
+            dependencies: Vec::new(),
+            metadata: None,
+        };
+        assert_eq!(
+            displaced_foreign_package(&conn, &npm).unwrap(),
+            Some(("dual-crate".to_string(), "cargo".to_string()))
+        );
+
+        // A different name of the *same* kind is an ordinary rename, not a
+        // collapse, and must stay quiet.
+        let renamed = PackageInfo {
+            name: "dual-crate-2".to_string(),
+            kind: "cargo",
+            ..npm
+        };
+        assert_eq!(displaced_foreign_package(&conn, &renamed).unwrap(), None);
     }
 
     #[test]

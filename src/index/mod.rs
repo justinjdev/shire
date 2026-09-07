@@ -1032,25 +1032,36 @@ fn phase_parse(
     // Record a parse error as either a silent "no package" skip or a
     // reported failure (also tracked by manifest key, to exclude it from
     // hash storage).
-    let mut record_err = |manifest: &WalkedManifest, e: anyhow::Error| -> Result<()> {
-        if manifest::is_no_package_marker(&e) {
-            tracing::debug!(
-                manifest = %manifest.abs_path.display(),
-                reason = %e,
-                "manifest declares no package of its own; skipping"
-            );
-            // The manifest may previously have declared a real package here
-            // (e.g. a leaf crate later converted into a virtual workspace
-            // root) — remove any such stale row now. Its hash is about to be
-            // (re)stored as "resolved", so this is the only chance to clean
-            // it up; otherwise it would linger in the DB forever.
-            delete_package_at_path(conn, &manifest.relative_dir)?;
-        } else {
-            failed_keys.insert(manifest.manifest_key.clone());
-            failures.push((manifest.abs_path.display().to_string(), e.to_string()));
-        }
-        Ok(())
-    };
+    let mut record_err =
+        |manifest: &WalkedManifest, filename: &str, e: anyhow::Error| -> Result<()> {
+            if manifest::is_no_package_marker(&e) {
+                tracing::debug!(
+                    manifest = %manifest.abs_path.display(),
+                    reason = %e,
+                    "manifest declares no package of its own; skipping"
+                );
+                // The manifest may previously have declared a real package here
+                // (e.g. a leaf crate later converted into a virtual workspace
+                // root) — remove any such stale row now. Its hash is about to be
+                // (re)stored as "resolved", so this is the only chance to clean
+                // it up; otherwise it would linger in the DB forever.
+                //
+                // Scoped to this manifest's own ecosystem: a sibling manifest of
+                // another ecosystem in the same directory (a root `package.json`
+                // next to a virtual-workspace `Cargo.toml`, an aggregator
+                // `pom.xml` next to a `build.gradle`, …) shares the same
+                // `packages.path`, and a path-only delete would drop its package
+                // too — permanently, since that manifest's hash is unchanged and
+                // it will not be re-parsed on the next build.
+                if let Some(kind) = no_package_manifest_kind(filename) {
+                    delete_packages_at_path(conn, &manifest.relative_dir, Some(kind))?;
+                }
+            } else {
+                failed_keys.insert(manifest.manifest_key.clone());
+                failures.push((manifest.abs_path.display().to_string(), e.to_string()));
+            }
+            Ok(())
+        };
 
     for manifest in to_parse {
         let filename = manifest
@@ -1079,7 +1090,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e)?,
+                Err(e) => record_err(manifest, filename, e)?,
             }
             continue;
         }
@@ -1105,7 +1116,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e)?,
+                Err(e) => record_err(manifest, filename, e)?,
             }
             continue;
         }
@@ -1121,7 +1132,7 @@ fn phase_parse(
                     let winner = upsert_package(conn, &pkg)?;
                     parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                 }
-                Err(e) => record_err(manifest, e)?,
+                Err(e) => record_err(manifest, filename, e)?,
             }
             continue;
         }
@@ -1136,7 +1147,7 @@ fn phase_parse(
                         let winner = upsert_package(conn, &pkg)?;
                         parsed_packages.push((winner, pkg.path.clone(), pkg.kind.to_string()));
                     }
-                    Err(e) => record_err(manifest, e)?,
+                    Err(e) => record_err(manifest, filename, e)?,
                 }
                 break;
             }
@@ -1163,27 +1174,55 @@ fn phase_parse(
 /// is still on disk but no longer declares a package there — e.g. a leaf
 /// crate whose `Cargo.toml` was converted into a virtual workspace root).
 fn delete_package_at_path(conn: &Connection, path: &str) -> Result<()> {
+    delete_packages_at_path(conn, path, None)
+}
+
+/// The package kind a `NoPackageManifest` result belongs to, derived from the
+/// manifest's filename.
+///
+/// Only manifests that can report [`manifest::NoPackageManifest`] need an
+/// entry here. The kind scopes the stale-row cleanup below: several manifests
+/// of different ecosystems can live in one directory (a repo root holding both
+/// a virtual-workspace `Cargo.toml` and a real `package.json`, say), and they
+/// all share the same `packages.path`, so a path-only delete would wipe the
+/// sibling ecosystem's package.
+fn no_package_manifest_kind(filename: &str) -> Option<&'static str> {
+    match filename {
+        "Cargo.toml" => Some("cargo"),
+        "pom.xml" => Some("maven"),
+        _ => None,
+    }
+}
+
+/// Remove package rows at `path` — every kind when `kind` is `None`, only that
+/// ecosystem's when it is `Some` — along with their dependencies, symbols, and
+/// hash caches.
+fn delete_packages_at_path(conn: &Connection, path: &str, kind: Option<&str>) -> Result<()> {
+    let (predicate, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &kind {
+        Some(k) => ("path = ?1 AND kind = ?2", vec![&path, k]),
+        None => ("path = ?1", vec![&path]),
+    };
+    // Table names are compile-time literals, so the formatting is not a
+    // parameterisation hole; `path`/`kind` stay bound.
+    for table in [
+        "source_hashes",
+        "file_hashes",
+        "symbols",
+        "symbol_refs",
+        "dependencies",
+    ] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} \
+                 WHERE package IN (SELECT name FROM packages WHERE {predicate})"
+            ),
+            params.as_slice(),
+        )?;
+    }
     conn.execute(
-        "DELETE FROM source_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-        [path],
+        &format!("DELETE FROM packages WHERE {predicate}"),
+        params.as_slice(),
     )?;
-    conn.execute(
-        "DELETE FROM file_hashes WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-        [path],
-    )?;
-    conn.execute(
-        "DELETE FROM symbols WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-        [path],
-    )?;
-    conn.execute(
-        "DELETE FROM symbol_refs WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-        [path],
-    )?;
-    conn.execute(
-        "DELETE FROM dependencies WHERE package IN (SELECT name FROM packages WHERE path = ?1)",
-        [path],
-    )?;
-    conn.execute("DELETE FROM packages WHERE path = ?1", [path])?;
     Ok(())
 }
 
@@ -4879,6 +4918,37 @@ anyhow = "1"
             dep_count, 0,
             "the stale package's dependencies must also be cleaned up"
         );
+    }
+
+    #[test]
+    fn test_no_package_manifest_does_not_delete_a_sibling_ecosystem_package() {
+        // A virtual-workspace `Cargo.toml` and a real `package.json` in the
+        // same directory share one `packages.path`. The "no package here any
+        // more" cleanup must only reach the Cargo row, or the npm package is
+        // dropped — permanently, since package.json's hash is unchanged and
+        // it is never re-parsed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("package.json"),
+            br#"{"name": "web-root", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+
+        let db_path = root.join(".shire/index.db");
+        let conn = db::open_readonly(&db_path).unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM packages ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, vec!["web-root".to_string()], "got {names:?}");
     }
 
     // --- MANIFESTS-18: unit tests for the cross-package context collectors ---

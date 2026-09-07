@@ -60,6 +60,28 @@ pub(crate) struct WalkedManifest {
     content_hash: String,
 }
 
+/// A `WalkBuilder` configured the way every shire walk must be configured.
+///
+/// The crate defaults honour three sources of ignore rules; only one of them
+/// is part of the repository. `git_global` pulls in the developer's personal
+/// `core.excludesFile` (`~/.gitignore_global`) and `git_exclude` the
+/// untracked, per-clone `.git/info/exclude`, so with the defaults what shire
+/// indexes is a function of the machine it runs on: a user whose global
+/// excludes contain `dist/`, `*.min.js` — or `*.ts` — gets an index silently
+/// missing those files, on every repo, with no diagnostic, and the test
+/// suite indexes different files on a developer's box than in CI
+/// (INFRA-2-1). Both are therefore off. Committed `.gitignore` files (root
+/// and nested) are kept: every collaborator shares those, so they describe
+/// the repository rather than the machine.
+///
+/// `symbols::walker` builds its own walk and must keep these settings
+/// identical — the three walks have to agree on which files exist.
+fn ignore_walk_builder(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder.hidden(true).git_global(false).git_exclude(false);
+    builder
+}
+
 /// Walk the repo and collect manifest paths with content hashes.
 fn walk_manifests(
     repo_root: &Path,
@@ -80,8 +102,7 @@ fn walk_manifests(
         .collect();
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
-    let walker = WalkBuilder::new(repo_root)
-        .hidden(true)
+    let walker = ignore_walk_builder(repo_root)
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str()
@@ -487,8 +508,7 @@ const MAX_FILES: usize = 500_000;
 fn walk_files(repo_root: &Path, config: &Config) -> Result<Vec<WalkedFile>> {
     let exclude_set: HashSet<String> = config.discovery.exclude.iter().cloned().collect();
 
-    let walker = WalkBuilder::new(repo_root)
-        .hidden(true)
+    let walker = ignore_walk_builder(repo_root)
         .threads(rayon::current_num_threads().min(8))
         .filter_entry(move |entry| {
             if let Some(name) = entry.file_name().to_str()
@@ -5027,6 +5047,81 @@ anyhow = "1"
         assert_ne!(pkg.name, "com.example:app");
         assert_ne!(pkg.name, "team-b-app");
         assert_eq!(pkg.name, "team-b-app-2");
+    }
+
+    // --- INFRA-2-1: the walks must depend only on committed ignore files ---
+
+    /// A repo whose `.git/info/exclude` (untracked, per-clone — the same
+    /// class of machine-local input as the user's `core.excludesFile`)
+    /// excludes everything the test then looks for.
+    fn repo_with_local_git_excludes(root: &std::path::Path, patterns: &str) {
+        let info = root.join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), patterns).unwrap();
+    }
+
+    #[test]
+    fn test_walk_files_ignores_untracked_local_git_excludes() {
+        // The index must not depend on a file that is not in the repository:
+        // a per-clone `.git/info/exclude` (or a developer's personal
+        // `~/.gitignore_global`) silently dropped files from the index, so
+        // `search_symbols` answered "not found" for code that exists.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        repo_with_local_git_excludes(root, "*.ts\n");
+        fs::write(root.join("kept.ts"), "export function kept() {}\n").unwrap();
+
+        let files = walk_files(root, &Config::default()).unwrap();
+
+        assert!(
+            files.iter().any(|f| f.relative_path == "kept.ts"),
+            "a file excluded only by .git/info/exclude must still be indexed: {:?}",
+            files.iter().map(|f| &f.relative_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_walk_files_still_honours_the_committed_gitignore() {
+        // The other half of the contract: a `.gitignore` is committed, every
+        // collaborator shares it, and it still applies.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        repo_with_local_git_excludes(root, "");
+        fs::write(root.join(".gitignore"), "generated.ts\n").unwrap();
+        fs::write(root.join("generated.ts"), "export function gen() {}\n").unwrap();
+        fs::write(root.join("kept.ts"), "export function kept() {}\n").unwrap();
+
+        let files = walk_files(root, &Config::default()).unwrap();
+        let paths: Vec<&String> = files.iter().map(|f| &f.relative_path).collect();
+
+        assert!(paths.iter().any(|p| p.as_str() == "kept.ts"));
+        assert!(
+            !paths.iter().any(|p| p.as_str() == "generated.ts"),
+            "a committed .gitignore must still be honoured: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_walk_manifests_ignores_untracked_local_git_excludes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        repo_with_local_git_excludes(root, "package.json\n");
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(
+            pkg.join("package.json"),
+            br#"{"name": "p", "version": "1"}"#,
+        )
+        .unwrap();
+
+        let parsers: Vec<Box<dyn ManifestParser>> = vec![Box::new(npm::NpmParser)];
+        let walked = walk_manifests(root, &Config::default(), &parsers).unwrap();
+
+        assert_eq!(
+            walked.iter().map(|m| &m.manifest_key).collect::<Vec<_>>(),
+            vec!["pkg/package.json"],
+            "a manifest excluded only by .git/info/exclude must still be discovered"
+        );
     }
 
     // --- MANIFESTS-6 follow-up: NoPackageManifest transitions clean up stale packages ---

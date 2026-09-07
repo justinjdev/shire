@@ -44,6 +44,22 @@ Config is resolved in this order, with **no merging** — the first one found is
 
 Because the fallback is whole-file replacement rather than a merge, a local `shire.toml` containing only `db_path` discards every other setting in `~/.claude/shire.toml` (excludes, custom discovery rules, etc.) rather than layering on top of it.
 
+## What gets walked
+
+Every shire walk — manifests, files, and source files for symbol extraction —
+skips hidden entries, the directories in `discovery.exclude`, and anything
+matched by a committed `.gitignore` (the repo root's and any nested ones).
+
+Ignore files that are *not* part of the repository are deliberately not
+consulted: neither your personal global gitignore (`core.excludesFile`,
+usually `~/.gitignore_global`) nor the per-clone `.git/info/exclude`. Both are
+machine-local, so honouring them would make the index — and what
+`search_symbols` can find — depend on which machine built it, with no
+diagnostic and nothing in the repo to explain the difference.
+
+To keep a path out of the index for everyone, add it to the repo's
+`.gitignore` or to `discovery.exclude`.
+
 ## Watch daemon
 
 ```toml

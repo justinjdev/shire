@@ -335,10 +335,17 @@ pub(crate) fn seed_db_path(
 }
 
 #[allow(dead_code)]
-/// Walk up from `start` to the nearest ancestor directory containing `shire.toml`, a
-/// `.shire/` directory, or a `.git` entry — the same "find the repo root" heuristic
-/// tools like git and cargo use. Falls back to `start` itself if no such ancestor is
-/// found (e.g. it isn't inside a repo at all).
+/// Walk up from `start` to the nearest ancestor directory containing `shire.toml` or a
+/// `.git` entry — the same "find the repo root" heuristic tools like git and cargo use.
+/// Falls back to `start` itself if no such ancestor is found (e.g. it isn't inside a
+/// repo at all).
+///
+/// Deliberately does NOT treat a bare `.shire/` directory as a marker: unlike
+/// `shire.toml` and `.git`, `.shire` is not something the user places to mark a repo
+/// root — `logging::init` creates `<root>/.shire/logs` under *any* directory shire is
+/// pointed at, so a stray `.shire` left behind by a one-off `shire build --root
+/// pkg/subdir` would otherwise get misread as the repo root and silently divert every
+/// future lookup to that subdirectory.
 ///
 /// Used to resolve the repository root for `shire rebuild --stdin`: the Claude Code
 /// hook's `cwd` is wherever the session happened to be launched, which in a monorepo is
@@ -347,10 +354,7 @@ pub(crate) fn seed_db_path(
 pub fn find_repo_root(start: &Path) -> PathBuf {
     let mut dir = start;
     loop {
-        if dir.join("shire.toml").exists()
-            || dir.join(".shire").exists()
-            || dir.join(".git").exists()
-        {
+        if dir.join("shire.toml").exists() || dir.join(".git").exists() {
             return dir.to_path_buf();
         }
         match dir.parent() {
@@ -944,13 +948,32 @@ max_file_size = 524288
     }
 
     #[test]
-    fn find_repo_root_finds_dot_shire_dir() {
+    fn find_repo_root_does_not_treat_bare_dot_shire_as_a_marker() {
+        // A stray `.shire/` (e.g. left behind by a one-off `shire build` run from a
+        // package subdirectory) must NOT be mistaken for the repo root — only the real
+        // repo root's shire.toml/.git should count. See WATCHCLI-2-3: treating `.shire`
+        // as a marker silently diverted every future hook rebuild to the subdirectory.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("shire.toml"), "").unwrap();
+        let stray = root.join("pkg/.shire");
+        std::fs::create_dir_all(&stray).unwrap();
+        let sub = root.join("pkg/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Must walk past pkg/.shire and land on the real root, not pkg/.
+        assert_eq!(find_repo_root(&sub), root);
+    }
+
+    #[test]
+    fn find_repo_root_falls_back_to_start_when_only_dot_shire_exists() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".shire")).unwrap();
         let sub = root.join("a/b/c");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(find_repo_root(&sub), root);
+        // No shire.toml or .git anywhere above `sub`, so `.shire` alone must not stop
+        // the walk — it should fall all the way back to `start`.
+        assert_eq!(find_repo_root(&sub), sub);
     }
 
     #[test]

@@ -350,8 +350,11 @@ pub fn start_daemon(root: &Path, db: Option<&Path>, config: Option<&Path>) -> Re
 /// return `false` on the very next check regardless of whether the daemon had actually
 /// exited, which made callers' "did it really stop?" checks meaningless (WATCH-6) and let
 /// `shire clean` race the daemon's own shutdown. If the process is still alive when the
-/// wait times out, the PID file is left in place so a caller's own `is_running()` check
-/// still reports the daemon as running.
+/// wait times out, the PID file is left in place (so a caller's own `is_running()` check
+/// still reports the daemon as running) and this returns an error — the daemon only
+/// handles SIGTERM between rebuilds, so a slow/uninterruptible rebuild can easily outlast
+/// the wait, and silently reporting success in that case (WATCHCLI-2-2) told the user the
+/// opposite of what actually happened.
 pub fn stop_daemon(root: &Path) -> Result<()> {
     let pid_file = pid_path(root);
 
@@ -427,9 +430,15 @@ pub fn stop_daemon(root: &Path) -> Result<()> {
     if exited {
         let _ = std::fs::remove_file(&pid_file);
         let _ = std::fs::remove_file(sock_path(root));
+        return Ok(());
     }
 
-    Ok(())
+    anyhow::bail!(
+        "Sent SIGTERM to watch daemon (pid {pid}), but it had not stopped after 5s. It may \
+         be finishing an uninterruptible rebuild — the daemon only handles SIGTERM between \
+         rebuilds. Its pid/socket files were left in place; retry `shire watch --stop` or \
+         check `shire watch --status`."
+    )
 }
 
 /// Print a human-readable status report for the watch daemon at `root`: PID file

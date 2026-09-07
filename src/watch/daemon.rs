@@ -114,18 +114,55 @@ fn read_proc_state(pid: u32) -> Option<char> {
     text.trim().chars().next()
 }
 
-/// Whether an executable's basename (from `/proc/<pid>/exe` or `ps -o comm=`) is shire's
-/// own binary. Handles the Linux kernel's `readlink(/proc/<pid>/exe)` appending
-/// `" (deleted)"` when the on-disk binary was replaced/removed after exec (e.g. an
-/// upgrade while the daemon kept running) — that's still shire, just an older copy.
-fn exe_basename_is_shire(name: &str) -> bool {
-    name.trim_end_matches(" (deleted)") == "shire"
+/// Whether an executable path plausibly belongs to shire's own binary. Two ways to
+/// pass:
+///
+/// 1. Its basename starts with `shire` (`shire`, `shire-v0.7`, `shire-0.6.2`, ...) —
+///    covers a versioned install, a release tarball's binary renamed on download, or a
+///    copy kept side by side during an upgrade. Does not require the file to exist on
+///    disk, so it still works after the on-disk binary was replaced (see the
+///    `" (deleted)"` handling below).
+/// 2. It resolves (after canonicalization) to the exact same file as this process's own
+///    `std::env::current_exe()` — covers a wrapper name that doesn't start with `shire`
+///    at all, so long as it truly is the same binary that would be spawned by
+///    `start_daemon` (which always re-execs `current_exe()`).
+///
+/// Handles the Linux kernel's `readlink(/proc/<pid>/exe)` appending `" (deleted)"` when
+/// the on-disk binary was replaced/removed after exec (e.g. an upgrade while the daemon
+/// kept running) — that's still shire, just an older copy; canonicalization is skipped
+/// in that case since the path is known not to exist anymore.
+fn exe_path_is_shire(raw: &str) -> bool {
+    let deleted = raw.ends_with(" (deleted)");
+    let trimmed = raw.trim_end_matches(" (deleted)");
+    let candidate = Path::new(trimmed);
+
+    if let Some(name) = candidate.file_name().and_then(|f| f.to_str())
+        && name.starts_with("shire")
+    {
+        return true;
+    }
+
+    if deleted {
+        // The file no longer exists on disk, so a same-file comparison against
+        // current_exe() can't succeed either way; the basename check above is all we
+        // have.
+        return false;
+    }
+
+    match (
+        candidate.canonicalize(),
+        std::env::current_exe().and_then(|p| p.canonicalize()),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Result of checking a process's executable identity.
 enum ExeCheck {
-    /// The executable's basename was read successfully.
-    Basename(String),
+    /// The executable's path was read successfully (may carry a trailing
+    /// `" (deleted)"` marker — see `exe_path_is_shire`).
+    Path(String),
     /// Could not be determined — most commonly `/proc/<pid>/exe` returning EACCES
     /// because the process is owned by another user (reading it requires the same
     /// permission as a ptrace attach). Callers must not treat this the same as a
@@ -136,8 +173,8 @@ enum ExeCheck {
 #[cfg(target_os = "linux")]
 fn read_exe_basename(pid: u32) -> ExeCheck {
     match std::fs::read_link(format!("/proc/{pid}/exe")) {
-        Ok(link) => match link.file_name().and_then(|f| f.to_str()) {
-            Some(name) => ExeCheck::Basename(name.to_string()),
+        Ok(link) => match link.to_str() {
+            Some(path) => ExeCheck::Path(path.to_string()),
             None => ExeCheck::Unverifiable,
         },
         Err(_) => ExeCheck::Unverifiable,
@@ -145,7 +182,7 @@ fn read_exe_basename(pid: u32) -> ExeCheck {
 }
 
 /// Fallback for non-Linux Unixes (macOS): `ps -o comm=` gives the full executable path
-/// there (unlike Linux's truncated `comm`), so take its basename.
+/// there (unlike Linux's truncated `comm`).
 #[cfg(all(unix, not(target_os = "linux")))]
 fn read_exe_basename(pid: u32) -> ExeCheck {
     let out = match Command::new("ps")
@@ -163,10 +200,7 @@ fn read_exe_basename(pid: u32) -> ExeCheck {
     if trimmed.is_empty() {
         return ExeCheck::Unverifiable;
     }
-    match Path::new(trimmed).file_name().and_then(|f| f.to_str()) {
-        Some(name) => ExeCheck::Basename(name.to_string()),
-        None => ExeCheck::Unverifiable,
-    }
+    ExeCheck::Path(trimmed.to_string())
 }
 
 /// Result of checking whether a PID is safe to signal (and whether its state files are
@@ -216,9 +250,9 @@ fn check_pid_ownership(pid: u32) -> PidOwnership {
 fn ownership_from_checks(exe: ExeCheck, is_zombie: bool) -> PidOwnership {
     match exe {
         ExeCheck::Unverifiable => PidOwnership::Unverifiable,
-        ExeCheck::Basename(name) if !exe_basename_is_shire(&name) => PidOwnership::NotShire,
-        ExeCheck::Basename(_) if is_zombie => PidOwnership::NotShire,
-        ExeCheck::Basename(_) => PidOwnership::Owned,
+        ExeCheck::Path(path) if !exe_path_is_shire(&path) => PidOwnership::NotShire,
+        ExeCheck::Path(_) if is_zombie => PidOwnership::NotShire,
+        ExeCheck::Path(_) => PidOwnership::Owned,
     }
 }
 
@@ -566,14 +600,28 @@ mod tests {
     }
 
     #[test]
-    fn exe_basename_is_shire_matches_only_shire() {
-        assert!(exe_basename_is_shire("shire"));
+    fn exe_path_is_shire_accepts_shire_and_renamed_or_versioned_copies() {
+        assert!(exe_path_is_shire("/usr/bin/shire"));
+        assert!(exe_path_is_shire("shire"));
         // Linux appends this when the on-disk binary was replaced/removed after exec.
-        assert!(exe_basename_is_shire("shire (deleted)"));
-        assert!(!exe_basename_is_shire("python3"));
-        assert!(!exe_basename_is_shire("sleep"));
-        assert!(!exe_basename_is_shire("shire-something-else"));
-        assert!(!exe_basename_is_shire(""));
+        assert!(exe_path_is_shire("/usr/bin/shire (deleted)"));
+        // WATCHCLI-2-1: a versioned install, a renamed release tarball binary, or a
+        // side-by-side upgrade copy must still be recognized as shire's own binary.
+        assert!(exe_path_is_shire("/opt/shire-v0.7/shire-v0.7"));
+        assert!(exe_path_is_shire("/opt/bin/shire-0.6.2"));
+        assert!(!exe_path_is_shire("/usr/bin/python3"));
+        assert!(!exe_path_is_shire("/bin/sleep"));
+        assert!(!exe_path_is_shire(""));
+    }
+
+    #[test]
+    fn exe_path_is_shire_accepts_a_wrapper_name_that_is_the_same_file_as_current_exe() {
+        // A wrapper/alias that doesn't even start with "shire" is still recognized as
+        // long as it resolves to the exact same on-disk file as this test binary's own
+        // current_exe() — the fallback path start_daemon relies on implicitly, since it
+        // always re-execs current_exe().
+        let current = std::env::current_exe().unwrap();
+        assert!(exe_path_is_shire(current.to_str().unwrap()));
     }
 
     // --- ownership_from_checks: pure tri-state decision logic ---
@@ -586,7 +634,15 @@ mod tests {
     #[test]
     fn ownership_owned_when_exe_matches_and_not_zombie() {
         assert_eq!(
-            ownership_from_checks(ExeCheck::Basename("shire".into()), false),
+            ownership_from_checks(ExeCheck::Path("shire".into()), false),
+            PidOwnership::Owned
+        );
+    }
+
+    #[test]
+    fn ownership_owned_for_a_versioned_or_renamed_shire_binary() {
+        assert_eq!(
+            ownership_from_checks(ExeCheck::Path("/opt/bin/shire-v0.7".into()), false),
             PidOwnership::Owned
         );
     }
@@ -594,7 +650,7 @@ mod tests {
     #[test]
     fn ownership_not_shire_when_exe_is_not_shire() {
         assert_eq!(
-            ownership_from_checks(ExeCheck::Basename("python3".into()), false),
+            ownership_from_checks(ExeCheck::Path("/usr/bin/python3".into()), false),
             PidOwnership::NotShire
         );
     }
@@ -602,7 +658,7 @@ mod tests {
     #[test]
     fn ownership_not_shire_for_zombie_even_with_matching_exe() {
         assert_eq!(
-            ownership_from_checks(ExeCheck::Basename("shire".into()), true),
+            ownership_from_checks(ExeCheck::Path("shire".into()), true),
             PidOwnership::NotShire
         );
     }

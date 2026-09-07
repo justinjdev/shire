@@ -321,15 +321,16 @@ fn run_clean(root: &Path, db: Option<PathBuf>, cfg_path: Option<&Path>) -> Resul
     // lock on an unlinked inode while the next builder creates a fresh
     // file at the same path and takes it immediately (INDEX-3-6).
     //
-    // Taken only once `classify_for_removal` has accepted `db_path`, so a
-    // repo-controlled `shire.toml` cannot get a lock file created next
-    // to an arbitrary file (INDEX-3-7). `Skip` rather than a wait:
-    // `clean` is interactive, and "a build is running" is the useful
-    // answer.
+    // Taken only when `classify_for_removal` says the file is shire's own to
+    // remove. `db_path` comes from a repo-controlled `shire.toml`, and the
+    // lock file's path is that plus ".lock" — so for a `Missing` path (nothing
+    // to clean) or one holding a file `clean` is about to refuse
+    // (`NotSqlite`/`Foreign`), taking the lock would create an empty file, and
+    // the directories above it, beside a file shire has just decided it may
+    // not touch (INDEX-3-7). `Skip` rather than a wait: `clean` is
+    // interactive, and "a build is running" is the useful answer.
     let _build_lock =
-        if guard::classify_for_removal(&db_path, Some(&root))? == guard::RemovalVerdict::Missing {
-            None
-        } else {
+        if guard::classify_for_removal(&db_path, Some(&root))? == guard::RemovalVerdict::Allowed {
             match index::lock::acquire(&db_path, index::lock::LockWait::Skip)? {
                 Some(lock) => Some(lock),
                 None => anyhow::bail!(
@@ -338,6 +339,10 @@ fn run_clean(root: &Path, db: Option<PathBuf>, cfg_path: Option<&Path>) -> Resul
                     db_path.display()
                 ),
             }
+        } else {
+            // `remove_index_db` re-classifies and turns the verdict into
+            // either "nothing to do" or the refusal the user sees.
+            None
         };
     remove_index_db(&db_path, &root)?;
 
@@ -494,6 +499,57 @@ mod tests {
         drop(held);
         run_clean(repo.path(), Some(db.clone()), None).unwrap();
         assert!(!db.exists());
+    }
+
+    #[test]
+    fn clean_creates_no_lock_file_beside_a_file_it_refuses() {
+        // The lock's path is db_path + ".lock", and db_path comes from a
+        // repo-controlled shire.toml. Taking the lock for a verdict `clean` is
+        // about to refuse would drop an empty file (and any missing parent
+        // directories) next to a file shire has just decided it may not touch.
+        let repo = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+
+        for victim in ["secret", "notes.db"] {
+            let path = elsewhere.path().join(victim);
+            if victim.ends_with(".db") {
+                write_foreign_sqlite_db(&path);
+            } else {
+                std::fs::write(&path, b"hunter2\n").unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+
+            let err = run_clean(repo.path(), Some(path.clone()), None)
+                .expect_err("clean must refuse a file shire did not build");
+            assert!(
+                format!("{err:#}").contains("Refusing to remove"),
+                "got {err:#}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{victim} was touched"
+            );
+            assert!(
+                !index::lock::lock_path(&path).exists(),
+                "no lock file may be created beside {victim}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_creates_no_lock_file_for_a_db_path_that_does_not_exist() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let db = elsewhere.path().join("never-built.db");
+
+        run_clean(repo.path(), Some(db.clone()), None).unwrap();
+
+        assert!(!db.exists());
+        assert!(
+            !index::lock::lock_path(&db).exists(),
+            "a clean with nothing to remove must not leave a lock file behind"
+        );
     }
 
     #[test]

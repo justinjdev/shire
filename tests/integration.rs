@@ -3864,4 +3864,178 @@ mod watch_daemon_ownership {
         assert!(real_stop.success());
         assert!(wait_until(|| !pid_alive(pid), Duration::from_secs(5)));
     }
+
+    /// WW-3-2: an in-place upgrade of a renamed install — the on-disk binary at the
+    /// exact install path gets replaced while the daemon keeps running — must not
+    /// leave the daemon unstoppable. `/proc/<pid>/exe` reads `"<path> (deleted)"` once
+    /// the original file is unlinked; a naive basename-only check can't verify
+    /// identity in that state, so this exercises the directory+basename identity
+    /// fallback (`same_install_location`) that recognizes "same install location,
+    /// newer binary" without requiring the old and new files to share an inode.
+    #[test]
+    fn stop_recognizes_a_daemon_after_its_binary_is_replaced_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("shire.toml"), "").unwrap();
+
+        // A renamed (non-"shire"-prefixed) install, so only the identity fallback —
+        // not the basename heuristic — can recognize it after the upgrade.
+        let installed = root.join("totally-different-name");
+        copy_renamed_binary(&installed);
+
+        let start_status = Command::new(&installed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .status()
+            .expect("failed to run watch (start)");
+        assert!(start_status.success(), "starting the daemon should succeed");
+
+        let pid_file = root.join(".shire/watch.pid");
+        let sock_file = root.join(".shire/watch.sock");
+        assert!(
+            wait_until(|| sock_file.exists(), Duration::from_secs(5)),
+            "daemon never created its socket"
+        );
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .expect("pid file should exist")
+            .trim()
+            .parse()
+            .expect("pid file should contain a valid pid");
+        assert!(
+            pid_alive(pid),
+            "daemon pid should be alive right after starting"
+        );
+
+        // Simulate an in-place upgrade: build the new binary at a side path, then
+        // rename it over the original — this unlinks the old inode (the running
+        // daemon keeps executing it just fine) while `installed` starts naming the
+        // new file. `/proc/<pid>/exe` for the still-running daemon now reads
+        // "<installed> (deleted)".
+        let staged = root.join("totally-different-name.new");
+        copy_renamed_binary(&staged);
+        fs::rename(&staged, &installed).expect("failed to replace the binary in place");
+
+        let exe_link = fs::read_link(format!("/proc/{pid}/exe"))
+            .expect("failed to read /proc/<pid>/exe for the running daemon");
+        assert!(
+            exe_link.to_string_lossy().ends_with(" (deleted)"),
+            "expected the kernel to mark the daemon's exe link deleted after the \
+             in-place replace, got {exe_link:?}"
+        );
+
+        // `--status`, run through the replaced (now different-inode) binary at the
+        // same install path, must still recognize its own daemon.
+        let status_out = Command::new(&installed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--status")
+            .output()
+            .expect("failed to run watch --status");
+        let status_text = String::from_utf8_lossy(&status_out.stdout);
+        assert!(
+            status_text.contains("looks like a shire watch daemon"),
+            "status should recognize the daemon after an in-place upgrade: {status_text}"
+        );
+
+        let stop_status = Command::new(&installed)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--stop")
+            .status()
+            .expect("failed to run watch --stop");
+        assert!(
+            stop_status.success(),
+            "stop should succeed for a daemon whose binary was replaced in place"
+        );
+
+        assert!(
+            wait_until(|| !pid_alive(pid), Duration::from_secs(5)),
+            "daemon should have been stopped after the in-place upgrade, not orphaned"
+        );
+        assert!(
+            !pid_file.exists(),
+            "pid file should be cleaned up after a confirmed stop"
+        );
+        assert!(
+            !sock_file.exists(),
+            "socket file should be cleaned up after a confirmed stop"
+        );
+    }
+
+    /// WW-3-2: `shire clean` must refuse (non-zero exit, nothing removed) rather than
+    /// silently succeed when the watch daemon is alive but its ownership can't be
+    /// positively verified by the binary running `clean` — here, a daemon started by
+    /// one binary and `clean`ed by a genuinely different one, so neither the basename
+    /// heuristic (the wrapper's name doesn't start with "shire") nor the
+    /// current_exe() identity check can succeed. Before this fix, `clean` treated that
+    /// as "stopped" (because stopping had already deleted the still-live socket file
+    /// out from under the daemon) and went on to remove `.shire`.
+    #[test]
+    fn clean_refuses_when_the_watch_daemon_cannot_be_verified_but_is_alive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("shire.toml"), "").unwrap();
+
+        // Started by a renamed wrapper binary — a distinct file from `cargo_bin()`.
+        let wrapper = root.join("myshire");
+        copy_renamed_binary(&wrapper);
+
+        let start_status = Command::new(&wrapper)
+            .args(["watch", "--root"])
+            .arg(root)
+            .status()
+            .expect("failed to run watch (start)");
+        assert!(start_status.success(), "starting the daemon should succeed");
+
+        let pid_file = root.join(".shire/watch.pid");
+        let sock_file = root.join(".shire/watch.sock");
+        assert!(
+            wait_until(|| sock_file.exists(), Duration::from_secs(5)),
+            "daemon never created its socket"
+        );
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            pid_alive(pid),
+            "daemon pid should be alive right after starting"
+        );
+
+        // `clean`, run via the *actual* built `shire` binary — a different file from
+        // the wrapper that started the daemon — must refuse rather than remove
+        // `.shire` out from under a demonstrably live listener.
+        let clean_output = Command::new(cargo_bin())
+            .args(["clean", "--root"])
+            .arg(root)
+            .output()
+            .expect("failed to run clean");
+
+        assert!(
+            !clean_output.status.success(),
+            "clean must fail rather than silently orphan a live, unverifiable daemon"
+        );
+        assert!(
+            pid_alive(pid),
+            "the daemon must survive an unsuccessful clean"
+        );
+        assert!(
+            root.join(".shire").exists(),
+            ".shire must not be removed while its daemon is still alive"
+        );
+        assert!(pid_file.exists(), "pid file must be left in place");
+        assert!(sock_file.exists(), "socket file must be left in place");
+
+        // Clean up via the binary that actually started it (which *can* verify its
+        // own daemon), so this test doesn't leak a process.
+        let stop_status = Command::new(&wrapper)
+            .args(["watch", "--root"])
+            .arg(root)
+            .arg("--stop")
+            .status()
+            .unwrap();
+        assert!(stop_status.success());
+        assert!(wait_until(|| !pid_alive(pid), Duration::from_secs(5)));
+    }
 }

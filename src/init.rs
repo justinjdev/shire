@@ -23,7 +23,7 @@ fn print_header(msg: &str) {
 /// Mode to (re)write `path` with: its current mode if it exists, otherwise
 /// `default_new_mode`.
 #[cfg(unix)]
-fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
+pub(crate) fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
@@ -31,7 +31,7 @@ fn target_mode(path: &Path, default_new_mode: u32) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
+pub(crate) fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
     default_new_mode
 }
 
@@ -51,7 +51,7 @@ fn target_mode(_path: &Path, default_new_mode: u32) -> u32 {
 /// concurrent process — the create fails with `AlreadyExists`/`ELOOP` rather than
 /// following it or overwriting it, and that is a hard error here, not a silent retry.
 #[cfg(unix)]
-fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
+pub(crate) fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -93,7 +93,7 @@ fn write_with_mode(path: &Path, content: &str, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
+pub(crate) fn write_with_mode(path: &Path, content: &str, _mode: u32) -> Result<()> {
     let _ = fs::remove_file(path);
     fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
@@ -222,6 +222,8 @@ pub struct InitOptions {
     pub patch_claude_md: bool,
     /// When true, add the db directory to .gitignore.
     pub gitignore_db_dir: bool,
+    /// When true, install the Claude Code status mod (user-wide; experimental).
+    pub install_mod: bool,
     /// When true, skip interactive prompts for existing files.
     pub non_interactive: bool,
 }
@@ -236,6 +238,7 @@ impl InitOptions {
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: true,
+            install_mod: false,
             non_interactive: true,
         }
     }
@@ -249,12 +252,13 @@ impl InitOptions {
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
+            install_mod: false,
             non_interactive: true,
         }
     }
 }
 
-fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
+fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> Result<InitOptions> {
     let defaults = if global {
         InitOptions::default_global()
     } else {
@@ -326,6 +330,18 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         .default(true)
         .interact()?;
 
+    // 8. Claude Code status mod (user-wide, experimental)
+    let install_mod = match mod_flag {
+        Some(v) => v,
+        None => Confirm::new()
+            .with_prompt(
+                "Install the Claude Code status mod (experimental)? Shows index health in \
+                 Claude Code's status line for all your projects",
+            )
+            .default(false)
+            .interact()?,
+    };
+
     Ok(InitOptions {
         use_hook,
         db_path,
@@ -334,6 +350,7 @@ fn prompt_options(global: bool, no_hook_flag: bool) -> Result<InitOptions> {
         generate_rules,
         patch_claude_md,
         gitignore_db_dir,
+        install_mod,
         non_interactive: false,
     })
 }
@@ -391,7 +408,7 @@ pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
     out
 }
 
-pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
+pub fn run_init(root: &Path, no_hook: bool, yes: bool, mod_flag: Option<bool>) -> Result<()> {
     print_header("Shire — codebase search index");
 
     // In interactive mode, ask local vs global first
@@ -403,7 +420,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
             .default(0)
             .interact()?;
         if selection == 1 {
-            return run_init_global(no_hook, false);
+            return run_init_global(no_hook, false, mod_flag);
         }
     }
 
@@ -412,9 +429,10 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         if no_hook {
             defaults.use_hook = false;
         }
+        defaults.install_mod = mod_flag.unwrap_or(false);
         defaults
     } else {
-        prompt_options(false, no_hook)?
+        prompt_options(false, no_hook, mod_flag)?
     };
 
     // 1. Create or update shire.toml
@@ -471,7 +489,13 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool) -> Result<()> {
         ensure_claude_md_line()?;
     }
 
-    // 6. Ensure the db directory is in .gitignore (only when config was actually written)
+    // 6. Claude Code status mod — always user-wide: Claude Code reads plugin
+    //    folders from ~/.claude/settings.json only, never a project's settings.
+    if opts.install_mod {
+        install_claude_mod(&home_dir()?.join(".claude"))?;
+    }
+
+    // 7. Ensure the db directory is in .gitignore (only when config was actually written)
     if should_write
         && opts.gitignore_db_dir
         && let Some(dir) = gitignore_dir_from_db_path(&opts.db_path)
@@ -499,16 +523,17 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME environment variable not set")
 }
 
-pub fn run_init_global(no_hook: bool, yes: bool) -> Result<()> {
+pub fn run_init_global(no_hook: bool, yes: bool, mod_flag: Option<bool>) -> Result<()> {
     let claude_dir = home_dir()?.join(".claude");
     let opts = if yes || !std::io::stdin().is_terminal() {
         let mut defaults = InitOptions::default_global();
         if no_hook {
             defaults.use_hook = false;
         }
+        defaults.install_mod = mod_flag.unwrap_or(false);
         defaults
     } else {
-        prompt_options(true, no_hook)?
+        prompt_options(true, no_hook, mod_flag)?
     };
     run_init_global_in(&claude_dir, &opts)
 }
@@ -576,6 +601,11 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
         ensure_claude_md_line()?;
     }
 
+    // 6. Claude Code status mod
+    if opts.install_mod {
+        install_claude_mod(claude_dir)?;
+    }
+
     if opts.use_hook {
         eprintln!(
             "\n  Next: run {} in each repo you want to index.",
@@ -586,6 +616,21 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
             "\n  On-demand reindexing enabled globally. The MCP server will rebuild the index automatically when needed."
         );
         print_skipped("No PostToolUse hook installed.");
+    }
+    Ok(())
+}
+
+fn install_claude_mod(claude_dir: &Path) -> Result<()> {
+    let dir = crate::claude_mod::mod_dir(claude_dir);
+    match crate::claude_mod::install(claude_dir)? {
+        crate::claude_mod::Installed::Added => print_created(&format!(
+            "Installed the Claude Code status mod in {} (takes effect in new Claude Code sessions)",
+            dir.display()
+        )),
+        crate::claude_mod::Installed::Refreshed => print_created(&format!(
+            "Updated the Claude Code status mod in {}",
+            dir.display()
+        )),
     }
     Ok(())
 }
@@ -908,7 +953,7 @@ mod tests {
     #[test]
     fn test_init_creates_config_and_mcp() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         // shire.toml created
         let config_path = dir.path().join("shire.toml");
@@ -944,7 +989,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config_path = dir.path().join("shire.toml");
         fs::write(&config_path, "existing").unwrap();
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         // shire.toml unchanged
         let content = fs::read_to_string(&config_path).unwrap();
@@ -958,8 +1003,8 @@ mod tests {
     #[test]
     fn test_init_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), false, true).unwrap();
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         let mcp_path = dir.path().join(".mcp.json");
         let parsed: Map<String, Value> =
@@ -997,7 +1042,7 @@ mod tests {
         });
         fs::write(&mcp_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&mcp_path).unwrap()).unwrap();
@@ -1020,7 +1065,7 @@ mod tests {
         )
         .unwrap();
 
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         let parsed: Map<String, Value> =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -1182,7 +1227,7 @@ mod tests {
     #[test]
     fn test_init_no_hook_creates_mcp_with_root_and_no_hook() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), true, true).unwrap();
+        run_init(dir.path(), true, true, None).unwrap();
 
         let mcp_path = dir.path().join(".mcp.json");
         let parsed: Map<String, Value> =
@@ -1201,8 +1246,8 @@ mod tests {
     #[test]
     fn test_init_no_hook_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), true, true).unwrap();
-        run_init(dir.path(), true, true).unwrap();
+        run_init(dir.path(), true, true, None).unwrap();
+        run_init(dir.path(), true, true, None).unwrap();
 
         let mcp_path = dir.path().join(".mcp.json");
         let parsed: Map<String, Value> =
@@ -1213,7 +1258,7 @@ mod tests {
     #[test]
     fn test_init_with_hook_still_installs_hook() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         let mcp_path = dir.path().join(".mcp.json");
         let parsed: Map<String, Value> =
@@ -1281,6 +1326,7 @@ mod tests {
             generate_rules: true,
             patch_claude_md: false,
             gitignore_db_dir: false,
+            install_mod: false,
             non_interactive: true,
         };
         let toml = generate_config_toml(&opts, false);
@@ -1378,14 +1424,14 @@ mod tests {
     #[test]
     fn test_init_rules_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
 
         // Modify the rules file
         let rules_path = dir.path().join(".claude/rules/shire.md");
         fs::write(&rules_path, "custom content").unwrap();
 
         // Re-run init — should not overwrite
-        run_init(dir.path(), false, true).unwrap();
+        run_init(dir.path(), false, true, None).unwrap();
         let content = fs::read_to_string(&rules_path).unwrap();
         assert_eq!(content, "custom content");
     }
@@ -1724,6 +1770,33 @@ mod tests {
     // directory sits at a write's target path ---
 
     #[test]
+    fn test_init_global_installs_the_claude_mod_only_when_asked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+
+        run_init_global_in(&claude_dir, &InitOptions::default_global()).unwrap();
+        assert!(!crate::claude_mod::is_installed(&claude_dir), "opt-in only");
+
+        let opts = InitOptions {
+            install_mod: true,
+            ..InitOptions::default_global()
+        };
+        run_init_global_in(&claude_dir, &opts).unwrap();
+        assert!(crate::claude_mod::is_installed(&claude_dir));
+        let settings: Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            settings["hooks"]["PostToolUse"].is_array(),
+            "the hook and the mod share settings.json"
+        );
+        assert_eq!(
+            settings["env"][crate::claude_mod::PLUGIN_DIRS_VAR],
+            crate::claude_mod::mod_dir(&claude_dir).to_str().unwrap()
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn run_init_refuses_a_symlinked_claude_directory() {
         // A hostile repo commits `.claude` itself as a symlink to a directory outside
@@ -1734,7 +1807,7 @@ mod tests {
         let outside = tempfile::TempDir::new().unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude")).unwrap();
 
-        let result = run_init(repo.path(), false, true);
+        let result = run_init(repo.path(), false, true, None);
 
         assert!(
             result.is_err(),
@@ -1758,7 +1831,7 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
         std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude/rules")).unwrap();
 
-        let result = run_init(repo.path(), true, true);
+        let result = run_init(repo.path(), true, true, None);
 
         assert!(result.is_err());
         assert!(!outside.path().join("shire.md").exists());

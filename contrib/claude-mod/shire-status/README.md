@@ -19,17 +19,25 @@ which never rebuilds or writes.
 
 A `shire` on `PATH` that has the `status` subcommand.
 
+The files here are compiled into the `shire` binary (`src/claude_mod.rs`), so
+changing one changes what `shire init --mod` installs.
+
 ## Install
 
-Load the folder as a plugin directory:
+```sh
+shire init --mod          # or answer yes to the prompt in `shire init`
+```
+
+This writes the mod, compiled into the `shire` binary so it always matches its
+`shire status`, to `~/.claude/shire-mod/shire-status/` and lists that folder in
+`env.CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`. `shire install`
+refreshes it after an upgrade, and `shire uninstall` removes it.
+
+To run this folder straight from a checkout instead:
 
 ```sh
 claude --plugin-dir /path/to/shire/contrib/claude-mod/shire-status
 ```
-
-or, where no flag can be passed (desktop app, SDK), list it in
-`CLAUDE_CODE_PLUGIN_DIRS` (process environment or the `env` block of
-`~/.claude/settings.json`).
 
 ## Develop
 

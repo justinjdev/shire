@@ -1,3 +1,4 @@
+pub mod claude_mod;
 pub mod config;
 pub mod db;
 pub mod git;

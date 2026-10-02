@@ -50,7 +50,8 @@ pub struct Counts {
 pub struct Status {
     pub shire_version: &'static str,
     pub root: PathBuf,
-    pub db_path: PathBuf,
+    /// `None` when it could not be resolved (a broken `shire.toml`).
+    pub db_path: Option<PathBuf>,
     pub state: State,
     /// Why the index is `unreadable`, or why it could not be read mid-build.
     pub error: Option<String>,
@@ -76,6 +77,62 @@ pub struct Status {
     pub watch: Liveness,
 }
 
+/// `shire status`'s whole job: resolve the repo root and `db_path` the way
+/// the other subcommands do, then [`collect`]. A failure to resolve them (a
+/// malformed `shire.toml`, a `--root` that does not exist) is reported as an
+/// `unreadable` status rather than an error, so a poller always gets JSON.
+pub fn collect_for(root: Option<&Path>, db: Option<&Path>, config: Option<&Path>) -> Status {
+    let given_root = root.map(Path::to_path_buf);
+    let resolve = || -> Result<(PathBuf, PathBuf)> {
+        let root = match root {
+            Some(r) => std::fs::canonicalize(r)
+                .map_err(|e| anyhow::anyhow!("cannot resolve --root {}: {e}", r.display()))?,
+            None => crate::config::find_repo_root(&std::fs::canonicalize(".")?),
+        };
+        let db_path = match db {
+            Some(p) => p.to_path_buf(),
+            None => {
+                let cfg = crate::config::load_config_from(config, &root)?;
+                crate::config::resolve_db_path(&cfg, &root)?
+            }
+        };
+        Ok((root, db_path))
+    };
+    match resolve() {
+        Ok((root, db_path)) => collect(&root, &db_path),
+        Err(e) => {
+            let root = given_root
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            unresolved(root, format!("{e:#}"))
+        }
+    }
+}
+
+/// A status for a repo whose `db_path` could not even be worked out.
+fn unresolved(root: PathBuf, error: String) -> Status {
+    Status {
+        shire_version: env!("CARGO_PKG_VERSION"),
+        head_commit: crate::git::head_commit(&root),
+        watch: crate::watch::daemon::liveness(&root),
+        root,
+        db_path: None,
+        state: State::Unreadable,
+        error: Some(error),
+        db_size_bytes: None,
+        build_running: false,
+        indexed_at: None,
+        build_duration_ms: None,
+        git_commit: None,
+        head_matches: None,
+        counts: Counts::default(),
+        references_enabled: None,
+        file_walk: None,
+        pending_source_recheck: Vec::new(),
+        last_build_failures: Vec::new(),
+    }
+}
+
 /// Gather the status of the index at `db_path` for the repo at `root`.
 pub fn collect(root: &Path, db_path: &Path) -> Status {
     let build_running = crate::index::lock::is_held(db_path);
@@ -83,7 +140,7 @@ pub fn collect(root: &Path, db_path: &Path) -> Status {
     let mut status = Status {
         shire_version: env!("CARGO_PKG_VERSION"),
         root: root.to_path_buf(),
-        db_path: db_path.to_path_buf(),
+        db_path: Some(db_path.to_path_buf()),
         state: State::Missing,
         error: None,
         db_size_bytes: None,
@@ -102,6 +159,13 @@ pub fn collect(root: &Path, db_path: &Path) -> Status {
     };
 
     match std::fs::symlink_metadata(db_path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            // EACCES on a parent directory is not "no index": a build would
+            // fail too, so say what is actually wrong.
+            status.state = State::Unreadable;
+            status.error = Some(format!("cannot stat db_path: {e}"));
+            return status;
+        }
         Err(_) => {
             status.state = if build_running {
                 State::Building
@@ -250,7 +314,11 @@ pub fn render_text(s: &Status) -> String {
         let _ = writeln!(out, "error:      {e}");
     }
     let _ = writeln!(out, "root:       {}", s.root.display());
-    let _ = writeln!(out, "db:         {}", s.db_path.display());
+    let db = s
+        .db_path
+        .as_ref()
+        .map_or("-".into(), |p| p.display().to_string());
+    let _ = writeln!(out, "db:         {db}");
     if let Some(n) = s.db_size_bytes {
         let _ = writeln!(out, "size:       {n} bytes");
     }
@@ -434,6 +502,39 @@ mod tests {
         s.head_commit = Some("def456".into());
         s.head_matches = Some(false);
         assert!(render_text(&s).contains("HEAD has moved since"));
+    }
+
+    #[test]
+    fn a_broken_config_is_reported_not_raised() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("shire.toml"), "db_path = [not toml").unwrap();
+        let s = collect_for(Some(dir.path()), None, None);
+        assert_eq!(s.state, State::Unreadable);
+        assert_eq!(s.db_path, None);
+        assert!(s.error.is_some());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["db_path"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_missing_root_is_reported_not_raised() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let gone = dir.path().join("nope");
+        let s = collect_for(Some(&gone), None, None);
+        assert_eq!(s.state, State::Unreadable);
+        assert!(s.error.unwrap().contains("--root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unstattable_db_path_is_unreadable_not_missing() {
+        // A file used as a directory component: ENOTDIR, not ENOENT.
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let s = collect(dir.path(), &file.join("index.db"));
+        assert_eq!(s.state, State::Unreadable);
+        assert!(s.error.unwrap().contains("cannot stat db_path"));
     }
 
     #[test]

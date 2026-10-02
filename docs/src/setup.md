@@ -38,6 +38,34 @@ During interactive setup, `shire init` prompts:
 
 If accepted, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Code to prefer Shire MCP tools over Grep/Glob for code search. The line is idempotent — running init again won't duplicate it. If `~/.claude/CLAUDE.md` doesn't exist yet, it creates the file.
 
+### Claude Code status mod (experimental)
+
+During interactive setup, `shire init` also asks:
+
+> Install the Claude Code status mod (experimental)?
+
+The default is **no**. Answering yes, or passing `--mod` (`--no-mod` skips the question),
+installs a Claude Code [mod](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)
+that polls [`shire status --json`](#index-status) and shows index health in Claude Code's status
+line (for example `shire ● 412 pkgs · 38.2k syms · 4m ago`), shows a toast when something
+changes (new build failures, an interrupted build, the watch daemon stopping), and adds a
+`/shire` pane with rebuild buttons.
+
+The mod is always installed **for your user**, even from a project-level `shire init`. Claude
+Code loads extra plugin folders only from `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`,
+never from a project's settings, so a cloned repository cannot turn it on. `shire init` writes
+the mod's files, which are compiled into the `shire` binary, to `~/.claude/shire-mod/shire-status/`
+and adds that folder to `env.CLAUDE_CODE_PLUGIN_DIRS`, keeping any folders already listed there.
+New Claude Code sessions pick it up.
+
+- `shire install` refreshes an installed mod's files, so they keep matching the binary after an
+  upgrade. It never installs the mod.
+- `shire uninstall` removes the folder and its entry in `CLAUDE_CODE_PLUGIN_DIRS`.
+
+The mod uses Claude Code's early-access mod API, which may change between Claude Code releases.
+If a Claude Code update breaks it, Claude Code names the mod in the transcript, and
+`shire uninstall`, or deleting the folder, turns it off.
+
 ### Terminal output
 
 `shire init` uses styled terminal output to show what it does:
@@ -189,12 +217,11 @@ shire status --json     # one JSON object, for scripts and editor integrations
 `state` is one of `missing`, `refused` (symlinked `db_path`), `unreadable`, `building`,
 `interrupted` (the last build died part-way; the next build repairs it) or `ok`. With no
 `--root`, the repo is found by walking up from the current directory. The command always
-exits 0; read `state` to decide.
+exits 0, even when `shire.toml` cannot be read (`state` is then `unreadable`, `db_path` is null and
+`error` says why); read `state` to decide.
 
-For Claude Code, [`contrib/claude-mod/shire-status`](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)
-is a mod that polls `shire status --json` and shows index health in the status line, toasts
-when it changes, and adds a `/shire` pane with rebuild buttons. Load it with
-`claude --plugin-dir contrib/claude-mod/shire-status`.
+For Claude Code, `shire init --mod` installs a mod that polls `shire status --json` and shows
+index health in the status line (see [Claude Code status mod](#claude-code-status-mod-experimental)).
 
 ### Watch daemon status
 

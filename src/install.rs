@@ -131,6 +131,16 @@ pub fn run_install(dry_run: bool, force: bool) -> Result<()> {
     // Claude Code — use `claude mcp add` CLI if available
     results.push(register_claude_code(&binary_path, dry_run, force));
 
+    // Keep an installed Claude Code status mod in step with this binary's
+    // `shire status`. Never installs it: that is `shire init --mod`.
+    if !dry_run && let Ok(home) = home_dir() {
+        match crate::claude_mod::refresh_if_installed(&home.join(".claude")) {
+            Ok(true) => println!("[Claude Code mod] Updated to this version"),
+            Ok(false) => {}
+            Err(e) => println!("[Claude Code mod] Update failed: {e:#}"),
+        }
+    }
+
     // Codex CLI — ~/.codex/config.toml
     results.push(register_codex(&binary_path, dry_run, force));
 
@@ -306,6 +316,20 @@ pub fn run_uninstall(dry_run: bool) -> Result<()> {
     remove_editor_mcp("Gemini CLI", &gemini_config_path(), "mcpServers", dry_run);
     remove_editor_mcp("VS Code", &vscode_config_path(), "servers", dry_run);
     remove_editor_mcp("Zed", &zed_config_path(), "context_servers", dry_run);
+
+    // Claude Code status mod (installed by `shire init --mod`)
+    if let Ok(home) = home_dir() {
+        let claude_dir = home.join(".claude");
+        match crate::claude_mod::uninstall(&claude_dir, dry_run) {
+            Ok(true) if dry_run => println!(
+                "[Claude Code mod] [dry-run] Would remove {}",
+                crate::claude_mod::mod_dir(&claude_dir).display()
+            ),
+            Ok(true) => println!("[Claude Code mod] Removed"),
+            Ok(false) => {}
+            Err(e) => println!("[Claude Code mod] Removal failed: {e:#}"),
+        }
+    }
 
     println!("\nDone. Binary and databases were NOT removed.");
     Ok(())

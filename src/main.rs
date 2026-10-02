@@ -98,6 +98,12 @@ enum Commands {
         /// Skip interactive prompts and use defaults
         #[arg(long, short)]
         yes: bool,
+        /// Install the Claude Code status mod (experimental; user-wide) without asking
+        #[arg(long = "mod", conflicts_with = "no_mod")]
+        install_mod: bool,
+        /// Don't install the Claude Code status mod, and don't ask
+        #[arg(long)]
+        no_mod: bool,
     },
     /// Register shire as an MCP server with all detected AI tools
     Install {
@@ -233,15 +239,22 @@ async fn main() -> Result<()> {
             global,
             no_hook,
             yes,
+            install_mod,
+            no_mod,
         } => {
+            let mod_flag = match (install_mod, no_mod) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
             if global {
-                init::run_init_global(no_hook, yes)
+                init::run_init_global(no_hook, yes, mod_flag)
             } else {
                 std::fs::create_dir_all(&root)
                     .with_context(|| format!("Failed to create directory {}", root.display()))?;
                 let root = std::fs::canonicalize(&root)
                     .with_context(|| format!("Failed to resolve path {}", root.display()))?;
-                init::run_init(&root, no_hook, yes)
+                init::run_init(&root, no_hook, yes, mod_flag)
             }
         }
         Commands::Install { dry_run, force } => install::run_install(dry_run, force),
@@ -252,18 +265,8 @@ async fn main() -> Result<()> {
             config: cfg_path,
             json,
         } => {
-            let root = match root {
-                Some(r) => std::fs::canonicalize(r)?,
-                None => config::find_repo_root(&std::fs::canonicalize(".")?),
-            };
-            let db_path = match db {
-                Some(p) => p,
-                None => {
-                    let config = config::load_config_from(cfg_path.as_deref(), &root)?;
-                    config::resolve_db_path(&config, &root)?
-                }
-            };
-            let status = shire::status::collect(&root, &db_path);
+            let status =
+                shire::status::collect_for(root.as_deref(), db.as_deref(), cfg_path.as_deref());
             if json {
                 println!("{}", serde_json::to_string(&status)?);
             } else {

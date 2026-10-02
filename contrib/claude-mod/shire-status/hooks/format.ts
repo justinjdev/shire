@@ -123,7 +123,7 @@ export function detailRows(s: ShireStatus, nowMs: number): [string, string][] {
   const rows: [string, string][] = [
     ['state', s.state + (s.error ? ` (${s.error})` : '')],
     ['root', s.root],
-    ['index', s.db_path + (s.db_size_bytes === null ? '' : ` · ${bytes(s.db_size_bytes)}`)],
+    ['index', (s.db_path ?? '?') + (s.db_size_bytes === null ? '' : ` · ${bytes(s.db_size_bytes)}`)],
   ]
   if (s.indexed_at !== null) {
     const took = s.build_duration_ms === null ? '' : ` · took ${s.build_duration_ms}ms`

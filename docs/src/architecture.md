@@ -4,6 +4,7 @@
 src/
 ├── main.rs          # CLI (clap): build, serve, watch, rebuild, init, install, uninstall, clean, status subcommands
 ├── lib.rs           # Library re-exports for embedding shire as a crate
+├── claude_mod.rs    # Optional Claude Code status mod: embedded files, install/refresh/uninstall
 ├── config.rs        # shire.toml parsing
 ├── git.rs           # Git worktree detection and repo root resolution
 ├── init.rs          # `shire init` setup (config, MCP server, hooks, rules)

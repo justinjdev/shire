@@ -125,3 +125,8 @@ test('a missing shire binary is reported, not thrown', async ($, on) => {
   expect(lines.at(-1)).toBe('shire ✗ unavailable (/shire for details)')
   expect(toasts[0]).toContain('shire not found on PATH')
 })
+
+test('an unreadable config still renders', () => {
+  const s = status({ state: 'unreadable', db_path: null, error: 'bad shire.toml' })
+  expect(statusLine(s, NOW)).toBe('shire ✗ index unreadable')
+})

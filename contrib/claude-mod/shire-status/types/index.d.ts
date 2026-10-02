@@ -2,7 +2,8 @@
 export type ShireStatus = {
   shire_version: string
   root: string
-  db_path: string
+  /** null when shire.toml could not be read (state is then `unreadable`). */
+  db_path: string | null
   state: 'missing' | 'refused' | 'unreadable' | 'building' | 'interrupted' | 'ok'
   error: string | null
   db_size_bytes: number | null

@@ -4373,3 +4373,192 @@ mod watch_daemon_ownership {
         assert!(wait_until(|| !pid_alive(pid), Duration::from_secs(5)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// #121: a file's symbols and references belong to its *nearest* enclosing
+// package, never to every ancestor package as well.
+// ---------------------------------------------------------------------------
+
+fn write_nested_npm_fixture(root: &Path) {
+    fs::write(
+        root.join("shire.toml"),
+        "db_path = \".shire/index.db\"\n\n[symbols]\nreferences_enabled = true\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("pkgs/a/src")).unwrap();
+    fs::create_dir_all(root.join("pkgs/a/sub/b/src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","workspaces":["pkgs/*","pkgs/a/sub/*"]}"#,
+    )
+    .unwrap();
+    fs::write(root.join("pkgs/a/package.json"), r#"{"name":"a"}"#).unwrap();
+    fs::write(
+        root.join("pkgs/a/src/outer.ts"),
+        "export function outer() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join("pkgs/a/sub/b/package.json"), r#"{"name":"b"}"#).unwrap();
+    fs::write(
+        root.join("pkgs/a/sub/b/src/inner.ts"),
+        "export function inner() { outer() }\n",
+    )
+    .unwrap();
+}
+
+fn symbol_packages(root: &Path, name: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+    conn.prepare("SELECT package FROM symbols WHERE name = ?1 ORDER BY package")
+        .unwrap()
+        .query_map([name], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn ref_packages(root: &Path, name: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+    conn.prepare("SELECT package FROM symbol_refs WHERE name = ?1 ORDER BY package")
+        .unwrap()
+        .query_map([name], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn test_nested_npm_packages_attribute_to_nearest_package() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    write_nested_npm_fixture(root);
+    let bin = cargo_bin();
+    run_build_for_root(&bin, root);
+
+    assert_eq!(symbol_packages(root, "inner"), vec!["b"]);
+    assert_eq!(symbol_packages(root, "outer"), vec!["a"]);
+    assert_eq!(ref_packages(root, "outer"), vec!["b"]);
+
+    // Incremental: editing the nested file re-extracts it for its own
+    // package only, and the ancestors' incremental walks don't pick it up.
+    fs::write(
+        root.join("pkgs/a/sub/b/src/inner.ts"),
+        "export function inner() { outer(); outer() }\nexport function inner2() {}\n",
+    )
+    .unwrap();
+    run_build_for_root(&bin, root);
+    assert_eq!(symbol_packages(root, "inner"), vec!["b"]);
+    assert_eq!(symbol_packages(root, "inner2"), vec!["b"]);
+    assert_eq!(symbol_packages(root, "outer"), vec!["a"]);
+    assert_eq!(ref_packages(root, "outer"), vec!["b", "b"]);
+
+    // file_hashes (the incremental oracle) agrees on ownership.
+    let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+    let owners: Vec<String> = conn
+        .prepare("SELECT package FROM file_hashes WHERE file_path = 'pkgs/a/sub/b/src/inner.ts'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(owners, vec!["b"]);
+}
+
+#[test]
+fn test_nested_package_duplicates_from_old_index_are_removed() {
+    // An index written before #121 carries a copy of every nested file's
+    // rows under each ancestor package. With no edit at all, the next build
+    // must notice the ancestor's file set shrank and drop those copies —
+    // without touching the nearest package's own rows.
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    write_nested_npm_fixture(root);
+    let bin = cargo_bin();
+    run_build_for_root(&bin, root);
+
+    {
+        let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+        let path = "pkgs/a/sub/b/src/inner.ts";
+        for pkg in ["a", "root"] {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, signature, file_path, line, visibility, \
+                 parent_symbol, return_type, parameters, package) \
+                 SELECT name, kind, signature, file_path, line, visibility, parent_symbol, \
+                 return_type, parameters, ?1 FROM symbols WHERE package = 'b'",
+                [pkg],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_refs (name, kind, file_id, line, package, enclosing_symbol) \
+                 SELECT name, kind, file_id, line, ?1, enclosing_symbol \
+                 FROM symbol_refs WHERE package = 'b'",
+                [pkg],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_hashes (file_path, package, content_hash, hashed_at) \
+                 SELECT file_path, ?1, content_hash, hashed_at FROM file_hashes \
+                 WHERE package = 'b' AND file_path = ?2",
+                [pkg, path],
+            )
+            .unwrap();
+        }
+        assert_eq!(symbol_packages(root, "inner"), vec!["a", "b", "root"]);
+    }
+
+    run_build_for_root(&bin, root);
+    assert_eq!(symbol_packages(root, "inner"), vec!["b"]);
+    assert_eq!(ref_packages(root, "outer"), vec!["b"]);
+}
+
+#[test]
+fn test_nested_go_modules_attribute_to_nearest_module() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::create_dir_all(root.join("tools/gen")).unwrap();
+    fs::write(root.join("go.mod"), "module example.com/top\n\ngo 1.22\n").unwrap();
+    fs::write(root.join("top.go"), "package top\n\nfunc Top() {}\n").unwrap();
+    fs::write(
+        root.join("tools/gen/go.mod"),
+        "module example.com/top/tools/gen\n\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tools/gen/gen.go"),
+        "package gen\n\nfunc Generate() {}\n",
+    )
+    .unwrap();
+    run_build_for_root(&cargo_bin(), root);
+
+    assert_eq!(symbol_packages(root, "Generate"), vec!["gen"]);
+    assert_eq!(symbol_packages(root, "Top"), vec!["top"]);
+}
+
+#[test]
+fn test_nested_cargo_crates_attribute_to_nearest_crate() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    fs::write(root.join("shire.toml"), "db_path = \".shire/index.db\"\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("crates/inner/src")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn outer_fn() {}\n").unwrap();
+    fs::write(
+        root.join("crates/inner/Cargo.toml"),
+        "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("crates/inner/src/lib.rs"),
+        "pub fn inner_fn() {}\n",
+    )
+    .unwrap();
+    run_build_for_root(&cargo_bin(), root);
+
+    assert_eq!(symbol_packages(root, "inner_fn"), vec!["inner"]);
+    assert_eq!(symbol_packages(root, "outer_fn"), vec!["outer"]);
+}

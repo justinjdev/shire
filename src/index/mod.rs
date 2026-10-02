@@ -532,8 +532,8 @@ fn upsert_symbols_and_refs_for_file(
         })
     {
         conn.execute(
-            "DELETE FROM symbol_refs WHERE file_id = ?1",
-            rusqlite::params![file_id],
+            "DELETE FROM symbol_refs WHERE file_id = ?1 AND (package = ?2 OR package IS NULL)",
+            rusqlite::params![file_id, package],
         )?;
         file_ids.insert(file_path.to_string(), file_id);
     }
@@ -1752,6 +1752,59 @@ impl SinglePassExtract {
     }
 }
 
+/// Every indexed package path, sorted, so the packages nested inside any one
+/// of them can be found with a range lookup. Source-file walks are rooted at
+/// a package directory; these are the subtrees each walk must prune so a file
+/// is extracted only for its nearest enclosing package (#121) — the same
+/// longest-prefix ownership `associate_files_with_packages` gives `files`.
+struct PackageNesting {
+    sorted_paths: Vec<String>,
+}
+
+impl PackageNesting {
+    fn load(conn: &Connection) -> Result<Self> {
+        let paths = conn
+            .prepare("SELECT path FROM packages")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_paths(paths))
+    }
+
+    fn from_paths(mut sorted_paths: Vec<String>) -> Self {
+        sorted_paths.sort();
+        sorted_paths.dedup();
+        Self { sorted_paths }
+    }
+
+    /// Paths of the packages strictly inside `pkg_path` (the root package,
+    /// path `""`, contains every other one).
+    fn nested_in(&self, pkg_path: &str) -> &[String] {
+        if pkg_path.is_empty() {
+            let start = self.sorted_paths.partition_point(|p| p.is_empty());
+            return &self.sorted_paths[start..];
+        }
+        // Everything starting with "<pkg_path>/" is one contiguous run in
+        // lexicographic order.
+        let prefix = format!("{pkg_path}/");
+        let start = self
+            .sorted_paths
+            .partition_point(|p| p.as_str() < prefix.as_str());
+        let len = self.sorted_paths[start..]
+            .iter()
+            .take_while(|p| p.starts_with(prefix.as_str()))
+            .count();
+        &self.sorted_paths[start..start + len]
+    }
+
+    /// `nested_in`, joined onto `repo_root` the same way the walk root is.
+    fn nested_dirs(&self, repo_root: &Path, pkg_path: &str) -> Vec<PathBuf> {
+        self.nested_in(pkg_path)
+            .iter()
+            .map(|p| repo_root.join(p))
+            .collect()
+    }
+}
+
 /// Single-pass: walk source files, read once, hash + extract symbols.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn single_pass_extract(
@@ -1761,6 +1814,7 @@ fn single_pass_extract(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     exclude_dirs: &[String],
+    nested_package_dirs: &[PathBuf],
     skip_references: bool,
     max_file_size: u64,
     max_references_per_file: usize,
@@ -1788,11 +1842,12 @@ fn single_pass_extract(
             !exclude_extensions.contains(&with_dot)
         })
         .collect();
-    let source_files = symbols::walker::walk_source_files_with_excludes(
+    let source_files = symbols::walker::walk_package_source_files(
         &package_dir,
         &extensions,
         exclude_patterns,
         exclude_dirs,
+        nested_package_dirs,
     )?;
 
     if source_files.is_empty() {
@@ -1925,6 +1980,7 @@ fn phase_extract_symbols(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     exclude_dirs: &[String],
+    nesting: &PackageNesting,
     progress: &Option<Arc<ProgressBar>>,
     skip_deletes: bool,
     ref_writer: &mut RefWriter,
@@ -1947,6 +2003,7 @@ fn phase_extract_symbols(
                 exclude_extensions,
                 exclude_patterns,
                 exclude_dirs,
+                &nesting.nested_dirs(repo_root, pkg_path),
                 skip_references,
                 max_file_size,
                 max_references_per_file,
@@ -2196,6 +2253,7 @@ fn phase_source_incremental(
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     exclude_dirs: &[String],
+    nesting: &PackageNesting,
     progress: &Option<Arc<ProgressBar>>,
     ref_writer: &mut RefWriter,
     force_source_reextract: bool,
@@ -2271,11 +2329,12 @@ fn phase_source_incremental(
 
                     // One walk, used both by the staleness pre-check and by
                     // the hash pass below.
-                    let source_files = match symbols::walker::walk_source_files_with_excludes(
+                    let source_files = match symbols::walker::walk_package_source_files(
                         &package_dir,
                         &extensions,
                         exclude_patterns,
                         exclude_dirs,
+                        &nesting.nested_dirs(repo_root, pkg_path),
                     ) {
                         Ok(files) => files,
                         Err(e) => {
@@ -2506,9 +2565,14 @@ fn phase_source_incremental(
                         "DELETE FROM symbols WHERE package = ?1 AND file_path = ?2",
                         rusqlite::params![pkg_name, del_path],
                     )?;
+                    // Scoped to the package: a path can leave this
+                    // package's walk while still existing on disk, owned by
+                    // a nested package (#121), whose refs must survive.
                     conn.execute(
-                        "DELETE FROM symbol_refs WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
-                        rusqlite::params![del_path],
+                        "DELETE FROM symbol_refs \
+                         WHERE file_id = (SELECT id FROM files WHERE path = ?1) \
+                         AND (package = ?2 OR package IS NULL)",
+                        rusqlite::params![del_path, pkg_name],
                     )?;
                 }
                 // Delete file_hashes for deleted files
@@ -3895,6 +3959,9 @@ fn build_index_inner(
             conn.execute("DELETE FROM symbol_refs", [])?;
         }
         let mut ref_writer = RefWriter::new(&conn, refs_enabled)?;
+        // Read once the package set is final for this build, so both
+        // extraction paths agree on which package owns each file.
+        let nesting = PackageNesting::load(&conn)?;
         let extract_failures = phase_extract_symbols(
             &conn,
             repo_root,
@@ -3902,6 +3969,7 @@ fn build_index_inner(
             &config.symbols.exclude_extensions,
             &config.symbols.exclude_patterns,
             &config.discovery.exclude,
+            &nesting,
             &pb_sym_clone,
             is_full_build || force,
             &mut ref_writer,
@@ -3917,6 +3985,7 @@ fn build_index_inner(
             &config.symbols.exclude_extensions,
             &config.symbols.exclude_patterns,
             &config.discovery.exclude,
+            &nesting,
             &pb_sym_clone,
             &mut ref_writer,
             force_source_reextract,
@@ -5137,7 +5206,7 @@ anyhow = "1"
         // `Extracted` as authoritative and deletes every symbol, reference
         // and file hash the package has.
         let dir = tempfile::TempDir::new().unwrap();
-        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], &[], true, 0, 0)
+        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], &[], &[], true, 0, 0)
             .err()
             .expect("a vanished package directory must not look like an empty package");
         assert!(
@@ -5162,7 +5231,7 @@ anyhow = "1"
         .unwrap();
 
         let extract =
-            single_pass_extract(dir.path(), "pkg", "go", &[], &[], &[], true, 0, 0).unwrap();
+            single_pass_extract(dir.path(), "pkg", "go", &[], &[], &[], &[], true, 0, 0).unwrap();
 
         assert_eq!(
             extract.file_hashes.len(),
@@ -6341,6 +6410,36 @@ anyhow = "1"
         assert_eq!(
             root_names.get("group-a").cloned().flatten().as_deref(),
             Some("group-a")
+        );
+    }
+
+    #[test]
+    fn test_package_nesting_finds_strict_descendants_only() {
+        let n = PackageNesting::from_paths(
+            [
+                "",
+                "pkgs/a",
+                "pkgs/a/sub/b",
+                "pkgs/a/sub/b/deep",
+                "pkgs/ab",
+                "pkgs/a-b",
+                "other",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+        // Root contains everything but itself.
+        assert_eq!(n.nested_in("").len(), 6);
+        // `pkgs/ab` and `pkgs/a-b` share a string prefix with `pkgs/a` but
+        // are siblings, not children.
+        assert_eq!(n.nested_in("pkgs/a"), ["pkgs/a/sub/b", "pkgs/a/sub/b/deep"]);
+        assert_eq!(n.nested_in("pkgs/a/sub/b"), ["pkgs/a/sub/b/deep"]);
+        assert!(n.nested_in("pkgs/ab").is_empty());
+        assert!(n.nested_in("other").is_empty());
+        assert_eq!(
+            n.nested_dirs(Path::new("/repo"), "pkgs/a/sub/b"),
+            vec![PathBuf::from("/repo/pkgs/a/sub/b/deep")]
         );
     }
 

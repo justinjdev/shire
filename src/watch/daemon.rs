@@ -384,6 +384,28 @@ pub fn is_running(root: &Path) -> bool {
     }
 }
 
+/// What `shire status` reports about the watch daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Liveness {
+    /// Same verdict as [`is_running`].
+    pub running: bool,
+    /// Something accepted a connection on the socket.
+    pub listening: bool,
+    /// The pid file's pid, when it plausibly belongs to a shire watch daemon.
+    pub pid: Option<u32>,
+}
+
+pub fn liveness(root: &Path) -> Liveness {
+    let listening = connect_if_not_symlink(root).is_some();
+    let pid = read_pid_file(root)
+        .filter(|&p| !matches!(check_pid_ownership(p, root), PidOwnership::NotShire));
+    Liveness {
+        running: listening || pid.is_some(),
+        listening,
+        pid,
+    }
+}
+
 /// What `stop_daemon` should do about a PID read from `.shire/watch.pid`, decided from
 /// its ownership verdict plus whether *something* is actually listening on the socket
 /// right now. Factored out from `stop_daemon` so this decision can be exercised

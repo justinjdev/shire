@@ -135,6 +135,44 @@ pub fn acquire(db_path: &Path, wait: LockWait) -> Result<Option<BuildLock>> {
     }
 }
 
+/// Is a build running against `db_path` right now?
+///
+/// For `shire status`, which must observe without interfering: it never
+/// creates the lock file (whose path derives from a repo-controlled
+/// `db_path`), and takes only a shared lock, released at once. A builder
+/// that polls in that instant under [`LockWait::Wait`] simply retries; one
+/// under [`LockWait::Skip`] — the MCP server's per-call check — skips one
+/// check that comes round again next call.
+pub fn is_held(db_path: &Path) -> bool {
+    let Ok(Some(file)) = crate::db::guard::open_no_follow(&lock_path(db_path)) else {
+        return false;
+    };
+    probe_shared(&file)
+}
+
+#[cfg(unix)]
+fn probe_shared(file: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        if rc == 0 {
+            // Dropping `file` would release it too; be explicit.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return false;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::EINTR => continue,
+            Some(code) if code == libc::EWOULDBLOCK => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn probe_shared(_file: &std::fs::File) -> bool {
+    false
+}
+
 /// `Ok(true)` when the exclusive lock was taken, `Ok(false)` when someone
 /// else holds it.
 #[cfg(unix)]
@@ -193,6 +231,29 @@ mod tests {
         assert!(
             acquire(&db, LockWait::Skip).unwrap().is_some(),
             "the lock must be released when the guard is dropped"
+        );
+    }
+
+    #[test]
+    fn is_held_reports_a_running_build_without_creating_the_lock_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join(".shire").join("index.db");
+
+        assert!(!is_held(&db));
+        assert!(
+            !lock_path(&db).exists(),
+            "probing must not create the lock file"
+        );
+
+        let held = acquire(&db, LockWait::Wait(LOCK_TIMEOUT))
+            .unwrap()
+            .expect("builder");
+        assert!(is_held(&db));
+        drop(held);
+        assert!(!is_held(&db));
+        assert!(
+            acquire(&db, LockWait::Skip).unwrap().is_some(),
+            "the probe must not leave a lock behind"
         );
     }
 

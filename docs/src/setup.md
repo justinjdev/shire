@@ -174,6 +174,23 @@ Remove the index database, WAL/SHM files, the `.shire` directory, and stop the w
 shire clean
 ```
 
+### Index status
+
+Show the index's state without rebuilding or writing anything: whether a build is running,
+when the index was built and at which commit (and whether `HEAD` has moved since), counts,
+packages still owed a source re-check, the last build's failures, whether the file walk saw
+the whole tree, and the watch daemon's liveness:
+
+```sh
+shire status            # human-readable
+shire status --json     # one JSON object, for scripts and editor integrations
+```
+
+`state` is one of `missing`, `refused` (symlinked `db_path`), `unreadable`, `building`,
+`interrupted` (the last build died part-way; the next build repairs it) or `ok`. With no
+`--root`, the repo is found by walking up from the current directory. The command always
+exits 0; read `state` to decide.
+
 ### Watch daemon status
 
 Check whether the watch daemon is running for a repo (PID, socket path, and whether it's

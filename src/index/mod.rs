@@ -2666,11 +2666,19 @@ struct FileIndexResult {
     changed_packages: HashSet<String>,
 }
 
+/// `shire_meta` key recording whether the last file walk saw the whole tree:
+/// `complete`, `partial` (some paths unreadable) or `capped` (hit `MAX_FILES`).
+pub const FILE_WALK_KEY: &str = "file_walk";
+
+/// `shire_meta` key holding the last build's failures as a JSON array of
+/// `{"kind": "manifest" | "extract", "target": ..., "error": ...}`.
+pub const LAST_BUILD_FAILURES_KEY: &str = "last_build_failures";
+
 /// `shire_meta` key holding the packages that still owe a source re-check.
 const PENDING_SOURCE_RECHECK_KEY: &str = "pending_source_recheck";
 
 /// Read the persisted set of packages that still need a source hash pass.
-fn read_pending_source_recheck(conn: &Connection) -> HashSet<String> {
+pub(crate) fn read_pending_source_recheck(conn: &Connection) -> HashSet<String> {
     conn.query_row(
         "SELECT value FROM shire_meta WHERE key = ?1",
         [PENDING_SOURCE_RECHECK_KEY],
@@ -2743,6 +2751,20 @@ fn phase_index_files(
         unreadable,
         capped,
     } = walk_files(repo_root, config)?;
+
+    // Informational, for `shire status`: whether this build saw the whole
+    // tree. Nothing in the build reads it back.
+    let walk_state = if capped {
+        "capped"
+    } else if unreadable.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, ?2)",
+        [FILE_WALK_KEY, walk_state],
+    )?;
 
     // Compute file-tree hash from (path, size) tuples
     let file_tuples: Vec<(String, u64)> = walked_files
@@ -3161,26 +3183,7 @@ fn cleanup_stale_hashes(conn: &Connection, walked_keys: &HashSet<String>) -> Res
 
 /// Store build metadata in shire_meta.
 fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -> Result<()> {
-    let git_commit = match std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_root)
-        .output()
-    {
-        Ok(output) => {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                tracing::info!("git rev-parse failed (not a git repo?)");
-                None
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "could not run git");
-            None
-        }
-    };
+    let git_commit = crate::git::head_commit(repo_root);
 
     conn.execute(
         "INSERT OR REPLACE INTO shire_meta (key, value) VALUES ('indexed_at', ?1)",
@@ -3212,7 +3215,24 @@ fn store_metadata(conn: &Connection, repo_root: &Path, summary: &BuildSummary) -
             [commit],
         )?;
     }
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, ?2)",
+        [LAST_BUILD_FAILURES_KEY, &build_failures_json(summary)],
+    )?;
     Ok(())
+}
+
+/// The failures `shire status` reports, written on every completed build so a
+/// clean build clears the previous one's.
+fn build_failures_json(summary: &BuildSummary) -> String {
+    let entry = |kind: &str, (target, error): &(String, String)| serde_json::json!({ "kind": kind, "target": target, "error": error });
+    let all: Vec<_> = summary
+        .failures
+        .iter()
+        .map(|f| entry("manifest", f))
+        .chain(summary.extract_failures.iter().map(|f| entry("extract", f)))
+        .collect();
+    serde_json::Value::Array(all).to_string()
 }
 
 fn print_summary_failures(summary: &BuildSummary) {
@@ -5868,6 +5888,52 @@ anyhow = "1"
             .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(packages, 3, "and the next one must build normally");
+    }
+
+    #[test]
+    fn test_build_records_walk_state_and_failures_for_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        concurrent_build_fixture(root);
+        std::fs::create_dir_all(root.join("broken")).unwrap();
+        std::fs::write(root.join("broken/package.json"), "{ not json").unwrap();
+        let db = root.join("index.db");
+        build_index_inner(
+            root,
+            &Config::default(),
+            false,
+            Some(&db),
+            true,
+            lock::LockWait::Skip,
+        )
+        .unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let meta = |k: &str| -> String {
+            conn.query_row("SELECT value FROM shire_meta WHERE key = ?1", [k], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(meta(FILE_WALK_KEY), "complete");
+        let failures: Vec<serde_json::Value> =
+            serde_json::from_str(&meta(LAST_BUILD_FAILURES_KEY)).unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0]["kind"], "manifest");
+        assert!(failures[0]["target"].as_str().unwrap().contains("broken"));
+
+        // A clean rebuild clears the previous build's failures.
+        std::fs::remove_dir_all(root.join("broken")).unwrap();
+        build_index_inner(
+            root,
+            &Config::default(),
+            false,
+            Some(&db),
+            true,
+            lock::LockWait::Skip,
+        )
+        .unwrap();
+        assert_eq!(meta(LAST_BUILD_FAILURES_KEY), "[]");
     }
 
     #[test]

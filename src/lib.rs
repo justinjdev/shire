@@ -7,5 +7,6 @@ pub mod init;
 pub mod install;
 pub mod logging;
 pub mod mcp;
+pub mod status;
 pub mod symbols;
 pub mod watch;

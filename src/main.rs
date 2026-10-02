@@ -114,6 +114,21 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show the index's state without rebuilding it
+    Status {
+        /// Root directory of the repository (defaults to the repo containing the current directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to the index database (overrides shire.toml db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print a single JSON object instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove the index database and all shire artifacts for a project
     Clean {
         /// Root directory of the repository (defaults to current directory)
@@ -231,6 +246,31 @@ async fn main() -> Result<()> {
         }
         Commands::Install { dry_run, force } => install::run_install(dry_run, force),
         Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
+        Commands::Status {
+            root,
+            db,
+            config: cfg_path,
+            json,
+        } => {
+            let root = match root {
+                Some(r) => std::fs::canonicalize(r)?,
+                None => config::find_repo_root(&std::fs::canonicalize(".")?),
+            };
+            let db_path = match db {
+                Some(p) => p,
+                None => {
+                    let config = config::load_config_from(cfg_path.as_deref(), &root)?;
+                    config::resolve_db_path(&config, &root)?
+                }
+            };
+            let status = shire::status::collect(&root, &db_path);
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                print!("{}", shire::status::render_text(&status));
+            }
+            Ok(())
+        }
         Commands::Clean {
             root,
             db,

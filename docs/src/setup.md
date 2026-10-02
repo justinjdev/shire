@@ -191,6 +191,11 @@ shire status --json     # one JSON object, for scripts and editor integrations
 `--root`, the repo is found by walking up from the current directory. The command always
 exits 0; read `state` to decide.
 
+For Claude Code, [`contrib/claude-mod/shire-status`](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)
+is a mod that polls `shire status --json` and shows index health in the status line, toasts
+when it changes, and adds a `/shire` pane with rebuild buttons. Load it with
+`claude --plugin-dir contrib/claude-mod/shire-status`.
+
 ### Watch daemon status
 
 Check whether the watch daemon is running for a repo (PID, socket path, and whether it's

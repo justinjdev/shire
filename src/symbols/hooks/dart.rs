@@ -1,34 +1,30 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, narrow_by_enclosing_types, underscore_visibility,
+};
 use tree_sitter::Node;
 
-/// Dart visibility: names starting with `_` are private.
-/// Also checks ancestor class/mixin/extension visibility.
-fn is_visible(node: &Node, source: &str) -> bool {
-    let name = extract_name(node, source).unwrap_or_default();
-    if name.starts_with('_') {
-        return false;
-    }
+/// Dart visibility: a name starting with `_` is private to its library, and
+/// so is every member of a type whose name does.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        &[
+            "class_declaration",
+            "mixin_declaration",
+            "enum_declaration",
+            "extension_declaration",
+        ],
+        own_visibility,
+    )
+}
 
-    // Check all ancestor type declarations for private names
-    let mut current = node.parent();
-    while let Some(n) = current {
-        match n.kind() {
-            "class_declaration"
-            | "mixin_declaration"
-            | "enum_declaration"
-            | "extension_declaration" => {
-                if let Some(ancestor_name) = extract_name(&n, source)
-                    && ancestor_name.starts_with('_')
-                {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-        current = n.parent();
-    }
-
-    true
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    extract_name(node, source)
+        .map(underscore_visibility)
+        .unwrap_or(Visibility::Public)
 }
 
 /// Extract the name from various Dart node types.
@@ -370,11 +366,6 @@ fn find_inner_signature<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
 
 /// Post-process Dart symbols.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    // Defense-in-depth: filter private symbols that slipped through is_visible
-    if sym.name.starts_with('_') {
-        return None;
-    }
-
     // Skip operator methods (they have no useful name capture)
     if node.kind() == "method_signature"
         && let Some(inner) = find_inner_signature(node)
@@ -422,13 +413,26 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         _ => {}
     }
 
+    // A named constructor is private when its own name is (`Dog._internal`),
+    // which the type-name-based `visibility` hook cannot see.
+    if sym
+        .name
+        .rsplit('.')
+        .next()
+        .is_some_and(|n| n.starts_with('_'))
+    {
+        sym.visibility = Visibility::Private;
+    }
+
     Some(sym)
 }
 
 /// Return Dart language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
+        is_visible: None,
+        is_definition: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),
@@ -458,9 +462,12 @@ mod tests {
     }
 
     #[test]
-    fn test_private_class_filtered() {
+    fn test_private_class_is_private() {
         let syms = extract("class _Internal {}");
-        assert!(syms.is_empty(), "private class should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "_Internal");
+        assert_eq!(syms[0].kind, SymbolKind::Class);
+        assert_eq!(syms[0].visibility, Visibility::Private);
     }
 
     #[test]
@@ -529,9 +536,13 @@ mod tests {
     }
 
     #[test]
-    fn test_private_function_filtered() {
-        let syms = extract("void _helper() {}");
-        assert!(syms.is_empty(), "private function should be filtered out");
+    fn test_private_function_is_private() {
+        let syms = extract("void _helper() {}\nvoid helper() {}");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "_helper");
+        assert_eq!(syms[0].visibility, Visibility::Private);
+        assert_eq!(syms[1].name, "helper");
+        assert_eq!(syms[1].visibility, Visibility::Public);
     }
 
     #[test]
@@ -618,16 +629,20 @@ class Dog {
     }
 
     #[test]
-    fn test_method_in_private_class_filtered() {
+    fn test_method_in_private_class_is_private() {
         let source = r#"
 class _Internal {
   void doStuff() {}
 }
 "#;
         let syms = extract(source);
-        assert!(
-            syms.is_empty(),
-            "methods in private class should be filtered"
+        assert_eq!(syms.len(), 2, "got {syms:?}");
+        let method = syms.iter().find(|s| s.name == "doStuff").unwrap();
+        assert_eq!(method.parent_symbol.as_deref(), Some("_Internal"));
+        assert_eq!(
+            method.visibility,
+            Visibility::Private,
+            "a member of a private class is private"
         );
     }
 
@@ -678,7 +693,7 @@ typedef Callback = void Function();
     // --- Balrog findings: HIGH ---
 
     #[test]
-    fn test_private_method_filtered() {
+    fn test_private_method_is_private() {
         let source = r#"
 class MyClass {
   void _privateMethod() {}
@@ -690,8 +705,11 @@ class MyClass {
             .iter()
             .filter(|s| s.kind == SymbolKind::Method)
             .collect();
-        assert_eq!(methods.len(), 1, "private method should be filtered");
-        assert_eq!(methods[0].name, "publicMethod");
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].name, "_privateMethod");
+        assert_eq!(methods[0].visibility, Visibility::Private);
+        assert_eq!(methods[1].name, "publicMethod");
+        assert_eq!(methods[1].visibility, Visibility::Public);
     }
 
     #[test]
@@ -796,13 +814,22 @@ class Dog {
         let syms = extract(source);
         let ctors: Vec<_> = syms
             .iter()
-            .filter(|s| s.kind == SymbolKind::Method && !s.name.starts_with('_'))
+            .filter(|s| s.kind == SymbolKind::Method)
             .collect();
+        let create = ctors.iter().find(|s| s.name == "Dog.create");
         assert!(
-            ctors.iter().any(|s| s.name == "Dog.create"),
+            create.is_some(),
             "factory named constructor should have dotted name, got: {:?}",
             ctors.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
+        assert_eq!(create.unwrap().visibility, Visibility::Public);
+        // `Dog._()` is a private named constructor: indexed, tagged private.
+        for ctor in ctors
+            .iter()
+            .filter(|s| s.name.rsplit('.').next() == Some("_"))
+        {
+            assert_eq!(ctor.visibility, Visibility::Private, "{ctor:?}");
+        }
     }
 
     #[test]

@@ -1,47 +1,26 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, field_text, find_ancestor,
-    node_text,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, field_text,
+    find_ancestor, narrow_by_enclosing_types, node_text, underscore_visibility,
 };
 use tree_sitter::Node;
 
-/// Check if a Python symbol should be included.
-///
-/// For methods (function_definition inside a class body): skip names starting
-/// with `_` except `__init__`. Top-level functions and classes are always visible.
-fn is_visible(node: &Node, source: &str) -> bool {
-    let name = match node.child_by_field_name("name") {
-        Some(n) => match n.utf8_text(source.as_bytes()) {
-            Ok(s) => s,
-            Err(_) => return true,
-        },
-        None => return true,
-    };
+/// Python visibility: a leading `_` marks a name private by convention;
+/// dunder names (`__init__`, `__eq__`) are public. A member of a private class
+/// is private too.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        &["class_definition"],
+        own_visibility,
+    )
+}
 
-    // Only apply underscore filtering to methods (functions inside a class body)
-    if node.kind() == "function_definition"
-        && let Some(mut parent) = node.parent()
-    {
-        // A decorated function/method is wrapped in a `decorated_definition`
-        // node; walk through it to reach the real parent (`block`).
-        if parent.kind() == "decorated_definition"
-            && let Some(grandparent) = parent.parent()
-        {
-            parent = grandparent;
-        }
-
-        // parent is the `block` node; its parent is the `class_definition`
-        if parent.kind() == "block"
-            && let Some(grandparent) = parent.parent()
-            && grandparent.kind() == "class_definition"
-        {
-            // Inside a class: skip _private except __init__
-            if name.starts_with('_') && name != "__init__" {
-                return false;
-            }
-        }
-    }
-
-    true
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    field_text(node, "name", source)
+        .map(underscore_visibility)
+        .unwrap_or(Visibility::Public)
 }
 
 /// Resolve the parent symbol (class name) for methods.
@@ -161,7 +140,9 @@ fn post_process(mut sym: SymbolInfo, _node: &Node, _source: &str) -> Option<Symb
 /// Return the language hooks for Python.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
+        is_visible: None,
+        is_definition: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

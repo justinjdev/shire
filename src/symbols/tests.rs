@@ -1,6 +1,21 @@
 use super::*;
 use std::sync::Arc;
 
+/// The visibility of the one symbol called `name`, failing the test if there
+/// is no such symbol (a private symbol must be indexed, not dropped).
+fn vis(symbols: &[SymbolInfo], name: &str) -> Visibility {
+    symbols
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "no symbol named {name:?} in {:?}",
+                symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            )
+        })
+        .visibility
+}
+
 // ============================================================
 // Python tests (ported from python.rs)
 // ============================================================
@@ -37,8 +52,8 @@ fn test_python_class_with_methods() {
         pass
 "#;
     let (symbols, _) = extract_file("py", source, Arc::from("auth.py"), true, 0);
-    // class + __init__ + validate (skip _internal)
-    assert_eq!(symbols.len(), 3);
+    // class + __init__ + validate + _internal (private, but indexed)
+    assert_eq!(symbols.len(), 4);
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Class);
 
@@ -53,7 +68,47 @@ fn test_python_class_with_methods() {
     assert_eq!(symbols[2].name, "validate");
     assert_eq!(symbols[2].kind, SymbolKind::Method);
 
-    assert!(!symbols.iter().any(|s| s.name == "_internal"));
+    assert_eq!(symbols[3].name, "_internal");
+    assert_eq!(symbols[3].kind, SymbolKind::Method);
+    assert_eq!(symbols[3].visibility, Visibility::Private);
+    assert_eq!(vis(&symbols, "AuthService"), Visibility::Public);
+    assert_eq!(vis(&symbols, "__init__"), Visibility::Public);
+    assert_eq!(vis(&symbols, "validate"), Visibility::Public);
+}
+
+#[test]
+fn test_python_private_symbols_are_indexed_with_visibility() {
+    let source = r#"def public_fn():
+    pass
+
+def _private_fn():
+    pass
+
+class _PrivateClass:
+    def method(self):
+        pass
+
+class Service:
+    def __eq__(self, other):
+        return True
+
+    def __mangled(self):
+        pass
+
+    def _helper(self):
+        pass
+"#;
+    let (symbols, _) = extract_file("py", source, Arc::from("svc.py"), true, 0);
+    assert_eq!(vis(&symbols, "public_fn"), Visibility::Public);
+    assert_eq!(vis(&symbols, "_private_fn"), Visibility::Private);
+    assert_eq!(vis(&symbols, "_PrivateClass"), Visibility::Private);
+    // A member of a private class is private too.
+    assert_eq!(vis(&symbols, "method"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Service"), Visibility::Public);
+    // Dunder methods are public; name-mangled and `_` methods are private.
+    assert_eq!(vis(&symbols, "__eq__"), Visibility::Public);
+    assert_eq!(vis(&symbols, "__mangled"), Visibility::Private);
+    assert_eq!(vis(&symbols, "_helper"), Visibility::Private);
 }
 
 #[test]
@@ -101,7 +156,8 @@ class User:
         ("display_name", SymbolKind::Method, Some("User")),
         ("make", SymbolKind::Method, Some("User")),
         ("plain_method", SymbolKind::Method, Some("User")),
-        // `_hidden` is decorated but still private inside a class — must stay excluded.
+        // `_hidden` is decorated and private: indexed, tagged private.
+        ("_hidden", SymbolKind::Method, Some("User")),
     ];
     expected.sort_by_key(|s| s.0);
     assert_eq!(got, expected, "got {:?}", got);
@@ -112,6 +168,8 @@ class User:
     assert_eq!(display_name.line, 15);
     let make = symbols.iter().find(|s| s.name == "make").unwrap();
     assert_eq!(make.line, 19);
+    assert_eq!(vis(&symbols, "_hidden"), Visibility::Private);
+    assert_eq!(vis(&symbols, "display_name"), Visibility::Public);
 }
 
 #[test]
@@ -300,14 +358,28 @@ func (s *AuthService) Validate(token string) error {
 }
 
 #[test]
-fn test_go_skip_unexported() {
+fn test_go_unexported_symbols_are_indexed_as_private() {
     let source = r#"package main
 
 func internalHelper() {}
 type internalType struct {}
+func (t *internalType) exportedMethod() {}
+func (t *internalType) Exported() {}
+func PublicFunc() {}
+type PublicType interface {}
 "#;
     let (symbols, _) = extract_file("go", source, Arc::from("internal.go"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(symbols.len(), 6);
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "internalType"), Visibility::Private);
+    assert_eq!(vis(&symbols, "exportedMethod"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Exported"), Visibility::Public);
+    assert_eq!(vis(&symbols, "PublicFunc"), Visibility::Public);
+    assert_eq!(vis(&symbols, "PublicType"), Visibility::Public);
+    let helper = symbols.iter().find(|s| s.name == "internalHelper").unwrap();
+    assert_eq!(helper.kind, SymbolKind::Function);
+    let ty = symbols.iter().find(|s| s.name == "internalType").unwrap();
+    assert_eq!(ty.kind, SymbolKind::Struct);
 }
 
 // References
@@ -2888,7 +2960,7 @@ sub validate {
 }
 
 #[test]
-fn test_perl_skip_private_subs() {
+fn test_perl_private_subs_are_indexed_as_private() {
     let source = r#"package Foo;
 
 sub public_method {
@@ -2901,9 +2973,19 @@ sub _private_helper {
 "#;
     let (symbols, _) = extract_file("pm", source, Arc::from("lib/Foo.pm"), true, 0);
 
-    assert_eq!(symbols.len(), 2); // package + public_method only
+    assert_eq!(symbols.len(), 3); // package + public_method + _private_helper
     assert_eq!(symbols[0].name, "Foo");
+    assert_eq!(symbols[0].visibility, Visibility::Public);
     assert_eq!(symbols[1].name, "public_method");
+    assert_eq!(symbols[1].visibility, Visibility::Public);
+    assert_eq!(symbols[2].name, "_private_helper");
+    assert_eq!(symbols[2].kind, SymbolKind::Method);
+    assert_eq!(symbols[2].parent_symbol.as_deref(), Some("Foo"));
+    assert_eq!(symbols[2].visibility, Visibility::Private);
+    assert_eq!(
+        symbols[2].signature.as_deref(),
+        Some("sub Foo::_private_helper")
+    );
 }
 
 #[test]
@@ -3571,5 +3653,61 @@ def main():
     assert!(
         call_count >= 3,
         "cap=0 should be unlimited, got {call_count} call refs"
+    );
+}
+
+#[test]
+fn test_private_symbols_reach_the_index_in_convention_languages() {
+    // Guard against the old behaviour, where the hook dropped these outright:
+    // the converted languages' private symbols must reach the index.
+    for (ext, source, name) in [
+        ("go", "package p\nfunc helper() {}\n", "helper"),
+        ("pl", "sub _helper { 1 }\n", "_helper"),
+        (
+            "py",
+            "class A:\n    def _helper(self):\n        pass\n",
+            "_helper",
+        ),
+        ("dart", "void _helper() {}\n", "_helper"),
+    ] {
+        let (symbols, _) =
+            extract_file(ext, source, Arc::from(format!("f.{ext}").as_str()), true, 0);
+        assert_eq!(
+            vis(&symbols, name),
+            Visibility::Private,
+            "{ext}: {name} should be indexed as private"
+        );
+    }
+}
+
+#[test]
+fn test_extract_file_for_index_drops_only_private_and_keeps_references() {
+    let source = r#"package p
+
+func Exported() { helper() }
+
+func helper() { Exported() }
+"#;
+    let path: Arc<str> = Arc::from("p.go");
+    let (all_syms, all_refs) = extract_file_for_index("go", source, path.clone(), false, 0, true);
+    let (pub_syms, pub_refs) = extract_file_for_index("go", source, path, false, 0, false);
+    assert_eq!(vis(&all_syms, "helper"), Visibility::Private);
+    assert_eq!(
+        pub_syms.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["Exported"],
+        "include_private = false drops the private symbol only"
+    );
+    // References never depended on visibility: identical either way,
+    // including the call made from inside the dropped private function.
+    let key = |r: &ReferenceInfo| (r.name.clone(), r.kind, r.line, r.enclosing_symbol.clone());
+    assert_eq!(
+        all_refs.iter().map(key).collect::<Vec<_>>(),
+        pub_refs.iter().map(key).collect::<Vec<_>>()
+    );
+    assert!(
+        pub_refs
+            .iter()
+            .any(|r| r.name == "Exported" && r.enclosing_symbol.as_deref() == Some("helper")),
+        "got {pub_refs:?}"
     );
 }

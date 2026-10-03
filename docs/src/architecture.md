@@ -89,9 +89,14 @@ reorganising those.
 Indexes written by shire 0.7.0 and earlier extracted nested files once per
 ancestor package, and could leave a nested file's references under an ancestor
 alone. The first build against such an index re-extracts every package once
-(comparable in cost to a full rebuild) and records
-`nearest_package_attribution` in `shire_meta`; later builds are incremental
-again. If that build is interrupted, the next one repeats the pass.
+(comparable in cost to a full rebuild) and records the current
+`extractor_state` in `shire_meta`; later builds are incremental again. The
+same one-time pass runs whenever `extractor_state` — the extractor version
+plus `symbols.include_private` — changes: after an upgrade whose extractor
+emits different symbols, or when that option is toggled. If the build is
+interrupted, the next one repeats the pass; a package whose walk failed
+during it is recorded in `pending_source_reextract` and retried on the next
+build.
 
 ## When a walk cannot see the whole tree
 

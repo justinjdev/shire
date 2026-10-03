@@ -186,6 +186,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
         is_visible: Some(is_visible),
+        is_definition: None,
+        visibility: None,
         resolve_parent: None,
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

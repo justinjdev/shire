@@ -138,6 +138,8 @@ fn extract_return_type(_node: &Node, _source: &str) -> Option<String> {
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
         is_visible: Some(is_visible),
+        is_definition: None,
+        visibility: None,
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

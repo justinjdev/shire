@@ -1818,6 +1818,7 @@ fn single_pass_extract(
     skip_references: bool,
     max_file_size: u64,
     max_references_per_file: usize,
+    include_private: bool,
 ) -> Result<SinglePassExtract> {
     let package_dir = repo_root.join(pkg_path);
     if !package_dir.is_dir() {
@@ -1917,12 +1918,13 @@ fn single_pass_extract(
                 }
             };
             let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-            let (syms, refs) = symbols::extract_file(
+            let (syms, refs) = symbols::extract_file_for_index(
                 ext,
                 &source,
                 file_path_arc,
                 skip_references,
                 max_references_per_file,
+                include_private,
             );
             Ok(FileExtractResult {
                 relative_path,
@@ -1986,6 +1988,7 @@ fn phase_extract_symbols(
     ref_writer: &mut RefWriter,
     max_file_size: u64,
     max_references_per_file: usize,
+    include_private: bool,
 ) -> Result<Vec<(String, String)>> {
     tracing::debug!(
         packages = parsed_packages.len(),
@@ -2007,6 +2010,7 @@ fn phase_extract_symbols(
                 skip_references,
                 max_file_size,
                 max_references_per_file,
+                include_private,
             );
             if let Some(pb) = progress {
                 pb.inc(1);
@@ -2259,6 +2263,7 @@ fn phase_source_incremental(
     forced: &ForcedReextract,
     max_file_size: u64,
     max_references_per_file: usize,
+    include_private: bool,
     file_index_changed: &HashSet<String>,
 ) -> Result<(usize, Vec<(String, String)>)> {
     // Pre-fetch package info, stored hashes, hashed_at, and per-file hashes from DB
@@ -2348,9 +2353,10 @@ fn phase_source_incremental(
 
                     // Pre-check: skip the package entirely when nothing on
                     // disk suggests a change. Bypassed when the package is
-                    // forced (a references_enabled false→true transition, or
-                    // the one-time nearest-package attribution pass, must
-                    // repopulate refs even for untouched packages), and when phase_index_files
+                    // forced (a references_enabled false→true transition, an
+                    // extractor upgrade or include_private toggle, or a forced
+                    // pass a failed walk left owed, must re-run extraction
+                    // even for untouched packages), and when phase_index_files
                     // observed a path/size change inside this package —
                     // that signal catches mtime-preserving edits the stat
                     // scan cannot see.
@@ -2477,12 +2483,13 @@ fn phase_source_incremental(
                                     }
                                 };
                                 let file_path_arc: Arc<str> = Arc::from(relative_path.as_str());
-                                let (syms, refs) = symbols::extract_file(
+                                let (syms, refs) = symbols::extract_file_for_index(
                                     ext,
                                     &source,
                                     file_path_arc,
                                     skip_references,
                                     max_references_per_file,
+                                    include_private,
                                 );
                                 Some(FileResult {
                                     file_path: relative_path,
@@ -2817,34 +2824,10 @@ impl ForcedReextract {
     }
 }
 
-/// `shire_meta` key recording that every package's symbols and references
-/// were last extracted under nearest-package attribution (#121).
-///
-/// An index written before that change extracted each nested file once per
-/// ancestor package, and because the old `symbol_refs` delete was not scoped
-/// to the package, whichever package happened to be written last kept the
-/// file's references — often an ancestor, with none under the file's nearest
-/// package. Once the ancestor's walk stops at the nested package, its
-/// incremental pass deletes its copy, while the nearest package's stored hash
-/// for the file still matches and it never re-extracts: the file would be
-/// left with no references at all. The first build against an index without
-/// this marker therefore re-extracts every package once (see
-/// `forced_reextract_for_build`).
-const NEAREST_PACKAGE_ATTRIBUTION_KEY: &str = "nearest_package_attribution";
-
 /// `shire_meta` key holding the packages whose forced re-extract failed
 /// (their walk errored), so it is retried on the next build instead of being
 /// lost with the trigger that asked for it.
 const PENDING_SOURCE_REEXTRACT_KEY: &str = "pending_source_reextract";
-
-fn has_nearest_package_attribution(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM shire_meta WHERE key = ?1",
-        [NEAREST_PACKAGE_ATTRIBUTION_KEY],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
 
 fn read_pending_source_reextract(conn: &Connection) -> HashSet<String> {
     conn.query_row(
@@ -2878,22 +2861,77 @@ fn write_pending_source_reextract(conn: &Connection, pkgs: &HashSet<String>) -> 
     Ok(())
 }
 
+/// Version of the symbol extractor's *output* for unchanged source.
+///
+/// Builds are incremental by content hash, so a change to what the extractor
+/// produces for a given file — a language starting to index its private
+/// symbols, a new visibility rule, nearest-package attribution — would
+/// otherwise reach only the files edited after the upgrade. Bump this
+/// whenever such a change ships: the next build sees the stored
+/// [`extractor_state`] differ and re-extracts every package once
+/// (`ForcedReextract::All`, see [`forced_reextract_for_build`]).
+///
+/// History:
+/// - 1: private/unexported symbols are indexed, tagged with their
+///   visibility, instead of being dropped (Go, Python, Perl, Dart).
+const EXTRACTOR_VERSION: &str = "1";
+
+/// `shire_meta` key holding the [`extractor_state`] the stored symbols were
+/// produced under. Absent on an index built before the key existed — which
+/// covers every index written before nearest-package attribution (#121) as
+/// well, so their one-time attribution repair is the same forced pass.
+const EXTRACTOR_STATE_KEY: &str = "extractor_state";
+
+/// Everything that decides what extraction emits for an unchanged file: the
+/// extractor version and the `symbols.include_private` policy. A change in
+/// either is the same problem — every unchanged file still carries the old
+/// output — so both are folded into one stored value and one check.
+fn extractor_state(include_private: bool) -> String {
+    format!("v{EXTRACTOR_VERSION};include_private={include_private}")
+}
+
+/// The [`extractor_state`] the index's symbols were produced under, if recorded.
+fn read_extractor_state(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM shire_meta WHERE key = ?1",
+        [EXTRACTOR_STATE_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Record the state the index's symbols now reflect. Called inside the
+/// extraction transaction, so it commits together with the re-extracted
+/// symbols: a build that dies first leaves the old value, and the next build
+/// forces the re-extract again. A package whose walk failed during the
+/// forced pass is not lost either: it is recorded in
+/// `pending_source_reextract` in the same transaction and retried.
+fn write_extractor_state(conn: &Connection, state: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![EXTRACTOR_STATE_KEY, state],
+    )?;
+    Ok(())
+}
+
 /// Decide what this build must force-re-extract.
 ///
 /// - `refs_transition`: `references_enabled` just flipped on, so no unchanged
 ///   file has references yet.
-/// - `!attribution_current`: the index predates nearest-package attribution
-///   (see `NEAREST_PACKAGE_ATTRIBUTION_KEY`). On a fresh or `--force` build
-///   this costs nothing extra: every package is new and goes through the
+/// - `!extractor_state_current`: the stored [`extractor_state`] is missing
+///   (an index predating it, including one from before nearest-package
+///   attribution), from another [`EXTRACTOR_VERSION`], or from the other
+///   `symbols.include_private` setting. On a fresh or `--force` build this
+///   costs nothing extra: every manifest package is new and goes through the
 ///   full single-pass extraction, so the incremental set this applies to is
-///   empty.
+///   (at most) the already-indexed custom-discovered packages.
 /// - otherwise, only the packages a previous forced pass could not finish.
 fn forced_reextract_for_build(
     refs_transition: bool,
-    attribution_current: bool,
+    extractor_state_current: bool,
     pending: HashSet<String>,
 ) -> ForcedReextract {
-    if refs_transition || !attribution_current {
+    if refs_transition || !extractor_state_current {
         ForcedReextract::All
     } else if pending.is_empty() {
         ForcedReextract::None
@@ -4131,16 +4169,26 @@ fn build_index_inner(
              so symbol_refs is populated for every source file"
         );
     }
-    let attribution_current = has_nearest_package_attribution(&conn);
-    if !attribution_current && !incremental_paths.is_empty() {
+    // Same repair when what extraction emits has changed — an extractor
+    // upgrade (including the one that introduced nearest-package
+    // attribution), or `symbols.include_private` toggled: unchanged files
+    // still carry what the previous extractor/settings produced.
+    let include_private = config.symbols.include_private;
+    let current_extractor_state = extractor_state(include_private);
+    let prior_extractor_state = read_extractor_state(&conn);
+    let extractor_state_current =
+        prior_extractor_state.as_deref() == Some(&current_extractor_state);
+    if !extractor_state_current && !incremental_paths.is_empty() {
         tracing::info!(
-            "index predates nearest-package attribution — re-extracting every \
-             package once so each file's references sit under its nearest package"
+            prior = ?prior_extractor_state,
+            current = %current_extractor_state,
+            "symbol extraction changed since the last build (extractor upgrade or \
+             symbols.include_private) — re-extracting every package once"
         );
     }
     let forced_reextract = forced_reextract_for_build(
         refs_transition,
-        attribution_current,
+        extractor_state_current,
         read_pending_source_reextract(&conn),
     );
     let (num_source_reextracted, extract_failures) = with_transaction(&conn, || {
@@ -4168,6 +4216,7 @@ fn build_index_inner(
             &mut ref_writer,
             config.symbols.max_file_size,
             config.symbols.max_references_per_file,
+            include_private,
         )?;
         // Always run: this phase's own per-package mtime/dir-mtime/file-set
         // pre-check and per-file content hashes are the freshness oracle.
@@ -4184,6 +4233,7 @@ fn build_index_inner(
             &forced_reextract,
             config.symbols.max_file_size,
             config.symbols.max_references_per_file,
+            include_private,
             &file_index.changed_packages,
         )?;
         // Commit the refs-trustworthy flag atomically with the extraction
@@ -4207,16 +4257,15 @@ fn build_index_inner(
         write_pending_source_recheck(&conn, &still_pending)?;
         // Likewise for a forced re-extract: it is done only for the
         // packages that actually walked, and only once this transaction
-        // commits. The attribution marker goes in the same transaction, so
-        // an interrupted upgrade build retries the whole pass.
+        // commits. The extractor state goes in the same transaction, so an
+        // interrupted upgrade build retries the whole pass, while a package
+        // whose walk failed is carried in `pending_source_reextract` and
+        // retried on its own — the state can advance without losing it.
         write_pending_source_reextract(
             &conn,
             &pending_reextract_after_extraction(&forced_reextract, &extract_failures),
         )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, '1')",
-            [NEAREST_PACKAGE_ATTRIBUTION_KEY],
-        )?;
+        write_extractor_state(&conn, &current_extractor_state)?;
         Ok((count, extract_failures))
     })?;
     if let Some(pb) = pb_sym {
@@ -4599,6 +4648,275 @@ mod tests {
         assert!(!refs_transition_requires_rehash(false, false, false));
         assert!(!refs_transition_requires_rehash(false, true, false));
         assert!(!refs_transition_requires_rehash(false, false, true));
+    }
+
+    #[test]
+    fn test_extractor_state_tracks_version_and_include_private() {
+        assert_ne!(extractor_state(true), extractor_state(false));
+        assert!(extractor_state(true).starts_with(&format!("v{EXTRACTOR_VERSION};")));
+        // A missing or different state forces every package once.
+        let pending = HashSet::new();
+        assert_eq!(
+            forced_reextract_for_build(false, false, pending.clone()),
+            ForcedReextract::All
+        );
+        assert_eq!(
+            forced_reextract_for_build(false, true, pending),
+            ForcedReextract::None
+        );
+    }
+
+    /// Visibility of `name` in the index at `root`, or None if absent.
+    fn indexed_visibility(root: &Path, name: &str) -> Option<String> {
+        let conn = db::open_readonly(&root.join(".shire/index.db")).unwrap();
+        conn.query_row(
+            "SELECT visibility FROM symbols WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// A one-package Go repo with an exported and an unexported function.
+    fn go_repo_with_private_symbol(root: &Path) {
+        fs::write(root.join("go.mod"), "module example.com/svc\n\ngo 1.21\n").unwrap();
+        fs::write(
+            root.join("svc.go"),
+            "package svc\n\nfunc Exported() {}\n\nfunc helper() {}\n",
+        )
+        .unwrap();
+    }
+
+    fn symbol_count(root: &Path) -> i64 {
+        let conn = db::open_readonly(&root.join(".shire/index.db")).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_extractor_upgrade_reextracts_unchanged_files_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        go_repo_with_private_symbol(root);
+
+        let config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(
+            indexed_visibility(root, "helper").as_deref(),
+            Some("private")
+        );
+        assert_eq!(
+            indexed_visibility(root, "Exported").as_deref(),
+            Some("public")
+        );
+        let db_path = root.join(".shire/index.db");
+        {
+            let conn = db::open_or_create(&db_path).unwrap();
+            assert_eq!(
+                read_extractor_state(&conn),
+                Some(extractor_state(true)),
+                "a full build records the extractor state"
+            );
+        }
+
+        // Control: with the state current, an incremental build trusts the
+        // stored symbols of an unchanged file — a row missing from it (what
+        // an older extractor that dropped private symbols left behind) is
+        // not brought back.
+        {
+            let conn = db::open_or_create(&db_path).unwrap();
+            conn.execute("DELETE FROM symbols WHERE name = 'helper'", [])
+                .unwrap();
+        }
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(indexed_visibility(root, "helper"), None);
+
+        // An index written by the previous extractor: no state recorded.
+        {
+            let conn = db::open_or_create(&db_path).unwrap();
+            conn.execute(
+                "DELETE FROM shire_meta WHERE key = ?1",
+                [EXTRACTOR_STATE_KEY],
+            )
+            .unwrap();
+        }
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(
+            indexed_visibility(root, "helper").as_deref(),
+            Some("private"),
+            "the upgrade must re-extract the unchanged file and pick up its private symbol"
+        );
+        assert_eq!(
+            indexed_visibility(root, "Exported").as_deref(),
+            Some("public")
+        );
+        assert_eq!(
+            symbol_count(root),
+            2,
+            "re-extraction must not duplicate symbols"
+        );
+        let conn = db::open_or_create(&db_path).unwrap();
+        assert_eq!(
+            read_extractor_state(&conn),
+            Some(extractor_state(true)),
+            "the state is stored once the re-extract commits"
+        );
+    }
+
+    #[test]
+    fn test_include_private_false_drops_private_symbols_and_toggling_reextracts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        go_repo_with_private_symbol(root);
+
+        // Off from the start: the private symbol is never indexed.
+        let mut config = Config::default();
+        config.symbols.include_private = false;
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(indexed_visibility(root, "helper"), None);
+        assert_eq!(
+            indexed_visibility(root, "Exported").as_deref(),
+            Some("public")
+        );
+        assert_eq!(symbol_count(root), 1);
+
+        // Flip it on with no file change: the unchanged file is re-extracted.
+        config.symbols.include_private = true;
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(
+            indexed_visibility(root, "helper").as_deref(),
+            Some("private")
+        );
+        assert_eq!(symbol_count(root), 2);
+
+        // And back off: the private symbol goes again, the public one stays.
+        config.symbols.include_private = false;
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(indexed_visibility(root, "helper"), None);
+        assert_eq!(
+            indexed_visibility(root, "Exported").as_deref(),
+            Some("public")
+        );
+        assert_eq!(symbol_count(root), 1);
+
+        // A build with the setting unchanged does not re-extract anything.
+        let conn = db::open_or_create(&root.join(".shire/index.db")).unwrap();
+        assert_eq!(read_extractor_state(&conn), Some(extractor_state(false)));
+    }
+
+    /// Make `dir` unreadable for the rest of the test, returning false (and
+    /// leaving it readable) when that does not actually stop a walk — e.g.
+    /// when the tests run as root.
+    #[cfg(unix)]
+    fn make_unreadable(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(dir).is_ok() {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+            return false;
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_failing_the_extractor_forced_pass_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for pkg in ["a", "b"] {
+            let pkg_dir = root.join(pkg);
+            fs::create_dir_all(pkg_dir.join("sub")).unwrap();
+            fs::write(
+                pkg_dir.join("go.mod"),
+                format!("module example.com/{pkg}\n\ngo 1.21\n"),
+            )
+            .unwrap();
+            fs::write(
+                pkg_dir.join("sub/svc.go"),
+                format!("package sub\n\nfunc Exported_{pkg}() {{}}\n\nfunc helper_{pkg}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let mut config = Config::default();
+        build_index(root, &config, false, None).unwrap();
+        assert!(indexed_visibility(root, "helper_b").is_some());
+        let pkg_b: String = {
+            let conn = db::open_readonly(&root.join(".shire/index.db")).unwrap();
+            conn.query_row("SELECT name FROM packages WHERE path = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+
+        // Toggle include_private (an extractor-state change) while b cannot
+        // be walked: a is re-extracted, b keeps its rows and is owed a retry.
+        if !make_unreadable(&root.join("b/sub")) {
+            return; // running as root: permissions do not stop the walk
+        }
+        config.symbols.include_private = false;
+        let result = build_index(root, &config, false, None);
+        fs::set_permissions(root.join("b/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "the unwalkable package is reported");
+        assert_eq!(indexed_visibility(root, "helper_a"), None);
+        assert_eq!(
+            indexed_visibility(root, "helper_b").as_deref(),
+            Some("private"),
+            "a package whose walk failed keeps its rows"
+        );
+        {
+            let conn = db::open_or_create(&root.join(".shire/index.db")).unwrap();
+            assert_eq!(read_extractor_state(&conn), Some(extractor_state(false)));
+            assert_eq!(
+                read_pending_source_reextract(&conn),
+                HashSet::from([pkg_b.clone()]),
+                "the state advanced, so the failed package must be owed a forced pass"
+            );
+        }
+
+        // Readable again, no file changed: the owed pass runs and clears.
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(indexed_visibility(root, "helper_b"), None);
+        assert_eq!(
+            indexed_visibility(root, "Exported_b").as_deref(),
+            Some("public")
+        );
+        let conn = db::open_or_create(&root.join(".shire/index.db")).unwrap();
+        assert!(read_pending_source_reextract(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_include_private_toggle_reaches_custom_discovered_packages() {
+        // Custom-discovered packages have no manifest; they take part in the
+        // incremental re-check through `indexed_custom_package_paths`, so
+        // the extractor-state forced pass covers them too.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("services/svc")).unwrap();
+        fs::write(root.join("services/svc/OWNERS"), "team\n").unwrap();
+        fs::write(
+            root.join("services/svc/svc.go"),
+            "package svc\n\nfunc Exported() {}\n\nfunc helper() {}\n",
+        )
+        .unwrap();
+        let mut config: Config = toml::from_str(
+            "[[discovery.custom]]\nname = \"svc\"\nkind = \"custom\"\n\
+             requires = [\"OWNERS\"]\npaths = [\"services/\"]\n",
+        )
+        .unwrap();
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(
+            indexed_visibility(root, "helper").as_deref(),
+            Some("private")
+        );
+
+        config.symbols.include_private = false;
+        build_index(root, &config, false, None).unwrap();
+        assert_eq!(indexed_visibility(root, "helper"), None);
+        assert_eq!(
+            indexed_visibility(root, "Exported").as_deref(),
+            Some("public")
+        );
     }
 
     #[test]
@@ -5411,9 +5729,21 @@ anyhow = "1"
         // `Extracted` as authoritative and deletes every symbol, reference
         // and file hash the package has.
         let dir = tempfile::TempDir::new().unwrap();
-        let err = single_pass_extract(dir.path(), "gone", "go", &[], &[], &[], &[], true, 0, 0)
-            .err()
-            .expect("a vanished package directory must not look like an empty package");
+        let err = single_pass_extract(
+            dir.path(),
+            "gone",
+            "go",
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+            0,
+            0,
+            true,
+        )
+        .err()
+        .expect("a vanished package directory must not look like an empty package");
         assert!(
             err.to_string().contains("gone"),
             "the error must name the directory: {err}"
@@ -5435,8 +5765,20 @@ anyhow = "1"
         )
         .unwrap();
 
-        let extract =
-            single_pass_extract(dir.path(), "pkg", "go", &[], &[], &[], &[], true, 0, 0).unwrap();
+        let extract = single_pass_extract(
+            dir.path(),
+            "pkg",
+            "go",
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+            0,
+            0,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(
             extract.file_hashes.len(),

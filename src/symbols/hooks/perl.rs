@@ -1,25 +1,27 @@
-use super::{LanguageHooks, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor, node_text};
+use super::{
+    LanguageHooks, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor, node_text,
+    underscore_visibility,
+};
 use tree_sitter::Node;
 
-/// Skip private subs (starting with _).
-fn is_visible(node: &Node, source: &str) -> bool {
-    if node.kind() == "subroutine_declaration_statement" {
-        if let Some(name_node) = node.child_by_field_name("name")
-            && let Some(name) = node_text(&name_node, source)
-        {
-            return !name.starts_with('_');
-        }
-        // No field name — find first identifier child
-        for i in 0..node.child_count() {
-            let child = node.child(i).unwrap();
-            if child.kind() == "bareword"
-                && let Some(name) = node_text(&child, source)
-            {
-                return !name.starts_with('_');
-            }
-        }
+/// Perl visibility: by convention a sub whose name starts with `_` is private
+/// to its package. Packages themselves are public.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if node.kind() != "subroutine_declaration_statement" {
+        return Visibility::Public;
     }
-    true
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| node_text(&n, source))
+        .or_else(|| {
+            // No field name — fall back to the first bareword child
+            (0..node.child_count())
+                .filter_map(|i| node.child(i))
+                .find(|c| c.kind() == "bareword")
+                .and_then(|c| node_text(&c, source))
+        });
+    name.map(underscore_visibility)
+        .unwrap_or(Visibility::Public)
 }
 
 /// Resolve package name as parent for subs defined inside a package.
@@ -81,7 +83,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return Perl language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
+        is_visible: None,
+        is_definition: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: None,

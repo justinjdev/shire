@@ -52,7 +52,8 @@ fn normalize_import_name(name: &str, kind: ReferenceKind) -> String {
 }
 
 /// Build a SymbolInfo from a classified definition match.
-/// Returns None if the symbol should be skipped (duplicate range, visibility filter, post-process).
+/// Returns None if the match should be skipped (duplicate range, legacy visibility filter, not a
+/// definition, post-process).
 #[allow(clippy::too_many_arguments)]
 fn emit_definition(
     name: &str,
@@ -71,11 +72,22 @@ fn emit_definition(
     }
     def_name_ranges.insert((name_node.start_byte(), name_node.end_byte()));
 
+    // Legacy filter of the not-yet-converted languages (see
+    // `LanguageHooks::is_visible`).
     if let Some(is_visible) = hooks.is_visible
         && !is_visible(node, source)
     {
         return None;
     }
+    if let Some(is_definition) = hooks.is_definition
+        && !is_definition(node, source)
+    {
+        return None;
+    }
+    let visibility = hooks
+        .visibility
+        .map(|f| f(node, source))
+        .unwrap_or(Visibility::Public);
     let line = node.start_position().row + 1;
     let parent = hooks.resolve_parent.and_then(|f| f(node, source));
     let signature = hooks
@@ -103,7 +115,7 @@ fn emit_definition(
         signature: Some(signature),
         file_path: file_path.clone(),
         line,
-        visibility: Visibility::Public,
+        visibility,
         parent_symbol: parent,
         return_type,
         parameters,

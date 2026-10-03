@@ -434,15 +434,23 @@ fn test_symbol_extraction_go() {
         .unwrap();
     assert_eq!(parent, "Router");
 
-    // internalSetup should NOT be extracted (lowercase)
-    let count: i64 = conn
+    // internalSetup is unexported (lowercase): indexed, tagged private
+    let visibility: String = conn
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'internalSetup'",
+            "SELECT visibility FROM symbols WHERE name = 'internalSetup'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(visibility, "private");
+    let visibility: String = conn
+        .query_row(
+            "SELECT visibility FROM symbols WHERE name = 'NewRouter'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(visibility, "public");
 }
 
 #[test]
@@ -4571,17 +4579,43 @@ fn meta_value(root: &Path, key: &str) -> Option<String> {
     .ok()
 }
 
+/// The `extractor_state` a build with default settings records: the
+/// extractor version (which this test does not pin) plus the
+/// `include_private` default.
+fn is_current_default_extractor_state(state: Option<&str>) -> bool {
+    state.is_some_and(|s| s.starts_with('v') && s.ends_with(";include_private=true"))
+}
+
 #[test]
-fn test_fresh_index_is_marked_nearest_package_attributed() {
+fn test_fresh_index_records_the_extractor_state() {
+    // A fresh build extracts everything under the current extractor, so it
+    // records the current state straight away — the next build must not
+    // pay for a second, forced pass.
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
     write_nested_npm_fixture(root);
-    run_build_for_root(&cargo_bin(), root);
-    assert_eq!(
-        meta_value(root, "nearest_package_attribution").as_deref(),
-        Some("1")
+    let bin = cargo_bin();
+    run_build_for_root(&bin, root);
+    let state = meta_value(root, "extractor_state");
+    assert!(
+        is_current_default_extractor_state(state.as_deref()),
+        "got {state:?}"
     );
     assert_eq!(meta_value(root, "pending_source_reextract"), None);
+
+    // Prove no forced pass follows: a planted clobber of the references
+    // survives an edit-free rebuild.
+    {
+        let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();
+        conn.execute(
+            "UPDATE symbol_refs SET package = 'a' WHERE package = 'b'",
+            [],
+        )
+        .unwrap();
+    }
+    run_build_for_root(&bin, root);
+    assert_eq!(ref_packages(root, "outer"), vec!["a"]);
+    assert_eq!(meta_value(root, "extractor_state"), state);
 }
 
 #[test]
@@ -4627,24 +4661,23 @@ fn test_upgrade_restores_refs_an_ancestor_package_held() {
             [],
         )
         .unwrap();
-        // ...in an index that predates the attribution marker.
-        conn.execute(
-            "DELETE FROM shire_meta WHERE key = 'nearest_package_attribution'",
-            [],
-        )
-        .unwrap();
+        // ...in an index that predates nearest-package attribution, so it
+        // carries no `extractor_state` either.
+        conn.execute("DELETE FROM shire_meta WHERE key = 'extractor_state'", [])
+            .unwrap();
     }
     assert_eq!(ref_packages(root, "outer"), vec!["a"]);
 
     run_build_for_root(&bin, root);
     assert_eq!(ref_packages(root, "outer"), vec!["b"]);
     assert_eq!(symbol_packages(root, "inner"), vec!["b"]);
-    assert_eq!(
-        meta_value(root, "nearest_package_attribution").as_deref(),
-        Some("1")
+    let state = meta_value(root, "extractor_state");
+    assert!(
+        is_current_default_extractor_state(state.as_deref()),
+        "got {state:?}"
     );
 
-    // The pass is one-time: re-plant the clobber with the marker present
+    // The pass is one-time: re-plant the clobber with the state current
     // and the next build leaves it alone (no edit means no re-extract).
     {
         let conn = rusqlite::Connection::open(root.join(".shire/index.db")).unwrap();

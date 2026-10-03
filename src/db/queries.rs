@@ -318,8 +318,23 @@ pub fn search_symbols(
         result.push(row?);
     }
 
+    demote_private(&mut result);
     promote_exact_name(conn, query, package_filter, kind_filter, limit, &mut result)?;
     Ok(result)
+}
+
+/// Move private symbols behind the rest, keeping FTS rank order within each
+/// group (a stable sort).
+///
+/// Private symbols are indexed so they can be found, but a search for a
+/// concept should lead with the API a caller can use. This only reorders the
+/// window FTS already returned — sorting on `visibility` in SQL would cost
+/// the fts5 streaming plan (see [`promote_exact_name`]) — so a private symbol
+/// is never hidden, only ranked after the public ones next to it. A private
+/// symbol named exactly like the query is still promoted to the top
+/// afterwards.
+fn demote_private(result: &mut [SymbolRow]) {
+    result.sort_by_key(|r| r.visibility == "private");
 }
 
 /// Case-insensitive equality that folds the way the `unicode61` tokenizer
@@ -453,8 +468,11 @@ fn promote_one_name(
     Ok(false)
 }
 
-/// List symbols in a package, optionally filtered by kind, ordered by
-/// `(file_path, line)` and capped at `limit` (clamped to `1..=MAX_ROWS`).
+/// List symbols in a package, optionally filtered by kind, capped at `limit`
+/// (clamped to `1..=MAX_ROWS`). Non-private symbols come first, then private
+/// ones, each group ordered by `(file_path, line)`: a capped listing of a
+/// package is a look at its API, and must not be filled up with the private
+/// helpers of its alphabetically-first files.
 /// The cap is enforced in SQL: this is the query behind `search_symbols`
 /// with no `query`, whose output goes straight into an LLM context window.
 pub fn get_package_symbols(
@@ -470,7 +488,7 @@ pub fn get_package_symbols(
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE package = ?1 AND kind = ?2
-             ORDER BY file_path, line
+             ORDER BY visibility = 'private', file_path, line
              LIMIT ?3",
             vec![
                 Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
@@ -483,7 +501,7 @@ pub fn get_package_symbols(
                     visibility, parent_symbol, return_type, parameters
              FROM symbols
              WHERE package = ?1
-             ORDER BY file_path, line
+             ORDER BY visibility = 'private', file_path, line
              LIMIT ?2",
             vec![
                 Box::new(package.to_string()) as Box<dyn rusqlite::types::ToSql>,
@@ -2533,6 +2551,88 @@ mod tests {
         assert_eq!(hits[0].name, "handle");
         let hits = search_symbols(&conn, "handle", Some("auth-service"), None, 20).unwrap();
         assert_eq!(hits[0].name, "handle");
+    }
+
+    /// Insert one symbol with an explicit visibility (rowid order = insert
+    /// order, which also decides FTS rank ties).
+    fn insert_symbol_with_visibility(
+        conn: &Connection,
+        name: &str,
+        file_path: &str,
+        line: i64,
+        visibility: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (package, name, kind, file_path, line, visibility, name_tokens)
+             VALUES ('auth-service', ?1, 'function', ?2, ?3, ?4, '')",
+            rusqlite::params![name, file_path, line, visibility],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_search_symbols_ranks_private_after_public() {
+        let conn = test_db();
+        insert_symbol_with_visibility(&conn, "parseHeader", "services/auth/src/a.ts", 1, "private");
+        insert_symbol_with_visibility(&conn, "parseBody", "services/auth/src/a.ts", 2, "private");
+        insert_symbol_with_visibility(&conn, "parseToken", "services/auth/src/b.ts", 3, "public");
+        insert_symbol_with_visibility(
+            &conn,
+            "parseClaims",
+            "services/auth/src/b.ts",
+            4,
+            "internal",
+        );
+        let hits = search_symbols(&conn, "parse", None, None, 10).unwrap();
+        let names: Vec<(&str, &str)> = hits
+            .iter()
+            .map(|h| (h.name.as_str(), h.visibility.as_str()))
+            .collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "private symbols are found, not hidden: {names:?}"
+        );
+        assert!(
+            names[..2].iter().all(|(_, v)| *v != "private"),
+            "non-private symbols must lead: {names:?}"
+        );
+        assert!(
+            names[2..].iter().all(|(_, v)| *v == "private"),
+            "private symbols come last: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_symbols_still_promotes_an_exactly_named_private_symbol() {
+        let conn = test_db();
+        insert_symbol_with_visibility(
+            &conn,
+            "handleRequest",
+            "services/auth/src/a.ts",
+            1,
+            "public",
+        );
+        insert_symbol_with_visibility(&conn, "handle", "services/auth/src/b.ts", 2, "private");
+        let hits = search_symbols(&conn, "handle", None, None, 10).unwrap();
+        assert_eq!(hits[0].name, "handle", "got {hits:?}");
+        assert_eq!(hits[0].visibility, "private");
+    }
+
+    #[test]
+    fn test_get_package_symbols_lists_non_private_first() {
+        let conn = test_db();
+        insert_symbol_with_visibility(&conn, "aHelper", "services/auth/src/a.ts", 1, "private");
+        insert_symbol_with_visibility(&conn, "aApi", "services/auth/src/a.ts", 2, "public");
+        insert_symbol_with_visibility(&conn, "zApi", "services/auth/src/z.ts", 1, "public");
+        insert_symbol_with_visibility(&conn, "zHelper", "services/auth/src/z.ts", 2, "private");
+        let rows = get_package_symbols(&conn, "auth-service", None, 100).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["aApi", "zApi", "aHelper", "zHelper"]);
+        // A capped listing is the package's API, not its first file's helpers.
+        let rows = get_package_symbols(&conn, "auth-service", Some("function"), 2).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["aApi", "zApi"]);
     }
 
     /// The exact match must survive even when the limit is smaller than the

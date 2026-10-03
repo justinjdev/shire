@@ -1,9 +1,12 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, node_text};
+use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, node_text};
 use tree_sitter::Node;
 
-/// Public def keywords that should be extracted as symbols.
-const PUBLIC_DEF_KEYWORDS: &[&str] = &[
+/// Def keywords whose form defines a symbol. `defmethod` is deliberately
+/// absent: it adds an implementation to an existing `defmulti` rather than
+/// defining a new name.
+const DEF_KEYWORDS: &[&str] = &[
     "defn",
+    "defn-",
     "def",
     "defmacro",
     "defprotocol",
@@ -12,9 +15,6 @@ const PUBLIC_DEF_KEYWORDS: &[&str] = &[
     "defmulti",
     "ns",
 ];
-
-/// Keywords that should be skipped (private or implementation details).
-const SKIP_KEYWORDS: &[&str] = &["defn-", "defmethod"];
 
 /// Get the first sym_lit named child of a list_lit, returning its text.
 /// This is the def keyword (defn, def, defprotocol, etc.).
@@ -28,19 +28,35 @@ fn def_keyword_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     None
 }
 
-/// Filter: only include list_lit nodes where the first sym is a public def keyword.
-fn is_visible(node: &Node, source: &str) -> bool {
-    if node.kind() != "list_lit" {
-        return false;
+/// The query matches every list form whose first two elements are symbols —
+/// `(println x)` as much as `(defn f ...)`. Only def forms are definitions.
+fn is_definition(node: &Node, source: &str) -> bool {
+    node.kind() == "list_lit"
+        && def_keyword_text(node, source).is_some_and(|k| DEF_KEYWORDS.contains(&k))
+}
+
+/// Clojure visibility: `defn-` and `^:private` (or `^{:private true}`)
+/// metadata on the name make a var private to its namespace.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if def_keyword_text(node, source) == Some("defn-") {
+        return Visibility::Private;
     }
-    let keyword = match def_keyword_text(node, source) {
-        Some(k) => k,
-        None => return false,
-    };
-    if SKIP_KEYWORDS.contains(&keyword) {
-        return false;
+    let private_meta = second_sym_lit(node).is_some_and(|name| {
+        (0..name.named_child_count())
+            .filter_map(|i| name.named_child(i))
+            .filter(|c| c.kind().ends_with("meta_lit"))
+            .any(|meta| {
+                node_text(&meta, source).is_some_and(|t| {
+                    let t: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    t == "^:private" || t.contains(":private true")
+                })
+            })
+    });
+    if private_meta {
+        Visibility::Private
+    } else {
+        Visibility::Public
     }
-    PUBLIC_DEF_KEYWORDS.contains(&keyword)
 }
 
 /// Find the parameter vector for a defn/defmacro form.
@@ -90,7 +106,7 @@ fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> 
     let keyword = def_keyword_text(node, source).unwrap_or("def");
 
     match keyword {
-        "defn" | "defmacro" | "defmulti" => {
+        "defn" | "defn-" | "defmacro" | "defmulti" => {
             if let Some(vec_node) = find_param_vector(node) {
                 let params_text = node_text(&vec_node, source).unwrap_or("[]");
                 format!("({keyword} {name} {params_text})")
@@ -115,7 +131,7 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
         None => return Vec::new(),
     };
 
-    if keyword != "defn" && keyword != "defmacro" {
+    if !matches!(keyword, "defn" | "defn-" | "defmacro") {
         return Vec::new();
     }
 
@@ -152,7 +168,7 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         "defrecord" | "deftype" => sym.kind = SymbolKind::Class,
         "ns" => sym.kind = SymbolKind::Class, // No Module variant; Class is the convention
         "def" => sym.kind = SymbolKind::Constant,
-        "defn" | "defmacro" | "defmulti" => sym.kind = SymbolKind::Function,
+        "defn" | "defn-" | "defmacro" | "defmulti" => sym.kind = SymbolKind::Function,
         _ => {}
     }
 
@@ -167,14 +183,29 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         sym.signature = Some(format!("(ns {full_name})"));
     }
 
+    // Metadata on the name (`(def ^:private x ...)`) lives inside the name's
+    // `sym_lit`, so the captured text is `^:private x`. Strip it: the symbol
+    // is `x`, and the metadata has already been read by `visibility`.
+    if let Some(name_sym) = second_sym_lit(node)
+        && let Some(meta_end) = (0..name_sym.named_child_count())
+            .filter_map(|i| name_sym.named_child(i))
+            .filter(|c| c.kind().ends_with("meta_lit"))
+            .map(|c| c.end_byte())
+            .max()
+        && let Some(bare) = source.get(meta_end..name_sym.end_byte())
+    {
+        let bare = bare.trim();
+        sym.name = bare.to_string();
+        sym.signature = Some(build_signature(node, source, bare, sym.kind));
+    }
+
     Some(sym)
 }
 
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
-        is_definition: None,
-        visibility: None,
+        is_definition: Some(is_definition),
+        visibility: Some(visibility),
         resolve_parent: None,
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),
@@ -223,9 +254,31 @@ mod tests {
     }
 
     #[test]
-    fn test_private_defn_skipped() {
+    fn test_private_defn_is_private() {
         let syms = extract("(defn- private-fn [x] x)");
-        assert!(syms.is_empty(), "defn- should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "private-fn");
+        assert_eq!(syms[0].kind, SymbolKind::Function);
+        assert_eq!(syms[0].visibility, Visibility::Private);
+        assert_eq!(syms[0].signature.as_deref(), Some("(defn- private-fn [x])"));
+        let params = syms[0].parameters.as_ref().unwrap();
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn test_private_metadata_is_private() {
+        let syms = extract(
+            "(def ^:private secret 42)\n(defn ^{:private true} helper [] 1)\n(defn open [] 1)",
+        );
+        let vis_of = |name: &str| {
+            syms.iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name} in {syms:?}"))
+                .visibility
+        };
+        assert_eq!(vis_of("secret"), Visibility::Private);
+        assert_eq!(vis_of("helper"), Visibility::Private);
+        assert_eq!(vis_of("open"), Visibility::Public);
     }
 
     #[test]
@@ -305,12 +358,12 @@ mod tests {
 "#;
         let syms = extract(source);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
-        // Should include: my.namespace, greet, pi, Greetable, Person, unless, area
-        // Should NOT include: private-fn, defmethod impl
-        assert_eq!(syms.len(), 7, "got symbols: {:?}", names);
+        // Should include: my.namespace, greet, private-fn, pi, Greetable,
+        // Person, unless, area. Should NOT include the defmethod impl.
+        assert_eq!(syms.len(), 8, "got symbols: {:?}", names);
         assert!(names.contains(&"my.namespace"));
         assert!(names.contains(&"greet"));
-        assert!(!names.contains(&"private-fn"));
+        assert!(names.contains(&"private-fn"));
         assert!(names.contains(&"pi"));
         assert!(names.contains(&"Greetable"));
         assert!(names.contains(&"Person"));

@@ -1,5 +1,6 @@
 ; TypeScript symbol extraction queries
-; All patterns require export_statement wrapper to only capture exported symbols.
+; Exported and module-level declarations; the visibility hook tags the
+; unexported ones private.
 
 ; Exported functions
 (export_statement
@@ -55,6 +56,54 @@
   "default"
   (class_declaration
     name: (type_identifier) @name) @definition.class)
+
+; Module-level declarations that are not exported (private to the module;
+; the visibility hook tags them, and recognises names exported later through
+; an `export { ... }` clause). Each node also matches nothing above, or the
+; same range as a pattern above (deduped by seen_def_ranges).
+(program
+  (function_declaration
+    name: (identifier) @name) @definition.function)
+
+(program
+  (class_declaration
+    name: (type_identifier) @name) @definition.class)
+
+(program
+  (class_declaration
+    body: (class_body
+      (method_definition
+        name: (property_identifier) @name) @definition.method)))
+
+(program
+  (interface_declaration
+    name: (type_identifier) @name) @definition.interface)
+
+(program
+  (type_alias_declaration
+    name: (type_identifier) @name) @definition.type)
+
+(program
+  (enum_declaration
+    name: (identifier) @name) @definition.enum)
+
+(program
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name) @definition.constant))
+
+; `#private` methods, in an exported or a module-level class
+(export_statement
+  (class_declaration
+    body: (class_body
+      (method_definition
+        name: (private_property_identifier) @name) @definition.method)))
+
+(program
+  (class_declaration
+    body: (class_body
+      (method_definition
+        name: (private_property_identifier) @name) @definition.method)))
 
 ; Reference: calls
 (call_expression

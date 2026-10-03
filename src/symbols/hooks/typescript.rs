@@ -1,36 +1,92 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor, node_text,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, modifier_text, narrowest, node_text,
 };
 use tree_sitter::Node;
 
-/// Visibility filter for TypeScript/JavaScript symbols.
+/// TypeScript/JavaScript visibility.
 ///
-/// The query already filters to export_statement, so most symbols are visible.
-/// For methods inside classes, skip `#`-prefixed names and nodes with
-/// private/protected accessibility modifiers.
-fn is_visible(node: &Node, source: &str) -> bool {
-    if node.kind() == "method_definition" {
-        // Check for #private names
-        if let Some(name_node) = node.child_by_field_name("name")
-            && let Ok(name) = name_node.utf8_text(source.as_bytes())
-            && name.starts_with('#')
-        {
-            return false;
+/// A module-level declaration is public when it is exported — wrapped in an
+/// `export` statement, or named in an `export { ... }` clause of the same file
+/// — and private to its module otherwise. (CommonJS `module.exports = ...` is
+/// not recognised, so a CommonJS module's functions are recorded as private.)
+///
+/// A class method takes its own `private`/`protected` modifier (or a
+/// `#private` name), narrowed by its class's visibility.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if node.kind() != "method_definition" {
+        return declaration_visibility(node, source);
+    }
+    let own = if node
+        .child_by_field_name("name")
+        .and_then(|n| node_text(&n, source))
+        .is_some_and(|name| name.starts_with('#'))
+    {
+        Visibility::Private
+    } else {
+        match modifier_text(node, source, "accessibility_modifier") {
+            Some("private") => Visibility::Private,
+            Some("protected") => Visibility::Protected,
+            _ => Visibility::Public,
         }
+    };
+    match find_ancestor(node, "class_declaration") {
+        Some(class) => narrowest(own, declaration_visibility(&class, source)),
+        None => own,
+    }
+}
 
-        // Check for private/protected accessibility modifier
-        for i in 0..node.child_count() {
-            let child = node.child(i).unwrap();
-            if child.kind() == "accessibility_modifier"
-                && let Ok(text) = child.utf8_text(source.as_bytes())
-                && (text == "private" || text == "protected")
+/// Whether a module-level declaration is exported. A `variable_declarator` is
+/// judged by its enclosing `lexical_declaration`.
+fn declaration_visibility(node: &Node, source: &str) -> Visibility {
+    let decl = if node.kind() == "variable_declarator" {
+        node.parent().unwrap_or(*node)
+    } else {
+        *node
+    };
+    let Some(parent) = decl.parent() else {
+        return Visibility::Public;
+    };
+    if parent.kind() == "export_statement" {
+        return Visibility::Public;
+    }
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| node_text(&n, source));
+    if parent.kind() == "program"
+        && let Some(name) = name
+        && named_in_export_clause(&parent, name, source)
+    {
+        return Visibility::Public;
+    }
+    Visibility::Private
+}
+
+/// True if `program` has an `export { ..., name, ... }` clause (with or
+/// without `as`) that exports the local binding `name`.
+fn named_in_export_clause(program: &Node, name: &str, source: &str) -> bool {
+    for i in 0..program.named_child_count() {
+        let stmt = program.named_child(i).unwrap();
+        if stmt.kind() != "export_statement" || stmt.child_by_field_name("source").is_some() {
+            // `export { x } from "./m"` re-exports another module's binding.
+            continue;
+        }
+        let Some(clause) = find_child_by_kind(&stmt, "export_clause") else {
+            continue;
+        };
+        for j in 0..clause.named_child_count() {
+            let spec = clause.named_child(j).unwrap();
+            if spec.kind() == "export_specifier"
+                && spec
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(&n, source))
+                    == Some(name)
             {
-                return false;
+                return true;
             }
         }
     }
-
-    true
+    false
 }
 
 /// Resolve parent symbol name for methods inside classes.
@@ -180,11 +236,12 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process symbols.
 ///
-/// - Filters class/interface/type_alias declarations whose direct parent is
-///   not `export_statement`. These come from supplementary suppression-only
-///   query patterns whose sole purpose is to seed def_name_ranges (run before
-///   post_process) so the bare `(type_identifier) @reference.type` pattern
-///   does not emit a self-ref at the declaration line.
+/// - Filters class/interface/type_alias declarations that are neither
+///   exported nor at module level (e.g. a class declared inside a function
+///   body). These come from supplementary suppression-only query patterns
+///   whose sole purpose is to seed def_name_ranges (run before post_process)
+///   so the bare `(type_identifier) @reference.type` pattern does not emit a
+///   self-ref at the declaration line.
 /// - For `variable_declarator` nodes (Constant kind): extract name from the
 ///   variable_declarator's name field, and set signature from the parent
 ///   lexical_declaration's first line.
@@ -195,10 +252,10 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
         node.kind(),
         "class_declaration" | "interface_declaration" | "type_alias_declaration"
     ) {
-        let exported = node
+        let module_level = node
             .parent()
-            .is_some_and(|p| p.kind() == "export_statement");
-        if !exported {
+            .is_some_and(|p| matches!(p.kind(), "export_statement" | "program"));
+        if !module_level {
             return None;
         }
     }
@@ -224,9 +281,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return the language hooks for TypeScript and JavaScript.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

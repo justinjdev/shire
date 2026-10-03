@@ -1,45 +1,29 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, modifier_text, narrow_by_enclosing_types,
+};
 use tree_sitter::Node;
 
-/// Check whether a Kotlin symbol is visible (not private or internal).
-/// Kotlin defaults to public visibility.
-/// Also checks ancestor class visibility — methods inside a private class are not visible.
-fn is_visible(node: &Node, source: &str) -> bool {
-    if has_private_or_internal_modifier(node, source) {
-        return false;
+/// A declaration's own Kotlin visibility modifier; no modifier means public.
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    match modifier_text(node, source, "visibility_modifier") {
+        Some("private") => Visibility::Private,
+        Some("protected") => Visibility::Protected,
+        Some("internal") => Visibility::Internal,
+        _ => Visibility::Public,
     }
-
-    // Check all ancestor classes/objects for visibility
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if (n.kind() == "class_declaration" || n.kind() == "object_declaration")
-            && has_private_or_internal_modifier(&n, source)
-        {
-            return false;
-        }
-        current = n.parent();
-    }
-
-    true
 }
 
-/// Check if a node has private or internal visibility modifier.
-fn has_private_or_internal_modifier(node: &Node, source: &str) -> bool {
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        if child.kind() == "modifiers" {
-            for j in 0..child.child_count() {
-                let modifier = child.child(j).unwrap();
-                if modifier.kind() == "visibility_modifier"
-                    && let Ok(text) = modifier.utf8_text(source.as_bytes())
-                    && (text == "private" || text == "internal")
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Kotlin visibility: the declaration's own modifier, narrowed by every
+/// enclosing class/object — a public method of a private class is private.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        &["class_declaration", "object_declaration"],
+        own_visibility,
+    )
 }
 
 /// For methods inside class/object bodies, resolve the parent class or object name.
@@ -220,9 +204,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return Kotlin language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

@@ -1,10 +1,16 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
-/// Gleam visibility: only `pub` symbols are visible.
-/// Checks for a `visibility_modifier` child node.
-fn is_visible(node: &Node, _source: &str) -> bool {
-    find_child_by_kind(node, "visibility_modifier").is_some()
+/// Gleam visibility: a `pub` definition (a `visibility_modifier` child) is
+/// public; anything else is private to its module.
+fn visibility(node: &Node, _source: &str) -> Visibility {
+    if find_child_by_kind(node, "visibility_modifier").is_some() {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 /// Build signature string for Gleam symbols.
@@ -114,9 +120,8 @@ fn post_process(sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolIn
 /// Return the language hooks for Gleam.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: None,
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),
@@ -173,13 +178,20 @@ mod tests {
     }
 
     #[test]
-    fn test_private_function_filtered() {
+    fn test_private_function_is_private() {
         let syms = extract(
             r#"fn private_helper() -> Int {
   42
 }"#,
         );
-        assert!(syms.is_empty(), "private function should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "private_helper");
+        assert_eq!(syms[0].kind, SymbolKind::Function);
+        assert_eq!(syms[0].visibility, Visibility::Private);
+        assert_eq!(
+            syms[0].signature.as_deref(),
+            Some("fn private_helper() -> Int")
+        );
     }
 
     #[test]
@@ -220,20 +232,25 @@ mod tests {
     }
 
     #[test]
-    fn test_private_type_filtered() {
+    fn test_private_type_is_private() {
         let syms = extract(
             r#"type InternalState {
   Loading
   Ready
 }"#,
         );
-        assert!(syms.is_empty(), "private type should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "InternalState");
+        assert_eq!(syms[0].visibility, Visibility::Private);
     }
 
     #[test]
-    fn test_private_constant_filtered() {
+    fn test_private_constant_is_private() {
         let syms = extract("const internal_limit = 50");
-        assert!(syms.is_empty(), "private constant should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "internal_limit");
+        assert_eq!(syms[0].kind, SymbolKind::Constant);
+        assert_eq!(syms[0].visibility, Visibility::Private);
     }
 
     #[test]
@@ -313,9 +330,12 @@ pub opaque type Counter {
         let syms = extract(source);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
-        assert!(
-            !names.contains(&"private_helper"),
-            "should not contain private_helper"
+        let helper = syms.iter().find(|s| s.name == "private_helper");
+        assert_eq!(
+            helper.map(|s| s.visibility),
+            Some(Visibility::Private),
+            "private_helper should be indexed as private, got: {:?}",
+            names
         );
         assert!(names.contains(&"Color"), "missing Color, got: {:?}", names);
         assert!(
@@ -334,7 +354,12 @@ pub opaque type Counter {
             "missing Counter, got: {:?}",
             names
         );
-        assert_eq!(syms.len(), 6, "expected 6 public symbols, got: {:?}", names);
+        assert_eq!(
+            syms.len(),
+            7,
+            "expected 6 public symbols + private_helper, got: {:?}",
+            names
+        );
     }
 
     #[test]

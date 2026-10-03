@@ -42,51 +42,54 @@ and neither package is dropped.
 
 Shire extracts symbols (functions, classes, types, methods, interfaces) from source files using [tree-sitter](https://tree-sitter.github.io/tree-sitter/), with full signatures, parameters, and return types.
 
-Every symbol carries a `visibility` — `public`, `protected`, `internal` or
-`private`. For the languages with a rule in the Visibility column below,
-private and unexported symbols are indexed (tagged `private`) rather than
-skipped; search ranks them after the others (see [MCP Tools](mcp-tools.md)),
-and `symbols.include_private = false` drops them (see
-[Configuration](configuration.md)). Languages marked — still skip the private
-symbols their extractor recognises, as before.
+Private and unexported symbols are indexed too, not skipped. Every symbol
+carries a `visibility` — `public`, `protected`, `internal` or `private` —
+derived from the language's own convention (the Visibility column below). A
+member is narrowed by its enclosing type: a public method of a private class
+is `private`. Search ranks private symbols after the others (see
+[MCP Tools](mcp-tools.md)), and `symbols.include_private = false` drops them
+(see [Configuration](configuration.md)) — only `private` ones: `internal`
+(e.g. Java package-private, Rust `pub(crate)`) and `protected` symbols are
+always kept. Where a language has no visibility rule that Shire reads, every
+symbol is `public`.
 
 | Language | Extractor | Visibility |
 |---|---|---|
-| TypeScript / JavaScript | tree-sitter | — |
+| TypeScript / JavaScript | tree-sitter | Module-level declarations: exported (`export ...` or named in an `export { ... }` clause) is `public`, anything else `private`. Methods: `private` / `#name` / `protected` modifiers. CommonJS `module.exports` is not recognised. |
 | Go | tree-sitter | Capitalised name `public`, otherwise `private` |
-| Rust | tree-sitter | — |
-| Python | tree-sitter | Leading `_` → `private` (members of a `_Class` too); dunder names (`__init__`) are `public` |
-| Java | tree-sitter | — |
-| Kotlin | tree-sitter | — |
-| Dart | tree-sitter | Leading `_` → `private` (members of a `_Class` too, and named constructors such as `Foo._internal`) |
-| Protobuf | tree-sitter | — |
-| C | tree-sitter | — |
-| C++ | tree-sitter | — |
-| C# | tree-sitter | — |
-| Swift | tree-sitter | — |
-| PHP | tree-sitter | — |
-| Scala | tree-sitter | — |
-| Zig | tree-sitter | — |
-| Bash / Shell | tree-sitter | — |
-| R | tree-sitter | — |
-| Haskell | tree-sitter | — |
-| YAML | tree-sitter | — |
-| SQL | tree-sitter | — |
-| HCL / Terraform | tree-sitter | — |
-| TOML | tree-sitter | — |
+| Rust | tree-sitter | `pub` → `public`; `pub(crate)` / `pub(super)` / `pub(in …)` → `internal`; no modifier or `pub(self)` → `private`. Trait-impl methods are `public`. |
+| Python | tree-sitter | Leading `_` → `private`; dunder names (`__init__`) are `public` |
+| Java | tree-sitter | `public` / `protected` / `private`; package-private (no modifier) → `internal`. Interface members and enum constants are implicitly `public`. |
+| Kotlin | tree-sitter | `private` / `protected` / `internal`; no modifier → `public` |
+| Dart | tree-sitter | Leading `_` → `private` (including named constructors such as `Foo._internal`) |
+| Protobuf | tree-sitter | all `public` |
+| C | tree-sitter | `static` → `private`, otherwise `public` |
+| C++ | tree-sitter | Class members from the nearest `public:` / `protected:` / `private:` label (default `private` in a `class`, `public` in a `struct`); non-member `static` → `private` |
+| C# | tree-sitter | `public` / `protected` / `internal` / `private`; with no modifier a class member is `private`, an interface member `public`, a top-level type `internal` |
+| Swift | tree-sitter | `private` / `fileprivate` → `private`; explicit `internal` → `internal`; no modifier → `public` |
+| PHP | tree-sitter | `private` / `protected`; no modifier → `public` |
+| Scala | tree-sitter | `private` / `private[this]` → `private`; `private[pkg]` → `internal`; `protected` |
+| Zig | tree-sitter | `pub` → `public`, otherwise `private` |
+| Bash / Shell | tree-sitter | all `public` |
+| R | tree-sitter | all `public` |
+| Haskell | tree-sitter | all `public` (export lists are not read) |
+| YAML | tree-sitter | all `public` |
+| SQL | tree-sitter | all `public` |
+| HCL / Terraform | tree-sitter | all `public` |
+| TOML | tree-sitter | all `public` |
 | Perl | tree-sitter | Leading `_` → `private` |
-| Ruby | tree-sitter | — |
-| OCaml | tree-sitter | — |
-| Lua | tree-sitter | — |
-| Elixir | tree-sitter | — |
-| Clojure | tree-sitter | — |
-| Erlang | tree-sitter | — |
-| Julia | tree-sitter | — |
-| Gleam | tree-sitter | — |
-| Odin | tree-sitter | — |
-| Nix | tree-sitter | — |
-| Nim | tree-sitter | — |
-| COBOL | regex-based | — |
+| Ruby | tree-sitter | Methods after a bare `private` / `protected` line, or written `private def …`; `private :name` is not tracked |
+| OCaml | tree-sitter | all `public` (`.mli` signatures are not read) |
+| Lua | tree-sitter | `local function` / `local f = function` → `private` |
+| Elixir | tree-sitter | `defp` / `defmacrop` / `defguardp` / `@typep` → `private` |
+| Clojure | tree-sitter | `defn-` and `^:private` metadata → `private` |
+| Erlang | tree-sitter | all `public` (`-export` lists are not read) |
+| Julia | tree-sitter | all `public` (`export` statements are not read) |
+| Gleam | tree-sitter | `pub` → `public`, otherwise `private` |
+| Odin | tree-sitter | all `public` |
+| Nix | tree-sitter | all `public` |
+| Nim | tree-sitter | `*` export marker → `public`, otherwise `private` |
+| COBOL | regex-based | all `public` |
 
 An index built by an older Shire picks the private symbols up on its first
 build after upgrading: the extractor version is stored in the index, and a

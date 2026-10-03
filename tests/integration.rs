@@ -3973,6 +3973,54 @@ mod watch_daemon_ownership {
         let mut perms = fs::metadata(dest).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(dest, perms).unwrap();
+        wait_until_executable(dest);
+    }
+
+    /// Wait until `path` can be exec'd. While `fs::copy` writes it, any other test
+    /// thread that spawns a process forks a child holding the copy's write fd until
+    /// that child execs, and exec'ing a file some process has open for writing
+    /// fails with ETXTBSY ("Text file busy"). Our own fd is closed by now, so no new
+    /// holder can appear: one exec that does not fail with ETXTBSY proves every
+    /// later one won't either.
+    fn wait_until_executable(path: &std::path::Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match Command::new(path)
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("cannot exec {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// The race `wait_until_executable` exists for, made deterministic: a copy
+    /// held open for writing cannot be exec'd, and the wait returns once it is
+    /// closed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_until_executable_waits_out_a_writer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest = dir.path().join("busy-bin");
+        fs::copy(cargo_bin(), &dest).unwrap();
+        let writer = fs::OpenOptions::new().write(true).open(&dest).unwrap();
+        let err = Command::new(&dest).arg("--help").status().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY), "{err}");
+
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(writer);
+        });
+        let start = Instant::now();
+        wait_until_executable(&dest);
+        assert!(start.elapsed() >= Duration::from_millis(150));
+        released.join().unwrap();
     }
 
     fn pid_alive(pid: u32) -> bool {

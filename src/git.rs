@@ -22,6 +22,28 @@ impl WorktreeInfo {
     }
 }
 
+/// `git rev-parse HEAD` in `repo_root`, or `None` outside a git repo (or
+/// without a `git` on PATH).
+pub fn head_commit(repo_root: &Path) -> Option<String> {
+    match std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+            .ok()
+            .map(|s| s.trim().to_string()),
+        Ok(_) => {
+            tracing::info!("git rev-parse failed (not a git repo?)");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not run git");
+            None
+        }
+    }
+}
+
 /// Detect worktree identity by inspecting the `.git` entry at `repo_root`.
 ///
 /// - If `.git` is a directory → this is the main working tree.

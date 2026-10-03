@@ -98,6 +98,12 @@ enum Commands {
         /// Skip interactive prompts and use defaults
         #[arg(long, short)]
         yes: bool,
+        /// Install the Claude Code status mod (experimental; user-wide) without asking
+        #[arg(long = "mod", conflicts_with = "no_mod")]
+        install_mod: bool,
+        /// Don't install the Claude Code status mod, and don't ask
+        #[arg(long)]
+        no_mod: bool,
     },
     /// Register shire as an MCP server with all detected AI tools
     Install {
@@ -113,6 +119,21 @@ enum Commands {
         /// Show what would be done without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Show the index's state without rebuilding it
+    Status {
+        /// Root directory of the repository (defaults to the repo containing the current directory)
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Path to the index database (overrides shire.toml db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to config file (defaults to <root>/shire.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print a single JSON object instead of text
+        #[arg(long)]
+        json: bool,
     },
     /// Remove the index database and all shire artifacts for a project
     Clean {
@@ -218,19 +239,45 @@ async fn main() -> Result<()> {
             global,
             no_hook,
             yes,
+            install_mod,
+            no_mod,
         } => {
+            let mod_flag = match (install_mod, no_mod) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
             if global {
-                init::run_init_global(no_hook, yes)
+                init::run_init_global(no_hook, yes, mod_flag)
             } else {
                 std::fs::create_dir_all(&root)
                     .with_context(|| format!("Failed to create directory {}", root.display()))?;
                 let root = std::fs::canonicalize(&root)
                     .with_context(|| format!("Failed to resolve path {}", root.display()))?;
-                init::run_init(&root, no_hook, yes)
+                init::run_init(&root, no_hook, yes, mod_flag)
             }
         }
         Commands::Install { dry_run, force } => install::run_install(dry_run, force),
         Commands::Uninstall { dry_run } => install::run_uninstall(dry_run),
+        Commands::Status {
+            root,
+            db,
+            config: cfg_path,
+            json,
+        } => {
+            let status =
+                shire::status::collect_for(root.as_deref(), db.as_deref(), cfg_path.as_deref());
+            let out = if json {
+                format!("{}\n", serde_json::to_string(&status)?)
+            } else {
+                shire::status::render_text(&status)
+            };
+            // Not print!: it panics (exit 101) when the reader has gone away,
+            // e.g. `shire status | head -1`, and status always exits 0.
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(out.as_bytes());
+            Ok(())
+        }
         Commands::Clean {
             root,
             db,

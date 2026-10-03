@@ -2,13 +2,15 @@
 
 ```
 src/
-├── main.rs          # CLI (clap): build, serve, watch, rebuild, init, install, uninstall, clean subcommands
+├── main.rs          # CLI (clap): build, serve, watch, rebuild, init, install, uninstall, clean, status subcommands
 ├── lib.rs           # Library re-exports for embedding shire as a crate
+├── claude_mod.rs    # Optional Claude Code status mod: embedded files, install/refresh/uninstall
 ├── config.rs        # shire.toml parsing
 ├── git.rs           # Git worktree detection and repo root resolution
 ├── init.rs          # `shire init` setup (config, MCP server, hooks, rules)
 ├── install.rs       # `shire install`/`uninstall` — registers/removes shire as an MCP server across detected AI tools
 ├── logging.rs       # Rotating file logging (tracing-appender), per-session IDs
+├── status.rs        # `shire status` — read-only index/build/daemon snapshot (text or JSON)
 ├── db/
 │   ├── mod.rs       # SQLite schema, open/create
 │   └── queries.rs   # FTS search, dependency graph BFS, listing

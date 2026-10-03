@@ -69,6 +69,28 @@ restore and some patch tools do. Nothing on disk distinguishes it from an
 untouched file without reading every byte of the repo on every build, so
 shire does not try — run `shire build --force` after one.
 
+## Which package owns a file
+
+A source file's symbols and references belong to its **nearest** enclosing
+package only — the same longest-prefix rule the `files` table uses. Each
+package's source walk stops at the directories of packages nested inside it,
+so a file under `pkgs/a/sub/b/` is extracted once, for `b`, not once more for
+`a` and again for the root package.
+
+Packages found by `discovery.custom` rules take part in incremental builds like
+any other: their edits are picked up, and a nested manifest package appearing
+or disappearing under one moves the affected files out of it or back into it.
+A custom package whose directory stops matching its rule is not removed,
+though, even by `shire build --force`; run `shire clean` and rebuild after
+reorganising those.
+
+Indexes written by shire 0.7.0 and earlier extracted nested files once per
+ancestor package, and could leave a nested file's references under an ancestor
+alone. The first build against such an index re-extracts every package once
+(comparable in cost to a full rebuild) and records
+`nearest_package_attribution` in `shire_meta`; later builds are incremental
+again. If that build is interrupted, the next one repeats the pass.
+
 ## When a walk cannot see the whole tree
 
 Both walks a build makes — the repo-wide file walk and the per-package source

@@ -154,4 +154,4 @@ max_depth = 4
 | `name_prefix` | no | Prefix prepended to directory-derived package name (e.g., `go:services/auth`) |
 | `extensions` | no | Override which file extensions get symbol extraction |
 
-Custom discovery runs alongside manifest-based discovery. Directories already found by manifest parsers are skipped. Subdirectories of matched directories are also skipped to prevent nested matches.
+Custom discovery runs alongside manifest-based discovery. Directories already found by manifest parsers are skipped. Subdirectories of matched directories are also skipped to prevent nested matches. A manifest package nested under a custom package still owns its own subtree: its files are indexed for it, not for the custom package. Custom packages are re-checked on every incremental build like manifest packages, but one whose directory stops matching its rule is not removed (not even by `shire build --force`); run `shire clean` and rebuild to drop it.

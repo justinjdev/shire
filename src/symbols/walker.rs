@@ -154,9 +154,31 @@ pub fn walk_source_files_with_excludes(
     extra_skip_patterns: &[String],
     exclude_dirs: &[String],
 ) -> Result<Vec<PathBuf>> {
+    walk_package_source_files(dir, extensions, extra_skip_patterns, exclude_dirs, &[])
+}
+
+/// Like `walk_source_files_with_excludes`, but also prunes the subtrees
+/// rooted at `nested_package_dirs` — the directories of the other packages
+/// that sit strictly inside `dir`. A source file belongs to its *nearest*
+/// enclosing package (the same longest-prefix rule the `files` table uses),
+/// so without this every file under a nested package was extracted once per
+/// ancestor package and its symbols and references indexed N times, each
+/// copy carrying a different `package` (#121).
+///
+/// Unlike `exclude_dirs`, which matches a directory *name* anywhere in the
+/// tree, these are matched by full path, and should be built by joining the
+/// same root `dir` was built from so the two compare equal.
+pub fn walk_package_source_files(
+    dir: &Path,
+    extensions: &[&str],
+    extra_skip_patterns: &[String],
+    exclude_dirs: &[String],
+    nested_package_dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let ext_set: HashSet<&str> = extensions.iter().copied().collect();
     let mut exclude_set: HashSet<String> = EXCLUDED_DIRS.iter().map(|s| s.to_string()).collect();
     exclude_set.extend(exclude_dirs.iter().cloned());
+    let nested_set: HashSet<PathBuf> = nested_package_dirs.iter().cloned().collect();
 
     let mut files = Vec::new();
 
@@ -171,7 +193,12 @@ pub fn walk_source_files_with_excludes(
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_str().unwrap_or("");
-                return !exclude_set.contains(name);
+                if exclude_set.contains(name) {
+                    return false;
+                }
+                // Depth 0 is the package's own root, which may legitimately
+                // appear in the set if a caller passes it; never prune it.
+                return entry.depth() == 0 || !nested_set.contains(entry.path());
             }
             true
         })
@@ -459,6 +486,45 @@ mod tests {
         assert!(!PROTO_GENERATED_SUFFIXES.is_empty());
         assert!(PROTO_GENERATED_SUFFIXES.contains(&".pb.go"));
         assert!(PROTO_GENERATED_SUFFIXES.contains(&"_pb2.py"));
+    }
+
+    #[test]
+    fn test_walk_prunes_nested_package_dirs_by_path() {
+        // #121: a file belongs to its nearest package, so walking an
+        // ancestor package must not descend into a nested one.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("pkgs/a");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("sub/b/src")).unwrap();
+        // Same directory *name* as the nested package, different path:
+        // must still be walked.
+        fs::create_dir_all(root.join("other/b")).unwrap();
+        fs::write(root.join("src/outer.ts"), "export function outer() {}").unwrap();
+        fs::write(
+            root.join("sub/b/src/inner.ts"),
+            "export function inner() {}",
+        )
+        .unwrap();
+        fs::write(root.join("other/b/kept.ts"), "export function kept() {}").unwrap();
+
+        let nested = vec![root.join("sub/b")];
+        let files = walk_package_source_files(&root, &["ts"], &[], &[], &nested).unwrap();
+        let rel: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(rel, vec!["other/b/kept.ts", "src/outer.ts"]);
+
+        // The package's own root is never pruned, even if passed in.
+        let files =
+            walk_package_source_files(&root, &["ts"], &[], &[], std::slice::from_ref(&root))
+                .unwrap();
+        assert_eq!(files.len(), 3);
     }
 
     #[test]

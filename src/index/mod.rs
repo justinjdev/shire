@@ -2249,14 +2249,14 @@ fn load_stored_file_hashes(conn: &Connection, package: &str) -> Result<HashMap<S
 fn phase_source_incremental(
     conn: &Connection,
     repo_root: &Path,
-    unchanged: &[&WalkedManifest],
+    package_paths: &[String],
     exclude_extensions: &[String],
     exclude_patterns: &[String],
     exclude_dirs: &[String],
     nesting: &PackageNesting,
     progress: &Option<Arc<ProgressBar>>,
     ref_writer: &mut RefWriter,
-    force_source_reextract: bool,
+    forced: &ForcedReextract,
     max_file_size: u64,
     max_references_per_file: usize,
     file_index_changed: &HashSet<String>,
@@ -2270,10 +2270,9 @@ fn phase_source_incremental(
         Option<String>,
         Option<String>,
         HashMap<String, String>,
-    )> = unchanged
+    )> = package_paths
         .iter()
-        .filter_map(|manifest| {
-            let relative_dir = &manifest.relative_dir;
+        .filter_map(|relative_dir| {
             let (pkg_name, pkg_kind): (String, String) = conn
                 .query_row(
                     "SELECT name, kind FROM packages WHERE path = ?1",
@@ -2345,15 +2344,17 @@ fn phase_source_incremental(
                         }
                     };
 
+                    let force_reextract = forced.applies_to(pkg_name);
+
                     // Pre-check: skip the package entirely when nothing on
-                    // disk suggests a change. Bypassed when
-                    // `force_source_reextract` is set (a references_enabled
-                    // false→true transition must repopulate refs even for
-                    // untouched packages), and when phase_index_files
+                    // disk suggests a change. Bypassed when the package is
+                    // forced (a references_enabled false→true transition, or
+                    // the one-time nearest-package attribution pass, must
+                    // repopulate refs even for untouched packages), and when phase_index_files
                     // observed a path/size change inside this package —
                     // that signal catches mtime-preserving edits the stat
                     // scan cannot see.
-                    if !force_source_reextract
+                    if !force_reextract
                         && !file_index_changed.contains(pkg_name.as_str())
                         && let Some(ts_str) = hashed_at
                         && let Some(since) = parse_hashed_at(ts_str)
@@ -2445,11 +2446,10 @@ fn phase_source_incremental(
                             let content_hash = format!("{:x}", digest);
 
                             let stored = stored_file_hashes.get(&relative_path);
-                            if stored == Some(&content_hash) && !force_source_reextract {
+                            if stored == Some(&content_hash) && !force_reextract {
                                 // File unchanged — include in results for aggregate hash but no symbols.
-                                // `force_source_reextract` skips this fast-path so refs
-                                // populate for every file during a refs-enabled transition,
-                                // while leaving `stored_file_hashes` intact so the caller
+                                // A forced re-extract skips this fast-path so every
+                                // file's symbols and refs are rewritten, while leaving `stored_file_hashes` intact so the caller
                                 // can still compute `deleted_files` against it below.
                                 Some(FileResult {
                                     file_path: relative_path,
@@ -2787,6 +2787,149 @@ fn clear_pending_source_recheck(conn: &Connection) -> Result<()> {
         [PENDING_SOURCE_RECHECK_KEY],
     )?;
     Ok(())
+}
+
+/// Which packages `phase_source_incremental` must re-extract in full,
+/// bypassing both the staleness pre-check and the per-file hash fast-path
+/// (while still computing deleted files against the stored hashes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForcedReextract {
+    None,
+    All,
+    Packages(HashSet<String>),
+}
+
+impl ForcedReextract {
+    fn applies_to(&self, pkg_name: &str) -> bool {
+        match self {
+            ForcedReextract::None => false,
+            ForcedReextract::All => true,
+            ForcedReextract::Packages(pkgs) => pkgs.contains(pkg_name),
+        }
+    }
+}
+
+/// `shire_meta` key recording that every package's symbols and references
+/// were last extracted under nearest-package attribution (#121).
+///
+/// An index written before that change extracted each nested file once per
+/// ancestor package, and because the old `symbol_refs` delete was not scoped
+/// to the package, whichever package happened to be written last kept the
+/// file's references — often an ancestor, with none under the file's nearest
+/// package. Once the ancestor's walk stops at the nested package, its
+/// incremental pass deletes its copy, while the nearest package's stored hash
+/// for the file still matches and it never re-extracts: the file would be
+/// left with no references at all. The first build against an index without
+/// this marker therefore re-extracts every package once (see
+/// `forced_reextract_for_build`).
+const NEAREST_PACKAGE_ATTRIBUTION_KEY: &str = "nearest_package_attribution";
+
+/// `shire_meta` key holding the packages whose forced re-extract failed
+/// (their walk errored), so it is retried on the next build instead of being
+/// lost with the trigger that asked for it.
+const PENDING_SOURCE_REEXTRACT_KEY: &str = "pending_source_reextract";
+
+fn has_nearest_package_attribution(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM shire_meta WHERE key = ?1",
+        [NEAREST_PACKAGE_ATTRIBUTION_KEY],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+fn read_pending_source_reextract(conn: &Connection) -> HashSet<String> {
+    conn.query_row(
+        "SELECT value FROM shire_meta WHERE key = ?1",
+        [PENDING_SOURCE_REEXTRACT_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+    .map(|v| v.into_iter().collect())
+    .unwrap_or_default()
+}
+
+fn write_pending_source_reextract(conn: &Connection, pkgs: &HashSet<String>) -> Result<()> {
+    if pkgs.is_empty() {
+        conn.execute(
+            "DELETE FROM shire_meta WHERE key = ?1",
+            [PENDING_SOURCE_REEXTRACT_KEY],
+        )?;
+        return Ok(());
+    }
+    let mut sorted: Vec<&str> = pkgs.iter().map(|s| s.as_str()).collect();
+    sorted.sort_unstable();
+    conn.execute(
+        "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![
+            PENDING_SOURCE_REEXTRACT_KEY,
+            serde_json::to_string(&sorted)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Decide what this build must force-re-extract.
+///
+/// - `refs_transition`: `references_enabled` just flipped on, so no unchanged
+///   file has references yet.
+/// - `!attribution_current`: the index predates nearest-package attribution
+///   (see `NEAREST_PACKAGE_ATTRIBUTION_KEY`). On a fresh or `--force` build
+///   this costs nothing extra: every package is new and goes through the
+///   full single-pass extraction, so the incremental set this applies to is
+///   empty.
+/// - otherwise, only the packages a previous forced pass could not finish.
+fn forced_reextract_for_build(
+    refs_transition: bool,
+    attribution_current: bool,
+    pending: HashSet<String>,
+) -> ForcedReextract {
+    if refs_transition || !attribution_current {
+        ForcedReextract::All
+    } else if pending.is_empty() {
+        ForcedReextract::None
+    } else {
+        ForcedReextract::Packages(pending)
+    }
+}
+
+/// The packages whose forced re-extract is still owed after this run: those
+/// the forced set covered whose walk failed.
+fn pending_reextract_after_extraction(
+    forced: &ForcedReextract,
+    failures: &[(String, String)],
+) -> HashSet<String> {
+    failures
+        .iter()
+        .filter(|(pkg, _)| forced.applies_to(pkg))
+        .map(|(pkg, _)| pkg.clone())
+        .collect()
+}
+
+/// Packages found by `discovery.custom` rules that are already indexed.
+///
+/// No manifest vouches for them, so they are never in `diff.unchanged`, and
+/// phase 3.5 skips any path already in `packages` — without this they would
+/// be extracted once, on the build that discovered them, and never walked
+/// again. They take part in the incremental source re-check instead, like a
+/// package whose manifest is unchanged.
+///
+/// Known limitation: nothing removes a custom package whose directory stops
+/// matching its rule (or disappears) — `phase_remove_deleted` only acts on
+/// manifest removals, and `--force` does not clear `packages`. A vanished
+/// directory is skipped by the re-check (`!package_dir.is_dir()`), so its old
+/// rows are kept rather than reported as a failure.
+fn indexed_custom_package_paths(conn: &Connection) -> Result<Vec<String>> {
+    let paths = conn
+        .prepare(
+            "SELECT path FROM packages \
+             WHERE json_valid(metadata) \
+             AND json_extract(metadata, '$.custom_rule') IS NOT NULL",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(paths)
 }
 
 /// Phase 9: Walk all files, associate with packages, and insert into DB.
@@ -3914,14 +4057,33 @@ fn build_index_inner(
     sp.finish_with_message(format!("Indexed {} files", num_files));
 
     // Phase 8+9: Extract symbols + source-level re-extraction (transaction-wrapped)
+    //
+    // The incremental re-check covers every already-indexed package this
+    // build did not just (re)parse: those whose manifest is unchanged, and
+    // those found by `discovery.custom` rules on an earlier build (see
+    // `indexed_custom_package_paths`).
+    let incremental_paths: Vec<String> = {
+        let parsed_paths: HashSet<&str> = parsed_packages
+            .iter()
+            .map(|(_, path, _)| path.as_str())
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        diff.unchanged
+            .iter()
+            .map(|m| m.relative_dir.clone())
+            .chain(indexed_custom_package_paths(&conn)?)
+            .filter(|p| !parsed_paths.contains(p.as_str()))
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    };
     tracing::debug!(
         new_changed = parsed_packages.len(),
-        unchanged = diff.unchanged.len(),
+        incremental = incremental_paths.len(),
         "phase 8+9: extract symbols"
     );
     let t = Instant::now();
-    let pb_sym = if !parsed_packages.is_empty() || !diff.unchanged.is_empty() {
-        let total = parsed_packages.len() + diff.unchanged.len();
+    let pb_sym = if !parsed_packages.is_empty() || !incremental_paths.is_empty() {
+        let total = parsed_packages.len() + incremental_paths.len();
         let pb = make_progress(&mp, total as u64, "Extracting symbols");
         Some(Arc::new(pb))
     } else {
@@ -3933,7 +4095,7 @@ fn build_index_inner(
     // hash matches the stored hash, so `phase_source_incremental`'s
     // fast-paths skip extraction and leave `symbol_refs` empty for every
     // unchanged file — the user sees a partial ref index with no
-    // indication it's stale. We repair by passing `force_source_reextract`
+    // indication it's stale. We repair by passing `ForcedReextract::All`
     // into `phase_source_incremental`, which bypasses the mtime and
     // per-file-hash fast-paths while PRESERVING `file_hashes` — the
     // stored hashes are still needed to compute `deleted_files` (files
@@ -3941,15 +4103,26 @@ fn build_index_inner(
     // deleted-file cleanup.
     let prior_refs_enabled = crate::db::read_references_enabled(&conn);
     let refs_just_enabled = is_refs_transition_enable(refs_enabled, prior_refs_enabled);
-    let force_source_reextract =
-        refs_transition_requires_rehash(refs_just_enabled, is_full_build, force);
-    if force_source_reextract {
+    let refs_transition = refs_transition_requires_rehash(refs_just_enabled, is_full_build, force);
+    if refs_transition {
         tracing::warn!(
             prior = ?prior_refs_enabled,
             "references_enabled transitioned to true — forcing source re-extraction \
              so symbol_refs is populated for every source file"
         );
     }
+    let attribution_current = has_nearest_package_attribution(&conn);
+    if !attribution_current && !incremental_paths.is_empty() {
+        tracing::info!(
+            "index predates nearest-package attribution — re-extracting every \
+             package once so each file's references sit under its nearest package"
+        );
+    }
+    let forced_reextract = forced_reextract_for_build(
+        refs_transition,
+        attribution_current,
+        read_pending_source_reextract(&conn),
+    );
     let (num_source_reextracted, extract_failures) = with_transaction(&conn, || {
         // Wipe symbol_refs if the user has turned the experimental refs
         // feature off — this keeps the DB from carrying stale refs while
@@ -3981,14 +4154,14 @@ fn build_index_inner(
         let (count, incremental_failures) = phase_source_incremental(
             &conn,
             repo_root,
-            &diff.unchanged,
+            &incremental_paths,
             &config.symbols.exclude_extensions,
             &config.symbols.exclude_patterns,
             &config.discovery.exclude,
             &nesting,
             &pb_sym_clone,
             &mut ref_writer,
-            force_source_reextract,
+            &forced_reextract,
             config.symbols.max_file_size,
             config.symbols.max_references_per_file,
             &file_index.changed_packages,
@@ -4012,6 +4185,18 @@ fn build_index_inner(
         let still_pending =
             pending_after_extraction(&file_index.changed_packages, &extract_failures);
         write_pending_source_recheck(&conn, &still_pending)?;
+        // Likewise for a forced re-extract: it is done only for the
+        // packages that actually walked, and only once this transaction
+        // commits. The attribution marker goes in the same transaction, so
+        // an interrupted upgrade build retries the whole pass.
+        write_pending_source_reextract(
+            &conn,
+            &pending_reextract_after_extraction(&forced_reextract, &extract_failures),
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO shire_meta (key, value) VALUES (?1, '1')",
+            [NEAREST_PACKAGE_ATTRIBUTION_KEY],
+        )?;
         Ok((count, extract_failures))
     })?;
     if let Some(pb) = pb_sym {
@@ -6977,6 +7162,79 @@ mod pending_recheck_tests {
 
         clear_pending_source_recheck(&conn).unwrap();
         assert!(read_pending_source_recheck(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_pending_source_reextract_round_trips() {
+        let conn = db();
+        assert!(read_pending_source_reextract(&conn).is_empty());
+        let set = HashSet::from(["a".to_string(), "b".to_string()]);
+        write_pending_source_reextract(&conn, &set).unwrap();
+        assert_eq!(read_pending_source_reextract(&conn), set);
+        write_pending_source_reextract(&conn, &HashSet::new()).unwrap();
+        assert!(read_pending_source_reextract(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_forced_reextract_for_build() {
+        let pending = HashSet::from(["p".to_string()]);
+        // An index that predates nearest-package attribution re-extracts
+        // everything once; so does a references_enabled transition.
+        assert_eq!(
+            forced_reextract_for_build(false, false, HashSet::new()),
+            ForcedReextract::All
+        );
+        assert_eq!(
+            forced_reextract_for_build(true, true, pending.clone()),
+            ForcedReextract::All
+        );
+        // Otherwise only what a previous forced pass could not finish.
+        assert_eq!(
+            forced_reextract_for_build(false, true, HashSet::new()),
+            ForcedReextract::None
+        );
+        assert_eq!(
+            forced_reextract_for_build(false, true, pending.clone()),
+            ForcedReextract::Packages(pending)
+        );
+    }
+
+    #[test]
+    fn test_pending_reextract_keeps_only_forced_failures() {
+        let failures = vec![
+            ("a".to_string(), "denied".to_string()),
+            ("b".to_string(), "denied".to_string()),
+        ];
+        assert_eq!(
+            pending_reextract_after_extraction(&ForcedReextract::All, &failures),
+            HashSet::from(["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(
+            pending_reextract_after_extraction(
+                &ForcedReextract::Packages(HashSet::from(["b".to_string(), "c".to_string()])),
+                &failures
+            ),
+            HashSet::from(["b".to_string()])
+        );
+        assert!(pending_reextract_after_extraction(&ForcedReextract::None, &failures).is_empty());
+    }
+
+    #[test]
+    fn test_indexed_custom_package_paths_selects_custom_rule_packages() {
+        let conn = db();
+        conn.execute_batch(
+            "INSERT INTO packages (name, path, kind, metadata) \
+               VALUES ('svc', 'services/svc', 'go', '{\"custom_rule\":\"go-apps\"}');
+             INSERT INTO packages (name, path, kind, metadata) \
+               VALUES ('web', 'web', 'npm', '{\"private\":true}');
+             INSERT INTO packages (name, path, kind, metadata) \
+               VALUES ('lib', 'lib', 'cargo', NULL);",
+        )
+        .unwrap();
+        assert_eq!(
+            indexed_custom_package_paths(&conn).unwrap(),
+            vec!["services/svc".to_string()]
+        );
     }
 
     #[test]

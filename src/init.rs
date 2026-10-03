@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::IsTerminal;
@@ -258,22 +259,39 @@ impl InitOptions {
     }
 }
 
-/// Prompts for the two questions that need an explanation. dialoguer redraws a
-/// prompt by clearing only its last screen line, so a prompt that wraps is
-/// printed again under its own first line: keep every prompt short enough to
-/// fit one line of a narrow terminal, and put the explanation in a [`hint`]
-/// printed once above it.
-const REFS_PROMPT: &str = "Enable the cross-reference index? (experimental)";
-const REFS_HINT: &str = "Adds the symbol_references, symbol_callers and symbol_callees MCP tools. \
-     The index grows roughly 30-150%, depending on the language mix.";
-const MOD_PROMPT: &str = "Install the Claude Code status mod? (experimental)";
-const MOD_HINT: &str =
-    "Shows index health in Claude Code's status line. Installed for your user, in every project.";
+/// The prompt theme: a `?` while asking, a green `✔` and the answer once
+/// answered, so a finished run reads as a list of settings.
+fn theme() -> ColorfulTheme {
+    ColorfulTheme::default()
+}
 
-/// Print an explanation once, dimmed, above the prompt it explains. dialoguer
-/// writes to stderr, so this does too.
-fn hint(text: &str) {
-    eprintln!("{}", style(text).dim());
+/// A section heading between groups of questions.
+fn section(title: &str) {
+    let rule = "─".repeat(40usize.saturating_sub(title.chars().count()));
+    eprintln!("\n{}", style(format!("── {title} {rule}")).cyan().bold());
+}
+
+/// The optional extras, asked as one checklist. dialoguer redraws a line by
+/// clearing only its last screen row, so an item that wraps would be printed
+/// twice: keep each label to one line (see `extras_fit_one_line`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extra {
+    CrossReferences,
+    RulesFile,
+    ClaudeMd,
+    StatusMod,
+}
+
+impl Extra {
+    fn label(self, global: bool) -> &'static str {
+        match self {
+            Extra::CrossReferences => "Cross-reference tools (experimental; index +30-150%)",
+            Extra::RulesFile if global => "Tool guidance in ~/.claude/rules/shire.md",
+            Extra::RulesFile => "Tool guidance in .claude/rules/shire.md",
+            Extra::ClaudeMd => "Search guidance in ~/.claude/CLAUDE.md",
+            Extra::StatusMod => "Claude Code status mod (experimental; user-wide)",
+        }
+    }
 }
 
 fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> Result<InitOptions> {
@@ -282,13 +300,14 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
     } else {
         InitOptions::default_local()
     };
+    let theme = theme();
+    section("Index");
 
-    // 1. Rebuild strategy
     let use_hook = if no_hook_flag {
         false
     } else {
         let items = &["PostToolUse hook (recommended)", "On-demand (serve --root)"];
-        let selection = Select::new()
+        let selection = Select::with_theme(&theme)
             .with_prompt("Rebuild strategy")
             .items(items)
             .default(0)
@@ -296,16 +315,15 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
         selection == 0
     };
 
-    // 2. Database path
-    let db_path: String = Input::new()
+    let db_path: String = Input::with_theme(&theme)
         .with_prompt("Database path")
         .default(defaults.db_path.clone())
         .interact_text()?;
 
-    // 3. Gitignore the db directory? (local only — global init has no project .gitignore)
+    // Local only: a global init has no project .gitignore.
     let gitignore_db_dir = if !global {
         if let Some(dir) = gitignore_dir_from_db_path(&db_path) {
-            Confirm::new()
+            Confirm::with_theme(&theme)
                 .with_prompt(format!("Add `{dir}` to .gitignore?"))
                 .default(true)
                 .interact()?
@@ -316,9 +334,8 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
         false
     };
 
-    // 4. Additional exclude directories
-    let extra_input: String = Input::new()
-        .with_prompt("Additional exclude directories (comma-separated, or empty)")
+    let extra_input: String = Input::with_theme(&theme)
+        .with_prompt("Extra directories to exclude (comma-separated)")
         .default(String::new())
         .allow_empty(true)
         .interact_text()?;
@@ -328,48 +345,149 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
         .filter(|s| !s.is_empty())
         .collect();
 
-    // 5. Enable cross-reference index (experimental)
-    hint(REFS_HINT);
-    let refs_enabled = Confirm::new()
-        .with_prompt(REFS_PROMPT)
-        .default(false)
+    section("Extras");
+    // `--mod`/`--no-mod` already answered the mod question.
+    let mut extras = vec![
+        (Extra::CrossReferences, false),
+        (Extra::RulesFile, true),
+        (Extra::ClaudeMd, true),
+    ];
+    if mod_flag.is_none() {
+        extras.push((Extra::StatusMod, false));
+    }
+    let labels: Vec<&str> = extras.iter().map(|(e, _)| e.label(global)).collect();
+    let checked: Vec<bool> = extras.iter().map(|(_, on)| *on).collect();
+    eprintln!("{}", style("  space toggles an item, enter confirms").dim());
+    let picked = MultiSelect::with_theme(&theme)
+        .with_prompt("Extras to set up")
+        .items(&labels)
+        .defaults(&checked)
         .interact()?;
-
-    // 6. Generate .claude/rules/shire.md
-    let generate_rules = Confirm::new()
-        .with_prompt("Generate .claude/rules/shire.md with tool usage guidance?")
-        .default(true)
-        .interact()?;
-
-    // 7. Add Shire guidance to ~/.claude/CLAUDE.md
-    let patch_claude_md = Confirm::new()
-        .with_prompt("Add Shire search guidance to ~/.claude/CLAUDE.md?")
-        .default(true)
-        .interact()?;
-
-    // 8. Claude Code status mod (user-wide, experimental)
-    let install_mod = match mod_flag {
-        Some(v) => v,
-        None => {
-            hint(MOD_HINT);
-            Confirm::new()
-                .with_prompt(MOD_PROMPT)
-                .default(false)
-                .interact()?
-        }
-    };
+    let chosen = |extra: Extra| picked.iter().any(|&i| extras[i].0 == extra);
 
     Ok(InitOptions {
         use_hook,
         db_path,
         extra_excludes,
-        refs_enabled,
-        generate_rules,
-        patch_claude_md,
+        refs_enabled: chosen(Extra::CrossReferences),
+        generate_rules: chosen(Extra::RulesFile),
+        patch_claude_md: chosen(Extra::ClaudeMd),
         gitignore_db_dir,
-        install_mod,
+        install_mod: mod_flag.unwrap_or_else(|| chosen(Extra::StatusMod)),
         non_interactive: false,
     })
+}
+
+/// What happens to an existing `shire.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigWrite {
+    Create,
+    Overwrite,
+    Keep,
+}
+
+/// Decide whether to write `shire.toml`, asking first when it exists and the
+/// run is interactive. Asked before the review, so keeping an existing config
+/// while setting up the rest stays possible.
+fn decide_config_write(config_path: &Path, shown: &str, opts: &InitOptions) -> Result<ConfigWrite> {
+    if !config_path.exists() {
+        return Ok(ConfigWrite::Create);
+    }
+    if opts.non_interactive {
+        print_skipped(&format!("{shown} already exists, skipping"));
+        return Ok(ConfigWrite::Keep);
+    }
+    let overwrite = Confirm::with_theme(&theme())
+        .with_prompt(format!("{shown} exists. Overwrite it with these settings?"))
+        .default(true)
+        .interact()?;
+    Ok(if overwrite {
+        ConfigWrite::Overwrite
+    } else {
+        ConfigWrite::Keep
+    })
+}
+
+/// Where `init` writes things, so the review names real paths.
+struct Targets<'a> {
+    config: &'a str,
+    mcp: &'a str,
+    settings: &'a str,
+    rules: &'a str,
+    /// `None` for a global init, which has no project .gitignore.
+    gitignore: Option<&'a str>,
+}
+
+/// The review shown before anything is written: one `(target, action)` row
+/// per change `init` is about to make.
+fn plan(opts: &InitOptions, config: ConfigWrite, t: &Targets) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut row = |target: &str, action: String| rows.push((target.to_string(), action));
+    row(
+        t.config,
+        match config {
+            ConfigWrite::Create => "create".into(),
+            ConfigWrite::Overwrite => "overwrite with these settings".into(),
+            ConfigWrite::Keep => "keep as is".into(),
+        },
+    );
+    row(
+        t.mcp,
+        if opts.use_hook {
+            "register the shire MCP server".into()
+        } else {
+            "register the shire MCP server (serve --root .)".into()
+        },
+    );
+    if opts.use_hook {
+        row(t.settings, "add the PostToolUse rebuild hook".into());
+    }
+    if opts.generate_rules {
+        row(t.rules, "write tool guidance".into());
+    }
+    if opts.patch_claude_md {
+        row("~/.claude/CLAUDE.md", "add search guidance".into());
+    }
+    if opts.install_mod {
+        row(
+            "~/.claude/shire-mod/",
+            "install the status mod (user-wide)".into(),
+        );
+    }
+    if config != ConfigWrite::Keep
+        && opts.gitignore_db_dir
+        && let (Some(gitignore), Some(dir)) =
+            (t.gitignore, gitignore_dir_from_db_path(&opts.db_path))
+    {
+        row(gitignore, format!("ignore `{dir}`"));
+    }
+    if opts.refs_enabled {
+        row("index", "record cross-references (experimental)".into());
+    }
+    rows
+}
+
+/// Show the plan and ask to apply it, under the "Review" heading the caller
+/// printed before asking about an existing config. Always true for a
+/// non-interactive run.
+fn review(opts: &InitOptions, config: ConfigWrite, targets: &Targets) -> Result<bool> {
+    if opts.non_interactive {
+        return Ok(true);
+    }
+    let rows = plan(opts, config, targets);
+    let width = rows.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+    for (target, action) in rows {
+        eprintln!("  {}  {action}", style(format!("{target:width$}")).bold());
+    }
+    eprintln!();
+    let apply = Confirm::with_theme(&theme())
+        .with_prompt("Apply these changes?")
+        .default(true)
+        .interact()?;
+    if !apply {
+        print_skipped("Nothing written.");
+    }
+    Ok(apply)
 }
 
 pub fn generate_config_toml(opts: &InitOptions, global: bool) -> String {
@@ -431,7 +549,7 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool, mod_flag: Option<bool>) -
     // In interactive mode, ask local vs global first
     if !yes && std::io::stdin().is_terminal() {
         let items = &["Local (this project only)", "Global (all projects)"];
-        let selection = Select::new()
+        let selection = Select::with_theme(&theme())
             .with_prompt("Install scope")
             .items(items)
             .default(0)
@@ -452,29 +570,34 @@ pub fn run_init(root: &Path, no_hook: bool, yes: bool, mod_flag: Option<bool>) -
         prompt_options(false, no_hook, mod_flag)?
     };
 
-    // 1. Create or update shire.toml
     let config_path = root.join("shire.toml");
-    let config_exists = config_path.exists();
-    let should_write = if config_exists {
-        if opts.non_interactive {
-            print_skipped("shire.toml already exists, skipping");
-            false
-        } else {
-            Confirm::new()
-                .with_prompt("shire.toml already exists. Overwrite with new settings?")
-                .default(true)
-                .interact()?
-        }
-    } else {
-        true
+    if !opts.non_interactive {
+        section("Review");
+    }
+    let config = decide_config_write(&config_path, "shire.toml", &opts)?;
+    let targets = Targets {
+        config: "shire.toml",
+        mcp: ".mcp.json",
+        settings: ".claude/settings.json",
+        rules: ".claude/rules/shire.md",
+        gitignore: Some(".gitignore"),
     };
+    if !review(&opts, config, &targets)? {
+        return Ok(());
+    }
+    if !opts.non_interactive {
+        section("Done");
+    }
+
+    // 1. Create or update shire.toml
+    let config_exists = config == ConfigWrite::Overwrite;
+    let should_write = config != ConfigWrite::Keep;
     if should_write {
         let content = generate_config_toml(&opts, false);
         write_with_mode(&config_path, &content, target_mode(&config_path, 0o600))?;
         print_created(&format!(
-            "{} {}",
-            if config_exists { "Updated" } else { "Created" },
-            config_path.display()
+            "{} shire.toml",
+            if config_exists { "Updated" } else { "Created" }
         ));
     }
 
@@ -559,22 +682,28 @@ fn run_init_global_in(claude_dir: &Path, opts: &InitOptions) -> Result<()> {
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("Failed to create directory {}", claude_dir.display()))?;
 
-    // 1. Create or update shire.toml
     let config_path = claude_dir.join("shire.toml");
-    let config_exists = config_path.exists();
-    let should_write = if config_exists {
-        if opts.non_interactive {
-            print_skipped("~/.claude/shire.toml already exists, skipping");
-            false
-        } else {
-            Confirm::new()
-                .with_prompt("~/.claude/shire.toml already exists. Overwrite with new settings?")
-                .default(true)
-                .interact()?
-        }
-    } else {
-        true
+    if !opts.non_interactive {
+        section("Review");
+    }
+    let config = decide_config_write(&config_path, "~/.claude/shire.toml", opts)?;
+    let targets = Targets {
+        config: "~/.claude/shire.toml",
+        mcp: "~/.claude.json",
+        settings: "~/.claude/settings.json",
+        rules: "~/.claude/rules/shire.md",
+        gitignore: None,
     };
+    if !review(opts, config, &targets)? {
+        return Ok(());
+    }
+    if !opts.non_interactive {
+        section("Done");
+    }
+
+    // 1. Create or update shire.toml
+    let config_exists = config == ConfigWrite::Overwrite;
+    let should_write = config != ConfigWrite::Keep;
     if should_write {
         let content = generate_config_toml(opts, true);
         write_with_mode(&config_path, &content, target_mode(&config_path, 0o600))?;
@@ -968,12 +1097,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explained_prompts_fit_one_line() {
-        // A prompt that wraps is printed twice (see REFS_PROMPT). Leave room
-        // for dialoguer's " [y/N]" and the answer in an 80-column terminal.
-        for prompt in [REFS_PROMPT, MOD_PROMPT] {
-            assert!(prompt.len() <= 60, "{prompt:?} is {} chars", prompt.len());
+    fn extras_fit_one_line() {
+        // A checklist row that wraps is printed twice (see `Extra`). Leave
+        // room for the theme's "  [x] " prefix in an 80-column terminal.
+        for extra in [
+            Extra::CrossReferences,
+            Extra::RulesFile,
+            Extra::ClaudeMd,
+            Extra::StatusMod,
+        ] {
+            for global in [false, true] {
+                let label = extra.label(global);
+                assert!(label.chars().count() <= 60, "{label:?} is too long");
+            }
         }
+    }
+
+    fn local_targets() -> Targets<'static> {
+        Targets {
+            config: "shire.toml",
+            mcp: ".mcp.json",
+            settings: ".claude/settings.json",
+            rules: ".claude/rules/shire.md",
+            gitignore: Some(".gitignore"),
+        }
+    }
+
+    #[test]
+    fn plan_lists_what_the_defaults_write() {
+        let rows = plan(
+            &InitOptions::default_local(),
+            ConfigWrite::Create,
+            &local_targets(),
+        );
+        let targets: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            targets,
+            [
+                "shire.toml",
+                ".mcp.json",
+                ".claude/settings.json",
+                ".claude/rules/shire.md",
+                ".gitignore"
+            ]
+        );
+        assert_eq!(rows[0].1, "create");
+        assert_eq!(rows[4].1, "ignore `.shire`");
+    }
+
+    #[test]
+    fn plan_follows_the_choices() {
+        let mut opts = InitOptions::default_local();
+        opts.use_hook = false;
+        opts.generate_rules = false;
+        opts.patch_claude_md = true;
+        opts.install_mod = true;
+        opts.refs_enabled = true;
+        let rows = plan(&opts, ConfigWrite::Keep, &local_targets());
+        let targets: Vec<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
+        // No hook, no rules file, and a kept config adds nothing to .gitignore.
+        assert_eq!(
+            targets,
+            [
+                "shire.toml",
+                ".mcp.json",
+                "~/.claude/CLAUDE.md",
+                "~/.claude/shire-mod/",
+                "index"
+            ]
+        );
+        assert_eq!(rows[0].1, "keep as is");
+        assert!(rows[1].1.contains("serve --root"));
+    }
+
+    #[test]
+    fn a_global_plan_has_no_gitignore_row() {
+        let opts = InitOptions::default_global();
+        let targets = Targets {
+            gitignore: None,
+            ..local_targets()
+        };
+        let rows = plan(&opts, ConfigWrite::Overwrite, &targets);
+        assert!(rows.iter().all(|(t, _)| t != ".gitignore"));
+        assert_eq!(rows[0].1, "overwrite with these settings");
     }
 
     #[test]

@@ -2,9 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { ShireStatus } from '../types'
-import { detailRows, statusLine, transitions, warnings } from './format'
+import { detailRows, settled, statusLine, transitions, warnings } from './format'
 
 const status = atom({ plugin: 'shire-status', key: 'status' } as const, null)
+const baseline = atom({ plugin: 'shire-status', key: 'baseline' } as const, null)
 const error = atom({ plugin: 'shire-status', key: 'error' } as const, null)
 const busy = atom({ plugin: 'shire-status', key: 'busy' } as const, null)
 
@@ -18,34 +19,66 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const BUILD_TIMEOUT_MS = 600_000
 
 // Module variables: a reload starts them over, which is what they should do.
-let polling = false
 let soon: Timer | undefined
+/** The poll running now, and the one queued behind it. */
+let current: Promise<void> = Promise.resolve()
+let queued: Promise<void> | null = null
+/** Set synchronously, so two quick presses cannot both start a build. */
+let rebuilding = false
+/** Tells this module load's `busy` entry from one a reloaded module left. */
+const OWNER = `${Date.now()}-${Math.random()}`
 
-async function poll($: EngineInterface): Promise<void> {
-  if (polling) return
-  polling = true
+/**
+ * Read `shire status`. Polls run one at a time, and a call made while one is
+ * running waits for a fresh poll after it (shared by every such call), so a
+ * caller never gets a snapshot taken before it asked.
+ */
+function poll($: EngineInterface): Promise<void> {
+  if (queued !== null) return queued
+  const run = current.then(() => {
+    queued = null
+    return pollOnce($)
+  })
+  queued = run
+  current = run
+  return run
+}
+
+async function pollOnce($: EngineInterface): Promise<void> {
+  let ran
   try {
-    const ran = await $.process.run(['shire', 'status', '--json'], { timeoutMs: 10_000 })
-    if (ran.exitCode !== 0) {
-      // An older shire has no `status` subcommand: clap exits 2.
-      const why = ran.stderr.includes('unrecognized subcommand')
-        ? 'this shire has no `status` command; upgrade shire'
-        : ran.stderr.trim().split('\n')[0] || `shire status exited ${ran.exitCode}`
-      await fail($, why)
-      return
-    }
-    const next = JSON.parse(ran.stdout) as ShireStatus
-    const prev = await read($, status)
-    for (const line of transitions(prev, next)) $.ui.toast(`shire: ${line}`)
-    await update($, status, () => next)
-    await update($, error, () => null)
-    $.ui.status(statusLine(next, await $.clock.now()))
+    ran = await $.process.run(['shire', 'status', '--json'], { timeoutMs: 10_000 })
   } catch (e) {
-    // `$.process.run` rejects when the command cannot start at all.
-    await fail($, `shire not found on PATH (${e instanceof Error ? e.message : String(e)})`)
-  } finally {
-    polling = false
+    // Rejects when the command cannot start (no shire on PATH) or times out;
+    // the engine does not pass the cause through, so say both. A non-zero
+    // exit or output that is not JSON are reported separately below.
+    const msg = e instanceof Error ? e.message : String(e)
+    await fail($, `could not run shire status (is shire on PATH?): ${msg}`)
+    return
   }
+  if (ran.exitCode !== 0) {
+    // An older shire has no `status` subcommand: clap exits 2.
+    const why = ran.stderr.includes('unrecognized subcommand')
+      ? 'this shire has no `status` command; upgrade shire'
+      : ran.stderr.trim().split('\n')[0] || `shire status exited ${ran.exitCode}`
+    await fail($, why)
+    return
+  }
+  let next: ShireStatus
+  try {
+    next = JSON.parse(ran.stdout) as ShireStatus
+  } catch {
+    const first = ran.stdout.trim().split('\n')[0]?.slice(0, 120) ?? ''
+    await fail($, `shire status printed something that is not JSON: ${first || '(nothing)'}`)
+    return
+  }
+  if (settled(next)) {
+    for (const line of transitions(await read($, baseline), next)) $.ui.toast(`shire: ${line}`)
+    await update($, baseline, () => next)
+  }
+  await update($, status, () => next)
+  await update($, error, () => null)
+  $.ui.status(statusLine(next, await $.clock.now()))
 }
 
 async function fail($: EngineInterface, why: string): Promise<void> {
@@ -56,18 +89,24 @@ async function fail($: EngineInterface, why: string): Promise<void> {
   if (had !== why) $.ui.toast(`shire: ${why}`)
 }
 
-/** `shire rebuild` when the watch daemon is up (it debounces and builds), else a build. */
+/**
+ * `shire rebuild` when the watch daemon is up and listening (it debounces and
+ * builds), else a build. Not when it is merely running: `shire rebuild`
+ * exits 0 even when it cannot reach the socket, so a wedged daemon would make
+ * the button report a rebuild that never happened.
+ */
 async function rebuild($: EngineInterface, force: boolean): Promise<string> {
+  if (rebuilding) return 'shire: a rebuild is already running'
+  rebuilding = true
   const s = await read($, status)
   const root = s?.root
   const rootArgs = root ? ['--root', root] : []
-  const viaDaemon = !force && s?.watch.running === true
+  const viaDaemon = !force && s?.watch.running === true && s.watch.listening
   const argv = viaDaemon
     ? ['shire', 'rebuild', ...rootArgs]
     : ['shire', 'build', ...rootArgs, ...(force ? ['--force'] : [])]
   const label = force ? 'force rebuild' : viaDaemon ? 'rebuild (watch daemon)' : 'rebuild'
-  if ((await read($, busy)) !== null) return 'shire: a rebuild is already running'
-  await update($, busy, () => label)
+  await update($, busy, () => ({ label, owner: OWNER }))
   $.ui.status(`shire ⟳ ${label}…`)
   try {
     const ran = await $.process.run(argv, { timeoutMs: BUILD_TIMEOUT_MS })
@@ -78,7 +117,8 @@ async function rebuild($: EngineInterface, force: boolean): Promise<string> {
   } catch (e) {
     return `shire: ${label} could not run: ${e instanceof Error ? e.message : String(e)}`
   } finally {
-    await update($, busy, () => null)
+    rebuilding = false
+    await update($, busy, b => (b?.owner === OWNER ? null : b))
     await poll($)
   }
 }
@@ -124,7 +164,8 @@ export const register: Register = on => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const s = await read($, status)
     const err = await read($, error)
-    const running = await read($, busy)
+    const b = await read($, busy)
+    const running = b?.owner === OWNER ? b.label : null
     const now = await $.clock.now()
 
     if (s === null) {

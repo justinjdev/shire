@@ -1,6 +1,7 @@
 {
   "name": "shire-status",
   "version": "0.1.0",
+  "author": { "name": "shire" },
   "description": "shire index health in the status line, toasts when it changes, and a /shire pane with rebuild buttons",
   "types": "./types/index.d.ts"
 }

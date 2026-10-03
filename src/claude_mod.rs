@@ -68,18 +68,9 @@ pub enum Installed {
 /// Re-running it after an upgrade refreshes the files in place.
 pub fn install(claude_dir: &Path) -> Result<Installed> {
     let dir = mod_dir(claude_dir);
-    refuse_symlink(&dir)?;
-    for (rel, content) in FILES {
-        let path = dir.join(rel);
-        let parent = path.parent().expect("mod files live in a folder");
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-        let tmp = path.with_extension("shire-tmp");
-        write_with_mode(&tmp, content, 0o644)?;
-        fs::rename(&tmp, &path).with_context(|| format!("Failed to write {}", path.display()))?;
-    }
+    write_files(&dir)?;
     let added = edit_settings(&claude_dir.join("settings.json"), |dirs| {
-        if dirs.contains(&dir) {
+        if dirs.iter().any(|d| names_dir(d, &dir, claude_dir)) {
             false
         } else {
             dirs.push(dir.clone());
@@ -94,13 +85,44 @@ pub fn install(claude_dir: &Path) -> Result<Installed> {
 }
 
 /// Rewrite the mod's files if it is installed, so `shire install` keeps an
-/// installed mod in step with an upgraded binary. Never installs it.
+/// installed mod in step with an upgraded binary. Never installs it, and
+/// never touches the settings: a user who unlisted the folder to switch the
+/// mod off keeps it off.
 pub fn refresh_if_installed(claude_dir: &Path) -> Result<bool> {
     if !is_installed(claude_dir) {
         return Ok(false);
     }
-    install(claude_dir)?;
+    write_files(&mod_dir(claude_dir))?;
     Ok(true)
+}
+
+/// Write every embedded file into `dir`, each atomically.
+fn write_files(dir: &Path) -> Result<()> {
+    refuse_symlink(dir)?;
+    for (rel, content) in FILES {
+        let path = dir.join(rel);
+        let parent = path.parent().expect("mod files live in a folder");
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+        let tmp = path.with_extension("shire-tmp");
+        write_with_mode(&tmp, content, 0o644)?;
+        fs::rename(&tmp, &path).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether a `CLAUDE_CODE_PLUGIN_DIRS` entry names `dir`. Claude Code
+/// expands a leading `~` in these entries, so `~/.claude/shire-mod/...`
+/// names the same folder as its absolute spelling; `~` is the parent of
+/// `claude_dir` (`~/.claude`).
+fn names_dir(entry: &Path, dir: &Path, claude_dir: &Path) -> bool {
+    if entry == dir {
+        return true;
+    }
+    let (Ok(rest), Some(home)) = (entry.strip_prefix("~"), claude_dir.parent()) else {
+        return false;
+    };
+    home.join(rest) == dir
 }
 
 /// The mod's files are on disk (whether or not the settings list them).
@@ -111,23 +133,38 @@ pub fn is_installed(claude_dir: &Path) -> bool {
 
 /// Unregister the folder and delete it. `Ok(false)` when there was nothing
 /// to remove.
+///
+/// A `settings.json` that cannot be read or parsed does not stop the folder
+/// from being deleted (that does not depend on the settings); the error is
+/// returned afterwards, so the user still learns the entry may be left over.
 pub fn uninstall(claude_dir: &Path, dry_run: bool) -> Result<bool> {
     let dir = mod_dir(claude_dir);
     let settings = claude_dir.join("settings.json");
-    let listed = read_settings(&settings)?
-        .as_ref()
-        .is_some_and(|s| plugin_dirs(s).contains(&dir));
+    let (listed, settings_err) = match read_settings(&settings) {
+        Ok(s) => (
+            s.as_ref().is_some_and(|s| {
+                plugin_dirs(s)
+                    .iter()
+                    .any(|d| names_dir(d, &dir, claude_dir))
+            }),
+            None,
+        ),
+        Err(e) => (false, Some(e)),
+    };
     let on_disk = fs::symlink_metadata(&dir).is_ok();
-    if !listed && !on_disk {
+    if !listed && !on_disk && settings_err.is_none() {
         return Ok(false);
     }
     if dry_run {
-        return Ok(true);
+        return match settings_err {
+            Some(e) => Err(e),
+            None => Ok(true),
+        };
     }
     if listed {
         edit_settings(&settings, |dirs| {
             let before = dirs.len();
-            dirs.retain(|d| d != &dir);
+            dirs.retain(|d| !names_dir(d, &dir, claude_dir));
             dirs.len() != before
         })?;
     }
@@ -137,7 +174,13 @@ pub fn uninstall(claude_dir: &Path, dry_run: bool) -> Result<bool> {
         // The parent holds nothing but mods shire installed.
         let _ = fs::remove_dir(dir.parent().expect("mod_dir has a parent"));
     }
-    Ok(true)
+    match settings_err {
+        Some(e) => Err(e.context(format!(
+            "could not check {} for a leftover {PLUGIN_DIRS_VAR} entry",
+            settings.display()
+        ))),
+        None => Ok(true),
+    }
 }
 
 /// `remove_dir_all` on a symlink deletes nothing but the link on unix, but
@@ -312,6 +355,64 @@ mod tests {
         assert_eq!(settings(claude)["env"][PLUGIN_DIRS_VAR], "/other/mod");
 
         assert!(!uninstall(claude, false).unwrap(), "nothing left to remove");
+    }
+
+    #[test]
+    fn refresh_does_not_relist_a_mod_the_user_unlisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path();
+        install(claude).unwrap();
+        fs::write(claude.join("settings.json"), r#"{"env": {"FOO": "1"}}"#).unwrap();
+        fs::write(mod_dir(claude).join("hooks/register.tsx"), "stale").unwrap();
+
+        assert!(refresh_if_installed(claude).unwrap());
+        assert_ne!(
+            fs::read_to_string(mod_dir(claude).join("hooks/register.tsx")).unwrap(),
+            "stale"
+        );
+        assert!(settings(claude)["env"].get(PLUGIN_DIRS_VAR).is_none());
+    }
+
+    #[test]
+    fn a_tilde_spelling_of_the_folder_counts_as_listed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"env": {"CLAUDE_CODE_PLUGIN_DIRS": "~/.claude/shire-mod/shire-status"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(install(&claude).unwrap(), Installed::Refreshed);
+        assert_eq!(
+            settings(&claude)["env"][PLUGIN_DIRS_VAR],
+            "~/.claude/shire-mod/shire-status"
+        );
+
+        assert!(uninstall(&claude, false).unwrap());
+        assert!(settings(&claude).get("env").is_none());
+    }
+
+    #[test]
+    fn a_malformed_settings_file_does_not_block_removing_the_folder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path();
+        install(claude).unwrap();
+        fs::write(claude.join("settings.json"), "{ not json").unwrap();
+
+        assert!(
+            uninstall(claude, true).is_err(),
+            "dry run reports the problem"
+        );
+        assert!(mod_dir(claude).exists(), "dry run changes nothing");
+
+        assert!(uninstall(claude, false).is_err(), "still reported");
+        assert!(!mod_dir(claude).exists(), "but the folder is gone");
+        assert_eq!(
+            fs::read_to_string(claude.join("settings.json")).unwrap(),
+            "{ not json"
+        );
     }
 
     #[test]

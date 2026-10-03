@@ -34,8 +34,14 @@ declare module 'claude-code' {
       status: ShireStatus | null
       /** Why the last poll failed (shire not installed, an old shire, ...). */
       error: string | null
-      /** What a pane button is running right now, if anything. */
-      busy: string | null
+      /** The last snapshot taken while no build ran; toasts compare against it. */
+      baseline: ShireStatus | null
+      /**
+       * What a pane button is running right now, if anything. `owner` names
+       * the module load that started it: state survives a hot reload but the
+       * rebuild's `finally` may not, so another load's entry is stale.
+       */
+      busy: { label: string; owner: string } | null
     }
   }
 }

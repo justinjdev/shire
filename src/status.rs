@@ -4,6 +4,12 @@
 //! Unlike the MCP `index_status` tool this never rebuilds and never writes:
 //! the database is opened read-only, the build lock is only probed (see
 //! [`crate::index::lock::is_held`]), and a missing index stays missing.
+//!
+//! "Read-only" includes not leaving SQLite's `-wal`/`-shm` sidecars behind:
+//! the index is in WAL mode at rest, and SQLite creates both files when any
+//! connection, even a read-only one, opens a WAL database, then cannot
+//! remove them on close without write access. So an index nobody else has
+//! open is read with `immutable=1` (see [`read_meta`]).
 
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -135,7 +141,13 @@ fn unresolved(root: PathBuf, error: String) -> Status {
 
 /// Gather the status of the index at `db_path` for the repo at `root`.
 pub fn collect(root: &Path, db_path: &Path) -> Status {
-    let build_running = crate::index::lock::is_held(db_path);
+    collect_with(root, db_path, crate::index::lock::is_held)
+}
+
+/// [`collect`], with the build-lock probe injectable so tests can stage a
+/// build that starts while status is running.
+fn collect_with(root: &Path, db_path: &Path, build_lock_held: impl Fn(&Path) -> bool) -> Status {
+    let build_running = build_lock_held(db_path);
     let head_commit = crate::git::head_commit(root);
     let mut status = Status {
         shire_version: env!("CARGO_PKG_VERSION"),
@@ -190,7 +202,10 @@ pub fn collect(root: &Path, db_path: &Path) -> Status {
         }
     }
 
-    match read_meta(db_path) {
+    // With no sidecars on disk no WAL connection is open, and with the lock
+    // free no build is writing: the main file is the whole database.
+    let immutable = !build_running && !has_sidecars(db_path);
+    match read_meta(db_path, immutable) {
         Ok(meta) => {
             let interrupted = status.apply(meta);
             status.state = if build_running {
@@ -211,6 +226,14 @@ pub fn collect(root: &Path, db_path: &Path) -> Status {
             status.error = Some(format!("{e:#}"));
         }
     }
+    // A build that took the lock after the probe above sets its
+    // `build_in_progress` marker at once, so it reads as interrupted, and it
+    // can hold readers off long enough to read as unreadable. Probe again
+    // before blaming the index.
+    if matches!(status.state, State::Interrupted | State::Unreadable) && build_lock_held(db_path) {
+        status.build_running = true;
+        status.state = State::Building;
+    }
     status.head_matches = match (&status.git_commit, &status.head_commit) {
         (Some(a), Some(b)) => Some(a == b),
         _ => None,
@@ -218,13 +241,23 @@ pub fn collect(root: &Path, db_path: &Path) -> Status {
     status
 }
 
-fn sidecar_len(db_path: &Path, suffix: &str) -> u64 {
+fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
     let mut p = db_path.as_os_str().to_os_string();
     p.push(suffix);
-    match std::fs::symlink_metadata(PathBuf::from(p)) {
+    PathBuf::from(p)
+}
+
+fn sidecar_len(db_path: &Path, suffix: &str) -> u64 {
+    match std::fs::symlink_metadata(sidecar(db_path, suffix)) {
         Ok(m) if m.is_file() => m.len(),
         _ => 0,
     }
+}
+
+fn has_sidecars(db_path: &Path) -> bool {
+    ["-wal", "-shm"]
+        .iter()
+        .any(|s| std::fs::symlink_metadata(sidecar(db_path, s)).is_ok())
 }
 
 /// Every `shire_meta` value `shire status` reports.
@@ -234,14 +267,37 @@ struct Meta {
     pending_source_recheck: Vec<String>,
 }
 
-fn read_meta(db_path: &Path) -> Result<Meta> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+/// Read the metadata. `immutable` opens the file with SQLite's `immutable=1`,
+/// which takes no locks and never touches `-wal`/`-shm`: correct only while
+/// nothing else has the database open for writing, which the caller
+/// establishes (and re-checks afterwards, since a build may start meanwhile).
+fn read_meta(db_path: &Path, immutable: bool) -> Result<Meta> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = match db_path.to_str().filter(|_| immutable) {
+        Some(path) => Connection::open_with_flags(
+            format!("file:{}?immutable=1", uri_escape(path)),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )?,
+        // A path that is not UTF-8 cannot go in a URI; read it normally.
+        None => Connection::open_with_flags(db_path, flags)?,
+    };
     conn.busy_timeout(STATUS_BUSY_TIMEOUT)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     read_meta_from(&conn)
+}
+
+/// Percent-encode everything a SQLite URI path could misread (`?`, `#`, `%`
+/// and anything outside the unreserved set), keeping `/`.
+fn uri_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn read_meta_from(conn: &Connection) -> Result<Meta> {
@@ -535,6 +591,59 @@ mod tests {
         let s = collect(dir.path(), &file.join("index.db"));
         assert_eq!(s.state, State::Unreadable);
         assert!(s.error.unwrap().contains("cannot stat db_path"));
+    }
+
+    #[test]
+    fn reading_a_wal_index_leaves_no_sidecars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = built_index(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        drop(conn); // the last connection checkpoints and removes the sidecars
+        assert!(!has_sidecars(&db));
+
+        let s = collect(dir.path(), &db);
+        assert_eq!(s.state, State::Ok, "{:?}", s.error);
+        assert_eq!(s.counts.symbols, Some(42));
+        assert!(!has_sidecars(&db), "status must not create -wal/-shm");
+    }
+
+    #[test]
+    fn a_wal_index_another_connection_has_open_is_still_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = built_index(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute(
+            "UPDATE shire_meta SET value = '43' WHERE key = 'symbol_count'",
+            [],
+        )
+        .unwrap();
+        // The update is still in the WAL, which an immutable read would miss.
+        assert!(has_sidecars(&db));
+        assert_eq!(collect(dir.path(), &db).counts.symbols, Some(43));
+    }
+
+    #[test]
+    fn a_build_starting_mid_status_reads_as_building_not_interrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = built_index(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        crate::db::set_build_in_progress(&conn, true).unwrap();
+        drop(conn);
+        // Free at the first probe, held by the time the marker is read.
+        let probes = std::cell::Cell::new(0);
+        let s = collect_with(dir.path(), &db, |_| {
+            probes.set(probes.get() + 1);
+            probes.get() > 1
+        });
+        assert_eq!(s.state, State::Building);
+        assert!(s.build_running);
+    }
+
+    #[test]
+    fn uri_escape_keeps_slashes_and_escapes_the_rest() {
+        assert_eq!(uri_escape("/a b/c?d#e%f.db"), "/a%20b/c%3Fd%23e%25f.db");
     }
 
     #[test]

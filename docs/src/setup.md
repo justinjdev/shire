@@ -59,7 +59,8 @@ and adds that folder to `env.CLAUDE_CODE_PLUGIN_DIRS`, keeping any folders alrea
 New Claude Code sessions pick it up.
 
 - `shire install` refreshes an installed mod's files, so they keep matching the binary after an
-  upgrade. It never installs the mod.
+  upgrade. It never installs the mod, and never touches the settings: if you removed the folder
+  from `CLAUDE_CODE_PLUGIN_DIRS` to switch the mod off, it stays off.
 - `shire uninstall` removes the folder and its entry in `CLAUDE_CODE_PLUGIN_DIRS`.
 
 The mod uses Claude Code's early-access mod API, which may change between Claude Code releases.

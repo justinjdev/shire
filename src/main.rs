@@ -267,11 +267,15 @@ async fn main() -> Result<()> {
         } => {
             let status =
                 shire::status::collect_for(root.as_deref(), db.as_deref(), cfg_path.as_deref());
-            if json {
-                println!("{}", serde_json::to_string(&status)?);
+            let out = if json {
+                format!("{}\n", serde_json::to_string(&status)?)
             } else {
-                print!("{}", shire::status::render_text(&status));
-            }
+                shire::status::render_text(&status)
+            };
+            // Not print!: it panics (exit 101) when the reader has gone away,
+            // e.g. `shire status | head -1`, and status always exits 0.
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(out.as_bytes());
             Ok(())
         }
         Commands::Clean {

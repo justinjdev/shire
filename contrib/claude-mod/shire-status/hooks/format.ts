@@ -28,6 +28,7 @@ export function warnings(s: ShireStatus): string[] {
   if (s.pending_source_recheck.length > 0 && !s.build_running) {
     out.push(`${s.pending_source_recheck.length} pending re-check`)
   }
+  if (s.head_matches === false) out.push('HEAD moved')
   return out
 }
 
@@ -35,7 +36,8 @@ export function warnings(s: ShireStatus): string[] {
 export function compact(n: number | null): string {
   if (n === null) return '?'
   if (n < 1000) return String(n)
-  if (n < 1_000_000) return `${trim(n / 1000)}k`
+  // From 999_500 up, "k" would round to "1000k".
+  if (n < 999_500) return `${trim(n / 1000)}k`
   return `${trim(n / 1_000_000)}M`
 }
 
@@ -69,17 +71,27 @@ export function statusLine(s: ShireStatus, nowMs: number): string {
     const a = age(s.indexed_at, nowMs)
     if (a !== null) parts.push(`${a} ago`)
   }
-  if (s.head_matches === false) parts.push('HEAD moved')
   const [worst] = warnings(s)
   if (worst !== undefined) parts.push(worst)
   return `${head} ${parts.join(' · ')}`
 }
 
 /**
- * Toasts for what changed between two polls. Deliberately quiet: an
- * on-demand rebuild (`serve --root`) rewrites `indexed_at` every few seconds
- * while nothing changes, so a rebuild is only worth a toast when the counts
- * moved.
+ * Whether a snapshot can be compared against. One taken while a build runs
+ * may hold the last build's metadata or none at all (the build locks readers
+ * out), so toasts compare the last settled snapshot with the next settled
+ * one and skip the polls in between: otherwise a build a poll lands in loses
+ * its "index built" or "reindexed" toast.
+ */
+export function settled(s: ShireStatus): boolean {
+  return s.state !== 'building'
+}
+
+/**
+ * Toasts for what changed between two settled snapshots. Deliberately quiet:
+ * an on-demand rebuild (`serve --root`) rewrites `indexed_at` every few
+ * seconds while nothing changes, so a rebuild is only worth a toast when the
+ * counts moved, and build failures only when one is new.
  */
 export function transitions(prev: ShireStatus | null, next: ShireStatus): string[] {
   if (prev === null) return []
@@ -94,11 +106,13 @@ export function transitions(prev: ShireStatus | null, next: ShireStatus): string
       out.push(`reindexed${took}: ${signed(ds)} symbols, ${signed(df)} files`)
     }
   }
-  const pf = prev.last_build_failures.length
+  // A manifest that fails to parse fails again on every build, so compare
+  // what failed, not when the build ran.
+  const seen = new Set(prev.last_build_failures.map(failureKey))
+  const fresh = next.last_build_failures.filter(f => !seen.has(failureKey(f)))
   const nf = next.last_build_failures.length
-  const first = next.last_build_failures[0]
-  if (first !== undefined && (pf === 0 || next.indexed_at !== prev.indexed_at)) {
-    out.push(`build had ${nf} failure${nf === 1 ? '' : 's'}: ${first.target}`)
+  if (fresh[0] !== undefined) {
+    out.push(`build had ${nf} failure${nf === 1 ? '' : 's'}: ${fresh[0].target}`)
   }
   if (next.state === 'interrupted' && prev.state !== 'interrupted') {
     out.push('a build was interrupted; the next build repairs the index')
@@ -108,6 +122,10 @@ export function transitions(prev: ShireStatus | null, next: ShireStatus): string
   }
   if (prev.watch.running && !next.watch.running) out.push('watch daemon stopped')
   return out
+}
+
+function failureKey(f: ShireStatus['last_build_failures'][number]): string {
+  return `${f.kind}\u0000${f.target}`
 }
 
 function delta(a: number | null, b: number | null): number {

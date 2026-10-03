@@ -42,7 +42,7 @@ If accepted, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Co
 
 During interactive setup, `shire init` also asks:
 
-> Install the Claude Code status mod (experimental)?
+> Install the Claude Code status mod? (experimental)
 
 The default is **no**. Answering yes, or passing `--mod` (`--no-mod` skips the question),
 installs a Claude Code [mod](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)

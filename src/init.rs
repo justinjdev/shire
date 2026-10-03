@@ -258,6 +258,24 @@ impl InitOptions {
     }
 }
 
+/// Prompts for the two questions that need an explanation. dialoguer redraws a
+/// prompt by clearing only its last screen line, so a prompt that wraps is
+/// printed again under its own first line: keep every prompt short enough to
+/// fit one line of a narrow terminal, and put the explanation in a [`hint`]
+/// printed once above it.
+const REFS_PROMPT: &str = "Enable the cross-reference index? (experimental)";
+const REFS_HINT: &str = "Adds the symbol_references, symbol_callers and symbol_callees MCP tools. \
+     The index grows roughly 30-150%, depending on the language mix.";
+const MOD_PROMPT: &str = "Install the Claude Code status mod? (experimental)";
+const MOD_HINT: &str =
+    "Shows index health in Claude Code's status line. Installed for your user, in every project.";
+
+/// Print an explanation once, dimmed, above the prompt it explains. dialoguer
+/// writes to stderr, so this does too.
+fn hint(text: &str) {
+    eprintln!("{}", style(text).dim());
+}
+
 fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> Result<InitOptions> {
     let defaults = if global {
         InitOptions::default_global()
@@ -311,10 +329,9 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
         .collect();
 
     // 5. Enable cross-reference index (experimental)
+    hint(REFS_HINT);
     let refs_enabled = Confirm::new()
-        .with_prompt(
-            "Enable cross-reference index (experimental)? Adds symbol_references/callers/callees MCP tools. DB grows substantially (roughly 30%-150% depending on language mix)",
-        )
+        .with_prompt(REFS_PROMPT)
         .default(false)
         .interact()?;
 
@@ -333,13 +350,13 @@ fn prompt_options(global: bool, no_hook_flag: bool, mod_flag: Option<bool>) -> R
     // 8. Claude Code status mod (user-wide, experimental)
     let install_mod = match mod_flag {
         Some(v) => v,
-        None => Confirm::new()
-            .with_prompt(
-                "Install the Claude Code status mod (experimental)? Shows index health in \
-                 Claude Code's status line for all your projects",
-            )
-            .default(false)
-            .interact()?,
+        None => {
+            hint(MOD_HINT);
+            Confirm::new()
+                .with_prompt(MOD_PROMPT)
+                .default(false)
+                .interact()?
+        }
     };
 
     Ok(InitOptions {
@@ -949,6 +966,15 @@ fn ensure_claude_md_line_in(claude_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explained_prompts_fit_one_line() {
+        // A prompt that wraps is printed twice (see REFS_PROMPT). Leave room
+        // for dialoguer's " [y/N]" and the answer in an 80-column terminal.
+        for prompt in [REFS_PROMPT, MOD_PROMPT] {
+            assert!(prompt.len() <= 60, "{prompt:?} is {} chars", prompt.len());
+        }
+    }
 
     #[test]
     fn test_init_creates_config_and_mcp() {

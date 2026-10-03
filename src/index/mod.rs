@@ -2874,7 +2874,9 @@ fn write_pending_source_reextract(conn: &Connection, pkgs: &HashSet<String>) -> 
 /// History:
 /// - 1: private/unexported symbols are indexed, tagged with their
 ///   visibility, instead of being dropped (Go, Python, Perl, Dart).
-const EXTRACTOR_VERSION: &str = "1";
+/// - 2: the same for every other language; TS/JS index module-level
+///   unexported declarations.
+const EXTRACTOR_VERSION: &str = "2";
 
 /// `shire_meta` key holding the [`extractor_state`] the stored symbols were
 /// produced under. Absent on an index built before the key existed — which

@@ -1,12 +1,6 @@
 use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
-/// Julia visibility: all symbols are visible (Julia uses `export` at module level,
-/// not syntax-level access modifiers).
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
-}
-
 /// Build signature string for Julia symbols.
 fn build_signature(node: &Node, source: &str, name: &str, _kind: SymbolKind) -> String {
     match node.kind() {
@@ -173,7 +167,6 @@ fn post_process(
 /// Return the language hooks for Julia.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
         visibility: None,
         resolve_parent: None,

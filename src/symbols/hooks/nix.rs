@@ -1,11 +1,6 @@
 use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, node_text};
 use tree_sitter::Node;
 
-/// Nix has no visibility modifiers — all bindings are visible.
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
-}
-
 /// Get the value expression node from a binding (the `expression` field).
 fn binding_value<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
     node.child_by_field_name("expression")
@@ -185,7 +180,6 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return the language hooks for Nix.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
         visibility: None,
         resolve_parent: None,

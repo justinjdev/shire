@@ -1,27 +1,32 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
-/// Nim visibility: only exported symbols (those with `*` suffix, represented as
-/// `exported_symbol` nodes in the AST) are considered visible.
-fn is_visible(node: &Node, _source: &str) -> bool {
-    match node.kind() {
-        // Procedure-like declarations: name field is exported_symbol or identifier
+/// Nim visibility: a name marked with the `*` export suffix (an
+/// `exported_symbol` node in the AST) is public; anything else is private to
+/// its module.
+fn visibility(node: &Node, _source: &str) -> Visibility {
+    let exported = match node.kind() {
+        // Procedure-like and type declarations: name field is exported_symbol or identifier
         "proc_declaration"
         | "func_declaration"
         | "method_declaration"
         | "iterator_declaration"
         | "template_declaration"
         | "macro_declaration"
-        | "converter_declaration" => node
-            .child_by_field_name("name")
-            .is_some_and(|n| n.kind() == "exported_symbol"),
-        // type_symbol_declaration: name field is exported_symbol or identifier
-        "type_symbol_declaration" => node
+        | "converter_declaration"
+        | "type_symbol_declaration" => node
             .child_by_field_name("name")
             .is_some_and(|n| n.kind() == "exported_symbol"),
         // variable_declaration inside const_section: check symbol_declaration's name
         "variable_declaration" => has_exported_symbol(node),
-        _ => false,
+        _ => true,
+    };
+    if exported {
+        Visibility::Public
+    } else {
+        Visibility::Private
     }
 }
 
@@ -194,9 +199,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
 /// Return Nim language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: None,
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),
@@ -244,9 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn test_private_proc_filtered() {
-        let syms = extract("proc privateHelper(x: int): int = x * 2");
-        assert!(syms.is_empty(), "private proc should be filtered out");
+    fn test_private_proc_is_private() {
+        let syms = extract("proc privateHelper(x: int): int = x * 2\nproc shown*() = discard");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].name, "privateHelper");
+        assert_eq!(syms[0].kind, SymbolKind::Function);
+        assert_eq!(syms[0].visibility, Visibility::Private);
+        assert_eq!(syms[1].name, "shown");
+        assert_eq!(syms[1].visibility, Visibility::Public);
     }
 
     #[test]
@@ -328,10 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn test_private_type_filtered() {
+    fn test_private_type_is_private() {
         let source = "type\n  Internal = object\n    x: int";
         let syms = extract(source);
-        assert!(syms.is_empty(), "private type should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "Internal");
+        assert_eq!(syms[0].visibility, Visibility::Private);
     }
 
     #[test]
@@ -346,10 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn test_private_const_filtered() {
+    fn test_private_const_is_private() {
         let source = "const internalSize = 50";
         let syms = extract(source);
-        assert!(syms.is_empty(), "private const should be filtered out");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "internalSize");
+        assert_eq!(syms[0].kind, SymbolKind::Constant);
+        assert_eq!(syms[0].visibility, Visibility::Private);
     }
 
     #[test]
@@ -415,9 +429,12 @@ const MaxSize* = 100
             names
         );
         assert!(names.contains(&"greet"), "missing greet, got: {:?}", names);
-        assert!(
-            !names.contains(&"privateHelper"),
-            "privateHelper should be filtered"
+        let helper = syms.iter().find(|s| s.name == "privateHelper");
+        assert_eq!(
+            helper.map(|s| s.visibility),
+            Some(Visibility::Private),
+            "privateHelper should be indexed as private, got: {:?}",
+            names
         );
         assert!(names.contains(&"add"), "missing add, got: {:?}", names);
         assert!(names.contains(&"draw"), "missing draw, got: {:?}", names);
@@ -435,8 +452,8 @@ const MaxSize* = 100
         );
         assert_eq!(
             syms.len(),
-            9,
-            "expected 9 symbols, got {}: {:?}",
+            10,
+            "expected 10 symbols (incl. privateHelper), got {}: {:?}",
             syms.len(),
             names
         );

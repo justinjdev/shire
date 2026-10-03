@@ -1,6 +1,6 @@
 use super::{
     LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility,
-    find_child_by_kind, node_text,
+    find_child_by_kind, narrow_by_enclosing_types, node_text,
 };
 use tree_sitter::Node;
 
@@ -36,7 +36,7 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool) 
 /// interface methods and constants are implicitly `public` (and constants
 /// are additionally implicitly `static final`) — idiomatic Java almost never
 /// writes those modifiers explicitly, so `check_modifiers` alone would treat
-/// every interface member as package-private and drop it.
+/// every interface member as package-private.
 fn is_interface_member(node: &Node) -> bool {
     node.parent().is_some_and(|p| p.kind() == "interface_body")
 }
@@ -56,7 +56,7 @@ fn effective_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bo
     // Enum constants (`RED` in `enum Color { RED, GREEN }`) are implicitly
     // public static final per the JLS; `enum_constant` nodes don't carry a
     // `modifiers` child at all, so `check_modifiers` alone would report
-    // every one of them as package-private and drop it.
+    // every one of them as package-private.
     if node.kind() == "enum_constant" {
         public = true;
         is_static = true;
@@ -65,39 +65,39 @@ fn effective_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bo
     (public, protected, private, is_static, is_final)
 }
 
-/// Java visibility: only public or protected symbols are visible.
-/// Private and package-private (no modifier) are skipped.
-/// Also checks ancestor class visibility — members inside a private or package-private
-/// class are not externally visible.
-fn is_visible(node: &Node, source: &str) -> bool {
+/// A declaration's own Java access level: `public`, `protected`, `private`,
+/// or package-private (no modifier), which is recorded as `Internal`.
+fn own_visibility(node: &Node, source: &str) -> Visibility {
     let (public, protected, private, _, _) = effective_modifiers(node, source);
-    if private || !(public || protected) {
-        return false;
+    if public {
+        Visibility::Public
+    } else if protected {
+        Visibility::Protected
+    } else if private {
+        Visibility::Private
+    } else {
+        Visibility::Internal
     }
+}
 
-    // Check all ancestor classes for visibility — a public method in a package-private
-    // or private class (at any nesting level) is not externally visible.
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if matches!(
-            n.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-        ) {
-            // `effective_modifiers`, not `check_modifiers`: a type nested
-            // directly in an interface body is implicitly public, so a
-            // raw modifier check would wrongly hide all of its members.
-            let (p_public, p_protected, p_private, _, _) = effective_modifiers(&n, source);
-            if p_private || !(p_public || p_protected) {
-                return false;
-            }
-        }
-        current = n.parent();
-    }
-
-    true
+/// Java visibility: the declaration's own access level, narrowed by every
+/// enclosing type — a public method of a private or package-private class is
+/// not reachable from outside it. `effective_modifiers`, not
+/// `check_modifiers`: a type nested directly in an interface body is
+/// implicitly public.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+        ],
+        own_visibility,
+    )
 }
 
 /// For methods, fields and constants inside a class/interface/enum/record,
@@ -215,13 +215,6 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
     let (public, protected, private, is_static, is_final) = effective_modifiers(node, source);
 
-    // Set visibility string
-    if public {
-        sym.visibility = Visibility::Public;
-    } else if protected {
-        sym.visibility = Visibility::Protected;
-    }
-
     match sym.kind {
         SymbolKind::Method => {
             // Static methods become Function kind
@@ -231,8 +224,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             Some(sym)
         }
         SymbolKind::Constant => {
-            // Fields: only include if public/protected AND static AND final
-            if private || !(public || protected) || !is_static || !is_final {
+            // Fields: only `static final` ones are constants. Their access
+            // level is recorded in `sym.visibility`, not filtered on.
+            if !is_static || !is_final {
                 return None;
             }
 
@@ -250,10 +244,19 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
                 (name, find_type_node(node, source))
             };
 
-            let vis = &sym.visibility;
+            // The modifier as written (package-private has none).
+            let modifier = if public {
+                "public "
+            } else if protected {
+                "protected "
+            } else if private {
+                "private "
+            } else {
+                ""
+            };
             let signature = format!(
-                "{} static final {} {}",
-                vis,
+                "{}static final {} {}",
+                modifier,
                 type_str.as_deref().unwrap_or("?"),
                 name
             );
@@ -311,9 +314,8 @@ fn find_type_node(node: &Node, source: &str) -> Option<String> {
 /// Return Java language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

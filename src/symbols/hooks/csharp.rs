@@ -1,6 +1,6 @@
 use super::{
     LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
-    find_child_by_kind, node_text,
+    find_child_by_kind, narrow_by_enclosing_types, node_text,
 };
 use tree_sitter::Node;
 
@@ -35,37 +35,62 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool, bool, 
     (public, protected, private, internal, is_static, is_readonly)
 }
 
-/// C# visibility: only public or protected symbols are visible.
-/// Private and internal (no modifier) are skipped.
-/// Also checks ancestor type visibility — members inside a private or internal
-/// type are not externally visible.
-fn is_visible(node: &Node, source: &str) -> bool {
-    let (public, protected, private, internal, _, _) = check_modifiers(node, source);
-    if private || internal || !(public || protected) {
-        return false;
-    }
+/// Type kinds whose body makes a declaration a member.
+const TYPE_KINDS: &[&str] = &[
+    "class_declaration",
+    "struct_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+];
 
-    // Check all ancestor types for visibility — a public method in a private or internal
-    // type (at any nesting level) is not externally visible.
+/// A declaration's own C# accessibility. `protected internal` and `private
+/// protected` both count as protected. With no modifier, an interface member
+/// is public, any other member is private, and a top-level type is internal.
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    let (public, protected, private, internal, _, _) = check_modifiers(node, source);
+    if public {
+        return Visibility::Public;
+    }
+    if protected {
+        return Visibility::Protected;
+    }
+    if private {
+        return Visibility::Private;
+    }
+    if internal {
+        return Visibility::Internal;
+    }
+    match find_enclosing_type(node).map(|t| t.kind()) {
+        Some("interface_declaration") => Visibility::Public,
+        Some(_) => Visibility::Private,
+        None => Visibility::Internal,
+    }
+}
+
+/// The nearest enclosing type declaration, if `node` is a member of one.
+fn find_enclosing_type<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     let mut current = node.parent();
     while let Some(n) = current {
-        if matches!(
-            n.kind(),
-            "class_declaration"
-                | "struct_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-        ) {
-            let (p_public, p_protected, p_private, p_internal, _, _) = check_modifiers(&n, source);
-            if p_private || p_internal || !(p_public || p_protected) {
-                return false;
-            }
+        if TYPE_KINDS.contains(&n.kind()) {
+            return Some(n);
         }
         current = n.parent();
     }
+    None
+}
 
-    true
+/// C# visibility: the declaration's own accessibility, narrowed by every
+/// enclosing type — a public method of a private or internal type is not
+/// reachable from outside it.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        TYPE_KINDS,
+        own_visibility,
+    )
 }
 
 /// For methods and fields inside a type, return the type name.
@@ -176,15 +201,7 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process C# symbols.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    let (public, protected, private, internal, is_static, is_readonly) =
-        check_modifiers(node, source);
-
-    // Set visibility string
-    if public {
-        sym.visibility = Visibility::Public;
-    } else if protected {
-        sym.visibility = Visibility::Protected;
-    }
+    let (_, _, _, _, is_static, is_readonly) = check_modifiers(node, source);
 
     match sym.kind {
         SymbolKind::Method => {
@@ -195,11 +212,10 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             Some(sym)
         }
         SymbolKind::Constant => {
-            // Fields: only include if public/protected AND (const OR static readonly)
+            // Fields: only `const` or `static readonly` ones are constants.
+            // Their accessibility is recorded in `sym.visibility`, not
+            // filtered on.
             let is_const = has_modifier(node, source, "const");
-            if private || internal || !(public || protected) {
-                return None;
-            }
             if !(is_const || is_static && is_readonly) {
                 return None;
             }
@@ -210,7 +226,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
             let name = find_identifier(&declarator, source)?;
 
             let type_str = find_type_node(&var_decl, source);
-            let vis = &sym.visibility;
+            // The field's own accessibility, not the one narrowed by its
+            // enclosing types: the signature reads like the declaration.
+            let vis = own_visibility(node, source);
             let signature = if is_const {
                 format!(
                     "{} const {} {}",
@@ -294,9 +312,8 @@ fn find_type_node(node: &Node, source: &str) -> Option<String> {
 /// Return C# language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

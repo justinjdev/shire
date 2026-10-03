@@ -418,7 +418,6 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
 /// Return OCaml language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: None, // OCaml has no visibility modifiers
         is_definition: None,
         visibility: None,
         resolve_parent: Some(resolve_parent),

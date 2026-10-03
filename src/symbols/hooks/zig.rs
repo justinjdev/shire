@@ -1,9 +1,12 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_child_by_kind, node_text};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
-/// Zig visibility: only symbols marked `pub` are exported.
-/// The `pub` keyword appears as an anonymous child node with text "pub".
-fn is_visible(node: &Node, source: &str) -> bool {
+/// True if the declaration is marked `pub`. The `pub` keyword appears as an
+/// anonymous child node with text "pub".
+fn is_pub(node: &Node, source: &str) -> bool {
     for i in 0..node.child_count() {
         let child = node.child(i).unwrap();
         if child.is_named() {
@@ -15,6 +18,24 @@ fn is_visible(node: &Node, source: &str) -> bool {
         }
     }
     false
+}
+
+/// Zig visibility: `pub` declarations are public; the rest are private to
+/// their file/container.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if is_pub(node, source) {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
+}
+
+/// The query matches every `const`/`var` declaration, including locals in a
+/// function body. Only container-level declarations (file scope or a
+/// struct/enum/union body) are symbols; a local is never inside one without
+/// first being inside a `block`.
+fn is_definition(node: &Node, _source: &str) -> bool {
+    node.kind() != "variable_declaration" || find_ancestor(node, "block").is_none()
 }
 
 /// Zig doesn't have methods attached to types in the AST (they're just functions
@@ -38,21 +59,21 @@ fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> S
             source[start..end.min(source.len())].trim().to_string()
         }
         SymbolKind::Struct => {
-            if is_visible(node, source) {
+            if is_pub(node, source) {
                 format!("pub const {} = struct", name)
             } else {
                 format!("const {} = struct", name)
             }
         }
         SymbolKind::Enum => {
-            if is_visible(node, source) {
+            if is_pub(node, source) {
                 format!("pub const {} = enum", name)
             } else {
                 format!("const {} = enum", name)
             }
         }
         _ => {
-            if is_visible(node, source) {
+            if is_pub(node, source) {
                 format!("pub const {}", name)
             } else {
                 format!("const {}", name)
@@ -162,9 +183,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
 /// Return the language hooks for Zig.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
-        is_definition: None,
-        visibility: None,
+        is_definition: Some(is_definition),
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

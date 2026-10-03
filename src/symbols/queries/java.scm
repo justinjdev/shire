@@ -23,13 +23,13 @@
   (method_declaration
     name: (identifier) @name) @definition.method)
 
-; Fields inside class bodies (filtered to public static final constants in post_process hook)
+; Fields inside class bodies (filtered to static final constants in post_process hook)
 (class_body
   (field_declaration
     declarator: (variable_declarator
       name: (identifier) @name)) @definition.constant)
 
-; Methods inside interface bodies (implicitly public — see is_visible in java.rs)
+; Methods inside interface bodies (implicitly public — see effective_modifiers in java.rs)
 (interface_body
   (method_declaration
     name: (identifier) @name) @definition.method)
@@ -51,7 +51,7 @@
   (enum_constant
     name: (identifier) @name) @definition.constant)
 
-; Fields inside enum bodies (filtered to public static final constants in
+; Fields inside enum bodies (filtered to static final constants in
 ; post_process, same as class_body fields above).
 (enum_body_declarations
   (field_declaration

@@ -1,9 +1,24 @@
-use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
+use super::{LanguageHooks, Parameter, SymbolKind, Visibility, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
-/// Lua visibility: all symbols are visible (Lua has no access modifiers).
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
+/// Lua visibility: a `local function f()` or `local f = function() end` is
+/// scoped to its chunk (file), so it is private; globals and module-table
+/// functions (`function M.f()`) are public.
+fn visibility(node: &Node, _source: &str) -> Visibility {
+    let local = match node.kind() {
+        "function_declaration" => (0..node.child_count())
+            .filter_map(|i| node.child(i))
+            .any(|c| c.kind() == "local"),
+        "assignment_statement" => node
+            .parent()
+            .is_some_and(|p| p.kind() == "variable_declaration"),
+        _ => false,
+    };
+    if local {
+        Visibility::Private
+    } else {
+        Visibility::Public
+    }
 }
 
 /// Resolve the parent (table/module) name for methods and module functions.
@@ -137,9 +152,8 @@ fn extract_return_type(_node: &Node, _source: &str) -> Option<String> {
 /// Return the language hooks for Lua.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

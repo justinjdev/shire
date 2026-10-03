@@ -1,52 +1,32 @@
-use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind};
+use super::{
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, modifier_text, narrow_by_enclosing_types,
+};
 use tree_sitter::Node;
 
-/// Check whether a Swift symbol is visible (not private or fileprivate).
-/// Swift defaults to `internal` visibility, which is visible within the module.
-/// Also checks ancestor class visibility — methods inside a private class are not visible.
-fn is_visible(node: &Node, source: &str) -> bool {
-    if has_private_modifier(node, source) {
-        return false;
+/// A declaration's own Swift access level. `private` and `fileprivate` are
+/// private and an explicit `internal` is internal. No modifier is recorded as
+/// public: Swift's implicit `internal` is the module-wide default that almost
+/// all application code relies on, and it was indexed as public before
+/// private symbols were.
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    match modifier_text(node, source, "visibility_modifier") {
+        Some("private" | "fileprivate") => Visibility::Private,
+        Some("internal") => Visibility::Internal,
+        _ => Visibility::Public,
     }
-
-    // Check all ancestor classes/protocols for visibility
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if (n.kind() == "class_declaration" || n.kind() == "protocol_declaration")
-            && has_private_modifier(&n, source)
-        {
-            return false;
-        }
-        current = n.parent();
-    }
-
-    true
 }
 
-/// Check if a node has private or fileprivate visibility modifier.
-/// In this grammar, visibility_modifier may be inside a `modifiers` wrapper node.
-fn has_private_modifier(node: &Node, source: &str) -> bool {
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        if child.kind() == "visibility_modifier"
-            && let Ok(text) = child.utf8_text(source.as_bytes())
-            && (text == "private" || text == "fileprivate")
-        {
-            return true;
-        }
-        if child.kind() == "modifiers" {
-            for j in 0..child.child_count() {
-                let grandchild = child.child(j).unwrap();
-                if grandchild.kind() == "visibility_modifier"
-                    && let Ok(text) = grandchild.utf8_text(source.as_bytes())
-                    && (text == "private" || text == "fileprivate")
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Swift visibility: the declaration's own access level, narrowed by every
+/// enclosing class/protocol.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        &["class_declaration", "protocol_declaration"],
+        own_visibility,
+    )
 }
 
 /// For methods inside class/struct/enum/actor or protocol bodies, resolve the parent type name.
@@ -253,9 +233,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return Swift language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

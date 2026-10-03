@@ -125,8 +125,8 @@ in minor versions as language support broadens and edge cases surface.
 `symbols.include_private` (default `true`) controls whether private and
 unexported symbols are indexed. They are tagged `visibility = "private"`, by
 each language's own convention — a lowercase Go name, a leading `_` in
-Python, Perl or Dart (see the Visibility column in
-[Supported Ecosystems](ecosystems.md)) — and `search_symbols` ranks them after
+Python, a non-`pub` Rust item, a `private` Java member (see the Visibility
+column in [Supported Ecosystems](ecosystems.md)) — and `search_symbols` ranks them after
 the public ones, so they are there when you look for a helper by name without
 crowding out the API.
 
@@ -140,9 +140,10 @@ time. `internal` and `protected` symbols are kept either way, and
 cross-references (`references_enabled`) are unaffected — calls made from
 inside a private function are still recorded.
 
-**Size:** private code is often most of a codebase. As a guide, indexing
-private items took Shire's own (Rust) source from 286 to 1,120 symbols —
-about 4x the rows in `symbols` and `symbols_fts`. Expect a smaller jump in
+**Size:** private code is often most of a codebase. As a guide, Shire's own
+(Rust) source indexes roughly 3.4x as many symbols with the default as with
+`include_private = false`, and `symbols` and `symbols_fts` grow by about that
+much. Expect a smaller jump in
 code that is mostly exported, and a larger one in application code full of
 helpers.
 

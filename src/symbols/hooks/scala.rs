@@ -1,6 +1,6 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor,
-    find_child_by_kind,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, modifier_text, narrow_by_enclosing_types,
 };
 use tree_sitter::Node;
 
@@ -12,52 +12,35 @@ const TYPE_NODES: &[&str] = &[
     "enum_definition",
 ];
 
-/// Check whether a Scala symbol is visible (not private).
-/// Scala defaults to public visibility.
-/// Also checks ancestor class/object/trait visibility — methods inside a private
-/// type are not visible.
-fn is_visible(node: &Node, source: &str) -> bool {
-    if has_private_modifier(node, source) {
-        return false;
+/// A declaration's own Scala access modifier; no modifier means public.
+/// `private[pkg]` is visible throughout `pkg`, so it is internal;
+/// `private` and `private[this]` are private.
+fn own_visibility(node: &Node, source: &str) -> Visibility {
+    let Some(text) = modifier_text(node, source, "access_modifier") else {
+        return Visibility::Public;
+    };
+    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if text.starts_with("protected") {
+        Visibility::Protected
+    } else if text == "private" || text == "private[this]" {
+        Visibility::Private
+    } else if text.starts_with("private") {
+        Visibility::Internal
+    } else {
+        Visibility::Public
     }
-
-    // Check all ancestor types for visibility
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if TYPE_NODES.contains(&n.kind()) && has_private_modifier(&n, source) {
-            return false;
-        }
-        current = n.parent();
-    }
-
-    true
 }
 
-/// Check if a node has a `private` access modifier.
-/// In this grammar, access_modifier lives inside a `modifiers` wrapper node.
-fn has_private_modifier(node: &Node, source: &str) -> bool {
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        if child.kind() == "access_modifier"
-            && let Ok(text) = child.utf8_text(source.as_bytes())
-            && text.starts_with("private")
-        {
-            return true;
-        }
-        // The grammar wraps access_modifier inside a `modifiers` node
-        if child.kind() == "modifiers" {
-            for j in 0..child.child_count() {
-                let grandchild = child.child(j).unwrap();
-                if grandchild.kind() == "access_modifier"
-                    && let Ok(text) = grandchild.utf8_text(source.as_bytes())
-                    && text.starts_with("private")
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Scala visibility: the declaration's own modifier, narrowed by every
+/// enclosing class/object/trait/enum.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    narrow_by_enclosing_types(
+        node,
+        source,
+        own_visibility(node, source),
+        TYPE_NODES,
+        own_visibility,
+    )
 }
 
 /// For methods inside class/object/trait/enum bodies, resolve the parent type name.
@@ -219,9 +202,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
 /// Return Scala language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

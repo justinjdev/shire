@@ -539,23 +539,44 @@ fn test_rust_impl_method() {
     fn internal_helper(&self) {}
 }"#;
     let (symbols, _) = extract_file("rs", source, Arc::from("src/auth.rs"), true, 0);
-    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols.len(), 2);
     assert_eq!(symbols[0].name, "validate");
     assert_eq!(symbols[0].kind, SymbolKind::Method);
     assert_eq!(symbols[0].parent_symbol.as_deref(), Some("AuthService"));
+    assert_eq!(symbols[0].visibility, Visibility::Public);
     let params = symbols[0].parameters.as_ref().unwrap();
     assert_eq!(params.len(), 1); // self is skipped
     assert_eq!(params[0].name, "token");
+    assert_eq!(symbols[1].name, "internal_helper");
+    assert_eq!(symbols[1].kind, SymbolKind::Method);
+    assert_eq!(symbols[1].visibility, Visibility::Private);
 }
 
 #[test]
-fn test_rust_skip_non_pub() {
+fn test_rust_non_pub_items_are_indexed_as_private() {
     let source = r#"fn internal_fn() {}
 struct InternalStruct {}
 enum InternalEnum {}
+pub(crate) fn crate_fn() {}
+pub(super) struct SuperStruct {}
+pub(in crate::a) trait PathTrait {}
+pub(self) fn self_fn() {}
+pub fn public_fn() {}
+impl Display for InternalStruct {
+    fn fmt(&self) {}
+}
 "#;
     let (symbols, _) = extract_file("rs", source, Arc::from("src/internal.rs"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(vis(&symbols, "internal_fn"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalStruct"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalEnum"), Visibility::Private);
+    assert_eq!(vis(&symbols, "crate_fn"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "SuperStruct"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "PathTrait"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "self_fn"), Visibility::Private);
+    assert_eq!(vis(&symbols, "public_fn"), Visibility::Public);
+    // A trait-impl method has no modifier but is as visible as the trait.
+    assert_eq!(vis(&symbols, "fmt"), Visibility::Public);
 }
 
 // ============================================================
@@ -591,13 +612,15 @@ fn test_ts_exported_class_with_methods() {
     private _internal(): void {}
 }"#;
     let (symbols, _) = extract_file("ts", source, Arc::from("src/auth.ts"), true, 0);
-    assert_eq!(symbols.len(), 2, "expected class + public method only");
+    assert_eq!(symbols.len(), 3, "expected class + both methods");
     assert_eq!(symbols[0].name, "AuthService");
     assert_eq!(symbols[0].kind, SymbolKind::Class);
     assert_eq!(symbols[1].name, "validate");
     assert_eq!(symbols[1].kind, SymbolKind::Method);
     assert_eq!(symbols[1].parent_symbol.as_deref(), Some("AuthService"));
-    assert!(!symbols.iter().any(|s| s.name == "_internal"));
+    assert_eq!(symbols[1].visibility, Visibility::Public);
+    assert_eq!(symbols[2].name, "_internal");
+    assert_eq!(symbols[2].visibility, Visibility::Private);
 }
 
 #[test]
@@ -643,14 +666,72 @@ fn test_ts_exported_const() {
 }
 
 #[test]
-fn test_ts_skip_non_exported() {
+fn test_ts_non_exported_module_symbols_are_indexed_as_private() {
     let source = r#"
 function internalHelper() {}
-class InternalClass {}
+class InternalClass {
+    method(): void {}
+}
+interface InternalShape {}
+type InternalAlias = string;
+enum InternalEnum { A }
 const secret = 42;
+function laterExported() {}
+export { laterExported as renamed };
+export function outer() {
+    function nested() {}
+    class NestedClass {}
+}
+export class Api {
+    protected guarded(): void {}
+    #hidden(): void {}
+    open(): void {}
+}
 "#;
     let (symbols, _) = extract_file("ts", source, Arc::from("src/internal.ts"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalClass"), Visibility::Private);
+    // A method of an unexported class is not reachable from outside.
+    assert_eq!(vis(&symbols, "method"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalShape"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalAlias"), Visibility::Private);
+    assert_eq!(vis(&symbols, "InternalEnum"), Visibility::Private);
+    assert_eq!(vis(&symbols, "secret"), Visibility::Private);
+    // Exported through a later `export { ... }` clause.
+    assert_eq!(vis(&symbols, "laterExported"), Visibility::Public);
+    assert_eq!(vis(&symbols, "outer"), Visibility::Public);
+    assert_eq!(vis(&symbols, "Api"), Visibility::Public);
+    assert_eq!(vis(&symbols, "guarded"), Visibility::Protected);
+    assert_eq!(vis(&symbols, "#hidden"), Visibility::Private);
+    assert_eq!(vis(&symbols, "open"), Visibility::Public);
+    // Declarations local to a function body are not module symbols.
+    assert!(!symbols.iter().any(|s| s.name == "nested"));
+    assert!(!symbols.iter().any(|s| s.name == "NestedClass"));
+}
+
+#[test]
+fn test_js_non_exported_module_symbols_are_indexed_as_private() {
+    let source = r#"
+function internalHelper() {}
+class Internal {
+    run() {}
+    #secret() {}
+}
+const config = {};
+export function api() {}
+export class Service {
+    handle() {}
+}
+"#;
+    let (symbols, _) = extract_file("js", source, Arc::from("src/m.js"), true, 0);
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Internal"), Visibility::Private);
+    assert_eq!(vis(&symbols, "run"), Visibility::Private);
+    assert_eq!(vis(&symbols, "#secret"), Visibility::Private);
+    assert_eq!(vis(&symbols, "config"), Visibility::Private);
+    assert_eq!(vis(&symbols, "api"), Visibility::Public);
+    assert_eq!(vis(&symbols, "Service"), Visibility::Public);
+    assert_eq!(vis(&symbols, "handle"), Visibility::Public);
 }
 
 #[test]
@@ -1111,25 +1192,39 @@ public class AppConfig {
         .iter()
         .filter(|s| s.kind == SymbolKind::Constant)
         .collect();
-    assert_eq!(constants.len(), 2);
+    assert_eq!(constants.len(), 3);
     assert_eq!(constants[0].name, "API_VERSION");
     assert_eq!(constants[0].parent_symbol.as_deref(), Some("AppConfig"));
+    assert_eq!(constants[0].visibility, Visibility::Public);
+    assert_eq!(
+        constants[0].signature.as_deref(),
+        Some("public static final String API_VERSION")
+    );
     assert_eq!(constants[1].name, "MAX_RETRIES");
+    assert_eq!(constants[2].name, "SECRET");
+    assert_eq!(constants[2].visibility, Visibility::Private);
+    assert_eq!(
+        constants[2].signature.as_deref(),
+        Some("private static final String SECRET")
+    );
 }
 
 #[test]
-fn test_java_skip_private_class() {
+fn test_java_private_class_members_are_private() {
     let source = r#"
 private class InternalHelper {
     public void doSomething() {}
 }
 "#;
     let (symbols, _) = extract_file("java", source, Arc::from("InternalHelper.java"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(vis(&symbols, "InternalHelper"), Visibility::Private);
+    // A public method of a private class is narrowed to private.
+    assert_eq!(vis(&symbols, "doSomething"), Visibility::Private);
 }
 
 #[test]
-fn test_java_skip_package_private_method() {
+fn test_java_package_private_and_private_methods_are_indexed() {
     let source = r#"
 public class Service {
     void internalMethod(String data) {
@@ -1147,8 +1242,11 @@ public class Service {
         .iter()
         .filter(|s| s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
         .collect();
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].name, "publicMethod");
+    assert_eq!(methods.len(), 3);
+    // Package-private (no modifier) is recorded as internal.
+    assert_eq!(vis(&symbols, "internalMethod"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "secretMethod"), Visibility::Private);
+    assert_eq!(vis(&symbols, "publicMethod"), Visibility::Public);
 }
 
 #[test]
@@ -1190,7 +1288,7 @@ public interface Api {
 fn test_java_interface_members_are_extracted_as_implicitly_public() {
     // SYM-2 / SYM-V1: interface methods and constants carry no explicit
     // modifier (JLS: implicitly public, and constants implicitly static
-    // final), so a query fix alone is not enough — is_visible/post_process
+    // final), so a query fix alone is not enough — visibility/post_process
     // must treat `interface_body` members as visible.
     let source = r#"public interface Repo {
   String NAME = "repo";
@@ -1592,28 +1690,28 @@ fn test_kotlin_class_method() {
 }
 
 #[test]
-fn test_kotlin_skip_private_class() {
+fn test_kotlin_private_class_and_its_members_are_private() {
     let source = r#"private class InternalHelper {
     fun doSomething() {}
 }"#;
     let (symbols, _) = extract_file("kt", source, Arc::from("Internal.kt"), true, 0);
-    assert!(
-        symbols.is_empty(),
-        "private class and its methods should be skipped"
-    );
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(vis(&symbols, "InternalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "doSomething"), Visibility::Private);
 }
 
 #[test]
-fn test_kotlin_skip_internal_function() {
+fn test_kotlin_internal_function_is_internal() {
     let source = r#"internal fun helperFunction(x: Int): Int {
     return x * 2
 }"#;
     let (symbols, _) = extract_file("kt", source, Arc::from("Helper.kt"), true, 0);
-    assert!(symbols.is_empty(), "internal function should be skipped");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(vis(&symbols, "helperFunction"), Visibility::Internal);
 }
 
 #[test]
-fn test_kotlin_skip_private_method() {
+fn test_kotlin_private_method_is_private() {
     let source = r#"class PublicService {
     fun publicMethod(): String {
         return ""
@@ -1624,12 +1722,9 @@ fn test_kotlin_skip_private_method() {
     }
 }"#;
     let (symbols, _) = extract_file("kt", source, Arc::from("Service.kt"), true, 0);
-    assert!(symbols.iter().any(|s| s.name == "PublicService"));
-    assert!(symbols.iter().any(|s| s.name == "publicMethod"));
-    assert!(
-        !symbols.iter().any(|s| s.name == "secretMethod"),
-        "private method should be skipped"
-    );
+    assert_eq!(vis(&symbols, "PublicService"), Visibility::Public);
+    assert_eq!(vis(&symbols, "publicMethod"), Visibility::Public);
+    assert_eq!(vis(&symbols, "secretMethod"), Visibility::Private);
 }
 
 #[test]
@@ -1874,13 +1969,53 @@ fn test_c_enum() {
 }
 
 #[test]
-fn test_c_skip_static() {
+fn test_c_static_function_is_private() {
     let source = r#"static int internal_helper(void) {
     return 42;
 }
+
+int exported(void) {
+    return 1;
+}
 "#;
     let (symbols, _) = extract_file("c", source, Arc::from("internal.c"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(vis(&symbols, "internal_helper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "exported"), Visibility::Public);
+}
+
+#[test]
+fn test_cpp_access_specifiers_and_static_set_visibility() {
+    let source = r#"static void file_local() {}
+void global_fn() {}
+
+class Widget {
+    void implicit_private() {}
+public:
+    void draw() {}
+protected:
+    void on_resize() {}
+private:
+    void cleanup() {}
+};
+
+struct Point {
+    int norm() { return 0; }
+private:
+    int hidden() { return 0; }
+};
+"#;
+    let (symbols, _) = extract_file("cpp", source, Arc::from("widget.cpp"), true, 0);
+    assert_eq!(vis(&symbols, "file_local"), Visibility::Private);
+    assert_eq!(vis(&symbols, "global_fn"), Visibility::Public);
+    assert_eq!(vis(&symbols, "Widget"), Visibility::Public);
+    // `class` members default to private, `struct` members to public.
+    assert_eq!(vis(&symbols, "implicit_private"), Visibility::Private);
+    assert_eq!(vis(&symbols, "draw"), Visibility::Public);
+    assert_eq!(vis(&symbols, "on_resize"), Visibility::Protected);
+    assert_eq!(vis(&symbols, "cleanup"), Visibility::Private);
+    assert_eq!(vis(&symbols, "norm"), Visibility::Public);
+    assert_eq!(vis(&symbols, "hidden"), Visibility::Private);
 }
 
 #[test]
@@ -2068,7 +2203,7 @@ public class OrderService {
 }
 
 #[test]
-fn test_csharp_skip_private() {
+fn test_csharp_private_and_default_members_are_indexed() {
     let source = r#"
 public class Service {
     private void SecretMethod() {}
@@ -2080,8 +2215,42 @@ public class Service {
         .iter()
         .filter(|s| s.kind == SymbolKind::Method || s.kind == SymbolKind::Function)
         .collect();
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].name, "PublicMethod");
+    assert_eq!(methods.len(), 2);
+    assert_eq!(vis(&symbols, "SecretMethod"), Visibility::Private);
+    assert_eq!(vis(&symbols, "PublicMethod"), Visibility::Public);
+}
+
+#[test]
+fn test_csharp_visibility_defaults_and_narrowing() {
+    let source = r#"
+class InternalByDefault {
+    public void Exposed() {}
+}
+
+public interface IShape {
+    void Draw();
+}
+
+public class Outer {
+    void DefaultPrivate() {}
+    internal void Assembly() {}
+    protected internal void Family() {}
+    private const int Limit = 3;
+}
+"#;
+    let (symbols, _) = extract_file("cs", source, Arc::from("Shapes.cs"), true, 0);
+    // A top-level type with no modifier is internal, and narrows its members.
+    assert_eq!(vis(&symbols, "InternalByDefault"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "Exposed"), Visibility::Internal);
+    // Interface members are implicitly public.
+    assert_eq!(vis(&symbols, "Draw"), Visibility::Public);
+    // A class member with no modifier is private.
+    assert_eq!(vis(&symbols, "DefaultPrivate"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Assembly"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "Family"), Visibility::Protected);
+    let limit = symbols.iter().find(|s| s.name == "Limit").unwrap();
+    assert_eq!(limit.visibility, Visibility::Private);
+    assert_eq!(limit.signature.as_deref(), Some("private const int Limit"));
 }
 
 // ============================================================
@@ -2161,12 +2330,22 @@ fn test_swift_function() {
 }
 
 #[test]
-fn test_swift_skip_private() {
+fn test_swift_private_and_fileprivate_are_private() {
     let source = r#"private func internalHelper() -> Void {}
 fileprivate func alsoPrivate() -> Void {}
+internal func moduleWide() -> Void {}
+public func exposed() -> Void {}
+private class Hidden {
+    public func member() {}
+}
 "#;
     let (symbols, _) = extract_file("swift", source, Arc::from("Internal.swift"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "alsoPrivate"), Visibility::Private);
+    assert_eq!(vis(&symbols, "moduleWide"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "exposed"), Visibility::Public);
+    assert_eq!(vis(&symbols, "Hidden"), Visibility::Private);
+    assert_eq!(vis(&symbols, "member"), Visibility::Private);
 }
 
 // ============================================================
@@ -2308,11 +2487,27 @@ fn test_scala_function() {
 }
 
 #[test]
-fn test_scala_skip_private() {
+fn test_scala_access_modifiers_set_visibility() {
     let source = r#"private def internalHelper(): Unit = {}
+object Registry {
+  def lookup(): Unit = {}
+  protected def guarded(): Unit = {}
+  private[pkg] def packageWide(): Unit = {}
+  private[this] def instanceOnly(): Unit = {}
+}
+private class Secret {
+  def reveal(): Unit = {}
+}
 "#;
     let (symbols, _) = extract_file("scala", source, Arc::from("Internal.scala"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Registry"), Visibility::Public);
+    assert_eq!(vis(&symbols, "lookup"), Visibility::Public);
+    assert_eq!(vis(&symbols, "guarded"), Visibility::Protected);
+    assert_eq!(vis(&symbols, "packageWide"), Visibility::Internal);
+    assert_eq!(vis(&symbols, "instanceOnly"), Visibility::Private);
+    assert_eq!(vis(&symbols, "Secret"), Visibility::Private);
+    assert_eq!(vis(&symbols, "reveal"), Visibility::Private);
 }
 
 #[test]
@@ -2416,18 +2611,50 @@ fn test_zig_function() {
 }
 
 #[test]
-fn test_zig_skip_non_pub() {
+fn test_zig_non_pub_is_private_and_locals_are_skipped() {
     let source = r#"fn internalHelper() void {
+    const local = 1;
+    _ = local;
     return;
 }
+pub fn exported() void {}
+const Config = struct {
+    const inner_limit = 3;
+    pub fn load() void {}
+};
+pub const MAX = 10;
 "#;
     let (symbols, _) = extract_file("zig", source, Arc::from("internal.zig"), true, 0);
-    assert!(symbols.is_empty());
+    assert_eq!(vis(&symbols, "internalHelper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "exported"), Visibility::Public);
+    assert_eq!(vis(&symbols, "Config"), Visibility::Private);
+    assert_eq!(vis(&symbols, "inner_limit"), Visibility::Private);
+    assert_eq!(vis(&symbols, "load"), Visibility::Public);
+    assert_eq!(vis(&symbols, "MAX"), Visibility::Public);
+    // A const inside a function body is a local, not a symbol.
+    assert!(!symbols.iter().any(|s| s.name == "local"));
 }
 
 // ============================================================
 // Lua tests (SYM-12: previously untested — see registry.rs)
 // ============================================================
+
+#[test]
+fn test_lua_local_functions_are_private() {
+    let source = r#"local function helper() end
+local cached = function() end
+function global_fn() end
+local M = {}
+function M.api() end
+function M:method() end
+"#;
+    let (symbols, _) = extract_file("lua", source, Arc::from("mod.lua"), true, 0);
+    assert_eq!(vis(&symbols, "helper"), Visibility::Private);
+    assert_eq!(vis(&symbols, "cached"), Visibility::Private);
+    assert_eq!(vis(&symbols, "global_fn"), Visibility::Public);
+    assert_eq!(vis(&symbols, "api"), Visibility::Public);
+    assert_eq!(vis(&symbols, "method"), Visibility::Public);
+}
 
 #[test]
 fn test_lua_function_declaration() {
@@ -2526,7 +2753,7 @@ end
 }
 
 #[test]
-fn test_elixir_skip_private() {
+fn test_elixir_private_definitions_are_private() {
     let source = r#"defmodule MyApp do
   def public_fn do
     :ok
@@ -2540,9 +2767,31 @@ fn test_elixir_skip_private() {
 end
 "#;
     let (symbols, _) = extract_file("ex", source, Arc::from("lib/my_app.ex"), true, 0);
-    assert!(symbols.iter().any(|s| s.name == "public_fn"));
-    assert!(!symbols.iter().any(|s| s.name == "private_fn"));
-    assert!(!symbols.iter().any(|s| s.name == "private_macro"));
+    assert_eq!(vis(&symbols, "MyApp"), Visibility::Public);
+    assert_eq!(vis(&symbols, "public_fn"), Visibility::Public);
+    assert_eq!(vis(&symbols, "private_fn"), Visibility::Private);
+    assert_eq!(vis(&symbols, "private_macro"), Visibility::Private);
+    let private_fn = symbols.iter().find(|s| s.name == "private_fn").unwrap();
+    assert_eq!(private_fn.kind, SymbolKind::Function);
+    assert_eq!(private_fn.parent_symbol.as_deref(), Some("MyApp"));
+}
+
+#[test]
+fn test_elixir_typep_is_private_and_plain_calls_are_not_symbols() {
+    let source = r#"defmodule Shapes do
+  @type public_t :: integer()
+  @typep private_t :: atom()
+  @doc "docs"
+  def area(x), do: helper(x)
+end
+"#;
+    let (symbols, _) = extract_file("ex", source, Arc::from("lib/shapes.ex"), true, 0);
+    assert_eq!(vis(&symbols, "public_t"), Visibility::Public);
+    assert_eq!(vis(&symbols, "private_t"), Visibility::Private);
+    assert_eq!(vis(&symbols, "area"), Visibility::Public);
+    // `helper(x)` and `@doc` match the generic call patterns but define nothing.
+    assert!(!symbols.iter().any(|s| s.name == "helper"));
+    assert!(!symbols.iter().any(|s| s.name == "doc"));
 }
 
 #[test]
@@ -3657,11 +3906,50 @@ def main():
 }
 
 #[test]
+fn test_ruby_private_and_protected_sections_set_visibility() {
+    let source = r#"class Account
+  def balance
+  end
+
+  protected
+
+  def compare(other)
+  end
+
+  private
+
+  def recalc
+  end
+
+  public
+
+  def deposit(amount)
+  end
+
+  private def audit
+  end
+
+  def self.build
+  end
+end
+"#;
+    let (symbols, _) = extract_file("rb", source, Arc::from("account.rb"), true, 0);
+    assert_eq!(vis(&symbols, "Account"), Visibility::Public);
+    assert_eq!(vis(&symbols, "balance"), Visibility::Public);
+    assert_eq!(vis(&symbols, "compare"), Visibility::Protected);
+    assert_eq!(vis(&symbols, "recalc"), Visibility::Private);
+    assert_eq!(vis(&symbols, "deposit"), Visibility::Public);
+    assert_eq!(vis(&symbols, "audit"), Visibility::Private);
+    assert_eq!(vis(&symbols, "build"), Visibility::Public);
+}
+
+#[test]
 fn test_private_symbols_reach_the_index_in_convention_languages() {
     // Guard against the old behaviour, where the hook dropped these outright:
-    // the converted languages' private symbols must reach the index.
+    // every language's private symbols must reach the index.
     for (ext, source, name) in [
         ("go", "package p\nfunc helper() {}\n", "helper"),
+        ("rs", "fn helper() {}\n", "helper"),
         ("pl", "sub _helper { 1 }\n", "_helper"),
         (
             "py",
@@ -3669,6 +3957,14 @@ fn test_private_symbols_reach_the_index_in_convention_languages() {
             "_helper",
         ),
         ("dart", "void _helper() {}\n", "_helper"),
+        ("gleam", "fn helper() { 1 }\n", "helper"),
+        ("nim", "proc helper() = discard\n", "helper"),
+        ("clj", "(defn- helper [x] x)\n", "helper"),
+        (
+            "ex",
+            "defmodule M do\n  defp helper, do: 1\nend\n",
+            "helper",
+        ),
     ] {
         let (symbols, _) =
             extract_file(ext, source, Arc::from(format!("f.{ext}").as_str()), true, 0);

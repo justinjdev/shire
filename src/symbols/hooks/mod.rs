@@ -61,15 +61,6 @@ pub struct ReferenceHooks {
 /// All fields are optional — None means use the default behavior.
 #[derive(Default)]
 pub struct LanguageHooks {
-    /// Legacy privacy filter: return false to drop the symbol outright.
-    ///
-    /// Still used by the languages that have not been converted to the
-    /// `visibility` hook yet; they keep dropping private symbols exactly as
-    /// before. Removed once every language derives `visibility` instead
-    /// (branch `feat/private-symbols-all-languages`). Do not use it in new
-    /// code.
-    pub is_visible: Option<fn(node: &Node, source: &str) -> bool>,
-
     /// Filter for query matches that are not symbol definitions at all — a
     /// deliberately broad pattern (Clojure's `(list_lit ...)`, Elixir's `call`)
     /// that also matches ordinary calls, or a binding local to a function body.
@@ -166,6 +157,27 @@ pub fn underscore_visibility(name: &str) -> Visibility {
     } else {
         Visibility::Public
     }
+}
+
+/// Text of the first `kind` node among `node`'s children, or among the
+/// children of its `modifiers` child (grammars differ on whether access
+/// modifiers are wrapped). Used to read `private`/`internal`/... keywords.
+pub fn modifier_text<'a>(node: &Node, source: &'a str, kind: &str) -> Option<&'a str> {
+    for i in 0..node.child_count() {
+        let child = node.child(i).unwrap();
+        if child.kind() == kind {
+            return node_text(&child, source);
+        }
+        if child.kind() == "modifiers" {
+            for j in 0..child.child_count() {
+                let grandchild = child.child(j).unwrap();
+                if grandchild.kind() == kind {
+                    return node_text(&grandchild, source);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Helper: find first child node with the given kind.

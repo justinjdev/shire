@@ -116,7 +116,6 @@ fn post_process(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo
 /// Return the language hooks for R.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: None,
         is_definition: None,
         visibility: None,
         resolve_parent: None,

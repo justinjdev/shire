@@ -1,5 +1,5 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, find_ancestor,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, find_ancestor,
     find_child_by_kind, node_text,
 };
 use tree_sitter::Node;
@@ -162,6 +162,44 @@ fn extract_parameters(node: &Node, source: &str) -> Vec<Parameter> {
     params
 }
 
+/// Ruby visibility for an instance method: `private def foo` / `protected
+/// def foo`, or the nearest preceding bare `private` / `protected` / `public`
+/// line in the same class or module body. Everything else is public.
+/// (`private :foo` after the definition is not tracked.)
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if node.kind() != "method" {
+        return Visibility::Public;
+    }
+    fn keyword(text: Option<&str>) -> Option<Visibility> {
+        match text? {
+            "private" => Some(Visibility::Private),
+            "protected" => Some(Visibility::Protected),
+            "public" => Some(Visibility::Public),
+            _ => None,
+        }
+    }
+    // `private def foo ... end`: the method is the argument of a call.
+    if let Some(args) = node.parent().filter(|p| p.kind() == "argument_list")
+        && let Some(call) = args.parent().filter(|p| p.kind() == "call")
+        && let Some(vis) = keyword(
+            call.child_by_field_name("method")
+                .and_then(|m| node_text(&m, source)),
+        )
+    {
+        return vis;
+    }
+    let mut sibling = node.prev_named_sibling();
+    while let Some(sib) = sibling {
+        if sib.kind() == "identifier"
+            && let Some(vis) = keyword(node_text(&sib, source))
+        {
+            return vis;
+        }
+        sibling = sib.prev_named_sibling();
+    }
+    Visibility::Public
+}
+
 /// Post-process: reclassify methods inside classes/modules as Method kind.
 /// Singleton methods stay as Function.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
@@ -185,9 +223,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return Ruby language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: None,
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

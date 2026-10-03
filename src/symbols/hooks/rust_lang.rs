@@ -1,9 +1,34 @@
-use super::{LanguageHooks, Parameter, SymbolKind, field_text, find_ancestor, find_child_by_kind};
+use super::{
+    LanguageHooks, Parameter, SymbolKind, Visibility, field_text, find_ancestor,
+    find_child_by_kind, node_text,
+};
 use tree_sitter::Node;
 
-/// Check if a node has a `visibility_modifier` child (i.e., is `pub`).
-fn is_visible(node: &Node, _source: &str) -> bool {
-    find_child_by_kind(node, "visibility_modifier").is_some()
+/// Rust visibility from the item's `visibility_modifier`: `pub` is public;
+/// `pub(crate)`, `pub(super)` and `pub(in path)` are internal; `pub(self)` and
+/// no modifier at all are private. A method in a trait impl carries no
+/// modifier but is exactly as visible as the trait, so it counts as public.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    if let Some(modifier) = find_child_by_kind(node, "visibility_modifier") {
+        let text: String = node_text(&modifier, source)
+            .unwrap_or("pub")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        return match text.as_str() {
+            "pub" => Visibility::Public,
+            "pub(self)" => Visibility::Private,
+            _ => Visibility::Internal,
+        };
+    }
+    let in_trait_impl = node.kind() == "function_item"
+        && find_ancestor(node, "impl_item")
+            .is_some_and(|i| i.child_by_field_name("trait").is_some());
+    if in_trait_impl {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 /// For methods inside an impl block, resolve the impl target type name.
@@ -92,9 +117,8 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 /// Return the language hooks for Rust.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

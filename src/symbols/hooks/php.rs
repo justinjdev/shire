@@ -34,46 +34,15 @@ fn check_modifiers(node: &Node, source: &str) -> (bool, bool, bool, bool) {
     (public, protected, private, is_static)
 }
 
-/// PHP visibility: skip private symbols. Include public, protected, and symbols
-/// with no explicit modifier (PHP defaults to public for interface methods, and
-/// we include unmodified symbols by default for broader coverage).
-/// Also checks ancestor type visibility — members inside a private class are hidden.
-fn is_visible(node: &Node, source: &str) -> bool {
-    let (_, _, private, _) = check_modifiers(node, source);
-    if private {
-        return false;
+/// PHP visibility from the member's `public`/`protected`/`private` modifier;
+/// no modifier means public (PHP's default). PHP types themselves carry no
+/// access modifier, so nothing is narrowed by its enclosing class.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    match check_modifiers(node, source) {
+        (_, _, true, _) => Visibility::Private,
+        (_, true, _, _) => Visibility::Protected,
+        _ => Visibility::Public,
     }
-
-    // Check ancestor class/trait/interface visibility
-    let mut current = node.parent();
-    while let Some(n) = current {
-        if matches!(
-            n.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "trait_declaration"
-                | "enum_declaration"
-        ) {
-            // Walk up through the declaration_list to the type node
-            if let Some(type_node) = n.parent()
-                && matches!(
-                    type_node.kind(),
-                    "class_declaration"
-                        | "interface_declaration"
-                        | "trait_declaration"
-                        | "enum_declaration"
-                )
-            {
-                let (_, _, p_private, _) = check_modifiers(&type_node, source);
-                if p_private {
-                    return false;
-                }
-            }
-        }
-        current = n.parent();
-    }
-
-    true
 }
 
 /// For methods and constants inside a class/interface/trait/enum, return the type name.
@@ -196,28 +165,13 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 
 /// Post-process PHP symbols.
 fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo> {
-    let (public, protected, private, is_static) = check_modifiers(node, source);
-
-    // Set visibility string
-    if public {
-        sym.visibility = Visibility::Public;
-    } else if protected {
-        sym.visibility = Visibility::Protected;
-    }
+    let (_, _, _, is_static) = check_modifiers(node, source);
 
     match sym.kind {
         SymbolKind::Method => {
             // Static methods become Function kind
             if is_static {
                 sym.kind = SymbolKind::Function;
-            }
-            Some(sym)
-        }
-        SymbolKind::Constant => {
-            // Only include public constants (is_visible filters private already,
-            // but private constants inside public classes still reach post_process)
-            if private {
-                return None;
             }
             Some(sym)
         }
@@ -228,9 +182,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return PHP language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

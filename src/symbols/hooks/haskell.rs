@@ -200,7 +200,6 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return Haskell language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: None,
         is_definition: None,
         visibility: None,
         resolve_parent: Some(resolve_parent),

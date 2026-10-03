@@ -378,15 +378,15 @@ fn test_symbol_extraction_typescript() {
         .unwrap();
     assert_eq!(iface_kind, "interface");
 
-    // internalHelper should NOT be extracted (not exported)
-    let internal_count: i64 = conn
+    // internalHelper is not exported: indexed, tagged private
+    let visibility: String = conn
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'internalHelper'",
+            "SELECT visibility FROM symbols WHERE name = 'internalHelper'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(internal_count, 0, "non-exported symbols should be skipped");
+    assert_eq!(visibility, "private", "non-exported symbols are private");
 }
 
 #[test]
@@ -492,15 +492,23 @@ fn test_symbol_extraction_rust() {
         .unwrap();
     assert_eq!(kind, "struct");
 
-    // non-pub internal_fn should not be extracted
-    let count: i64 = conn
+    // non-pub internal_fn: indexed, tagged private
+    let visibility: String = conn
         .query_row(
-            "SELECT COUNT(*) FROM symbols WHERE name = 'internal_fn'",
+            "SELECT visibility FROM symbols WHERE name = 'internal_fn'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(visibility, "private");
+    let visibility: String = conn
+        .query_row(
+            "SELECT visibility FROM symbols WHERE name = 'process'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(visibility, "public");
 }
 
 #[test]

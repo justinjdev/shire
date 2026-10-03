@@ -1,19 +1,17 @@
-use super::{LanguageHooks, Parameter, SymbolKind, find_child_by_kind, node_text};
+use super::{LanguageHooks, Parameter, SymbolKind, Visibility, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
-/// C visibility: skip `static` functions/symbols (file-local linkage).
-/// All other symbols are included.
-fn is_visible(node: &Node, source: &str) -> bool {
-    for i in 0..node.child_count() {
-        let child = node.child(i).unwrap();
-        if child.kind() == "storage_class_specifier"
-            && let Some(text) = node_text(&child, source)
-            && text == "static"
-        {
-            return false;
-        }
+/// C visibility: a `static` definition has file-local linkage, so it is
+/// private to its translation unit. Everything else is public.
+pub(super) fn static_visibility(node: &Node, source: &str) -> Visibility {
+    let is_static = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .any(|c| c.kind() == "storage_class_specifier" && node_text(&c, source) == Some("static"));
+    if is_static {
+        Visibility::Private
+    } else {
+        Visibility::Public
     }
-    true
 }
 
 /// C has no classes or methods — no parent resolution needed.
@@ -107,9 +105,8 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 /// Return C language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(static_visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

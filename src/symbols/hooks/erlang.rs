@@ -1,12 +1,6 @@
 use super::{LanguageHooks, Parameter, SymbolInfo, SymbolKind};
 use tree_sitter::Node;
 
-/// Erlang visibility: all symbols are visible.
-/// Erlang uses -export([...]) to control visibility, but we index everything.
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
-}
-
 /// Build signature string for Erlang symbols.
 fn build_signature(node: &Node, source: &str, name: &str, kind: SymbolKind) -> String {
     match kind {
@@ -131,7 +125,6 @@ fn post_process(sym: SymbolInfo, _node: &Node, _source: &str) -> Option<SymbolIn
 /// Return the language hooks for Erlang.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
         visibility: None,
         resolve_parent: None,

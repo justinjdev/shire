@@ -1,13 +1,6 @@
 use super::{LanguageHooks, Parameter, SymbolKind, node_text};
 use tree_sitter::Node;
 
-/// Odin visibility: all top-level declarations are visible.
-/// Odin uses a package-level export annotation (`@(export)`) but it's not a
-/// standard syntax-level visibility modifier, so we include everything.
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
-}
-
 /// Helper: find first child node with the given kind (local version to avoid lifetime issues).
 fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     for i in 0..node.child_count() {
@@ -152,7 +145,6 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 /// Return the language hooks for Odin.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
         visibility: None,
         resolve_parent: None,

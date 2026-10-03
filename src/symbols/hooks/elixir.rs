@@ -1,20 +1,27 @@
 use super::{
-    LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind, node_text,
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
 };
 use tree_sitter::Node;
 
-/// Valid public definition keywords for call nodes.
-const PUBLIC_DEF_KEYWORDS: &[&str] = &[
+/// Definition keywords for call nodes.
+const DEF_KEYWORDS: &[&str] = &[
     "def",
+    "defp",
     "defmacro",
+    "defmacrop",
     "defguard",
+    "defguardp",
     "defdelegate",
     "defmodule",
     "defprotocol",
 ];
 
-/// Valid attribute names for unary_operator (@attr) nodes.
-const ATTR_KEYWORDS: &[&str] = &["type", "opaque", "callback"];
+/// The private (module-local) variants among `DEF_KEYWORDS`.
+const PRIVATE_DEF_KEYWORDS: &[&str] = &["defp", "defmacrop", "defguardp"];
+
+/// Definition attribute names for unary_operator (@attr) nodes.
+const ATTR_KEYWORDS: &[&str] = &["type", "typep", "opaque", "callback"];
 
 /// Get the target identifier text of a call node.
 fn call_target_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
@@ -29,16 +36,33 @@ fn attr_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
         .and_then(|t| node_text(&t, source))
 }
 
-/// Filter: include only valid public definitions.
-fn is_visible(node: &Node, source: &str) -> bool {
+/// The query patterns match any call with an identifier target — `foo(x)`
+/// and `@doc "..."` as much as `def foo(x)` and `@type t :: ...`. Only the
+/// definition keywords and type/callback attributes are definitions.
+fn is_definition(node: &Node, source: &str) -> bool {
     match node.kind() {
-        "call" => {
-            call_target_text(node, source).is_some_and(|kw| PUBLIC_DEF_KEYWORDS.contains(&kw))
-        }
+        "call" => call_target_text(node, source).is_some_and(|kw| DEF_KEYWORDS.contains(&kw)),
         "unary_operator" => {
             attr_name(node, source).is_some_and(|name| ATTR_KEYWORDS.contains(&name))
         }
         _ => false,
+    }
+}
+
+/// Elixir visibility: `defp`, `defmacrop`, `defguardp` and `@typep` are
+/// private to their module; everything else is public.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    let private = match node.kind() {
+        "call" => {
+            call_target_text(node, source).is_some_and(|kw| PRIVATE_DEF_KEYWORDS.contains(&kw))
+        }
+        "unary_operator" => attr_name(node, source) == Some("typep"),
+        _ => false,
+    };
+    if private {
+        Visibility::Private
+    } else {
+        Visibility::Public
     }
 }
 
@@ -219,9 +243,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
-        is_definition: None,
-        visibility: None,
+        is_definition: Some(is_definition),
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

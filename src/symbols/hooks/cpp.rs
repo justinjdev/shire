@@ -1,13 +1,36 @@
 use super::{
-    LanguageHooks, Parameter, SymbolInfo, SymbolKind, find_ancestor, find_child_by_kind, node_text,
+    LanguageHooks, Parameter, SymbolInfo, SymbolKind, Visibility, find_ancestor,
+    find_child_by_kind, node_text,
 };
 use tree_sitter::Node;
 
-/// C++ visibility: include all symbols.
-/// C++ exposes APIs through headers and visibility semantics are complex
-/// (friend, nested classes, etc.), so we don't filter by access specifiers.
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
+/// C++ visibility. A class member takes the nearest preceding access
+/// specifier label (`private:`, `protected:`, `public:`) in its class body,
+/// defaulting to private in a `class` and public in a `struct`/`union`. A
+/// non-member `static` definition has internal linkage and is private to its
+/// translation unit. Everything else is public.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    let Some(body) = node
+        .parent()
+        .filter(|p| p.kind() == "field_declaration_list")
+    else {
+        return super::c::static_visibility(node, source);
+    };
+    let mut sibling = node.prev_sibling();
+    while let Some(sib) = sibling {
+        if sib.kind() == "access_specifier" {
+            return match node_text(&sib, source).map(str::trim) {
+                Some("private") => Visibility::Private,
+                Some("protected") => Visibility::Protected,
+                _ => Visibility::Public,
+            };
+        }
+        sibling = sib.prev_sibling();
+    }
+    match body.parent().map(|p| p.kind()) {
+        Some("class_specifier") => Visibility::Private,
+        _ => Visibility::Public,
+    }
 }
 
 /// Resolve parent: if inside a class_specifier or struct_specifier, return the class/struct name.
@@ -141,9 +164,8 @@ fn post_process(mut sym: SymbolInfo, node: &Node, source: &str) -> Option<Symbol
 /// Return C++ language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
-        visibility: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),

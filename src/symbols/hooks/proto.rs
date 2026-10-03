@@ -1,11 +1,6 @@
 use super::{LanguageHooks, Parameter, SymbolKind, find_ancestor, find_child_by_kind, node_text};
 use tree_sitter::Node;
 
-/// Proto visibility: all symbols are public.
-fn is_visible(_node: &Node, _source: &str) -> bool {
-    true
-}
-
 /// Resolve parent symbol for nested definitions.
 /// - Messages/enums/oneofs inside a `message_body` get the parent message's `message_name`.
 /// - RPCs inside a `service` get the parent service's `service_name`.
@@ -137,7 +132,6 @@ fn extract_return_type(node: &Node, source: &str) -> Option<String> {
 /// Return Protobuf language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
         is_definition: None,
         visibility: None,
         resolve_parent: Some(resolve_parent),

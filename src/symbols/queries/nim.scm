@@ -5,7 +5,7 @@
   name: (exported_symbol
     (identifier) @name)) @definition.function
 
-; Proc declarations (private — filtered by is_visible hook)
+; Proc declarations (private — tagged Visibility::Private by the visibility hook)
 (proc_declaration
   name: (identifier) @name) @definition.function
 

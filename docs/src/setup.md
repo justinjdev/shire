@@ -24,6 +24,24 @@ shire build
 
 The index is ready. Claude Code will automatically use it via the MCP server.
 
+### Interactive setup
+
+Run in a terminal, `shire init` asks its questions in sections:
+
+- **Index:** the install scope, rebuild strategy, database path, whether to gitignore the
+  index directory, and extra directories to exclude.
+- **Extras:** one checklist (space toggles an item, enter confirms):
+  - the cross-reference tools
+  - the rules file
+  - the `~/.claude/CLAUDE.md` guidance
+  - the Claude Code status mod
+- **Review:** lists every file it is about to write, then asks **Apply these changes?**
+  Answering no writes nothing.
+  - If `shire.toml` already exists, you are asked first whether to overwrite it. Answer no to
+    keep it and still set up the rest.
+
+`--yes` (or running without a terminal) skips the questions and uses the defaults.
+
 ### Rules file
 
 `shire init` creates `~/.claude/rules/shire.md` with guidance on when to use Shire tools vs Grep/Glob. This helps Claude Code default to Shire for codebase searches, so you spend fewer tool calls on broad exploration.
@@ -32,20 +50,14 @@ If it already exists, `shire init` leaves it untouched — with one exception: t
 
 ### CLAUDE.md integration
 
-During interactive setup, `shire init` prompts:
-
-> Add Shire search guidance to ~/.claude/CLAUDE.md?
-
-If accepted, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Code to prefer Shire MCP tools over Grep/Glob for code search. The line is idempotent — running init again won't duplicate it. If `~/.claude/CLAUDE.md` doesn't exist yet, it creates the file.
+In interactive setup this is the **Search guidance in ~/.claude/CLAUDE.md** item in the
+Extras checklist, checked by default. If selected, it appends a one-liner to `~/.claude/CLAUDE.md` directing Claude Code to prefer Shire MCP tools over Grep/Glob for code search. The line is idempotent — running init again won't duplicate it. If `~/.claude/CLAUDE.md` doesn't exist yet, it creates the file.
 
 ### Claude Code status mod (experimental)
 
-During interactive setup, `shire init` also asks:
-
-> Install the Claude Code status mod (experimental)?
-
-The default is **no**. Answering yes, or passing `--mod` (`--no-mod` skips the question),
-installs a Claude Code [mod](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)
+In interactive setup this is the **Claude Code status mod** item in the Extras checklist,
+unchecked by default. Checking it, or passing `--mod`, installs it (`--mod` and `--no-mod` both answer the question, so the item is left out of the checklist). It is a Claude Code
+[mod](https://github.com/justinjdev/shire/tree/main/contrib/claude-mod/shire-status)
 that polls [`shire status --json`](#index-status) and shows index health in Claude Code's status
 line (for example `shire ● 412 pkgs · 38.2k syms · 4m ago`), shows a toast when something
 changes (new build failures, an interrupted build, the watch daemon stopping), and adds a

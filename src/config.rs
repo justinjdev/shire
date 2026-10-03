@@ -61,6 +61,15 @@ pub struct SymbolsConfig {
     /// 0 = no cap (unlimited).
     #[serde(default = "default_max_references_per_file")]
     pub max_references_per_file: usize,
+    /// Index private/unexported symbols (tagged `visibility = "private"`)
+    /// alongside public ones. Default: true. When false, symbols whose
+    /// visibility is `private` are dropped at extraction time; `internal` and
+    /// `protected` ones are kept, and references are unaffected.
+    ///
+    /// Toggling this takes effect on the next build, which re-extracts every
+    /// source file once.
+    #[serde(default = "default_include_private")]
+    pub include_private: bool,
 }
 
 impl Default for SymbolsConfig {
@@ -71,6 +80,7 @@ impl Default for SymbolsConfig {
             references_enabled: default_references_enabled(),
             max_file_size: default_symbols_max_file_size(),
             max_references_per_file: default_max_references_per_file(),
+            include_private: default_include_private(),
         }
     }
 }
@@ -85,6 +95,10 @@ fn default_symbols_max_file_size() -> u64 {
 
 fn default_max_references_per_file() -> usize {
     10_000
+}
+
+fn default_include_private() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -911,6 +925,15 @@ cache_dir = "/tmp/shire-rag"
         let config = Config::default();
         assert_eq!(config.symbols.max_file_size, 0); // disabled by default
         assert_eq!(config.symbols.max_references_per_file, 10_000);
+    }
+
+    #[test]
+    fn test_include_private_defaults_to_true_and_parses() {
+        assert!(Config::default().symbols.include_private);
+        let config: Config = toml::from_str("[symbols]\ninclude_private = false\n").unwrap();
+        assert!(!config.symbols.include_private);
+        let config: Config = toml::from_str("[symbols]\nmax_file_size = 1\n").unwrap();
+        assert!(config.symbols.include_private);
     }
 
     #[test]

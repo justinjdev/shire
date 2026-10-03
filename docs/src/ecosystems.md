@@ -40,45 +40,57 @@ and neither package is dropped.
 
 ## Symbol extraction
 
-Shire extracts public symbols (functions, classes, types, methods, interfaces) from source files using [tree-sitter](https://tree-sitter.github.io/tree-sitter/), with full signatures, parameters, and return types.
+Shire extracts symbols (functions, classes, types, methods, interfaces) from source files using [tree-sitter](https://tree-sitter.github.io/tree-sitter/), with full signatures, parameters, and return types.
 
-| Language | Extractor |
-|---|---|
-| TypeScript / JavaScript | tree-sitter |
-| Go | tree-sitter |
-| Rust | tree-sitter |
-| Python | tree-sitter |
-| Java | tree-sitter |
-| Kotlin | tree-sitter |
-| Dart | tree-sitter |
-| Protobuf | tree-sitter |
-| C | tree-sitter |
-| C++ | tree-sitter |
-| C# | tree-sitter |
-| Swift | tree-sitter |
-| PHP | tree-sitter |
-| Scala | tree-sitter |
-| Zig | tree-sitter |
-| Bash / Shell | tree-sitter |
-| R | tree-sitter |
-| Haskell | tree-sitter |
-| YAML | tree-sitter |
-| SQL | tree-sitter |
-| HCL / Terraform | tree-sitter |
-| TOML | tree-sitter |
-| Perl | tree-sitter |
-| Ruby | tree-sitter |
-| OCaml | tree-sitter |
-| Lua | tree-sitter |
-| Elixir | tree-sitter |
-| Clojure | tree-sitter |
-| Erlang | tree-sitter |
-| Julia | tree-sitter |
-| Gleam | tree-sitter |
-| Odin | tree-sitter |
-| Nix | tree-sitter |
-| Nim | tree-sitter |
-| COBOL | regex-based |
+Every symbol carries a `visibility` — `public`, `protected`, `internal` or
+`private`. For the languages with a rule in the Visibility column below,
+private and unexported symbols are indexed (tagged `private`) rather than
+skipped; search ranks them after the others (see [MCP Tools](mcp-tools.md)),
+and `symbols.include_private = false` drops them (see
+[Configuration](configuration.md)). Languages marked — still skip the private
+symbols their extractor recognises, as before.
+
+| Language | Extractor | Visibility |
+|---|---|---|
+| TypeScript / JavaScript | tree-sitter | — |
+| Go | tree-sitter | Capitalised name `public`, otherwise `private` |
+| Rust | tree-sitter | — |
+| Python | tree-sitter | Leading `_` → `private` (members of a `_Class` too); dunder names (`__init__`) are `public` |
+| Java | tree-sitter | — |
+| Kotlin | tree-sitter | — |
+| Dart | tree-sitter | Leading `_` → `private` (members of a `_Class` too, and named constructors such as `Foo._internal`) |
+| Protobuf | tree-sitter | — |
+| C | tree-sitter | — |
+| C++ | tree-sitter | — |
+| C# | tree-sitter | — |
+| Swift | tree-sitter | — |
+| PHP | tree-sitter | — |
+| Scala | tree-sitter | — |
+| Zig | tree-sitter | — |
+| Bash / Shell | tree-sitter | — |
+| R | tree-sitter | — |
+| Haskell | tree-sitter | — |
+| YAML | tree-sitter | — |
+| SQL | tree-sitter | — |
+| HCL / Terraform | tree-sitter | — |
+| TOML | tree-sitter | — |
+| Perl | tree-sitter | Leading `_` → `private` |
+| Ruby | tree-sitter | — |
+| OCaml | tree-sitter | — |
+| Lua | tree-sitter | — |
+| Elixir | tree-sitter | — |
+| Clojure | tree-sitter | — |
+| Erlang | tree-sitter | — |
+| Julia | tree-sitter | — |
+| Gleam | tree-sitter | — |
+| Odin | tree-sitter | — |
+| Nix | tree-sitter | — |
+| Nim | tree-sitter | — |
+| COBOL | regex-based | — |
+
+An index built by an older Shire picks the private symbols up on its first
+build after upgrading: the extractor version is stored in the index, and a
+mismatch re-extracts every source file once.
 
 ## Reference extraction
 

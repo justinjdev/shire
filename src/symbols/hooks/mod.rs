@@ -44,6 +44,9 @@ pub type SignatureFn = fn(node: &Node, source: &str, name: &str, kind: SymbolKin
 /// Function pointer type for post-processing a matched symbol; returning None drops it.
 pub type PostProcessFn = fn(sym: SymbolInfo, node: &Node, source: &str) -> Option<SymbolInfo>;
 
+/// Function pointer type for deriving a symbol's visibility from its definition node.
+pub type VisibilityFn = fn(node: &Node, source: &str) -> Visibility;
+
 /// Hooks for reference extraction. Only populated for languages with
 /// cross-reference support (currently: Go, Python, Java, TypeScript,
 /// JavaScript, Perl, Ruby, Scala).
@@ -58,9 +61,29 @@ pub struct ReferenceHooks {
 /// All fields are optional — None means use the default behavior.
 #[derive(Default)]
 pub struct LanguageHooks {
-    /// Filter: return true if the symbol should be included (is visible/exported).
-    /// Receives the definition node and source. Default: include all.
+    /// Legacy privacy filter: return false to drop the symbol outright.
+    ///
+    /// Still used by the languages that have not been converted to the
+    /// `visibility` hook yet; they keep dropping private symbols exactly as
+    /// before. Removed once every language derives `visibility` instead
+    /// (branch `feat/private-symbols-all-languages`). Do not use it in new
+    /// code.
     pub is_visible: Option<fn(node: &Node, source: &str) -> bool>,
+
+    /// Filter for query matches that are not symbol definitions at all — a
+    /// deliberately broad pattern (Clojure's `(list_lit ...)`, Elixir's `call`)
+    /// that also matches ordinary calls, or a binding local to a function body.
+    /// Return false to skip the match. Default: every match is a definition.
+    ///
+    /// Never use this to hide a symbol for being private or unexported: private
+    /// symbols are indexed, and `visibility` records what they are.
+    pub is_definition: Option<fn(node: &Node, source: &str) -> bool>,
+
+    /// Derive the symbol's visibility from its definition node, by the
+    /// language's own convention (a modifier, `pub`, a leading `_`, a
+    /// capitalised name, ...). Runs before `post_process`, which sees the
+    /// result in `sym.visibility`. Default: `Visibility::Public`.
+    pub visibility: Option<VisibilityFn>,
 
     /// Resolve parent symbol name (e.g., class name for methods, impl target for Rust).
     /// Receives the definition node and source. Default: None (no parent).
@@ -85,6 +108,64 @@ pub struct LanguageHooks {
     /// Reference extraction hooks. `None` means this language has no
     /// cross-reference support — the extractor skips ref processing entirely.
     pub reference_hooks: Option<ReferenceHooks>,
+}
+
+/// How restrictive a visibility is, for [`narrowest`]. `Protected` (subclasses
+/// plus, in Java, the package) ranks wider than `Internal` (the
+/// package/module/assembly only); the two are not strictly comparable, but a
+/// member is only ever narrowed by its enclosing type, where this order is
+/// the useful one.
+fn restrictiveness(v: Visibility) -> u8 {
+    match v {
+        Visibility::Public => 0,
+        Visibility::Protected => 1,
+        Visibility::Internal => 2,
+        Visibility::Private => 3,
+    }
+}
+
+/// The more restrictive of two visibilities: a `public` method of a
+/// `private` class is not reachable from outside, so it is private.
+pub fn narrowest(a: Visibility, b: Visibility) -> Visibility {
+    if restrictiveness(b) > restrictiveness(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Narrow `own` by the visibility of every ancestor of `node` whose kind is in
+/// `type_kinds` — the enclosing classes/types, computed by `of`.
+pub fn narrow_by_enclosing_types(
+    node: &Node,
+    source: &str,
+    own: Visibility,
+    type_kinds: &[&str],
+    of: fn(&Node, &str) -> Visibility,
+) -> Visibility {
+    let mut vis = own;
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if vis == Visibility::Private {
+            break;
+        }
+        if type_kinds.contains(&n.kind()) {
+            vis = narrowest(vis, of(&n, source));
+        }
+        current = n.parent();
+    }
+    vis
+}
+
+/// The leading-underscore convention (Python, Perl, Dart): `_name` and
+/// `__name` are private; dunder names such as `__init__` and `__eq__` are not.
+pub fn underscore_visibility(name: &str) -> Visibility {
+    let dunder = name.len() > 4 && name.starts_with("__") && name.ends_with("__");
+    if name.starts_with('_') && !dunder {
+        Visibility::Private
+    } else {
+        Visibility::Public
+    }
 }
 
 /// Helper: find first child node with the given kind.

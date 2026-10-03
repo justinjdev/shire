@@ -10,7 +10,7 @@ Shire exposes the following tools over the Model Context Protocol:
 | `list_packages` | List all indexed packages, optionally filtered by kind |
 | `package_dependencies` | List a package's dependencies. Set `depth>1` for transitive graph (returns edge list with different schema; `limit` caps the edge list too). |
 | `package_dependents` | Find all packages that depend on this package |
-| `search_symbols` | Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). `handle` matches `handleRequest`; `verify jwt` matches `verifyJwtToken`. Matches the symbol name and its sub-tokens only, never signatures or file paths. Omit `query` with a `package` filter to list that package's symbols in (file, line) order, capped at `limit`. |
+| `search_symbols` | Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). `handle` matches `handleRequest`; `verify jwt` matches `verifyJwtToken`. Matches the symbol name and its sub-tokens only, never signatures or file paths. Omit `query` with a `package` filter to list that package's symbols, capped at `limit`: non-private symbols in (file, line) order, then private ones. Private symbols are indexed and returned with their `visibility`; search ranks them after the public ones (an exactly-named symbol still comes first). |
 | `get_file_symbols` | List all symbols defined in a specific file. Use instead of reading the file to understand its exports. |
 | `search_files` | Find files by path or name. Use instead of Glob/find for locating files. Useful for "middleware", "proto files", or files in a specific directory. |
 | `search_docs` | Search documentation files by content, title, or path — returns matching docs with text snippets |
@@ -44,7 +44,10 @@ All four search tools (`search_symbols`, `search_packages`, `search_files`,
   the doc title, body and path.
 - `search_symbols` orders exact name matches first, so searching `handle` —
   or `handle*`, or a pasted `handle.` — never buries a symbol actually called
-  `handle` under its own prefixes.
+  `handle` under its own prefixes. After that, **private symbols rank after
+  the others**: the results FTS returns are reordered so `public`,
+  `protected` and `internal` symbols lead, keeping their relative rank. A
+  private symbol is never left out for being private — only ranked later.
 - Symbol names are additionally indexed by their **sub-tokens**:
   `verifyJwtToken` is indexed as `verify`, `jwt`, `token`, so `verify jwt`,
   `jwt` and `token` all find it. This applies to symbol names only, not to

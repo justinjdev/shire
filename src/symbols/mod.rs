@@ -133,5 +133,34 @@ pub fn extract_file(
     )
 }
 
+/// [`extract_file`] plus the index's visibility policy: with
+/// `include_private` false, symbols whose visibility is `Private` are
+/// dropped. This is the one place that policy is applied — languages never
+/// drop private symbols themselves. `Internal` and `Protected` symbols are
+/// always kept, and references are returned untouched: they are captured
+/// independently of the definitions, and a dropped definition still
+/// suppresses its own self-reference (its name range is recorded before any
+/// filter runs).
+pub fn extract_file_for_index(
+    ext: &str,
+    source: &str,
+    file_path: Arc<str>,
+    skip_references: bool,
+    max_references_per_file: usize,
+    include_private: bool,
+) -> (Vec<SymbolInfo>, Vec<ReferenceInfo>) {
+    let (mut symbols, references) = extract_file(
+        ext,
+        source,
+        file_path,
+        skip_references,
+        max_references_per_file,
+    );
+    if !include_private {
+        symbols.retain(|s| s.visibility != Visibility::Private);
+    }
+    (symbols, references)
+}
+
 #[cfg(test)]
 mod tests;

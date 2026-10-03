@@ -17,6 +17,7 @@ exclude_patterns = []       # file name patterns to skip (suffix match, e.g. "_g
 references_enabled = false  # EXPERIMENTAL, default false — see below
 max_file_size = 0           # 0 = disabled (default); set to e.g. 2097152 for 2 MiB cap
 max_references_per_file = 10000  # 0 = unlimited; default 10000 — caps cross-references per file
+include_private = true      # default true — index private/unexported symbols; see below
 
 # Documentation indexing
 [docs]
@@ -118,6 +119,36 @@ the next full rebuild (`shire build --force`).
 
 This feature is marked experimental: its schema and coverage may change
 in minor versions as language support broadens and edge cases surface.
+
+## Private symbols
+
+`symbols.include_private` (default `true`) controls whether private and
+unexported symbols are indexed. They are tagged `visibility = "private"`, by
+each language's own convention — a lowercase Go name, a leading `_` in
+Python, Perl or Dart (see the Visibility column in
+[Supported Ecosystems](ecosystems.md)) — and `search_symbols` ranks them after
+the public ones, so they are there when you look for a helper by name without
+crowding out the API.
+
+```toml
+[symbols]
+include_private = false  # index only what other code can use
+```
+
+With `false`, symbols whose visibility is `private` are dropped at extraction
+time. `internal` and `protected` symbols are kept either way, and
+cross-references (`references_enabled`) are unaffected — calls made from
+inside a private function are still recorded.
+
+**Size:** private code is often most of a codebase. As a guide, indexing
+private items took Shire's own (Rust) source from 286 to 1,120 symbols —
+about 4x the rows in `symbols` and `symbols_fts`. Expect a smaller jump in
+code that is mostly exported, and a larger one in application code full of
+helpers.
+
+Toggling the option takes effect on the next build, which re-extracts every
+source file once (no `--force` needed). The same happens once after upgrading
+to a Shire version whose extractor output changed.
 
 ## Custom package discovery
 

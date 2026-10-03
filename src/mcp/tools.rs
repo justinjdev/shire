@@ -722,7 +722,7 @@ impl ShireService {
     }
 
     #[tool(
-        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Matches the symbol name and its sub-tokens only, never signatures or file paths. Use instead of Grep for 'where is function X?'. Omit `query` with a `package` filter to list that package's symbols in (file, line) order, capped at `limit`."
+        description = "Find functions, classes, types, methods by identifier or identifier prefix (not regex or substring). Every whitespace-separated token must match, by prefix and against identifier sub-tokens: 'handle' finds handleRequest, 'verify jwt' finds verifyJwtToken. Matches the symbol name and its sub-tokens only, never signatures or file paths. Use instead of Grep for 'where is function X?'. Omit `query` with a `package` filter to list that package's symbols, capped at `limit`. Private symbols are indexed too (each result carries its `visibility`) and are ranked after the public ones: in search results, and in a package listing, which gives non-private symbols in (file, line) order, then private ones."
     )]
     fn search_symbols(
         &self,
@@ -750,13 +750,13 @@ impl ShireService {
                 Self::probe_limit(limit),
             )
             .map_err(|e| Self::mcp_err(e.to_string()))?;
-            // Ordered by (file_path, line), so a capped listing is the first
-            // `limit` symbols of the alphabetically-first files — say so.
+            // Ordered non-private first, then by (file_path, line), so a
+            // capped listing is the start of that order — say so.
             return Self::json_result(
                 &results,
                 limit,
-                "this is the start of the package in (file, line) order; \
-                 narrow with `kind` or `get_file_symbols`",
+                "this is the start of the package: non-private symbols in (file, line) \
+                 order, then private ones; narrow with `kind` or `get_file_symbols`",
             );
         }
         let conn = self.conn.lock().map_err(|e| Self::mcp_err(e.to_string()))?;

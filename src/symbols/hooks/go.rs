@@ -1,12 +1,19 @@
 use super::{
-    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, field_text, node_text,
+    LanguageHooks, Parameter, ReferenceHooks, SymbolInfo, SymbolKind, Visibility, field_text,
+    node_text,
 };
 use tree_sitter::Node;
 
-/// Go visibility: only symbols starting with an uppercase letter are exported.
-fn is_visible(node: &Node, source: &str) -> bool {
-    let name = field_text(node, "name", source);
-    name.is_some_and(|n| n.chars().next().is_some_and(|c| c.is_uppercase()))
+/// Go visibility: a name starting with an uppercase letter is exported;
+/// anything else (lowercase, `_`) is private to the package.
+fn visibility(node: &Node, source: &str) -> Visibility {
+    let exported = field_text(node, "name", source)
+        .is_some_and(|n| n.chars().next().is_some_and(|c| c.is_uppercase()));
+    if exported {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
 }
 
 /// For method_declaration, extract receiver type (strip leading `*`).
@@ -120,7 +127,9 @@ fn post_process(mut sym: SymbolInfo, node: &Node, _source: &str) -> Option<Symbo
 /// Return Go language hooks.
 pub fn hooks() -> LanguageHooks {
     LanguageHooks {
-        is_visible: Some(is_visible),
+        is_visible: None,
+        is_definition: None,
+        visibility: Some(visibility),
         resolve_parent: Some(resolve_parent),
         build_signature: Some(build_signature),
         extract_parameters: Some(extract_parameters),
